@@ -38,6 +38,9 @@ const STYLES = `
    ⚠️ 本文件整体是一段模板字面量，注释里**不能出现反引号**（会提前结束字符串，
    esbuild 直接在构建期报 "Expected ; but found …"）。 */
 .dim-jh-providerIcon.trae-cn-work { background: white; }
+/* Qoder 的官方图标是 412x412 的彩色 PNG（自带不透明底色），与 buddy 系那几条
+   base64 PNG 同类，故容器配色一致。类名同样必须存在：见上面那条集合相等断言。 */
+.dim-jh-providerIcon.qoder { background: white; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }
@@ -131,6 +134,23 @@ const STYLES = `
 .dim-jh-manualLogin { margin-bottom: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, #e37400 35%, var(--dsw-alias-border-l2, #eef0f3)); background: rgb(227 116 0 / 8%); font-size: 12px; line-height: 18px; color: #b45309; }
 .dim-jh-manualLogin a { color: #1677ff; font-weight: 600; word-break: break-all; text-decoration: underline; }
 .dim-jh-manualLogin p { margin: 0 0 6px; }
+
+/* ── Qoder 的 PAT 粘贴登录表单 ── */
+/* 面板内**内联展开**，不是弹窗：Qoder 没有浏览器登录流程（不需要 window.open
+   的手势约束），用户要做的就是「去签发页复制一串字符、粘回来」，弹窗只会多一层
+   关闭动作。配色与圆角对齐上面的 .dim-jh-loginHint / .dim-jh-manualLogin。 */
+.dim-jh-patForm { margin-bottom: 12px; padding: 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); background: var(--dsw-alias-bg-layer-2, #f7f8fa); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }
+.dim-jh-patForm p { margin: 0 0 8px; }
+.dim-jh-patForm a { color: #1677ff; font-weight: 600; word-break: break-all; text-decoration: underline; }
+.dim-jh-patField { display: grid; gap: 6px; margin-bottom: 8px; }
+/* 输入框用等宽字体：PAT 是一长串无空格字符，等宽更易逐段核对开头是不是 pt-。
+   width 100% + box-sizing 是为了不被面板宽度裁掉（长凭据会横向滚动而不是撑破布局）。 */
+.dim-jh-patField input { width: 100%; box-sizing: border-box; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); background: var(--dsw-alias-bg-layer-3, #fff); color: var(--dsw-alias-label-primary, #1a1a1a); font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.dim-jh-patField input:focus-visible { outline: none; border-color: color-mix(in srgb, #1677ff 72%, var(--dsw-alias-border-l2, #dfe1e5)); box-shadow: 0 0 0 1px color-mix(in srgb, #1677ff 24%, transparent) inset; }
+.dim-jh-patField input:disabled { background: var(--dsw-alias-bg-layer-2, #f7f8fa); color: var(--dsw-alias-label-secondary, #646a73); }
+.dim-jh-patActions { display: flex; gap: 8px; justify-content: flex-end; }
+/* 表单下方的常驻说明（PAT 存在哪、用来干什么） */
+.dim-jh-patHint { margin: 8px 0 0; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }
 
 /* 登录弹窗 */
 .dim-jh-loginOverlay { position: fixed; inset: 0; background: rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; z-index: 1000; }

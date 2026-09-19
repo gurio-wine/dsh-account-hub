@@ -92,6 +92,25 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('trae-cn-work')).toBe(false)
   })
 
+  it('Qoder 支持余额但**不支持**签到（100 Credits 只能桌面 App 手动领）', () => {
+    // `balance`：步骤 4 的 src/qoder-credits.ts 提供的余额与 `CreditBalance`
+    // 逐字段同构，CreditBalanceRow 直接复用，客户端不需要任何 provider 分支。
+    //
+    // `dailyCheckin` 刻意是 false：官方的每日 100 Credits 只能在 Qoder
+    // **桌面 App 里手动领取**，没有公开 API。
+    //
+    // ⚠️ 它与 `buddy` 在本矩阵里**同形（true/false）但原因完全不同**：
+    //   - `buddy` 是「后端根本没有这个接口」；
+    //   - `qoder` 是「有这项权益，但只在桌面 App 里手动领」。
+    // 两者只是恰好落成同一组布尔值，**不是**可以互相推导的同一种情况 ——
+    // 将来谁看见这两行「长得一样」想合并、或想「顺手改对称」，这条断言就会红。
+    // 同样不能因为 `balance` 是 true 就顺手把 `dailyCheckin` 也写成 true：
+    // 那会给面板加一个**每次点击都必然失败**的按钮（没有任何端点可打）。
+    expect(CREDITS_CAPABILITIES.qoder).toEqual({ balance: true, dailyCheckin: false })
+    expect(supportsCreditBalance('qoder')).toBe(true)
+    expect(supportsDailyCheckin('qoder')).toBe(false)
+  })
+
   it('能力矩阵的键与 PROVIDERS 的 id 逐字对齐（含连字符 provider）', () => {
     // 集合相等那条断言用 PROVIDER_ENTRY_PATTERN 抓 id，而它的字符类必须是
     // `[a-z-]+`：只认小写字母的话，带连字符的 id 抓不到，于是**漏登记时那条
@@ -107,8 +126,11 @@ describe('积分能力矩阵', () => {
     // 留在 PROVIDERS 里会让面板渲染出一个后端永远不认的标签页。
     expect(ids).toContain('buddy-cn')
     expect(ids).toContain('buddy')
+    // Qoder 是**第七条**，也是唯一登录形态不是浏览器登录的那条（PAT 粘贴）。
+    // id 无连字符、与后端 `QODER.id` 逐字一致。
+    expect(ids).toContain('qoder')
     expect(ids).not.toContain('workbuddy')
-    expect(ids).toHaveLength(6)
+    expect(ids).toHaveLength(7)
   })
 
   it('未登记的 provider 默认不支持任何积分能力（默认关闭）', () => {
@@ -140,7 +162,7 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
   const source = readClientSource()
 
   /**
-   * `PROVIDERS` 的六条最终形态。
+   * `PROVIDERS` 的**七条**最终形态。
    *
    * 顺序即面板标签页顺序，也是后端注册顺序；`label` 是面板标题与按钮文案里的
    * 显示名，`logoClass` 必须与 `jet-hub-styles.js` 的
@@ -153,9 +175,13 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     { id: 'lobsterai', label: 'LobsterAI', logoClass: 'lobsterai' },
     { id: 'trae-cn', label: 'Trae CN', logoClass: 'trae-cn' },
     { id: 'trae-cn-work', label: 'Trae CN Work', logoClass: 'trae-cn-work' },
+    // Qoder 排在最后（= PROVIDERS 的书写顺序）。它比上面六条多一个**全新的
+    // 登录形态**：PAT 粘贴（其余六条全是浏览器登录），见 jet-hub.js 的
+    // PAT_LOGIN_PROVIDERS。
+    { id: 'qoder', label: 'Qoder', logoClass: 'qoder' },
   ] as const
 
-  it('六条 provider 的 id / label / logoClass 与定稿一致', () => {
+  it('七条 provider 的 id / label / logoClass 与定稿一致', () => {
     const entries = [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)].map((m) => ({
       id: m[1]!, label: m[2]!, logoClass: m[4]!,
     }))
@@ -170,13 +196,24 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     // 判据是「有没有 loginHint」而不是某个显式的布尔标志：新增 provider 忘记
     // 声明时，最坏结果是多一个本来就能用的按钮，而不是把面板变成没有入口的死面板。
     const entries = [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)]
-    // 先钉死匹配器本身抓全了六条：漏抓的条目 `entry[5]` 恒为 undefined，
+    // 先钉死匹配器本身抓全了七条：漏抓的条目 `entry[5]` 恒为 undefined，
     // 会让下面那条「只有 Work 有」的断言在条目整个消失时反而是绿的。
     expect(entries).toHaveLength(EXPECTED.length)
     for (const entry of entries) {
       expect(entry[5] !== undefined, entry[1]).toBe(entry[1] === 'trae-cn-work')
     }
     expect(source).toContain('与 Trae CN 共用账号')
+    // ⚠️ Qoder 的区分（与上面那条断言是**两个方向**，别混为一谈）：
+    // 它**没有** loginHint，但原因**不是**「没有登录入口」—— 它有自己的入口，
+    // 只是形态不同（PAT 粘贴表单，见 jet-hub.js 的 PAT_LOGIN_PROVIDERS）。
+    // loginHint 的语义是「去**隔壁面板**登录」，与「在本面板换个形态登录」
+    // 是两件事：前者删掉入口、后者替换入口。
+    // 若哪天给 qoder 补上 loginHint，`canCreateAccount` 会变成 false，
+    // 面板的「+ 新建账号」整块消失，PAT 表单的唯一入口就没了 —— 而且不报错，
+    // 只会变成一个没有入口的死面板。故这里把「qoder 没有 loginHint」也钉死。
+    const providerEntryOf = (id: string) =>
+      [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)].find((m) => m[1] === id)
+    expect(providerEntryOf('qoder')?.[5]).toBeUndefined()
   })
 
   it('显示名不带公司注记', () => {
@@ -200,6 +237,9 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     //（同一产品），但常量名分开，将来换图只改一处。
     expect(entries.get('trae-cn')).toBe('TRAE_CN_ICON')
     expect(entries.get('trae-cn-work')).toBe('TRAE_CN_WORK_ICON')
+    // Qoder 的图标是**官方原图**（qoder.com 首页 rel=icon 指向的 412x412 PNG，
+    // 原样 base64 内联），不是 SVG，也不与任何既有常量共用。
+    expect(entries.get('qoder')).toBe('QODER_ICON')
     // 旧常量名不得残留（它们现在指向不存在的符号，客户端会直接崩）。
     expect(source).not.toContain('CODEBUDDY_ICON')
     expect(source).not.toContain('WORKBUDDY_ICON')

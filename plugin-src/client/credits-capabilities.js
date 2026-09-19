@@ -27,6 +27,7 @@
  * | `lobsterai`     | ✓                   | ✓ `client-activities` 三步流程 |
  * | `trae-cn`       | ✓ 通用池（IDE 路径能花的） | ✓ `checkin_credits` 两步 + 设备头 |
  * | `trae-cn-work`  | ✓ Work 池（TraeWork 能花的） | ✗ 签到留在 Trae CN 面板       |
+ * | `qoder`         | ✓ 与 CreditBalance 同构 | ✗ 每日 100 Credits 只能桌面 App 手动领 |
  *
  * - `balance`：Buddy 系走 `POST /v2/billing/meter/get-user-resource`，该端点
  *   在 Buddy CN 与 Buddy（国际版）**通用**（仅 baseURL 随 `product.endpoint`
@@ -40,11 +41,21 @@
  *   （用量通知），没有签到接口，故其面板不渲染「一键领取积分」。LobsterAI 是
  *   `client-activities` 三步流程（`src/lobsterai-credits.ts`）；Trae CN 是
  *   `checkin_credits/status` → `claim` 两步（`src/trae-cn-credits.ts`，claim 必须
- *   带设备四件套），故两者都支持。
+ *   带设备四件套），故两者都支持。Qoder **不支持**（见下）。
  * - `trae-cn-work` 的 `dailyCheckin` 是 **false**（尽管它属于 Trae CN 账号体系）：
  *   签到是**账号级、当日一次**的操作，与走哪条路径无关。两个面板都放签到按钮
  *   必然是同一个账号两处重复领取 —— 第二次点击只会得到「今天已签到」，
  *   这在用户看来就是按钮坏了。故签到**只留在 Trae CN 面板**。
+ * - ⚠️ `qoder` 的 `dailyCheckin` 是 **false**，且**与 Buddy（国际版）同形但
+ *   原因完全不同**，不要因为「看着像」就顺手改对称：
+ *   - `buddy` 是**后端根本没有接口**（内核里只有 `get-dosage-notify`）；
+ *   - `qoder` 是**有这项权益但没有公开接口** —— 官方的每日 100 Credits 只能在
+ *     **Qoder 桌面 App 里手动领取**，服务端未暴露可编程的签到端点。本插件也不
+ *     打算用任何「模拟桌面客户端」的手段去领（那既不可靠也超出本插件的边界）。
+ *   尤其**不能**因为它的 `balance` 是 true 就推断签到也能做 —— 正如不能用
+ *   Buddy（国际版）没有签到反推它查不到余额一样，两个能力彼此独立。
+ *   在面板上的表现是：Qoder 面板**渲染**积分行与「刷新积分」、**不渲染**
+ *   「一键领取积分」。
  *
  * `trae-cn` 的 `balance` 走 `POST /trae/api/v2/pay/web_user_ent_usage`，响应里的
  * 礼包按 `available_endpoint` 分池，而**每个面板只显示自己那条路径能花的池**
@@ -86,6 +97,22 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // （`poolProviderFor()`）、**显示池**映射到 Work（`traeCnPoolFor()`），都在
   // `src/jet-hub-rpc.ts`；客户端不为此写第二套逻辑。
   'trae-cn-work': Object.freeze({ balance: true, dailyCheckin: false }),
+  // Qoder：登录形态是 **PAT 粘贴**（其余六个 provider 全是浏览器登录），
+  // 但它同样落进**账号池**，故余额行、「刷新积分」等既有通用路径一并适用。
+  //
+  // `balance: true` —— 步骤 4 的 `src/qoder-credits.ts` 提供的余额与
+  //   `CreditBalance` **逐字段同构**（`total` / `packages` / `expiredTotal`），
+  //   于是 `CreditBalanceRow` 直接复用，客户端**不需要任何 provider 分支**，
+  //   宿主侧也不走 `traeCnPoolFor()` 那类选池映射（Qoder 只有一个池）。
+  // `dailyCheckin: false` —— **刻意不做签到**：官方的每日 100 Credits 只能在
+  //   Qoder **桌面 App 里手动领取**，没有公开 API（Qoder 的接入范围止于
+  //   目录 / chat / 额度，见 docs/qoder-integration-plan.md）。
+  //   ⚠️ 它与 `buddy` 在本矩阵里**同形（true/false）但原因完全不同**：
+  //   前者是「后端无此接口」，后者是「有权益但只在桌面 App 手动领」。
+  //   将来若有人照着 `buddy` 那一行「顺手改对称」，或者因为 `balance` 是 true
+  //   就顺手把 `dailyCheckin` 也写成 true，Qoder 面板就会多出一个**每次点击
+  //   都必然失败**的按钮（没有任何端点可打）。单测有断言钉死这两项。
+  qoder: Object.freeze({ balance: true, dailyCheckin: false }),
 });
 
 /**

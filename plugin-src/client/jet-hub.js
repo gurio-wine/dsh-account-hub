@@ -45,9 +45,27 @@ const TRAE_CN_ICON = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0i
  * 仍单独起一个常量名而不是在 `PROVIDERS` 里直接复用 `TRAE_CN_ICON`：条目与图标
  * 一一对应，将来若拿到 TraeWork 专属标识只需改这一处，不必回头拆条目；
  * 也让 `tests/unit/credits-capabilities.spec.ts` 的「图标常量名跟着产品走」
- * 那组断言对六个 provider 一视同仁。
+ * 那组断言对七个 provider 一视同仁。
  */
 const TRAE_CN_WORK_ICON = TRAE_CN_ICON
+
+/**
+ * Qoder 面板图标（内联 base64 PNG）。
+ *
+ * 来源：Qoder 官网首页 `<link rel="icon" type="image/png">` 指向的官方图标
+ * `https://img.alicdn.com/imgextra/i4/O1CN01QkSxiCocd3D0prc8_!!6000000008124-2-tps-412-412.png`
+ * （412x412 PNG，4990 字节，**原样内联、未做任何改动**，只做了 base64 编码）。
+ *
+ * 与 `LOBSTERAI_ICON` / `TRAE_CN_ICON` 那两条用官方资源、不自己画的理由一致；
+ * 区别只在格式：本条是 base64 PNG（约 6.6 KB），与 `CODEARTS_ICON` /
+ * `BUDDY_CN_ICON` 那几条体量同级，而 LobsterAI / Trae CN 是内联 SVG。
+ * 内容同样是**预先算好的 base64 字面量**，不用 `btoa()` 运行时拼接
+ * （理由见 `LOBSTERAI_ICON` 的说明）。
+ *
+ * 单独一个常量而不是复用别的图标：Qoder 与其余六个 provider 都不同源，
+ * 共用任何一条都会让面板显示别家的品牌标识。
+ */
+const QODER_ICON = 'data:image/png;base64,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'
 
 const PROVIDERS = Object.freeze([
   { id: 'codearts', label: 'Codearts', icon: CODEARTS_ICON, logoClass: 'codearts' },
@@ -73,6 +91,21 @@ const PROVIDERS = Object.freeze([
     logoClass: 'trae-cn-work',
     loginHint: '与 Trae CN 共用账号：请在 Trae CN 面板登录（本面板的账号、凭据、限流切换全部复用 Trae CN）。',
   },
+  // Qoder：登录形态是**全新的** —— PAT 粘贴（另外六个 provider 全是浏览器登录，
+  // 见下面的 PAT_LOGIN_PROVIDERS）。
+  //
+  // ⚠️ **不声明 `loginHint`**：`loginHint` 的语义是「本面板没有登录入口，去
+  //   **隔壁面板**登录」（目前只用于 Trae CN Work 那种共用账号的情形）。Qoder
+  //   **有自己的入口**，只是形态从「开浏览器」换成了「粘贴 PAT」，入口仍在
+  //   本面板（那条唯一的入口就是这个条目驱动的「+ 新建账号」按钮）。
+  //   若给它加上 loginHint，`canCreateAccount` 会变成 false，按钮整块消失 ——
+  //   PAT 表单就再也没有入口了，而且**不报任何错**，只是一个没有入口的死面板。
+  //   tests/unit/credits-capabilities.spec.ts 有断言钉死它没有 loginHint。
+  //
+  // 字段严格只有 id / label / icon / logoClass 四项：该条目的形态被
+  // credits-capabilities.spec.ts 的 FULL 匹配器逐字锁死（可选第五项 loginHint），
+  // 这就是「PAT 形态的元数据另立一张表」而不是塞进本条目第三个字段的原因。
+  { id: 'qoder', label: 'Qoder', icon: QODER_ICON, logoClass: 'qoder' },
 ]);
 
 /**
@@ -89,6 +122,178 @@ const PROVIDERS = Object.freeze([
  */
 function providerLoginHint(provider) {
   return PROVIDERS.find(p => p.id === provider)?.loginHint || null;
+}
+
+/**
+ * Qoder PAT 签发页。
+ *
+ * 与宿主侧 `src/qoder-product.ts` 的 `QODER_PAT_URL` **同值**（客户端 bundle
+ * 不能 import 宿主 TS —— 一侧是 esbuild 打包的浏览器代码、一侧是 tsc 编译的
+ * Node 代码），故此处是副本。副本的风险是「改了宿主、忘了客户端」：表现只是
+ * 面板上的链接指向一个旧地址（用户点过去 404），**不报任何错**，
+ * 故有单测钉死两处字面量相等。
+ */
+const QODER_PAT_URL = 'https://qoder.com/account/integrations';
+
+/**
+ * PAT 粘贴式登录的面板：provider → 该形态需要的元数据。
+ *
+ * 只有 Qoder 一条 —— 其余六个 provider 全是浏览器登录（两段式 RPC + 轮询）。
+ *
+ * **单独立表而不是往 `PROVIDERS` 条目里塞第三个可选字段**：条目形态被
+ * `tests/unit/credits-capabilities.spec.ts` 的 FULL 匹配器逐字锁死
+ * （id/label/icon/logoClass + 可选 loginHint），多一个字段会让那条「抓全七条」
+ * 的断言失效 —— 而且失效方式是**条目整个抓不到**，报错信息里看不出是字段多了。
+ *
+ * 缺省即浏览器登录（`providerPatLogin` 返回 null）：将来新增 provider 忘记登记时，
+ * 最坏结果是多出一个本来就用得上的浏览器登录入口，与 `loginHint` 的默认方向一致。
+ */
+const PAT_LOGIN_PROVIDERS = Object.freeze({
+  qoder: Object.freeze({ patUrl: QODER_PAT_URL }),
+});
+
+/**
+ * 该面板是否用 PAT 粘贴建号；`null` = 走浏览器登录（默认）。
+ *
+ * 面板里**不得**出现 `provider === 'qoder'` 这类散落字面量比较：散落的条件
+ * 将来漏改一处，表现就是「按钮还在，点了报 unknown provider」—— 用户只会觉得
+ * 功能坏了。一切经本函数。
+ */
+function providerPatLogin(provider) {
+  // hasOwnProperty 而不是直接下标：`PAT_LOGIN_PROVIDERS['__proto__']` 会命中
+  // Object.prototype（**真值**），于是一个叫 `__proto__` 的 provider 会被误判成
+  // PAT 形态。PROVIDERS 里当然不可能出现它，但能力矩阵那边已专门测过 `__proto__`
+  // 这个键，这里保持同一口径的健壮性，省得将来接手的人踩到。
+  return Object.prototype.hasOwnProperty.call(PAT_LOGIN_PROVIDERS, provider)
+    ? PAT_LOGIN_PROVIDERS[provider]
+    : null;
+}
+
+/**
+ * PAT 粘贴归一化：**只去尾部换行**，其余字符一律不动。
+ *
+ * 网页复制或终端 `cat` 出来的 PAT 常带一个（有时两个）尾部换行，而宿主是拿它
+ * 当 exchange 的 body 与目录端点的 Bearer 用的 —— 带着 `\n` 会被服务端当成
+ * 令牌正文的一部分。故这里只削掉尾部的 `\r` / `\n`。
+ *
+ * **刻意不做 `trim()`**：那会顺手删掉**开头**的空白，而开头的空白往往是
+ * 「粘错了东西」的信号（粘进了别处的缩进、粘了半截 YAML）。把它悄悄修好，用户
+ * 只会在「我明明粘对了却报无效」里绕圈，不如原样送去让服务端明确拒绝。
+ * 同理**不做 `pt-` 前缀校验**：那是宿主侧 `isQoderPersonalToken` 的职责，
+ * 客户端再判一次就是两处口径，改了一处另一处就静默失效。
+ *
+ * 非字符串（粘贴事件给了 null、或调用方传了数字）一律回空串，由调用方按「空」处理。
+ */
+function normalizePatInput(raw) {
+  return typeof raw === 'string' ? raw.replace(/[\r\n]+$/, '') : '';
+}
+
+/**
+ * 提交 PAT 建号：发 `account.create`，再按 `login.poll` 的惯例轮询「凭据是否可解析」。
+ *
+ * **刻意抽成模块级异步函数**（不依赖 ProviderPanel 的 hooks）：这样「载荷形状」
+ * 与「不吞错误」这两条契约能被单测**直接驱动**，而不是靠正则扫源码 ——
+ * 正则只能证明「源码里提过 rpcCall」，证明不了实际发出去的载荷长什么样。
+ *
+ * 与浏览器登录的三个差异：
+ *   1. **没有 `loginUrl`、不等用户操作**：PAT 是即时请求，宿主收到就已完成
+ *      exchange，故轮询窗口是 20 秒（40 x 500ms），而不是浏览器登录那套 5 分钟；
+ *      第一次轮询前先等一个间隔，与浏览器登录的 `setInterval` 惯例一致
+ *      （也避免在宿主还没写完凭据时白打一发）。
+ *   2. **`rpcCall` 抛错时原样抛出**，绝不吞：宿主在步骤 6 落地之前会对 qoder 回
+ *      `unknown provider: qoder`，那正是**预期**行为；吞掉它只会让按钮变成
+ *      「点了没反应」，用户拿不到任何原因。
+ *   3. **不特判任何 code**（尤其不特判 `unknown provider`）：错误分类是宿主的
+ *      事，客户端多判一条就多一处将来会分叉的口径。
+ *
+ * `sleep` 可注入（默认 `setTimeout`），单测用假 sleep 让轮询瞬时完成。
+ *
+ * @returns 判别联合：
+ *   - `{ kind: 'created', accountId }`       轮询结算且无 error（PAT 即时落盘，通常第一次就中）
+ *   - `{ kind: 'failed', accountId, error }`  宿主给出**失败终态**（`done` 且带 `error`）
+ *   - `{ kind: 'unconfirmed', accountId }`    次数用尽仍未 `done`（凭据可能稍后才落盘）
+ *   - `{ kind: 'incomplete' }`                响应缺 `accountId`（无从轮询，且**不轮询**）
+ */
+async function createAccountWithPat({ provider, pat, rpcCall, sleep, attempts = 40, intervalMs = 500 }) {
+  const wait = sleep || ((ms) => new Promise(resolve => setTimeout(resolve, ms)));
+  // 载荷形状是本函数的**核心契约**：`pat` 是归一化后的值、`provider` 是面板 id
+  // （'qoder'）。写成别的键名宿主只会回一个 bad-request，而这里看不出来。
+  const res = await rpcCall('account.create', { provider, pat });
+  const accountId = res?.accountId;
+  // 缺 accountId 就连轮询的入参都没有，直接判定，**不浪费时间轮询**。
+  if (!accountId) return { kind: 'incomplete' };
+  for (let i = 0; i < attempts; i++) {
+    await wait(intervalMs);
+    const pollRes = await rpcCall('login.poll', { accountId, provider });
+    if (pollRes?.done !== true) continue;
+    // 失败终态：宿主已结算但带 error，如实回报原因，不重试（PAT 被拒是确定性的，
+    // 重试只会让用户多等 20 秒）。
+    if (pollRes.error) return { kind: 'failed', accountId, error: pollRes.error };
+    return { kind: 'created', accountId };
+  }
+  return { kind: 'unconfirmed', accountId };
+}
+
+/**
+ * Qoder 的 PAT 粘贴表单。
+ *
+ * **内联展开**，不是弹窗、也**不新开浏览器标签**：Qoder 没有浏览器登录流程，
+ * 用户要做的只有「去签发页复制一串字符、粘回来」，弹窗只会多一层关闭动作。
+ * 与 `manualLogin`（弹窗被拦截时的兜底链接）的做法一致：都用原生 `<a>`
+ * 由浏览器自己导航，不受脚本开窗策略影响。
+ *
+ * **刻意抽成模块级组件而不是在 ProviderPanel 里内联**：ProviderPanel 用了 hooks，
+ * 单元测试加载不了它（react 不在依赖里，见 `tests/unit/jet-hub-credit-balance-row.spec.ts`
+ * 的文件头），抽出来才能对这棵树做整树深比较。
+ *
+ * 输入框用 `type: 'password'`：PAT 是**长期凭据**（官方明确不自动过期），
+ * 明文显示会让它出现在肩窥视野与随手截的屏里；用户核对开头是不是 `pt-` 看
+ * 掩码后的长度也够用。这不是「怕别人偷看」的过度设计 —— 它比面板里任何别的
+ * 字段都值钱。
+ */
+function PatLoginForm({ patUrl, value, busy, error, onChange, onSubmit, onCancel }) {
+  return React.createElement('div', { className: 'dim-jh-patForm' },
+    React.createElement('p', null,
+      'Qoder 不支持浏览器登录：请先在官方的 Integrations 页面签发一个 PAT（Personal Access Token），再把它粘贴到这里。'),
+    React.createElement('p', null,
+      React.createElement('a', {
+        href: patUrl,
+        target: '_blank',
+        rel: 'noreferrer noopener',
+      }, '打开 Qoder 的 Integrations 页面签发 PAT')),
+    React.createElement('div', { className: 'dim-jh-patField' },
+      React.createElement('input', {
+        type: 'password',
+        value,
+        placeholder: 'pt-…',
+        spellCheck: false,
+        autoComplete: 'off',
+        disabled: busy,
+        onChange: (e) => onChange(e.target.value),
+      })),
+    // 错误复用既有的提示块样式（.dim-jh-probeNotice + data-tone），不新造一套：
+    // 同一个面板里两处提示长得不一样只会让人以为是两类问题。
+    error
+      ? React.createElement('div', {
+          className: 'dim-jh-probeNotice',
+          'data-tone': 'error',
+          role: 'alert',
+        }, error)
+      : null,
+    React.createElement('div', { className: 'dim-jh-patActions' },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'data-kind': 'primary',
+        disabled: busy,
+        onClick: () => onSubmit(),
+      }, busy ? '提交中…' : '确认'),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        disabled: busy,
+        onClick: () => onCancel(),
+      }, '取消')),
+    React.createElement('p', { className: 'dim-jh-patHint' },
+      'PAT 只保存在本地，用于换取短期 job token；面板不会把它发给任何第三方。'));
 }
 
 /**
@@ -639,6 +844,13 @@ function ProviderPanel({ provider, rpcCall }) {
    * `<a href>` —— 用户手势由浏览器直接识别，不经过任何 await。
    */
   const [manualLogin, setManualLogin] = React.useState(null);
+  // PAT 粘贴登录（只有 Qoder 走这条）：表单展开状态 / 输入值 / 提交中 / 表单内错误。
+  // 与浏览器登录的 `creating` 分开：两者不会同时发生（`patLogin` 与浏览器登录
+  // 互斥），共用一个状态只会让「谁在忙」变得含糊。
+  const [patOpen, setPatOpen] = React.useState(false);
+  const [patValue, setPatValue] = React.useState('');
+  const [patBusy, setPatBusy] = React.useState(false);
+  const [patError, setPatError] = React.useState(null);
   const mounted = React.useRef(true);
   /**
    * 最新账号列表的 ref 镜像。
@@ -687,6 +899,15 @@ function ProviderPanel({ provider, rpcCall }) {
   // 本面板是否自己提供登录入口（null = 提供；见 providerLoginHint 的说明）。
   const loginHint = providerLoginHint(provider);
   const canCreateAccount = loginHint === null;
+  /**
+   * 本面板的登录形态：null = 浏览器登录（默认），否则是 PAT 粘贴的元数据。
+   *
+   * `loginHint` 与 `patLogin` 答的是**两个不同的问题**，不可互相顶替：
+   *   - `loginHint` 非空 = 本面板**没有**登录入口（去隔壁面板）；
+   *   - `patLogin` 非空 = 本面板**有**入口，但形态是粘贴 PAT 而不是开浏览器。
+   * 故 `canCreateAccount` 只管「要不要渲染按钮」，按钮**点了做什么**由本值决定。
+   */
+  const patLogin = providerPatLogin(provider);
 
   /**
    * 拉取本页全部账号的积分余额。
@@ -898,6 +1119,62 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  /**
+   * 提交粘贴进来的 PAT 建号（PAT 形态的唯一入口）。
+   *
+   * 归一化后为空就**不发请求**：空 PAT 打过去只会换回一个 after-the-fact 的
+   * 服务端错误，不如当场给一句可读提示。
+   *
+   * 结果按 `createAccountWithPat` 的判别联合分流，**三档提示位置刻意不同**：
+   *   - `incomplete` → 留在表单内（`patError`）：这是「这次粘贴」的问题，
+   *     用户要做的动作就是改一下再点一次，表单不该关掉。
+   *   - `failed` / `unconfirmed` → 用面板既有的 `probeNotice`：账号确实建了
+   *     （或建了但没确认），表单要关掉、列表要刷新，提示属于「这次操作的结果」，
+   *     与 `createAccount` 失败时用 `setError`+`phase='error'` 是同一类东西，
+   *     只是不再整页替换（那会把刚刷新的账号列表盖掉）。
+   */
+  const submitPat = async () => {
+    const pat = normalizePatInput(patValue);
+    if (pat.length === 0) {
+      setPatError('请先粘贴 PAT。');
+      return;
+    }
+    setPatBusy(true);
+    setPatError(null);
+    try {
+      const outcome = await createAccountWithPat({ provider, pat, rpcCall });
+      if (outcome.kind === 'incomplete') {
+        // 表单**不关**：账号没建成，用户的下一步就是再点一次。
+        if (mounted.current) setPatError('后端返回的账号信息不完整（缺少 accountId）。');
+        return;
+      }
+      if (!mounted.current) return;
+      setPatOpen(false);
+      setPatValue('');
+      if (outcome.kind === 'failed') {
+        setProbeNotice({ tone: 'error', text: '新建账号失败：' + outcome.error, details: [] });
+      } else if (outcome.kind === 'unconfirmed') {
+        // 既不说成功也不说失败：宿主没在窗口内确认凭据可解析，但它可能稍后才落盘。
+        setProbeNotice({
+          tone: 'warn',
+          text: 'PAT 已提交，但未确认凭据写入；请稍后刷新账号列表确认。',
+          details: [],
+        });
+      }
+      await loadAccounts();
+      // 新建的账号此刻还没有任何余额数据，顺带拉一次，免得卡片停在「读取中」。
+      if (canLoadCredits) await loadCredits();
+    } catch (caught) {
+      // **不特判任何 code**（尤其不特判 `unknown provider`）：宿主在 qoder 落地
+      // 之前回的那条错误正是预期，这里如实展示，绝不吞掉。
+      console.error('[jet-hub] create account with pat failed:', caught);
+      if (!mounted.current) return;
+      setPatError('新建账号失败：' + (caught?.message || '未知错误'));
+    } finally {
+      if (mounted.current) setPatBusy(false);
+    }
+  };
+
   const toggleAccount = async (accountId, enabled) => {
     try {
       await rpcCall('account.update', { accountId, patch: { enabled } });
@@ -1000,20 +1277,44 @@ function ProviderPanel({ provider, rpcCall }) {
         }, '重置所有'),
         // 「+ 新建账号」按 provider 的能力渲染：共用账号的 provider（Trae CN Work）
         // 不渲染按钮，改为下面那行提示文案 —— 见 providerLoginHint。
+        //
+        // 按钮**点了做什么**再看登录形态：PAT 形态（Qoder）只是把本面板的
+        // PAT 表单展开，**绝不**调用 createAccount()、**绝不** window.open ——
+        // 走错了就是「点一下弹出一个空白登录窗，而后端收不到 pat 直接拒绝」。
         canCreateAccount
           ? React.createElement('button', {
               className: 'dim-jh-btn',
               'data-kind': 'primary',
-              title: '通过浏览器登录一个新的账号并加入账号池。',
-              onClick: () => void createAccount(),
-              disabled: creating,
-            }, creating ? '正在登录…' : '+ 新建账号')
+              title: patLogin
+                ? '粘贴一个 Qoder PAT（Personal Access Token）并加入账号池。'
+                : '通过浏览器登录一个新的账号并加入账号池。',
+              onClick: patLogin
+                ? () => { setPatOpen(true); setPatError(null); }
+                : () => void createAccount(),
+              disabled: patLogin ? patBusy : creating,
+            }, patLogin
+              ? (patBusy ? '提交中…' : '+ 新建账号')
+              : (creating ? '正在登录…' : '+ 新建账号'))
           : null)),
     // 共用账号的 provider（Trae CN Work）在这里说明登录入口在哪。
     // 刻意做成**常驻提示行**而不是「+ 新建账号」按钮的 disabled 形态：
     // 按钮点了没反应只会让用户以为坏了，而这里要传达的是「去别处登录」。
     loginHint
       ? React.createElement('p', { className: 'dim-jh-loginHint' }, loginHint)
+      : null,
+    // PAT 粘贴表单（只有 Qoder）：渲染在标题区之后的第一个位置，紧邻驱动它的
+    // 「+ 新建账号」按钮，点开就在原地 —— 它是一次登录操作的 UI，
+    // 排在「账号列表 / 提示块」之后会离按钮太远。
+    patOpen && patLogin
+      ? React.createElement(PatLoginForm, {
+          patUrl: patLogin.patUrl,
+          value: patValue,
+          busy: patBusy,
+          error: patError,
+          onChange: setPatValue,
+          onSubmit: () => void submitPat(),
+          onCancel: () => { setPatOpen(false); setPatError(null); },
+        })
       : null,
     probeNotice
       ? React.createElement('div', {
@@ -1059,8 +1360,12 @@ function ProviderPanel({ provider, rpcCall }) {
               // 共用账号的 provider（Trae CN Work）账号为空时的下一步不是
               // 「在本面板新建」，而是「回 Trae CN 面板登录」—— 否则用户点进
               // 这里看到空白，会以为这个 provider 没接通。
+              // PAT 形态（Qoder）仍是**在本面板新建**，只是动作不是「浏览器登录」——
+              // 文案说错会让用户去找一个根本不存在的登录页。
               React.createElement('p', null, canCreateAccount
-                ? '点击"+ 新建账号"进行浏览器登录。'
+                ? (patLogin
+                    ? '点击"+ 新建账号"粘贴 PAT。'
+                    : '点击"+ 新建账号"进行浏览器登录。')
                 : '请先在上方提示的 Trae CN 面板登录账号。'))
           : React.createElement('div', null,
               accounts.map(account => React.createElement(AccountCard, {
