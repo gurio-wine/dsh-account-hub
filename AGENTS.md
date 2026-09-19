@@ -108,7 +108,9 @@ Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流�
 - **构建系统**：宿主侧用 TypeScript `tsc` 编译到 `lib/`；客户端 bundle 用
   `esbuild`（`plugin-src/client/build.mjs`）打包到 `lib/client/jet-hub.js`。
   两者都产出到已 gitignore 的 `lib/`，`prepare` 执行 `pnpm build:all` 保证
-  git 安装时两侧产物齐全。
+  git 安装时两侧产物齐全。`build:client` 末尾含产物顶层求值冒烟（stub require），
+  模板字符串求值类错误构建即炸 —— `plugin-src/` 不在 typecheck/test 视野内，
+  这道闸是客户端 bundle 的唯一语义防线，勿删。
 - **测试**：Vitest（单元测试 + E2E 端到端测试）
   - `pnpm test` — 单元测试（快速，无网络，全部 mock）
   - `pnpm test:e2e:*` — 端到端测试，按 provider 分列（如 `test:e2e:codearts`、`test:e2e:buddy-cn`、`test:e2e:buddy-claim`）；**均有闸门，默认全部跳过**，详见 `tests/e2e/README.md`
