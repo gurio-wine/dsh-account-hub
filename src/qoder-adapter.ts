@@ -34,23 +34,42 @@
  * 二次判别后由 `applyQoderQuotaVerdict` 确证的额度耗尽。**该回调省略时一律
  * 保守不换号**（步骤 4 才注入真实实现）。
  *
- * ## 本步不接线
+ * ## 模型目录（步骤 3 已接线，见 `src/qoder-models.ts`）
  *
- * 计划步骤 2 只交付适配器本体：不注册 `ctx.llm`、不实现动态目录（步骤 3）、
- * 不实现额度与 quota 二次判别（步骤 4）。故 `listModels` 是显式占位，
- * 真实的 provider 注册函数 {@link registerQoderLlm} 已导出但**尚未被
- * `src/index.ts` 调用**。
+ * `listModels` / `resolveModel` 从**动态目录**（`GET /api/v1/cloud/models`，
+ * 只认 PAT）取数，拉取成功时只播报 `is_enabled === true` 的项；目录不可用时
+ * 回退静态兜底表（含 `lite`）。12h TTL 缓存，**失败不写缓存**。
+ *
+ * ⚠️ **`resolveModel` 对表外模型不抛错**（与其余六个 provider 一致）：DSH 约定
+ * 「`listModels` 结果仅供参考，模型目录不构成路由白名单」，抛错会让历史会话里
+ * 的旧模型 id 与手动输入的 id **彻底无法发起请求**，且没有恢复入口。表外模型的
+ * 提示走**失败路径**（{@link QODER_OFF_CATALOG_HINT}），与 trae-cn 的
+ * `4001` 提示同一惯例。
+ *
+ * ## 本步仍不接线
+ *
+ * 计划步骤 3 只交付目录：不注册 `ctx.llm`（步骤 6）、不实现额度与 quota
+ * 二次判别（步骤 4）。真实的 provider 注册函数 {@link registerQoderLlm}
+ * 已导出但**尚未被 `src/index.ts` 调用**。
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { LlmAdapter, LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, LlmError, ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk, TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
 import { QODER, QODER_CHAT_PATH, qoderJobTokenHeaders } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
+import {
+  QODER_OFF_CATALOG_HINT,
+  QoderCatalogStore,
+  effectiveQoderCatalog,
+  fallbackQoderCatalog,
+  fetchQoderDirectory,
+} from './qoder-models.js'
+import type { QoderModelEntry } from './qoder-models.js'
 import {
   applyQoderQuotaVerdict,
   classifyQoderError,
@@ -91,6 +110,44 @@ const QODER_STREAM_LABEL = 'qoder: 上游流内错误'
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message
   try { return String(error) } catch { return 'unknown error' }
+}
+
+/**
+ * 本适配器对外声明的输入模态：**恒为纯文本**。
+ *
+ * 抽成常量而不是在 `listModels` / `resolveModel` 各写一份 `['text']`：DSH 的
+ * `LlmModelInfo.inputModalities` 注释明确「缺席 = 未知、显式给出 = 能力声明」，
+ * 两处若分叉（一处报 `['text','image']`）会让图片被路由进这条**必然丢图**的通道
+ * （`serializeQoderMessages` 只搬运文本块）。
+ *
+ * ⚠️ 这是**刻意的**：目录的 `is_vl` 在本 provider 上恒为 `true`（T1 17 项全部），
+ * 若照它声明，每个模型都会显示「支持图片」——那是错的（模型支持 ≠ 本适配器能送达）。
+ * 与 trae-cn 的写法（目录照实报能力、`stream()` 另设图片防线）不同，理由见
+ * `listModels` 的注释：那里的多模态有静态表逐项实测支撑，这里只有一个布尔。
+ */
+const QODER_TEXT_ONLY: readonly ['text'] = ['text']
+
+/**
+ * 思考档位 id → 展示名。
+ *
+ * 档位 id 取自目录的 `efforts`（T1 实测值域 `low` / `medium` / `high` / `xhigh`
+ * / `max`），逐字符照抄；展示名取**英文原词**（与 `buddy-adapter.ts` 的
+ * `EFFORT_NAMES` 同一套命名，那是本仓库对同一批档位已有的叫法）。
+ *
+ * 未登记的 id 直接回退成 id 本身（与 `buddy-adapter` / `trae-cn` 同款）——
+ * 目录将来加档位时不会显示成空白。
+ */
+const QODER_EFFORT_NAMES: Readonly<Record<string, string>> = {
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'XHigh',
+  max: 'Max',
+}
+
+/** 档位 id 的展示名；未登记的 id 回退为 id 本身。 */
+function effortDisplayName(id: string): string {
+  return QODER_EFFORT_NAMES[id] ?? id
 }
 
 /** 判断是否为传输级错误（可重试的 TRANSPORT）。 */
@@ -832,6 +889,14 @@ export interface QoderAdapterOptions {
    * **省略时返回 undefined ⇒ 分类器保守判「不换号」**，把真因直接报给用户。
    */
   quotaVerdict?: (classification: QoderErrorClassification) => Promise<QoderQuotaVerdict | undefined>
+  /**
+   * 覆盖目录拉取（测试 / 上层缓存注入）。
+   *
+   * 省略时适配器自己调 {@link fetchQoderDirectory}（PAT 直连，见
+   * `src/qoder-models.ts`）。注入点存在是为了让单测能确定性地喂 17 项快照，
+   * 而不必在适配器里假设响应形态 —— 解析规则只有一处（`parseQoderDirectory`）。
+   */
+  fetchRemoteModels?: (credential: QoderCredential) => Promise<readonly QoderModelEntry[]>
   fetchImpl?: typeof fetch
   /** 多账号池（用于确证额度耗尽后切换账号）。 */
   accountPool?: AccountPool
@@ -843,6 +908,8 @@ export interface QoderAdapterOptions {
 export class QoderAdapter extends LlmAdapter {
   private readonly product: QoderProduct
   private readonly fetchImpl: typeof fetch
+  /** 模型目录缓存（12h TTL，成功才写；见 {@link ensureCatalog}）。 */
+  private readonly catalog = new QoderCatalogStore()
 
   constructor(private readonly options: QoderAdapterOptions) {
     super()
@@ -864,30 +931,180 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
-   * 模型目录：**步骤 3 交付**，本步是显式占位。
+   * 模型目录：动态目录（只认 PAT）+ 静态兜底，12h TTL。
    *
-   * 刻意**抛错而不是返回空数组**：空数组在 DSH 侧等价于「这个 provider 什么
-   * 模型都没有」，模型选择器会静默变空、且没有任何提示指向「还没实现」。
-   * 抛错则把真因暴露出来。等步骤 3 接上 `GET {modelsBase}/api/v1/cloud/models`
-   * （只认 PAT）后本方法会被真实实现替换。
+   * 见 `src/qoder-models.ts` 的模块头：定案是「拉取成功时只播报
+   * `is_enabled === true` 的项」，故拿到非空动态目录时**直接播报它**，不并入
+   * 静态项（`lite` 因此只在目录失败时出现 —— 那条不对称是刻意的）。
+   *
+   * 黑名单在**播报前**过滤（`disabledModelsFor`）：黑名单是黑名单制（键存在且为
+   * `true` 才隐藏），每次调用实时读，改开关后无需重建适配器。它**只影响播报、
+   * 不影响路由**（见 {@link resolveModel}）。
    */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
-    throw new LlmError('qoder: 模型目录尚未实现（接入步骤 3）', 'INVALID_REQUEST')
+    await this.ensureCatalog()
+    const source = this.catalogEntries()
+    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+    const listed = disabled === undefined || disabled.size === 0
+      ? source
+      : source.filter((model) => !disabled.has(model.id))
+    return listed.map((model) => ({
+      provider: this.product.id,
+      id: model.id,
+      name: model.name,
+      // ⚠️ **恒为纯文本**，不按目录的 `is_vl` 声明 —— 本适配器的 chat 路径
+      // （`serializeQoderMessages`）只搬运文本块，图片块会被静默丢弃。把
+      // `is_vl:true` 报成「支持图片」会让 DSH 把图片路由进这条必然丢图的通道。
+      // 与 trae-cn 的「目录照实报能力、请求路径另设防线」**刻意不同**：那边的
+      // 图片通路有实测依据（静态表逐项标过多模态），这里只有目录一个布尔，
+      // 不足以支撑「图片能送达上游」这个结论。
+      inputModalities: QODER_TEXT_ONLY,
+    }))
   }
 
   /**
    * 解析单个模型的路由信息。
    *
-   * 本步**刻意不声明任何能力**（不报 `inputModalities`、不报 `reasoning`、
-   * 不报 `context`）：这些都是**目录的产物**，而目录属步骤 3。给一个猜的窗口
-   * 或猜的档位，会让选择器显示一个上游根本不认的值 —— 与 trae-cn 的
-   * 「未验证不盲改」同则：宁可少显示一行，也不报一个假的能力。
+   * ## 表外模型**不抛错**（这是有意的，不是漏写）
    *
-   * `id` 与 `name` 原样回显，保证 `resolveModel` 在目录就绪前不会拒绝任何
-   * 模型 id（DSH 约定：`listModels` 结果仅供参考，模型目录不构成路由白名单）。
+   * 计划文档说「目录里没有的模型名直报『不在 Qoder 可用目录』」，但**直报的位置
+   * 是失败路径而不是这里**：DSH 约定 `listModels` 结果仅供参考、模型目录**不构成
+   * 路由白名单**（`LlmModelInfo` 的注释原文：catalog membership is advisory,
+   * not request validation）。在 `resolveModel` 抛错会让两类**正常**用法彻底无法
+   * 发起请求且没有恢复入口：
+   *
+   * - 历史会话里保存的旧模型 id（roster 浮动，昨天可用的今天可能不在表里）；
+   * - 目录拉取失败时回退的静态表只有 3 项，而账号其实能用别的模型。
+   *
+   * 故表外 id **原样路由**，由上游回 402/`invalid_model_error`，届时
+   * {@link withOffCatalogHint} 补一句可读提示 —— 与 trae-cn 的 `4001` 提示同源同则。
    */
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
-    return { provider, id: model, name: model }
+    await this.ensureCatalog()
+    // **两级查找**（与 trae-cn 的 `catalogEntries() ?? fallbackIndex` 同构）：
+    // 生效目录优先，未命中再查静态兜底表。第二级不是冗余 —— `lite` 按设计
+    // **不在动态目录里**（见 `qoder-models.ts` 模块头），只有静态表能给它展示名；
+    // 少了这级，`lite` 在目录成功时会退化成「名字就是 id」。
+    const entry = this.catalogEntries().find((candidate) => candidate.id === model)
+      ?? fallbackQoderCatalog().find((candidate) => candidate.id === model)
+    const resolved: LlmResolvedModelInfo = {
+      provider,
+      id: model,
+      name: entry?.name ?? model,
+      // 模态与 `listModels` **同源同口径**（同一个常量），否则选择器显示的能力
+      // 与请求路径的实际行为会分叉。
+      inputModalities: QODER_TEXT_ONLY,
+    }
+    // 上下文窗口：目录的 `default_context_window`（缺它时取
+    // `available_context_windows` 首项）。272000 这类非整值**照收** —— 它是目录
+    // 的实测值，按「常见整数」规整化会让 DSH 的压缩时机与上游实际窗口不符。
+    if (entry?.contextWindow !== undefined) resolved.context = { contextWindow: entry.contextWindow }
+    // 思考档位：DSH 的「思考程度」选择器**唯一**的数据源是本字段 —— 不声明时
+    // 模型选择器里整行不渲染（显示「当前模型未提供推理等级」）。
+    //
+    // 数据源是目录的 `efforts` / `default_effort`（T1 定案：目录是思考档位的
+    // **权威来源**，不再需要像 trae-cn 那样从静态表按 id 补）—— 目录拉取失败
+    // 回退静态表时，只有 `qmodel_38max` / `qfmodel` 有档位（`lite` **不声明**，
+    // 目录没给、也没有别的实测来源）。
+    const efforts = entry?.reasoningEfforts ?? []
+    if (efforts.length > 0) {
+      resolved.reasoning = {
+        // id **逐字符照抄**目录值：它会原样进请求体（`reasoning_effort`），
+        // 规整化（如 xhigh→high）会让上游认不出档位。
+        efforts: efforts.map((id) => ({ id: ReasoningEffortId(id), name: effortDisplayName(id) })),
+        // 默认档必须落在 efforts 内：声明了却不在里面会被 DSH 判为
+        // `INVALID_MODEL_REASONING` 直接抛错（解析器已挡一道，这里再挡一道，
+        // 防静态表将来出现不自洽的组合）。
+        ...entry?.defaultReasoningEffort !== undefined && efforts.includes(entry.defaultReasoningEffort)
+          ? { defaultEffort: ReasoningEffortId(entry.defaultReasoningEffort) }
+          : {},
+      }
+    }
+    return resolved
+  }
+
+  /**
+   * 确保目录就绪（带 12h TTL）。
+   *
+   * `listModels` / `resolveModel` / `stream` 三处都会调用：`resolveModel` 可能先于
+   * `listModels` 被调用（直接从历史会话进入），`stream` 需要它来判定目标模型是否
+   * 在目录里（{@link withOffCatalogHint}）。
+   *
+   * ## 缓存策略（照 trae-cn / LobsterAI 的 12h 先例）
+   *
+   * - **成功**：写缓存 + 记时刻，{@link QODER_MODELS_TTL_MS} 内不再拉取；
+   * - **失败/空**：**不写缓存**（`store` 对空数组是 no-op），也**不清**已有缓存
+   *   —— 一次网络抖动不该把目录从「上次成功的完整目录」打回 3 项静态表；
+   * - **无凭据**：直接跳过（回退静态表），不发一次必然 401 的请求。
+   *
+   * 并发调用会各自触发一次拉取（没有 in-flight 去重）：目录是幂等 GET，重复一次的
+   * 代价远小于引入一个需要处理的共享 Promise 状态（与 trae-cn 同一取舍）。
+   */
+  private async ensureCatalog(): Promise<void> {
+    if (this.catalog.fresh() !== undefined) return
+    try {
+      // 目录端点用 **PAT** 直连（不传 model：目录对所有模型一致，故不做逐模型
+      // 限流过滤，见 AGENTS.md 的账号池约定）。
+      const credential = await this.options.resolveCredential()
+      if (credential === undefined || credential.access_token.length === 0) return
+      const entries = this.options.fetchRemoteModels === undefined
+        ? await fetchQoderDirectory(credential, { fetchImpl: this.fetchImpl, product: this.product })
+        : await this.options.fetchRemoteModels(credential)
+      this.catalog.store(entries)
+    } catch {
+      // 远端不可用：回退静态目录（由 catalogEntries 提供）。
+    }
+  }
+
+  /** 当前生效的目录（动态优先，失败/空回退静态表）。 */
+  private catalogEntries(): readonly QoderModelEntry[] {
+    return effectiveQoderCatalog(this.catalog.entries())
+  }
+
+  /**
+   * 目标模型是否**确知不在**可用目录里。
+   *
+   * ## 两道都要过：目录已确证 + 不是我们已知可用的 id
+   *
+   * 1. **只在动态目录已成功拉到**（`catalog.entries()` 有值）时才敢谈「不在目录中」
+   *    —— 那时目录是权威的完整集，表外即真的不可用。回退静态表时我们只有 3 项
+   *    （账号实际能用的远不止这些），对任何别的模型说「不在目录」都是**错的**。
+   * 2. **静态兜底表里的 id 恒不算「表外」**（含 `lite`）。`lite` 按设计不在动态
+   *    目录里，却是 quota=0 账号上**唯一实测可用**的模型（T2/T3）—— 对它说
+   *    「已不在可用目录中，请重选」会把用户从唯一能用的模型上劝走，是**有害**的
+   *    误导。同理两个目录项也已确证官方启用。
+   *
+   * 任一条件不满足即返回 false（不补提示）：宁可少说一句，也不给误导性建议。
+   */
+  private isModelKnownOffCatalog(model: string): boolean {
+    const remote = this.catalog.entries()
+    if (remote === undefined) return false
+    if (remote.some((candidate) => candidate.id === model)) return false
+    if (fallbackQoderCatalog().some((candidate) => candidate.id === model)) return false
+    return true
+  }
+
+  /**
+   * 给失败文案补「模型不在目录」提示（照 trae-cn 的 `4001` 提示惯例）。
+   *
+   * 两道判据都过才补：
+   * 1. **确知不在目录里**（{@link isModelKnownOffCatalog}）；
+   * 2. **失败码可归因于模型名** —— 只认流内的 `invalid_model_error`
+   *    （上游直说该模型名不受支持）。
+   *
+   * ⚠️ **判据只认 `code`，不认 `wrappedCode`**：`wrappedCode` 是 `provider_error`
+   * 包装码二次解析出的真码，而 `invalid_model_error` 是**流内直接给出的业务码**
+   * （走分类器第 5 条），它只落在 `code` 上。写 `wrappedCode` 会让本提示
+   * **永远不触发**（静默失效，且测试若也照抄该字段就会一起绿）。
+   *
+   * ⚠️ **402 一律不补**，无论是否已确证额度耗尽：402 的语义是额度，不是模型名
+   * （T3 实测 quota=0 时无效模型名也回 402 `code:116`）—— 对「只是没额度」的用户
+   * 说「模型不在目录、请重选」，会让他在换模型上白费功夫，而换模型救不了额度。
+   */
+  private withOffCatalogHint(message: string, model: string, classification: QoderErrorClassification): string {
+    if (classification.code !== 'invalid_model_error') return message
+    if (!this.isModelKnownOffCatalog(model)) return message
+    return `${message}${QODER_OFF_CATALOG_HINT}`
   }
 
   /**
@@ -933,6 +1150,19 @@ export class QoderAdapter extends LlmAdapter {
     }
 
     const body = buildQoderChatBody(options)
+
+    // ⚠️ **刻意不在这里拉目录**（只读已就绪的缓存）。
+    //
+    // 失败文案里的「不在目录」提示（{@link withOffCatalogHint}）需要目录，但
+    // **拉取动作不该发生在请求路径上**：那会给每次冷启动的对话多打一个与本次
+    // 请求无关的网络往返，并让 `stream()` 依赖目录端点的可用性（目录抖动会拖慢
+    // 首字节）。而目录在实践中**必然已经就绪** —— DSH 进对话前一定先经
+    // `prepareCall` → `resolveModel`（以及模型选择器的 `listModels`），两者都会
+    // 调 `ensureCatalog()`。
+    //
+    // 极端情况（有人绕过 `prepareCall` 直接调 `stream()`）下目录为空，
+    // `isModelKnownOffCatalog` 返回 false ⇒ 只是**少一句提示**，不影响请求本身。
+    // 这个降级方向是正确的：诊断信息的缺失远轻于把网络依赖引进热路径。
 
     /**
      * 已试过的账号 id。
@@ -1048,7 +1278,11 @@ export class QoderAdapter extends LlmAdapter {
     // 5. 试遍候选（或本就没有池、或已产出过内容不能再换号）：抛出**最后一次**的
     // 真实原因，不吞诊断信息。
     if (lastClassification !== undefined) {
-      throw new LlmError(lastMessage, qoderHarnessErrorCode(lastClassification), { status: lastStatus })
+      throw new LlmError(
+        this.withOffCatalogHint(lastMessage, options.model, lastClassification),
+        qoderHarnessErrorCode(lastClassification),
+        { status: lastStatus },
+      )
     }
     throw new LlmError(
       lastMessage.length > 0 ? lastMessage : `${this.product.id}: 请求失败`,

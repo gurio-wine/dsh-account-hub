@@ -107,7 +107,17 @@ function generateOptions(overrides: Partial<GenerateOptions> = {}): GenerateOpti
   } as unknown as GenerateOptions
 }
 
-/** 组装适配器选项（默认注入可用的 jt 提供者）。 */
+/**
+ * 组装适配器选项（默认注入可用的 jt 提供者）。
+ *
+ * ⚠️ **默认也注入 `fetchRemoteModels`**（返回空数组 = 目录不可用）：该默认值保证
+ * 本文件的每个用例都**零网络**。不注入的话，`resolveModel` / `listModels` 会去
+ * 打真实的 `https://api.qoder.com/api/v1/cloud/models` —— 单测里那是不可接受的：
+ * 它会让用例的成败取决于本机网络与线上 roster（两者都会变），而且慢。
+ *
+ * 空数组是「目录失败」的规范表达（见 `src/qoder-models.ts`），此时适配器回退
+ * 静态兜底表 —— 目录面的完整行为在 `tests/unit/qoder-models.spec.ts` 里测。
+ */
 function adapterOptions(overrides: Partial<QoderAdapterOptions> = {}): QoderAdapterOptions {
   return {
     credentialRef: 'QODER_PERSONAL_TOKEN' as QoderAdapterOptions['credentialRef'],
@@ -115,6 +125,7 @@ function adapterOptions(overrides: Partial<QoderAdapterOptions> = {}): QoderAdap
     refresh: async () => {},
     getJobToken: async () => 'jt-test',
     invalidateJobToken: () => {},
+    fetchRemoteModels: async () => [],
     ...overrides,
   }
 }
@@ -726,21 +737,24 @@ describe('换号循环边界', () => {
   })
 })
 
-// ── 9. 未接线的占位行为 ──
+// ── 9. 模型目录已接线（步骤 3；完整目录面在 qoder-models.spec.ts） ──
 
-describe('本步（步骤 2）的刻意占位', () => {
-  it('listModels 抛「未实现」而不是返回空数组', async () => {
+describe('模型目录已接线（步骤 3 起不再是占位）', () => {
+  it('listModels 不再抛「未实现」，而是给出目录（此处为目录失败的回退表）', async () => {
     const adapter = new QoderAdapter(adapterOptions())
-    await expect(adapter.listModels('qoder')).rejects.toThrow(/模型目录尚未实现/)
+    const models = await adapter.listModels('qoder')
+    expect(models.map((model) => model.id)).toEqual(['qmodel_38max', 'qfmodel', 'lite'])
   })
 
-  it('resolveModel 不声明任何未经验证的能力（不报模态/档位/窗口）', async () => {
+  it('resolveModel 声明目录产出的能力（此处为静态兜底表的档位与窗口）', async () => {
     const adapter = new QoderAdapter(adapterOptions())
     const resolved = await adapter.resolveModel('qoder', 'qmodel_38max')
-    expect(resolved).toEqual({ provider: 'qoder', id: 'qmodel_38max', name: 'qmodel_38max' })
-    expect(resolved.reasoning).toBeUndefined()
-    expect(resolved.inputModalities).toBeUndefined()
-    expect(resolved.context).toBeUndefined()
+    expect(resolved.name).toBe('Qwen3.8-Max')
+    expect(resolved.reasoning?.defaultEffort).toBe('medium')
+    expect(resolved.context).toEqual({ contextWindow: 200_000 })
+    // ⚠️ 模态**恒为纯文本**，与目录的 is_vl 无关（见 qoder-models.spec.ts 的
+    // 「模态恒声明纯文本」用例）。
+    expect(resolved.inputModalities).toEqual(['text'])
   })
 
   it('providerInfo 对非字符串 provider 做防御性回退', () => {
