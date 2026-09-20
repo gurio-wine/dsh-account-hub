@@ -1406,9 +1406,16 @@ function registerJetHubEndpoints(
             ctx.logger?.warn?.(`[jet-hub] 读取 ${req.provider} 窗口档位失败（不影响模型列表）: ${String(error)}`)
           }
         }
-        // ⚠️ 窗口字段只加在**目录里的模型**上：被适配器过滤掉、由上面回填的条目
-        // 已经不在当前目录里，既没有档位可言，其残留预算也不该在这里显示
-        // （`model.setContextBudget` 对它们一律拒绝，两边口径一致）。
+        // ⚠️ 窗口字段对**目录里的模型**与**回填行**一视同仁（2026-09-21 修复）：
+        // 档位数据来自适配器目录（`contextTiers`），**与用户的显示开关无关** ——
+        // 被关掉的模型只是从 listModels 里消失，它在目录里照样有 dev / Max 档。
+        // 早前只在 `models.map(...)` 那一支加窗口字段，于是回填行（正是被关闭的
+        // 那些）一律不带档位 ⇒ 用户报障「只有开启后才能选上下文档位」：关掉模型
+        // 想顺手改档，档位列整个不见了。修法就是把同一份 tiers 也用在回填行上，
+        // 而不是另算一套判据。
+        //
+        // 回填行走 `name = id`（拿不到原始展示名，见下），`withWindows` 只加字段、
+        // 不改 name，两者天然相容。
         const withWindows = (entry: { id: string; name: string; disabled: boolean }): RpcModelListEntry => {
           if (tiers === undefined) return entry
           const tier = tiers.get(entry.id)
@@ -1429,7 +1436,8 @@ function registerJetHubEndpoints(
               disabled: disabledMap[model.id] === true,
             })),
             // 这些模型已被适配器过滤掉，拿不到原始 name，回退为 id。
-            ...filteredOut.map((id) => ({ id, name: id, disabled: true })),
+            // 档位字段照常补（见上面 `withWindows` 的说明）。
+            ...filteredOut.map((id) => withWindows({ id, name: id, disabled: true })),
           ],
         }
         // **顺手清尸**：把命中垃圾判定的键从黑名单里真正剔除并写回 settings。

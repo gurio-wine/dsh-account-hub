@@ -1,0 +1,191 @@
+/**
+ * 上下文窗口档位文案的回归测试（`formatCapacity` + `ModelTierPicker`）。
+ *
+ * ## 为什么是「加载源码 + 断言元素树」而不是正则断言
+ *
+ * 本次要钉死的是一个**渲染结果**：「用户看到的到底是 `168K` 还是 `168000`」。
+ * 正则只能证明源码里出现过 `1e6` 这种字符串，证明不了 168000 走的是哪一支。
+ * 故沿用 `jet-hub-credit-balance-row.spec.ts` 的做法：把 `react` 与
+ * `credits-capabilities.js` 换成占位模块后加载客户端源码，直接调用纯函数
+ * —— 元素树是普通对象，不需要 DOM、不需要 react-dom。
+ *
+ * ## 用户报障背景（2026-09-21）
+ *
+ * 上一版规则是「**能被 1024 整除才缩写，否则原样输出数字**」，理由是缩写不能
+ * 失真。真机目录给的是 168000 这类**既非 1024 整数倍、又是厂商口径整数**的值，
+ * 于是界面上出现 `168000` / `1000000` 两串裸数字 —— 既难扫视，又与 Trae 客户端
+ * 显示的 `168K` 看起来像两个不同的东西。现在改按 **1000 进制**缩写（与
+ * OpenAI / Anthropic / 字节的模型卡口径一致），精确值挪进 `title` 兜底。
+ */
+
+import { createRequire } from 'node:module'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+import { afterAll, describe, expect, it } from 'vitest'
+
+const here = dirname(fileURLToPath(import.meta.url))
+
+/** 一个最小 react 占位模块：把参数收成可深比较的普通对象。 */
+const REACT_STUB = `
+'use strict';
+exports.createElement = function createElement(type, props) {
+  var children = Array.prototype.slice.call(arguments, 2);
+  return { type: type, props: props || {}, children: children };
+};
+`
+
+/** 能力矩阵占位（本文件测的两个函数都不消费它）。 */
+const CAPABILITIES_STUB = `
+'use strict';
+exports.supportsCreditBalance = function () { return true };
+exports.supportsDailyCheckin = function () { return true };
+`
+
+/**
+ * 与 `jet-hub-credit-balance-row.spec.ts` 同款改写：只覆盖真正用到的两行
+ * import，并逐条断言命中 —— import 形态变了要**立刻报错**，而不是静默加载出
+ * 一个缺模块的半成品。
+ */
+const IMPORT_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^import \* as React from 'react';$/m, "const React = require('react');"],
+  [
+    /^import \{ supportsCreditBalance, supportsDailyCheckin \} from '\.\/credits-capabilities\.js';$/m,
+    "const { supportsCreditBalance, supportsDailyCheckin } = require('./credits-capabilities.js');",
+  ],
+]
+
+function toCjs(source: string): string {
+  let out = source
+  for (const [pattern, replacement] of IMPORT_REWRITES) {
+    if (!pattern.test(out)) {
+      throw new Error(`jet-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
+    }
+    out = out.replace(pattern, replacement)
+  }
+  out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
+  return out.concat(
+    '\nmodule.exports.__testExports = { formatCapacity: formatCapacity, ModelTierPicker: ModelTierPicker };\n',
+  )
+}
+
+function loadClientModule(): Record<string, unknown> {
+  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8'))
+
+  const dir = mkdtempSync(join(tmpdir(), 'jet-hub-capacity-'))
+  mkdirSync(join(dir, 'node_modules', 'react'), { recursive: true })
+  writeFileSync(join(dir, 'node_modules', 'react', 'package.json'),
+    JSON.stringify({ name: 'react', version: '0.0.0-stub', main: 'index.js' }))
+  writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
+  writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
+  writeFileSync(join(dir, 'jet-hub.js'), cjs)
+
+  const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
+  const loaded = requireFromTemp(join(dir, 'jet-hub.js')) as { __testExports: Record<string, unknown> }
+  tempDir = dir
+  return loaded.__testExports
+}
+
+let tempDir: string | undefined
+afterAll(() => {
+  if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true })
+})
+
+const { formatCapacity, ModelTierPicker } = loadClientModule() as {
+  formatCapacity: (value: unknown) => string
+  ModelTierPicker: (props: Record<string, unknown>) => TierNode | null
+}
+
+/** `createElement` 占位的产物形态。 */
+interface TierNode {
+  type: unknown
+  props: Record<string, unknown>
+  children: unknown[]
+}
+
+/** 整棵树里全部可见文本（按渲染顺序展平）。 */
+function textsOf(node: unknown): string[] {
+  if (typeof node === 'string' || typeof node === 'number') return [String(node)]
+  if (node === null || node === undefined) return []
+  return ((node as TierNode).children ?? []).flatMap(textsOf)
+}
+
+/** 收集整棵树里所有 `title` 属性值。 */
+function titlesOf(node: unknown): string[] {
+  if (node === null || typeof node !== 'object') return []
+  const element = node as TierNode
+  return [
+    ...(typeof element.props?.title === 'string' ? [element.props.title] : []),
+    ...(element.children ?? []).flatMap(titlesOf),
+  ]
+}
+
+describe('formatCapacity：1000 进制缩写（与厂商口径一致）', () => {
+  it('**用户报障的那两个数**：168000 → `168K`、1000000 → `1M`', () => {
+    // 这两个值正是报障原文里的「显示168000和1000000不好看」。
+    expect(formatCapacity(168_000)).toBe('168K')
+    expect(formatCapacity(1_000_000)).toBe('1M')
+  })
+
+  it('M 档：整兆不带小数，非整兆保留一位（去掉尾随 `.0`）', () => {
+    expect(formatCapacity(1_000_000)).toBe('1M')
+    // 目录里的 Max 档真机值（1024 进制写法），按 1000 进制口径落在 1M。
+    expect(formatCapacity(1_048_576)).toBe('1M')
+    expect(formatCapacity(1_500_000)).toBe('1.5M')
+    expect(formatCapacity(2_000_000)).toBe('2M')
+    // 边界：刚好 1e6 走 M 支，差一点走 K 支。
+    expect(formatCapacity(999_999)).toBe('1000K')
+  })
+
+  it('K 档：四舍五入到整 K，目录真机值逐个核对', () => {
+    expect(formatCapacity(200_000)).toBe('200K')
+    // `glm-5.3` 的时代值（1024 进制写法）+ 漂移后的 dev 档。
+    expect(formatCapacity(119_040)).toBe('119K')
+    expect(formatCapacity(262_144)).toBe('262K')
+    expect(formatCapacity(204_800)).toBe('205K')
+    expect(formatCapacity(1_000)).toBe('1K')
+    expect(formatCapacity(1_500)).toBe('2K')
+  })
+
+  it('不足 1K 原样输出；非法值返回空串（不渲染出 `NaN` / `undefined`）', () => {
+    expect(formatCapacity(999)).toBe('999')
+    expect(formatCapacity(1)).toBe('1')
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, '168000', null, undefined, {}]) {
+      expect(formatCapacity(bad), String(bad)).toBe('')
+    }
+  })
+})
+
+describe('ModelTierPicker：标签用缩写、title 保留精确值', () => {
+  const model = {
+    id: 'glm-5.3',
+    name: 'GLM-5.3',
+    contextWindow: 200_000,
+    maxContextWindow: 1_000_000,
+  }
+
+  it('两个档位的可见文案是缩写（`默认 200K` / `Max 1M`）', () => {
+    const tree = ModelTierPicker({ model, busy: false, onSelect: () => {} })
+    expect(textsOf(tree)).toEqual(['默认 200K', 'Max 1M'])
+  })
+
+  it('精确值仍可见（四个 title 里带上原始 token 数）', () => {
+    // 缩写负责扫视、tooltip 负责核对 —— 「精确值不丢」是这条改动的边界条件。
+    const tree = ModelTierPicker({ model, busy: false, onSelect: () => {} })
+    const titles = titlesOf(tree)
+    expect(titles).toContain('默认档 · 200000 token')
+    expect(titles).toContain('Max档 · 1000000 token')
+  })
+
+  it('没有 Max 档（`max <= dev` / 缺字段）时整个组件不渲染', () => {
+    for (const bad of [
+      { ...model, maxContextWindow: undefined },
+      { ...model, maxContextWindow: 200_000 },
+      { ...model, maxContextWindow: 100_000 },
+      { ...model, contextWindow: undefined },
+    ]) {
+      expect(ModelTierPicker({ model: bad, busy: false, onSelect: () => {} }), JSON.stringify(bad)).toBeNull()
+    }
+  })
+})

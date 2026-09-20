@@ -437,7 +437,10 @@ export interface TraeCnModelEntry {
    * 静态表条目一律有值（真机 vscdb 的多模态标记）。
    */
   supportsImages?: boolean
-  /** 上下文窗口（目录给的 dev 档 / `prompt_max_tokens`）。缺省 = 未提供。 */
+  /**
+   * 上下文窗口（目录给的 dev 档：`context_window_tokens.dev`，回退 `prompt_max_tokens`）。
+   * 缺省 = 未提供。
+   */
   contextWindow?: number
   /**
    * 上下文窗口的 **Max 档**（两个来源，见下）。
@@ -611,7 +614,9 @@ export function applyTraeCnStaticMetadata(entries: readonly TraeCnModelEntry[]):
  * 字段读取：
  * - id：`config_name`（空串跳过）；
  * - 展示名：`display_config.display_name`，缺省回退 id；
- * - 上下文窗口：`model_detail_list[0].prompt_max_tokens`，回退 `context_window_tokens.dev`；
+ * - 上下文窗口：**`context_window_tokens.dev` 优先**，回退
+ *   `model_detail_list[0].prompt_max_tokens`（口径理由见函数体内的注释：与官方
+ *   客户端显示的 200K 对齐，消掉「同模型两个数」的困惑）；
  *   **Max 档**另读 `context_window_tokens.max`，且只在**严格大于**上面那个 dev 档时才收
  *   （`max <= dev`（含 0 与两档同值）、max 缺失、dev 档本身缺失，都视为无 Max 档，
  *   理由见 `TraeCnModelEntry.maxContextWindow`）；
@@ -648,11 +653,20 @@ export function parseTraeCnDirectory(body: unknown, functionName: string): TraeC
     const display = asRecord(record.display_config)
     const detail = firstRecord(record.model_detail_list)
     const contextTokens = asRecord(record.context_window_tokens)
-    const contextWindow = readPositive(detail?.prompt_max_tokens) ?? readPositive(contextTokens?.dev)
+    // ⚠️ **dev 优先**（2026-09-21 口径统一）：上游同时下发 `context_window_tokens.dev`
+    // 与 `model_detail_list[0].prompt_max_tokens` 两个**不同**的数（真机 `glm-5.3`
+    // 是 200000 与 168000），而**官方客户端按 dev 显示 200K**。早前取
+    // `prompt_max_tokens ?? dev` ⇒ 同一个模型在客户端显示 200K、在我们这儿是
+    // 168K，用户看到「两个数」而无从判断哪个是真的。
+    //
+    // 取哪个**只影响宿主的压缩触发点**（阈值 `0.8 × 窗口`），不影响上游服务：
+    // 4022 直测已证明两者都不是硬限（498K token 的请求正常服务，真正的墙在网关级
+    // 约 1M）。既然语义上无优劣，就取**与客户端一致**的那个，消掉认知不一致。
+    const contextWindow = readPositive(contextTokens?.dev) ?? readPositive(detail?.prompt_max_tokens)
     // Max 档：**只记录，不参与默认声明**（默认仍是 dev 档，见 TraeCnModelEntry.contextWindow）。
     // 它与 dev 的严格大小关系在下面 push 时判定 —— 判据必须对着**实际生效的 dev 档**
-    // （`prompt_max_tokens` 可能覆盖 `context_window_tokens.dev`），拿 `contextTokens.dev`
-    // 去比会在两者不一致时误收一个「其实不大于默认档」的 Max。
+    // （即上面解析出的 `contextWindow`），拿裸 `contextTokens.dev` 去比会在口径改变时
+    // 误收一个「其实不大于默认档」的 Max。
     const maxContextWindow = readPositive(contextTokens?.max)
     const maxTokens = readPositive(detail?.max_tokens)
     const reasoning = readReasoningConfig(record)
@@ -924,9 +938,9 @@ function locateAgentTierModels(body: unknown): readonly unknown[] | undefined {
  *
  * 1. `maxMode === true` —— 上游明说该模型有 Max 档；
  * 2. `max > entry.contextWindow` —— 严格大于**实际生效的 dev 档**。这里的
- *    `contextWindow` 已经是解析侧算好的 `prompt_max_tokens ?? context_window_tokens.dev`
- *    （见 {@link parseTraeCnDirectory}），故直接比它就是「与生效档比」，
- *    不需要、也不该再去读原始字段；
+ *    `contextWindow` 已经是解析侧算好的 `context_window_tokens.dev ??
+ *    prompt_max_tokens`（见 {@link parseTraeCnDirectory}），故直接比它就是
+ *    「与生效档比」，不需要、也不该再去读原始字段；
  * 3. `entry.contextWindow !== undefined` —— 没有比较基准的条目**跳过**
  *    （`max` 是不是「更大」无从判断）。
  *

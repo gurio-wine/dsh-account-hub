@@ -1125,6 +1125,68 @@ describe('model.list / model.setDisabled 端点', () => {
       expect(byId.get('deepseek-v4-flash')).not.toHaveProperty('contextBudget')
     })
 
+    /**
+     * 用户报障（2026-09-21）：「为什么只有开启后才能可选上下文？」
+     *
+     * 根因是**同一份档位数据被两条渲染路径区别对待**：`model.list` 早前只在
+     * `models.map(...)`（= 未被黑名单过滤的那批）上加窗口字段，而**被关闭的模型
+     * 由回填侧补回**（见上面的并集逻辑），走的是另一条 `filteredOut.map(...)`
+     * 分支 —— 那条分支只产出 `{id, name: id, disabled: true}`，档位列于是整行消失。
+     *
+     * 档位数据来自适配器目录（`contextTiers`），**与用户的显示开关毫无关系**：
+     * 关掉一个模型只是让它从对话框选择器里消失，它在目录里的 dev / Max 档一字未变。
+     * 下面两条一起钉死这件事。
+     */
+    it('**被关闭的模型（回填行）照样带窗口档位**，与开启状态逐字段一致', async () => {
+      // 先拿「开启」状态下的那一行做基准。
+      const enabled = await (async () => {
+        const { call } = registerEndpoints({
+          models: MODELS, contextTiers: tierSource,
+          contextBudgets: { 'trae-cn': { 'glm-5.2': 1_048_576 } },
+        })
+        const result = await call('model.list', { provider: 'trae-cn' })
+        return (result.value as { models: Array<Record<string, unknown>> }).models
+          .find(m => m.id === 'glm-5.2')!
+      })()
+
+      // 再拿同一个模型被关闭后的那一行：它已被适配器过滤掉，由**回填侧**产出。
+      const { call } = registerEndpoints({
+        models: MODELS, contextTiers: tierSource,
+        contextBudgets: { 'trae-cn': { 'glm-5.2': 1_048_576 } },
+        disabledModels: { 'trae-cn': { 'glm-5.2': true } },
+      })
+      const result = await call('model.list', { provider: 'trae-cn' })
+      const models = (result.value as { models: Array<Record<string, unknown>> }).models
+      const disabled = models.find(m => m.id === 'glm-5.2')!
+
+      // 三个档位字段一个不少（这正是用户要能在关闭状态下改档的前提）。
+      expect(disabled).toMatchObject({
+        contextWindow: 119_040, maxContextWindow: 1_048_576, contextBudget: 1_048_576,
+      })
+      // 与开启状态**逐字段相同**，只有开关状态与展示名不同（回填拿不到原始 name）。
+      expect({ ...disabled, disabled: false, name: enabled.name }).toEqual(enabled)
+      expect(disabled.name).toBe('glm-5.2')
+      expect(disabled.disabled).toBe(true)
+    })
+
+    it('关闭状态下**设置档位照常生效**（校验读的是目录，与显示开关无关）', async () => {
+      // UI 现在会在回填行上渲染档位 radio，那条路径必须真的能写进去 ——
+      // 否则就成了「点了没反应」，比不渲染更糟。
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS, contextTiers: tierSource,
+        disabledModels: { 'trae-cn': { 'glm-5.2': true } },
+      })
+
+      const set = await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window: 1_048_576 })
+      expect(set.ok).toBe(true)
+      expect(storedValue().contextBudgets).toEqual({ 'trae-cn': { 'glm-5.2': 1_048_576 } })
+
+      // 且回填行立刻反映出新预算（选中态据此渲染）。
+      const result = await call('model.list', { provider: 'trae-cn' })
+      const glm = (result.value as { models: Array<Record<string, unknown>> }).models.find(m => m.id === 'glm-5.2')!
+      expect(glm.contextBudget).toBe(1_048_576)
+    })
+
     it('其它 provider **一个窗口字段都不带**（档位只在 Trae CN 存在）', async () => {
       const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
       const result = await call('model.list', { provider: 'trae-cn-work' })

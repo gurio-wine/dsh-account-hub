@@ -13,7 +13,7 @@
  * 1. **解析**：只认 `solo_agent_remote` 组（不跨组拼接）、`max_mode === true` 是
  *    必要条件、`max` 走 readPositive 口径、`name` 才是 id；
  * 2. **合并**：只补现有条目的 `maxContextWindow`（**绝不新增条目** —— agent 组独有的
- *    `Doubao-Seed-Code` 必须被忽略）、基准是**生效档**（`prompt_max_tokens ?? dev`）；
+ *    `Doubao-Seed-Code` 必须被忽略）、基准是**生效档**（`cwt.dev ?? prompt_max_tokens`）；
  * 3. **降级**：档位拉取失败/超时/无本组 ⇒ **目录照常返回**，只是没有档位 ——
  *    档位绝不能拖垮目录。
  *
@@ -406,7 +406,8 @@ describe('fetchTraeCnDirectory：档位并入同一次刷新，失败静默降�
 
   it('目录成功 + 档位成功 ⇒ 条目带 Max 档，且共 3 次请求（2 POST + 1 GET）', async () => {
     const { fetcher, calls } = routedFetcher({
-      // 生效档取 `prompt_max_tokens`（168000），不是 `cwt.dev`。
+      // 真机形态：两个窗口字段给不同的数 —— 生效档取 `cwt.dev`（200000，
+      // 与官方客户端显示的 200K 同口径），`prompt_max_tokens` 只是回退值。
       remote: () => directoryResponse([
         { ...directoryModel('glm-5.3', 168_000), context_window_tokens: { dev: 200_000 } },
         directoryModel('kimi-k2.6', 200_000),
@@ -425,7 +426,7 @@ describe('fetchTraeCnDirectory：档位并入同一次刷新，失败静默降�
     const entries = await fetchTraeCnDirectory(makeCredential(), { fetchImpl: fetcher })
     expect(entries.map((entry) => entry.id)).toEqual(['glm-5.3', 'kimi-k2.6', 'Doubao-Seed-2.1-Turbo'])
     const glm = entries.find((entry) => entry.id === 'glm-5.3')!
-    expect(glm.contextWindow).toBe(168_000)
+    expect(glm.contextWindow).toBe(200_000)
     expect(glm.maxContextWindow).toBe(1_000_000)
     // 没有 Max 档的两项**不编造**。
     for (const id of ['kimi-k2.6', 'Doubao-Seed-2.1-Turbo']) {
@@ -451,7 +452,7 @@ describe('fetchTraeCnDirectory：档位并入同一次刷新，失败静默降�
       })
       const entries = await fetchTraeCnDirectory(makeCredential(), { fetchImpl: fetcher })
       expect(entries.map((entry) => entry.id)).toEqual(['glm-5.3'])
-      expect(entries[0]!.contextWindow).toBe(168_000)
+      expect(entries[0]!.contextWindow).toBe(200_000)
       expect(entries[0]).not.toHaveProperty('maxContextWindow')
       // 静态元数据照旧补上（档位失败不影响多模态 / 思考档）。
       expect(entries[0]!.supportsImages).toBe(false)

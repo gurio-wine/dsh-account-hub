@@ -1979,10 +1979,43 @@ describe('Trae CN 目录解析（parseTraeCnDirectory）', () => {
     expect(byId.get('g')).toMatchObject({ contextWindow: 1_000 })
   })
 
-  it('Max 的判据对着**实际生效的 dev 档**（`prompt_max_tokens` 覆盖 `context_window_tokens.dev`）', () => {
-    // 探针：`prompt_max_tokens`(300000) 才是实际生效的 dev 档，max(200000) 落在
-    // 两个候选 dev 值之间。若拿 `context_window_tokens.dev`(100000) 去比，
-    // 就会误收一个「其实不大于默认档」的 Max。
+  it('上下文窗口**取 dev、不取 prompt_max_tokens**（与官方客户端显示的 200K 同口径）', () => {
+    // 真机形态：上游两个字段给两个数（`glm-5.3`：dev 200000 / prompt_max_tokens
+    // 168000），而官方客户端显示 200K。早前取 `prompt_max_tokens` ⇒ 客户端 200K、
+    // 我们 168K，用户看到「同模型两个数」。
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [{
+        config_name: 'm',
+        model_detail_list: [{ prompt_max_tokens: 168_000 }],
+        context_window_tokens: { dev: 200_000 },
+      }],
+    }, 'solo_work_remote')
+    expect(parsed[0]).toMatchObject({ id: 'm', contextWindow: 200_000 })
+  })
+
+  it('dev 缺失时才回退 `prompt_max_tokens`（回退值，不是被取代值）', () => {
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [
+        // 只有 prompt_max_tokens。
+        { config_name: 'a', model_detail_list: [{ prompt_max_tokens: 168_000 }] },
+        // dev 是脏数据（0 / 负数 / 字符串）→ 走 readPositive 口径，视为未声明。
+        { config_name: 'b', model_detail_list: [{ prompt_max_tokens: 168_000 }], context_window_tokens: { dev: 0 } },
+        { config_name: 'c', model_detail_list: [{ prompt_max_tokens: 168_000 }], context_window_tokens: { dev: '200000' } },
+        // 两个都没有 → 不声明窗口。
+        { config_name: 'd' },
+      ],
+    }, 'solo_work_remote')
+    const byId = new Map(parsed.map((e) => [e.id, e]))
+    expect(byId.get('a')).toMatchObject({ contextWindow: 168_000 })
+    expect(byId.get('b')).toMatchObject({ contextWindow: 168_000 })
+    expect(byId.get('c')).toMatchObject({ contextWindow: 168_000 })
+    expect(byId.get('d')).not.toHaveProperty('contextWindow')
+  })
+
+  it('Max 的判据对着**实际生效的 dev 档**（一律是 `context_window_tokens.dev`）', () => {
+    // 探针：生效档 = dev(100000)，max(200000) 严格大于它 → 收下。
+    // 若误用 `prompt_max_tokens`(300000) 当基准，200000 <= 300000 就会**漏收**
+    // 一个真实存在的 Max 档（口径写反的另一种表现）。
     const parsed = parseTraeCnDirectory({
       config_info_list: [{
         config_name: 'm',
@@ -1990,8 +2023,7 @@ describe('Trae CN 目录解析（parseTraeCnDirectory）', () => {
         context_window_tokens: { dev: 100_000, max: 200_000 },
       }],
     }, 'solo_work_remote')
-    expect(parsed[0]).toMatchObject({ id: 'm', contextWindow: 300_000 })
-    expect(parsed[0]).not.toHaveProperty('maxContextWindow')
+    expect(parsed[0]).toMatchObject({ id: 'm', contextWindow: 100_000, maxContextWindow: 200_000 })
   })
 
   it('静态回退表**一律不带 Max 档**（4022 钳制是网关级证据，不是逐模型的档位表）', () => {

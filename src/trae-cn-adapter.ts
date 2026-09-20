@@ -202,7 +202,14 @@ function resolveChunkTimeoutMs(): number {
  * 被解析侧判成「无 Max 档」，同样不渲染）。
  */
 export interface TraeCnContextTier {
-  /** dev 档：目录公布的默认窗口（`prompt_max_tokens`，回退 `context_window_tokens.dev`）。 */
+  /**
+   * dev 档：目录公布的默认窗口（`context_window_tokens.dev`，回退 `prompt_max_tokens`）。
+   *
+   * ⚠️ **dev 优先**是 2026-09-21 统一的口径（早前反向）—— 上游两个字段给的是
+   * 不同的数（真机 `glm-5.3`：dev `200000` / `prompt_max_tokens` `168000`），
+   * 而官方客户端按 dev 显示 `200K`。取 dev 是为了让两边显示同一个数，
+   * 详见 `parseTraeCnDirectory`。
+   */
   contextWindow?: number
   /** Max 档：**仅当严格大于 dev 档**时才存在（见 `TraeCnModelEntry.maxContextWindow`）。 */
   maxContextWindow?: number
@@ -394,8 +401,9 @@ export class TraeCnAdapter extends LlmAdapter {
       // 否则选择器显示「支持图片」而请求路径按纯文本处理（或反之），是自相矛盾。
       inputModalities: this.inputModalitiesFor(entry?.supportsImages),
     }
-    // 上下文窗口：动态目录给 `prompt_max_tokens`（回退 `context_window_tokens.dev`），
-    // 静态表给真机 dev 档 —— 两者同口径（都是客户端默认实际使用的窗口）。
+    // 上下文窗口：动态目录给 `context_window_tokens.dev`（回退 `prompt_max_tokens`，
+    // 与官方客户端显示的 200K 同口径），静态表给真机 dev 档 —— 两者同口径
+    // （都是客户端默认实际使用的窗口）。
     // 用户在 Account Hub 选了 Max 档时由 `effectiveContextWindow` 换成该模型的 Max 档
     // （**纯声明值切换**：请求体一个字段都不动，见该方法说明）。
     if (entry !== undefined) {
