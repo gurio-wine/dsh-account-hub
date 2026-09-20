@@ -14,7 +14,7 @@
  * | `tool_choice` | **不适用**：DSH 的 `GenerateOptions` 无该字段，且 body 由本适配器自建，天然不会出现（Go 桥接层要归一化是因为它转发客户端的原始 body） |
  * | `prompt_cache_key` | **不发** —— 那是腾讯后端的前缀缓存机制，此处未实测支持 |
  * | 思考等级 | **不照抄** buddy 的 deepseek 补档逻辑（那是针对腾讯后端实测的）；仅透传 |
- * | 图片 | **不支持**，`inputModalities` 恒为 `['text']` |
+ * | 图片 | **不支持**，`inputModalities` 恒为 `['text']`（判定证据链见 {@link LOBSTERAI_IMAGE_MODALITY_NOTE}） |
  *
  * 可以原样复用的是 `src/sse.ts` 的三个工具函数（`readWithIdleTimeout` /
  * `resolveToolPairing` / `normalizeToolArguments` / `isTruncatedArguments`）——
@@ -43,11 +43,66 @@ import {
   type LobsteraiCredential,
 } from './lobsterai.js'
 import { LOBSTERAI, type LobsteraiFallbackModel, type LobsteraiProduct } from './lobsterai-product.js'
-import { classifyLobsteraiError, recordsLobsteraiRateLimit, shouldRotateLobsteraiAccount } from './lobsterai-errors.js'
+import {
+  LOBSTERAI_CONTEXT_OVERFLOW_HINT,
+  classifyLobsteraiError,
+  lobsteraiHarnessErrorCode,
+  recordsLobsteraiRateLimit,
+  shouldRotateLobsteraiAccount,
+} from './lobsterai-errors.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai'
+
+/**
+ * 图片模态**刻意不声明**的判定记录（2026-09-21 取证）。
+ *
+ * 结论：`inputModalities` 保持 `['text']`，**不补图片出站**。
+ * 下面是完整的证据链与取舍，供后来者复核而不是重新猜一遍。
+ *
+ * ## 已经确证的三件事
+ *
+ * 1. **远端确实声明图片能力**：真机 `GET /api/models/available` 的
+ *    `supportsImage` 在 14 个声明了窗口的模型里 **11 项为 true**（应用日志
+ *    `[Auth:getModels] Response data` 逐条可查）。
+ * 2. **官方客户端也按多模态用**：`%APPDATA%\LobsterAI\openclaw\state\openclaw.json`
+ *    的 `lobsterai-server` 提供者里，同批模型带 `"input": ["text","image"]`，
+ *    传输层 `api: "openai-completions"`（`kimi-k3` 还带 `video`）。
+ * 3. **协议形态是标准 OpenAI**：装包内 `openclaw` 的
+ *    `dist-openai-completions-stream-*.cjs` 把图片块编码为
+ *    `{type:'image_url', image_url:{url:'data:<mime>;base64,<data>'}}`
+ *    （与 buddy 适配器现在用的形态**逐字节同款**）。
+ *
+ * ## 为什么仍然不声明（三条独立理由，任一条都足以否决）
+ *
+ * 1. **我们发不到那个端点**。官方客户端**不直连上游**：它先起一个本地代理
+ *    `OpenClawTokenProxy`（应用日志 `started on 127.0.0.1:<port>`），
+ *    openclaw 的 `baseUrl` 是 `http://127.0.0.1:<port>/v1`，由该代理注入令牌并
+ *    转发到 `{apiBase}/api/proxy/v1`。**图片出站是否被上游 `/api/proxy/v1`
+ *    接受，证据全部产生于代理之后的链路**，而我方是直连 —— 「官方能发」推不出
+ *    「我们能发」。
+ * 2. **没有对上游的直接实测**。上述三条证据里没有一条是「向
+ *    `https://lobsterai-server.youdao.com/api/proxy/v1/chat/completions` 发一张
+ *    真图并拿到成功响应」。本项目的规矩是「没观察到的东西不猜」——
+ *    `reasoning_effort` 当初之所以能接线，是因为有**服务端行为**级的
+ *    单变量证据（错值 500、对值 200）；图片没有同等级的样本。
+ * 3. **声明错了比不声明更糟**。`stream()` 现在对图片块抛
+ *    `UNSUPPORTED_CONTENT`（见下方）。若先声明 `['text','image']` 再补出站，
+ *    一旦上游拒绝，用户拿到的会是「选了图片 → 请求失败」，而不是现在这种
+ *    「这个模型不吃图」的明确拒绝；更糟的是 DSH 会把图片块**当作已支持**而
+ *    路由进这条通道（`src/qoder-adapter.ts` 的注释记着同型教训：
+ *    「两处若分叉会让图片被路由进这条**必然丢图**的通道」）。
+ *
+ * ## 何时可以翻案
+ *
+ * 拿到「直连上游 + 真图 + 成功响应」的实测样本后：补 `readImage` 桥接
+ * （`src/index.ts` 已有 `makeReadImage`，buddy 系在用）、按 `supportsImage`
+ * 逐模型给模态、并让 `serializeMessages` 编码 `image_url`。
+ * 在那之前，本条与 `stream()` 的拒绝逻辑**必须保持一致**（一处声明、
+ * 一处拦截，分叉即静默故障）。
+ */
+export const LOBSTERAI_IMAGE_MODALITY_NOTE = '远端 supportsImage=true 但出站未支持，保守不声明'
 
 /**
  * 限流重置时间的本地兜底（毫秒，1 小时）。
@@ -400,13 +455,24 @@ function errorDetail(body: string): string {
   return body
 }
 
-/** 将 HTTP 状态码映射为 harness 错误码。 */
-function httpErrorCode(status: number): string {
-  if (status === 401 || status === 403) return 'AUTH'
-  if (status === 429) return 'RATE_LIMIT'
-  if (status === 400) return 'INVALID_REQUEST'
-  if (status >= 500) return 'SERVER'
-  return `HTTP_${status}`
+/**
+ * 构造上下文超限失败（本适配器**唯一**的 `CONTEXT_WINDOW_EXCEEDED` 抛出点）。
+ *
+ * 两处会用到它：无账号池的直报路径，以及换号循环**中途**撞上超限时的提前放行
+ * （见 `stream()` 里的说明）。收敛成一个构造函数，是为了让「文案 + 错误码 +
+ * status」三者在两条路径上逐字节一致 —— 否则用户会看到两种不同的措辞，
+ * 而排查者无从判断它们是不是同一种失败。
+ *
+ * 文案 = 上游原文（`errorDetail` 归一化）+ 中文补救说明（{@link
+ * LOBSTERAI_CONTEXT_OVERFLOW_HINT}）。原文必须保留：真机排障要与上游文档
+ * 对得上号，且它是判断「上游到底怎么表述超限」的唯一证据。
+ */
+function contextWindowError(body: string, status: number): LlmError {
+  return new LlmError(
+    `lobsterai: ${errorDetail(body)}${LOBSTERAI_CONTEXT_OVERFLOW_HINT}`,
+    lobsteraiHarnessErrorCode('context-window', status),
+    { status },
+  )
 }
 
 /**
@@ -535,7 +601,7 @@ export class LobsteraiAdapter extends LlmAdapter {
       provider: this.product.id,
       id: model.id,
       name: model.name,
-      // 图片输入未实测支持，一律只报文本。
+      // 图片输入刻意不声明，判定证据链见 LOBSTERAI_IMAGE_MODALITY_NOTE。
       inputModalities: ['text'] as const,
     }))
   }
@@ -547,6 +613,10 @@ export class LobsteraiAdapter extends LlmAdapter {
       provider,
       id: model,
       name: entry?.name ?? model,
+      // 与 listModels **同源同口径**：LobsterAI 逐模型区分多模态没有实测依据，
+      // 两处一律 `['text']`（判定证据链见 LOBSTERAI_IMAGE_MODALITY_NOTE）。
+      // ⚠️ 两处若分叉（一处报 `['text','image']`）会让图片被路由进这条
+      // **必然丢图**的通道 —— 与 qoder / trae-cn 的同型约束一致。
       inputModalities: ['text'],
     }
     // 上下文窗口：真机 `contextWindow` 为权威值；真机给 null 的条目**不声明**
@@ -601,8 +671,12 @@ export class LobsteraiAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    // 图片：LobsterAI 未实测支持，明确报错而不是静默丢弃（静默丢弃会让用户
-    // 以为模型看到了图片）。检查在取凭据之前，省掉一次无谓的凭据读取。
+    // 图片：明确报错而不是静默丢弃（静默丢弃会让用户以为模型看到了图片）。
+    // 检查在取凭据之前，省掉一次无谓的凭据读取。
+    //
+    // ⚠️ **这条拒绝与 `inputModalities` 的 `['text']` 是一对**：一旦哪天补上
+    // 图片出站，两处必须**同时**改（判定与翻案条件见
+    // {@link LOBSTERAI_IMAGE_MODALITY_NOTE}）。只改一处就是静默故障。
     for (const message of options.messages) {
       if (!Array.isArray(message.content)) continue
       const hasImage = message.content.some((block) =>
@@ -783,24 +857,42 @@ export class LobsteraiAdapter extends LlmAdapter {
           errorText = await response.text().catch(() => '')
           lastStatus = response.status
           lastKind = classifyLobsteraiError(response.status, errorText)
-          // 新账号也不可轮转（理论上不会：shouldRotate 仅对 none 为 false，
-          // 而非 2xx 已排除 none）—— 留作防御，避免将来改动引入死循环。
+          // 新账号也不可轮转时收手：两种情况，处置**完全不同**，故分开写。
+          //
+          // 1. `context-window` —— 必须在**这一轮**就把原始失败抛出去。
+          //    换号循环跑到这里说明「第一个账号已超限、又换了一个账号仍超限」，
+          //    而超限是**请求本身**的属性（prompt 太长），与账号无关：继续换下去
+          //    只会打出更多必然失败的请求，最后落到下面那句「所有账号均不可用」——
+          //    用户会以为是自己账号的问题，而真因（请求太长）被埋在终报里。
+          //    直接抛可让宿主立刻压缩上下文并重试。
+          // 2. 其它类别（理论上不该出现：`shouldRotate` 只对 `none` 与
+          //    `context-window` 为 false，而非 2xx 已排除 `none`）—— 留作防御，
+          //    避免将来改动引入死循环。
+          if (lastKind === 'context-window') throw contextWindowError(errorText, lastStatus)
           if (!shouldRotateLobsteraiAccount(lastKind)) break
         }
         // 试遍候选：报「均不可用」，并带上**最后一次**的真实原因（不吞诊断信息）。
         throw new LlmError(
           `lobsterai: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
-          lastKind === 'hard-credit' ? 'QUOTA_EXCEEDED' : httpErrorCode(lastStatus),
+          lobsteraiHarnessErrorCode(lastKind, lastStatus),
           { status: lastStatus },
         )
       }
+
+      // 上下文超限但没进换号循环（未配账号池，或首个账号就命中）：立刻交给宿主
+      // 压缩上下文后重试。**不换号**的理由见 `shouldRotateLobsteraiAccount`。
+      if (lastKind === 'context-window') throw contextWindowError(errorText, lastStatus)
 
       // 积分不足但无账号池（或只有一个账号）：用可读文案明确告知，
       // 而不是抛一个泛泛的 HTTP 错误 —— 这是 LobsterAI 最主要的失败模式。
       if (lastKind === 'hard-credit') {
         throw new LlmError(`lobsterai: 积分不足（${errorDetail(errorText)}）`, 'QUOTA_EXCEEDED', { status: lastStatus })
       }
-      throw new LlmError(`lobsterai: ${errorDetail(errorText)}`, httpErrorCode(lastStatus), { status: lastStatus })
+      throw new LlmError(
+        `lobsterai: ${errorDetail(errorText)}`,
+        lobsteraiHarnessErrorCode(lastKind, lastStatus),
+        { status: lastStatus },
+      )
     }
 
     // 5. 消费 SSE 流

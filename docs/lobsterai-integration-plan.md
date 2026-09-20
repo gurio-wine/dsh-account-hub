@@ -865,6 +865,14 @@ req.Header.Set("X-LobsterAI-Client-Version", clientVersion)               // 0.1
 | `prompt_cache_key` | **不要发**。那是 CodeBuddy 的前缀缓存机制，LobsterAI 未实测支持；发了无益且有被拒风险 |
 | `thinking` / `reasoning_effort` | **不要照抄 buddy 的逻辑**。buddy 那套（`isDeepSeekModel` + 强制补档位）是针对腾讯后端实测出来的；LobsterAI 只需**透传** `options.reasoningEffort`（如上游接受），是否支持待实测 |
 | 图片输入 | **暂不支持**。Go 桥接层没有任何图片处理代码，`inputModalities` 返回 `['text']`；不要桥接 `ctx.attachments` |
+
+> ⚠️ **结论保留，但这行的依据不对（2026-09-21 补记）**：「Go 层没有图片代码」
+> **推不出**「上游不支持图片」—— 真机 `supportsImage` 在 14 个声明窗口的模型里
+> 11 项为 `true`，官方客户端 `openclaw.json` 的同批模型也带
+> `"input": ["text","image"]`。不声明的**现依据**是「官方走本地
+> `OpenClawTokenProxy`、我方直连上游，**缺上游实测样本**」。
+> 完整证据链与翻案条件见 `src/lobsterai-adapter.ts` 的
+> `LOBSTERAI_IMAGE_MODALITY_NOTE`。
 | `usage` 缓存字段 | LobsterAI 的 `Aggregate` 直接透传整个 `usage` 对象，未做 `cached_tokens` 拆分。TS 侧先简单映射 `prompt_tokens` / `completion_tokens` |
 
 **模型元数据**：`resolveModel` 的上下文窗口先用兜底表（`handler.go:94-114` 里
@@ -872,6 +880,14 @@ req.Header.Set("X-LobsterAI-Client-Version", clientVersion)               // 0.1
 **不是**远端权威值 —— 远端 `/api/models/available` 只返回
 `modelId`/`modelName`/`provider`/`apiFormat`，**没有** context window）。
 → 兜底表标 131072，但**在注释里标明这是桥接层的猜测值**，待实测校正。
+
+> ⚠️ **本条已被真机推翻（2026-09-19 实测，2026-09-21 回填）**：两点都错了。
+> ① 远端**确实**返回 `contextWindow`（还有 `supportsThinking` / `thinkingConfig`），
+> 本段「远端不返回窗口大小」是**基于 Go 层解析代码的推断**，不是实测；
+> ② 因此 `131072` 既不是远端值也不是任何真实窗口，现在代码里**一个都没有**。
+> 真机值：**14 项 1,000,000 / 2 项 262,144 / 2 项 256,000 / 9 项 `null`**（`null` 不声明）。
+> 现行实现是「远端优先、静态兜底」，静态表在 `src/lobsterai-product.ts`。
+> 正文保留为当时的设计记录，**不要**据此改回 131072。
 
 ---
 
@@ -1243,6 +1259,10 @@ glm-5
 全部标 `context_length: 131072`（**桥接层的猜测值**，远端不返回窗口大小）、
 `owned_by: "lobsterai"`。
 
+> ⚠️ **「远端不返回窗口大小」是错的（2026-09-19 真机推翻）**，故这一整表的
+> `131072` 与 19 项清单都**已作废**：真机是 27 项、带真实 `contextWindow`。
+> 现行静态兜底表见 `src/lobsterai-product.ts` 的 `LOBSTERAI_FALLBACK_MODELS`。
+
 #### B. 当前项目怎么做的
 
 `src/product.ts` 的 `fallbackModels` + `BuddyAdapter.listModels/resolveModel`
@@ -1267,6 +1287,12 @@ glm-5
 1. **`product.fallbackModels` 直接用上面那 19 个**（含 `name` 与
    `contextWindow: 131072`）。`name` 可用 `modelName` 的实测值，
    未实测的用 id 本身。
+
+> ⚠️ **这一条已作废（2026-09-21 补记）**：上面那 19 个（含 `131072`）**不要用**。
+> 真机是 **27 项**（比它多 9 项、少 1 项）且**带真实窗口**，`131072` 一个都不对。
+> 现行兜底表是 `src/lobsterai-product.ts` 的 `LOBSTERAI_FALLBACK_MODELS`
+> （2026-09-19 真机逐字段照抄）。第 2、3 条仍然成立（`data` 直接为数组、
+> 不做 `reconcileWithFallback` 裁剪）。
 2. **`fetchRemoteModels`** → `GET {apiBase}/api/models/available` +
    keyfrom query（含 `uuid` / `userId`）。只需 `modelId`。
    → 返回 `LobsteraiRemoteModel[]`，与 `BuddyRemoteModel` 结构分开定义
@@ -1278,6 +1304,10 @@ glm-5
    LobsterAI 是否支持 `reasoning_effort` 待实测（Go 桥接层完全没处理）。
    模型选择器会显示「当前模型未提供推理等级」，这是诚实的。
 5. `inputModalities` 恒为 `['text']`（Go 层无图片处理代码）。
+
+> ⚠️ **括号里的理由已作废（2026-09-21 补记）**：结论（恒为 `['text']`）仍成立，
+> 但依据从「Go 层无图片代码」换成了「官方走本地代理、我方直连上游，
+> **缺上游图片实测样本**」。证据链见 `LOBSTERAI_IMAGE_MODALITY_NOTE`。
 
 ---
 
@@ -1676,14 +1706,24 @@ curl 命令（55-71 行）。
 
 | # | 问题 | 保守做法 |
 |---|---|---|
-| R4 | 是否支持 `reasoning_effort` / 思考等级？ | **不声明** `resolveModel().reasoning`，等实测 |
-| R5 | 各模型真实上下文窗口？ | 用 131072（桥接层静态值），注释标明是猜测 |
+| R4 | 是否支持 `reasoning_effort` / 思考等级？ | ~~**不声明** `resolveModel().reasoning`，等实测~~ → ✅ **已实测并接线**（2026-09-19），见 README「LobsterAI provider」的「思考档位」一节 |
+| R5 | 各模型真实上下文窗口？ | ~~用 131072（桥接层静态值），注释标明是猜测~~ → ✅ **已实测并接线**（2026-09-19），见下方补记 |
 | R6 | 是否接受 `prompt_cache_key`？ | **不发** |
 | R7 | `tool_choice` 归一化是否必需？ | **照做**（`prepareChatBody` 的做法，无害） |
-| R8 | 图片输入是否支持？ | **不支持**，`inputModalities: ['text']` |
+| R8 | 图片输入是否支持？ | **不支持**，`inputModalities: ['text']`（⚠️ 结论不变但**依据已换**，见下方补记） |
 | R9 | 429 错误体的「重置时间」格式是否与 CodeBuddy 相同？ | 先复用 `parseRateLimitError`，实测后再调整 |
 | R13 | `User-Agent` 该不该跟着真版本改成 `LobsterAI/2026.9.4`？ | **先照抄 `LobsterAI/0.1.0`**（Go 侧实测可用的值），只改 `X-LobsterAI-Client-Version` 头。UA 变更需单独实测，避免同时改两个变量导致无法归因 |
 | R14 | 登录换来的 `accessToken` 是否 JWT（可否解 `exp`）？ | Go 注释说「实测 HS512 access token 30 天」，说明是 JWT。**但要有 `expiresIn` 优先、JWT 兜底的顺序**（对齐 `main.go:313-319`），且两者都拿不到时按「不可刷新」处理而非崩溃 |
+
+> ⚠️ **补记（2026-09-21，R4 / R5 / R8 的现状回填）**：本节是**写于实施前的风险登记**，
+> 三行「保守做法」记的是**当时的待办**，其中两条已被真机推翻。**不要照着它们改代码**，
+> 现状以 README 的「LobsterAI provider」与源码注释为准：
+>
+> | 项 | 写本文时的保守做法 | 现状 |
+> |---|---|---|
+> | R4 | 不声明 `reasoning` | ✅ **已接线**：档位取自远端 `thinkingConfig.options[].level`（权威），下发字段名 `reasoning_effort`，`off` 档因实测 500 被剔除 |
+> | R5 | 一律 131072 | ✅ **已推翻**：131072 是 Go 桥接层静态表的值，**从未是真实窗口**。真机 `contextWindow` 为 **14 项 1,000,000 / 2 项 262,144 / 2 项 256,000 / 9 项 `null`（不声明）**，远端优先、静态表兜底 |
+> | R8 | 不支持图片（依据：Go 层无图片代码） | ⚠️ **结论不变，依据已换**：Go 层没有图片代码**不能**推出「上游不支持」—— 真机 `supportsImage` 与官方 `openclaw.json` 的 `input` 都声明了图片。不声明的现依据是「**官方走本地 OpenClawTokenProxy、我方直连上游，缺上游实测样本**」，完整证据链见 `src/lobsterai-adapter.ts` 的 `LOBSTERAI_IMAGE_MODALITY_NOTE` |
 
 ### 7.4 与 `lobsterai2api` 的一致性审计（实施后回查）
 

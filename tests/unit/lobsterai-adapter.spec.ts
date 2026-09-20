@@ -231,11 +231,22 @@ describe('LobsteraiAdapter 模型目录', () => {
     expect(models[0]).toMatchObject({ provider: 'lobsterai', id: 'deepseek-flash' })
   })
 
-  it('inputModalities 恒为 text（图片未实测支持）', async () => {
+  it('inputModalities 恒为 text（图片出站未支持，保守不声明）', async () => {
+    // 判定证据链见 `LOBSTERAI_IMAGE_MODALITY_NOTE`：远端 `supportsImage` 与
+    // 官方 openclaw.json 的 `input` 都声明了图片，但官方走的是本地
+    // OpenClawTokenProxy、我方直连上游，**没有对上游的图片实测样本**，
+    // 故不声明（声明错了比不声明更糟：DSH 会把图片路由进必然失败的通道）。
     const { adapter } = makeAdapter(() => textSse('x'))
     for (const model of await adapter.listModels('lobsterai')) {
       expect(model.inputModalities).toEqual(['text'])
     }
+  })
+
+  it('resolveModel 与 listModels 的模态**同源同口径**（都是 text）', async () => {
+    // 两处若分叉会让图片被路由进必然丢图的通道（qoder / trae-cn 的同型约束）。
+    const { adapter } = makeAdapter(() => textSse('x'))
+    expect((await adapter.resolveModel('lobsterai', 'glm-5.2')).inputModalities).toEqual(['text'])
+    expect((await adapter.resolveModel('lobsterai', '不存在')).inputModalities).toEqual(['text'])
   })
 
   it('远端可用时以远端为准（不做「以兜底表为准」的裁剪）', async () => {
@@ -488,6 +499,8 @@ describe('LobsteraiAdapter 错误处理', () => {
   })
 
   it('图片输入报 UNSUPPORTED_CONTENT（而不是静默丢弃）', async () => {
+    // ⚠️ 这条拒绝与 `inputModalities` 的 `['text']` 是一对：一旦补上图片出站，
+    // 两处必须**同时**改（判定与翻案条件见 `LOBSTERAI_IMAGE_MODALITY_NOTE`）。
     const { adapter, calls } = makeAdapter(() => textSse('hi'))
     const options = generateOptions({
       messages: [createUserMessage({
@@ -837,6 +850,112 @@ describe('LobsteraiAdapter 限流切换', () => {
     ))
     await expect(collect(generateOptions(), adapter)).rejects.toThrow(/积分不足/)
     expect(calls).toHaveLength(1)
+  })
+})
+
+/**
+ * 上下文窗口溢出的端到端行为（缺陷 1 的核心回归）。
+ *
+ * 宿主（DSH）的自动压缩补救**只认 `CONTEXT_WINDOW_EXCEEDED` 这一个码**
+ * （`compaction-basic` 监听 `agent/request-error`，首行即判该码），
+ * 故这里同时钉死三件事：**码对**、**不换号**、**不留徽章**。
+ */
+describe('LobsteraiAdapter 上下文窗口溢出', () => {
+  /** 真机可能的 OpenAI 兼容超限错误体。 */
+  const OVERFLOW_BODY = JSON.stringify({
+    error: {
+      message: "This model's maximum context length is 1000000 tokens. "
+        + 'However, your messages resulted in 1005000 tokens.',
+      type: 'invalid_request_error',
+      code: 'context_length_exceeded',
+    },
+  })
+
+  it('400 + 超限文案 → CONTEXT_WINDOW_EXCEEDED（而不是 INVALID_REQUEST）', async () => {
+    // 修复前这里是 INVALID_REQUEST —— 致命且不可重试，长会话从此彻底不可用。
+    const { adapter, calls } = makeAdapter(() => new Response(OVERFLOW_BODY, { status: 400 }))
+    const error = await collect(generateOptions(), adapter)
+      .catch((e: unknown) => e as { code?: string; message?: string })
+    expect(error.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    expect(calls).toHaveLength(1)
+  })
+
+  it('5xx + 超限文案同样映射（不被 SERVER 抢走）', async () => {
+    const { adapter } = makeAdapter(() => new Response(OVERFLOW_BODY, { status: 500 }))
+    const error = await collect(generateOptions(), adapter)
+      .catch((e: unknown) => e as { code?: string })
+    expect(error.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+  })
+
+  it('文案里保留上游原文 + 中文补救说明', async () => {
+    const { adapter } = makeAdapter(() => new Response(OVERFLOW_BODY, { status: 400 }))
+    const error = await collect(generateOptions(), adapter)
+      .catch((e: unknown) => e as { message?: string })
+    // 原文必须保留：真机排障要与上游文档对上号。
+    expect(error.message).toMatch(/maximum context length is 1000000 tokens/)
+    // 中文说明：告诉用户会被自动压缩、不必新建会话。
+    expect(error.message).toMatch(/无需手动新建会话/)
+  })
+
+  it('**不换号**：即便配了账号池也不发第二个请求', async () => {
+    // 超限是请求本身的属性，换号必然同样失败 —— 打了 N 个必然失败的请求，
+    // 最后还会把真因埋进「所有账号均不可用」的终报里。
+    const getAvailableAccount = vi.fn(async () => ({
+      entry: { id: 'acc-2', provider: 'lobsterai' },
+      credential: makeCredential({ access_token: 'AT-2' }),
+    }))
+    const updateModelRateLimit = vi.fn(async () => {})
+    const { adapter, calls } = makeAdapter(() => new Response(OVERFLOW_BODY, { status: 400 }), {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit,
+        getAvailableAccount,
+      } as never,
+    })
+    const error = await collect(generateOptions(), adapter)
+      .catch((e: unknown) => e as { code?: string; message?: string })
+    expect(error.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    expect(calls).toHaveLength(1)
+    expect(getAvailableAccount).not.toHaveBeenCalled()
+    expect(updateModelRateLimit).not.toHaveBeenCalled()
+    // 也不能出现「所有账号均不可用」这种归因错误的文案。
+    expect(error.message).not.toMatch(/所有账号均不可用/)
+  })
+
+  it('换号循环中途撞上超限时**提前抛出**（不继续换号、不报「均不可用」）', async () => {
+    // 场景：首个账号因限流换号，第二个账号回超限。此时必须立刻把超限抛出去，
+    // 而不是继续换第三个账号、最后报「所有账号均不可用（…上下文超限…）」——
+    // 用户会以为是账号问题，而真因是请求太长。
+    const getAvailableAccount = vi.fn(async () => ({
+      entry: { id: 'acc-2', provider: 'lobsterai' },
+      credential: makeCredential({ access_token: 'AT-2' }),
+    }))
+    let attempt = 0
+    const { adapter, calls } = makeAdapter(() => {
+      attempt += 1
+      return attempt === 1
+        ? new Response('too many requests', { status: 429 })
+        : new Response(OVERFLOW_BODY, { status: 400 })
+    }, {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        getAvailableAccount,
+      } as never,
+    })
+    const error = await collect(generateOptions(), adapter)
+      .catch((e: unknown) => e as { code?: string; message?: string })
+    expect(error.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    // 只发了两次（首个 + 换的一个），没有继续换到上限。
+    expect(calls).toHaveLength(2)
+    expect(error.message).not.toMatch(/所有账号均不可用/)
+  })
+
+  it('普通 400 仍是 INVALID_REQUEST（超限识别是只增不减的）', async () => {
+    const { adapter } = makeAdapter(() => new Response('bad request', { status: 400 }))
+    const error = await collect(generateOptions(), adapter)
+      .catch((e: unknown) => e as { code?: string })
+    expect(error.code).toBe('INVALID_REQUEST')
   })
 })
 
