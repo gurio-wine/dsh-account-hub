@@ -6,7 +6,7 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
 凭证可直接用于 CodeArts 后端模型调用。
 
-此外插件内置另外四个 provider 路由：
+此外插件内置另外六个 provider 路由：
 
 - **buddy-cn（Buddy CN）** — 见 [Buddy CN provider](#buddy-cn-provider)；
   另支持「一键领取积分」（每日签到）。
@@ -20,8 +20,11 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
   扣 Work 专属积分池），见
   [Trae CN Work provider](#trae-cn-work-providertraework-网页协议)；Account Hub
   面板**共用 Trae CN 的账号**，只提供积分行（**显示 Work 池**）与模型开关。
+- **qoder（Qoder）** — 见 [Qoder provider](#qoder-providerqoder)；
+  **唯一的非浏览器登录形态**（粘贴 PAT）；不支持「一键领取积分」（该权益只能在
+  Qoder 桌面 App 里手动领取，服务端没有公开的签到端点）。
 
-六个 provider 的 Account Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
+七个 provider 的 Account Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
@@ -240,13 +243,14 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册五个独立路由：`buddy-cn`（见
+除 `codearts` 外，插件另注册六个独立路由：`buddy-cn`（见
 [Buddy CN provider](#buddy-cn-provider)）与 `buddy`（见
 [Buddy provider](#buddy-provider)）两个 buddy 系路由、`lobsterai`
 （见 [LobsterAI provider](#lobsterai-provider)）、`trae-cn`
 （见 [Trae CN provider](#trae-cn-provider字节跳动-trae-国内版)）与
-`trae-cn-work`（见 [Trae CN Work provider](#trae-cn-work-providertraework-网页协议)）。
-六者互不覆盖，可同时使用。
+`trae-cn-work`（见 [Trae CN Work provider](#trae-cn-work-providertraework-网页协议)）、
+`qoder`（见 [Qoder provider](#qoder-providerqoder)）。
+七者互不覆盖，可同时使用。
 
 > `trae-cn-work` 与 `trae-cn` 是**同一批账号**（Work 无独立登录，见
 > [Account Hub 里的 Trae CN Work 面板](#account-hub-里的-trae-cn-work-面板)），
@@ -461,8 +465,8 @@ Account Hub 面板标题栏的「**显示列表**」按钮展开该 provider 的
   仍能正常收发请求。这是 DSH 对 `listModels` 的约定（目录是建议性的，缺省不构成
   请求拒绝）。好处是已有会话若正用着某个被关闭的模型，不会被强制中断。
 - 开关按 provider 隔离，Codearts / Buddy CN / Buddy / LobsterAI / Trae CN /
-  Trae CN Work **六份黑名单互不影响**。改名迁移会把这六份的 provider 键一并搬到
-  新命名，见「provider 改名与数据迁移」。
+  Trae CN Work / Qoder **七份黑名单互不影响**。改名迁移会把这七份的 provider 键
+  一并搬到新命名，见「provider 改名与数据迁移」。
 - Trae CN Work 是独立的第六份：两个池的模型 id 完全不重合，共用一份黑名单会让
   关闭 IDE 的某个模型连带影响 Work 路径（`TraeCnWorkAdapter.listModels` 读的正是
   `trae-cn-work` 这个键）。
@@ -516,7 +520,7 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
 账号卡片上的「积分」一行显示该账号的**可用积分**，与 IDE 顶部显示的
 `Credits Balance` 是同一个数值。鼠标悬停可看到各资源包的明细与到期时间。
 
-**支持范围**覆盖四个 provider、三套端点，语义一致：
+**支持范围**覆盖五个 provider、四套端点，语义一致：
 
 - **Buddy 系（`buddy-cn` / `buddy` 通用，仅 baseURL 随 `product.endpoint`
   切换）**：
@@ -550,8 +554,28 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
   150 通用积分，是口径陷阱。详见 [Trae CN provider](#trae-cn-provider字节跳动-trae-国内版)
   的「签到与积分余额」。
 
+- **Qoder**：
+
+  ```
+  GET https://openapi.qoder.sh/api/v2/quota/usage    → 三池 remaining 之和
+  ```
+
+  ⚠️ **只认 `jt-`**（job token）：拿 PAT 直接打这个端点回 401 `TOKEN_EXPIRE`，
+  故查询前由 `QoderAuth` 负责换取并缓存 jt（详见
+  [Qoder provider](#qoder-providerqoder) 的「端点」与「额度余额」）。
+
+  响应是**三池**结构：`userQuota`（必有）、`addOnQuota`、`orgResourcePackage`
+  （后两池**本账号缺席**，解析**容缺**）。**每个池只有一个 `remaining` 数字，
+  响应里没有包名字段** —— 资源包名取**池类型**，中文名分别为「主额度」/
+  「加量包」/「资源包」。余额 = 三池 `remaining` 之和（缺席按 0、负数 clamp、
+  两位小数规整）。**主池耗尽 ≠ 额度耗尽**：只要加量包或资源包里还有余额，
+  这个账号就还能用。`expiredTotal` 恒为 0（quota 端点只在账号级给一个
+  `expiresAt`，池本身没有失效字段）。
+
 「余额为 0」与「查不到」严格区分：失败时 `balance` 为 `null` 并带 `error`，
-卡片显示原因而非 0。
+卡片显示原因而非 0。**这一条在 Qoder 上尤其要紧**：额度端点 401 靠
+`TOKEN_EXPIRE` / `TOKEN_INVALID` 文案分型（分别对应「重换 jt」与「重新粘贴
+PAT」），而「三池全为 0」是一个**成功的查询结果**（`total: 0`），不是失败。
 
 > **Trae CN 的前端已登记。** 三个积分端点的 provider 分发在
 > `src/trae-cn-credits.ts` + `src/jet-hub-rpc.ts`，客户端一侧两件事都已落地：
@@ -603,8 +627,9 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
 判据全不同，各自独立成文件）；三者的客户端能力登记均已落地，故三个面板都显示
 该按钮。Codearts 是华为云账号体系不参与；Buddy（国际版）后端没有签到接口，
 故其面板不显示；**Trae CN Work 与 Trae CN 是同一批账号**，签到已在 Trae CN
-面板提供，故本面板刻意不显示（否则同一账号两处领取）。详见「积分余额」
-一节末尾的说明。
+面板提供，故本面板刻意不显示（否则同一账号两处领取）；**Qoder 的每日
+100 Credits 只能在 Qoder 桌面 App 里手动领取** —— 官方没有公开的签到端点，
+故其面板也不显示该按钮。详见「积分余额」一节末尾的说明。
 
 在 Account Hub 对应面板标题栏点击「**一键领取积分**」，插件会对该面板下
 **全部账号**顺序执行每日签到领取：
@@ -894,7 +919,7 @@ Bearer `access_token` 鉴权。
 余额），**IDE 网关** `https://trae-api-cn.mchost.guru`（`/api/ide/*`，即对话），
 登录门户 `https://www.trae.cn`。
 
-该 provider 与既有四条线**均不同源**，因此实现是独立一套 `src/trae-cn*.ts`，
+该 provider 与既有各条线**均不同源**，因此实现是独立一套 `src/trae-cn*.ts`，
 只共用架构模式（产品配置驱动、账号池、限流切换、模型黑名单）。
 
 | 项 | 腾讯系 | LobsterAI | **Trae CN** |
@@ -1048,7 +1073,7 @@ URL、只把 `redirect` 换成 `1`**（官方 `getLoginUrl(…, 1, …)` →
 provider id 是 `trae-cn`（带连字符，对齐用户与生态叫法），但 cordis 服务名
 **不是**机械派生的 `trae-cnAuth`，而是显式指定的 `ctx.traeCnAuth`
 （见 `src/trae-cn-product.ts` 的 `serviceName`）。理由是带连字符的属性名
-无法用点号语法访问，且与另外四个 provider 的命名风格不一致。
+无法用点号语法访问，且与另外六个 provider 的命名风格不一致。
 
 > ✅ **T5（回调 URL 形态）已用真机日志校准**（2026-09-17 main.log:136/139），
 > 不再是候选表：参数名、编码形态、回调载荷结构（`authCodeInfo` / `userInfo`）
@@ -1372,7 +1397,7 @@ id 形态极不规则（`qwen-3.7-plus` 带连字符、`minimax-m3` 全小写）
   `listModels` 与 `resolveModel` 读的是同一个 `supportsImages` 字段，两处口径强制
   同源（不一致会让选择器与请求路径自相矛盾）；
 - `maxTokens` **只记录不 materialize**：DSH 的 `defaultMaxTokens` 会在调用方未给
-  上限时自动填进请求体，而本仓库另外四个 provider 一个都没设该字段 ——
+  上限时自动填进请求体，而本仓库另外六个 provider 一个都没设该字段 ——
   由适配器替用户决定输出上限是行为变更，不在本次范围内。
 - **消耗倍率不再解析**：旧实现会从 `display_contact_config.consumption_rate.data.rate`
   读出倍率但不展示（DSH 的 `LlmModelInfo` 没有放自定义元数据的位置，塞进
@@ -2012,4 +2037,212 @@ id**、不做任何映射 —— 若在客户端映射，宿主那几个按池�
 第二个占位账号）与 `model.list` / `model.setDisabled`（黑名单按 provider id 存，
 映射过去会把 Work 的开关写进 IDE 路径的黑名单）。锁死这些语义的是
 `tests/unit/trae-cn-work-hub-panel.spec.ts`。
+
+## Qoder provider（Qoder）
+
+独立路由 `qoder`（**Qoder**），实现是独立一套 `src/qoder*.ts`
+（`qoder-product.ts` / `qoder-auth.ts` / `qoder-adapter.ts` / `qoder-errors.ts` /
+`qoder-models.ts` / `qoder-credits.ts`），只共用架构模式（产品配置驱动、账号池、
+限流切换、模型黑名单）。**四个端点散在三个不同的 host** 上（`openapi.qoder.sh`
+承载其中两个），这是它最容易被写错的地方。
+
+该 provider 与既有各条线**均不同源**，其中两项是本插件里的头一份：
+
+- **登录形态是 PAT 粘贴**，不是浏览器 OAuth —— 其余六条线全是浏览器登录
+  （两段式 RPC + 轮询）或本地回调；
+- **凭据只有一件长效物**（PAT），换来的 job token 是**进程内运行时缓存**、
+  **不落盘**。
+
+| 项 | 腾讯系（Buddy CN / Buddy） | LobsterAI | Trae CN | **Qoder** |
+|---|---|---|---|---|
+| 登录 | 轮询后端 API | 本地回调收 `authCode` | 本地回调 + PKCE(S256) | **粘贴 PAT（无浏览器、无回调）** |
+| 长期凭据 | access + refresh | access + refresh + 身份字段 | 五件套 | **PAT 一件**（`pt-`） |
+| 鉴权 | `Bearer` + 归属头 | `Bearer` | `Cloud-IDE-JWT` | **`Bearer`（但分红：目录用 PAT、chat/额度用 `jt-`）** |
+| 续期 | `X-Refresh-Token` 头 | `POST /api/auth/refresh` | exchange（body 四字段） | **重打 exchange**（PAT 不变，随时可重打） |
+| 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **不做**（无公开端点） |
+
+### 登录与凭据：PAT 粘贴（本插件唯一的非浏览器登录形态）
+
+- **PAT 签发页**：`https://qoder.com/account/integrations`（登录 → Account →
+  Integrations → 创建 → 立即复制）。前缀 **`pt-`**，官方明示**不自动刷新**：
+  PAT 在用户吊销前一直有效，**失效只能重新粘贴一个**。
+- **Account Hub 的「+ 新建账号」点开的是一个内联 PAT 表单**（输入框
+  `type=password`），**不是登录弹窗、也不新开浏览器标签** —— Qoder 根本没有
+  浏览器登录流程，用户要做的只有「去签发页复制一串字符、粘回来」。这也是它
+  与其余各面板最大的一处形态差异。
+- 凭据 ref：单账号 `QODER_PERSONAL_TOKEN`；多账号
+  `QODER_ACCOUNT_<SHORTID>`，由「+ 新建账号」生成。
+- 凭据结构（JSON 字符串，字段一律 snake_case）：
+
+  | 字段 | 含义 |
+  |---|---|
+  | `access_token` | **PAT 本体** —— 既是模型目录端点的 `Bearer`，也是换 `jt-` 的输入 |
+  | `refresh_token` | `jrt-…`（48h）；**未启用**（主路径是重打 exchange） |
+  | `token_expires_at` | `jt-` 的过期时刻，**仅元数据**（`jt-` 本体**不落盘**） |
+  | `user_id` / `user_type` | 身份字段，有则带 |
+
+- **三段令牌，三种生命周期**：PAT 长期（**不刷新**）／`jrt-` 48h／`jt-` 24h。
+  `jt-` 是**进程内运行时缓存**、**按 PAT 分键**，进程重启即冷 —— 冷启动会多打
+  一次 exchange，这是设计如此，不是故障。剩余有效期不足 1 小时时主动重换。
+
+> **`status().expiresAt` 对 Qoder 恒不返回**（账号条目也不写 `expiresAt`）：
+> PAT 的过期时间本地无从得知，而 `jt-` 的 24h 是**运行时缓存**的有效期 ——
+> 把它填进去会让账号卡片在闲置 24h 后显示「已过期」，而实际上下次请求会按需
+> 重换、一切正常。宁可少显示一行，也不报一个假的过期。
+
+### 端点：同一件事分散在三个 host，凭据还分红
+
+| 用途 | 端点 | 凭据 |
+|---|---|---|
+| 换 job token | `POST https://openapi.qoder.sh/api/v1/jobToken/exchange`，body `{"personal_token":"<PAT>"}` | 无（匿名头） |
+| chat | `POST https://api2-v2.qoder.sh/model/v1/chat/completions` | `Bearer jt-…` |
+| 模型目录 | `GET https://api.qoder.com/api/v1/cloud/models` | **`Bearer <PAT>`** |
+| 额度 | `GET https://openapi.qoder.sh/api/v2/quota/usage` | **`Bearer jt-…`** |
+
+⚠️ **两条最易错的地方**（都在实测里踩过）：
+
+1. **exchange 的 body 键名必须 snake_case `personal_token`** —— 写成 camelCase
+   `personalToken` 实测回 400 `{"errorCode":"BadRequest",…}`；
+2. **目录只认 PAT、chat 与额度只认 `jt-`** —— PAT 直打 chat **恒 401**
+   （`{"error":"unauthorized"}`，且伪造的同长度 PAT 返回逐字节相同的响应，
+   说明这是「令牌形态类」拒绝），PAT 打额度端点回 401 `TOKEN_EXPIRE`。
+   **四个端点不同源**，不要图省事统一成一个凭据。
+
+`POST /api/v1/jobToken/refresh`（用 `jrt-` 换新 `jt-`）只登记常量、**未实现也未实测**
+—— 续期主路径就是重打 exchange。
+
+### chat 与流式：标准 OpenAI 协议，但收尾判据只有一条
+
+**chat 是标准 OpenAI 协议**：`messages` / `tools` **原样透传，没有任何出站改名**
+（与 Trae CN 的 SOLO 通道刻意相反）。两点必须保留：带
+`metadata.context.client_type: "qodercli"`（**出站身份标识，一字符不能动**）、
+UA `qoder/1.1.16`；`stream` **恒为 true**。
+
+**三条流式硬事实**（T3 实测矩阵）：
+
+1. **`[DONE]` 是唯一成功收尾判据**。两类错误（网关层 pre-stream 错、HTTP 200 的
+   流内 error 帧）**都不出 `[DONE]`** —— 因此「没等到 `[DONE]` 的流」**绝不静默
+   当优雅结束**，而是报 `TRANSPORT`。静默当成功等于把失败伪装成空回复。
+2. **`stream:true` 会把 400 变成 200 + 流内 error 帧**：同一个坏 body，非流式回
+   400、流式回 200。故流式路径**必须解析流内错误**，只看状态码会漏掉全部
+   上游 body 类错误。
+3. **成功流的 usage 帧会被注入一个裸 LF**（真实缺陷，7 次成功流中 **5 次**中招）：
+   大 usage 帧的 JSON 中段被凭空插入一个 `0x0A`。恢复规则是「`data:` 行与紧随的
+   下一段**无分隔符直接拼接**」—— `JSON.parse(L1 + L2)` 通过，而
+   `JSON.parse(L1 + "\n" + L2)` 失败（那个 LF 不属于原文）。
+
+**工具调用**：标准结构化 `tool_calls`（非流式 `message.tool_calls`、流式
+`delta.tool_calls` 增量分片），arguments 是 JSON 字符串 —— **协议层无障碍**。
+⚠️ 但 forced `tool_choice` 时 `finish_reason` 是 **`"stop"` 而不是 `"tool_calls"`**
+（auto 才是），故聚合逻辑**只看 delta 本身，不看 `finish_reason`**。
+
+### 错误分类：402 是候选不是结论，401 先当令牌过期
+
+| 上游表现 | 分类与动作 |
+|---|---|
+| `402` + `code:116` | **额度类候选**（`quotaCandidate`），动作仍是直报 —— 必须由额度端点**二次判别**后才允许换号 |
+| chat `401 {"error":"unauthorized"}`（**无业务码**） | 先当「`jt-` 过期」：**静默重换一次 exchange 再试**；仍 401 才判 PAT 失效 |
+| 额度端点 `401 TOKEN_EXPIRE` / `TOKEN_INVALID` | 分别映射「重换 `jt-`」与「重新粘贴 PAT」（靠文案分型） |
+| 流内 error 帧 | **直报业务码**：`invalid_parameter_error` / `invalid_model_error` / `provider_error`（**包装码**，真码在字符串化的 `details` 里，需二次解析） |
+| 未收到 `[DONE]` | 报 `TRANSPORT`，**不静默成功** |
+
+⚠️ **`402 + code:116` 在本 provider 上有语义污染**：quota=0 的账号上，**无效模型名
+也回同一个 402 `code:116`**（网关先做扣费检查）。故它**只是候选**，绝不硬编码成
+「换号可救」—— 未确证一律直报。401 没有 `code` 字段、402 的 `code` 是**数字**
+`116` 而 400/流内的 `code` 是**字符串**，分类器两种都收。
+
+### 模型目录与思考档
+
+- **动态目录**：`GET /api/v1/cloud/models`（PAT 直连）+ 静态兜底。
+- ⚠️ **目录返回全表 + `is_enabled` 标记**：T1 快照 17 项里**仅 2 项**
+  `is_enabled:true`（`qmodel_38max` / `qfmodel`）。故**拉取成功时只播报
+  `is_enabled === true` 的项**（只认严格 `true`，字段缺失不保留）。
+- **`lite` 不在官方目录，但实测可用**（免费遗留路径）—— 所以**只在目录失败、
+  回退静态表时才出现**。这条不对称是**刻意的**：动态目录拿到了就绝不把静态项
+  并进去（并进去等于伪造「官方认可 lite」）。
+- **12h TTL 缓存，失败不写缓存**（也不清掉已有缓存）。
+- ⚠️ **目录的 `id` 是短 key**（`qmodel_38max` / `qfmodel` / `gmodel` / `dmodel` /
+  `mmodel`…），**不是 tier 名** —— `auto` / `efficient` 当 model 值发会回 402。
+- **目录 roster 会浮动**（与官方 CLI 表、国内版表都不同），**绝不硬编码全表**：
+  静态兜底只保留「目录失败时最可能仍然可用」的 **3 项**。
+- **`efforts` + `default_effort` 是思考档位的权威来源**（T1 实测值域
+  `low` / `medium` / `high` / `xhigh` / `max`），档位 id **逐字符照抄**；
+  `default_effort` 只在落在 `efforts` 列表内时才声明。
+
+⚠️ **思考档位的下发字段是 `reasoning_effort`，属「透传不拦截」策略**：DSH 给了就
+下发，适配器**不补档也不改档**（不带时整个字段不发）。**该字段是否真生效尚未
+验证**（计划 §3 风险登记，真机验收另做）—— 这与 Trae CN / LobsterAI 那两处
+**性质不同**：那两处是已取证的「字段被服务端真实消费」，此处只能说「已把目录值
+透传到请求体」，**不能说档位已生效**。
+
+⚠️ **模态恒为纯文本**：适配器 `inputModalities` **只声明 `['text']`**，
+**故意不按**目录的 `is_vl:true` 声明。理由：模型支持图片 ≠ 本适配器的 chat 路径
+能送达（`serializeQoderMessages` 只搬运文本块）。把 `is_vl` 报成「支持图片」会让
+DSH 把图片路由过来、然后在序列化时静默丢掉。
+
+`maxTokens` 只记录不 materialize（与 Trae CN 同则）；目录的
+`default_context_window` 有 `272000` 这类非整值，**不当常量**。
+
+### 额度余额与能力矩阵
+
+**端点**：`GET https://openapi.qoder.sh/api/v2/quota/usage`（`Bearer jt-…`）。
+
+- **三池结构，后两池可缺席**：`userQuota`（必有）、`addOnQuota`、
+  `orgResourcePackage`（后两池**本账号缺席**，解析**容缺**）；
+- **余额 = 三池 `remaining` 之和**（缺席按 0、负数 clamp 到 0、两位小数规整）；
+- ⚠️ **主池耗尽 ≠ 额度耗尽**：只要加量包或资源包里还有余额，这个账号就还能用 ——
+  这是换号判据的语义前提；
+- **包名取池类型**（响应里**没有**包名字段）：中文名「主额度」/「加量包」/「资源包」；
+- **「查不到」与「余额为 0」严格区分**：失败返回 `null` + `error`（卡片显示原因），
+  三池确实全空是一个**成功的查询**（`total: 0`）；
+- `expiredTotal` 恒为 0，且这是有依据的：quota 端点只在**账号级**给一个
+  `expiresAt`，**池本身没有失效字段** —— 拿账号级时间戳当池失效判据会在哨兵值上
+  产出**假的**「另有 N 已失效」，把一个满额账号显示成 0 分。
+
+**能力矩阵**：`balance: true`、`dailyCheckin: false`。
+
+⚠️ **签到刻意不做，且理由与 Buddy（国际版）不是同一种**：
+
+- Buddy（国际版）是**后端压根没有签到接口**；
+- Qoder 是**有这项权益但没有公开接口** —— 官方每日 **100 Credits** 只能在
+  **Qoder 桌面 App 里手动领取**，服务端没有暴露可编程的签到端点。本插件也不打算
+  用任何「模拟桌面客户端」的手段去领（既不可靠，也超出本插件的边界）。
+
+故 Qoder 面板**渲染**积分行与「刷新积分」、**不渲染**「一键领取积分」。
+
+### Account Hub 里的 Qoder 面板
+
+`PROVIDERS` 含 **Qoder** 一栏（排在 Trae CN Work 之后），能力矩阵登记为
+`balance ✓ / dailyCheckin ✗`：
+
+| 项 | Qoder 面板 |
+|---|---|
+| 账号列表 | ✓ 本 provider 自己的账号（`QODER_*`） |
+| 「+ 新建账号」 | ✓ **内联 PAT 表单**（输入框 `type=password`），不是登录弹窗 |
+| 积分行 / 「刷新积分」 | ✓ 三池之和的**单数字**与资源包明细 |
+| 「一键领取积分」 | ✗ **刻意不渲染** —— 官方只能在桌面 App 手动领，没有公开 API |
+| 卡片操作（刷新 / 删除 / 启停 / 重测 / 重置） | ✓ 「刷新」= **重打一次 exchange**（PAT 不变，随时可重打） |
+| 「显示列表」（模型开关） | ✓ 作用于 **`qoder` 这个键** |
+
+**三处积分端点里只有 `credits.balances` 有 qoder 分支**：`credits.status` 与
+`credits.claimAll` 对 qoder **如实回 `unsupported provider: qoder`** —— 这是
+**正确的契约**（该 provider 确实没有签到流程），不是缺陷。客户端靠能力矩阵在
+**发请求之前**就不发这两个请求，与 CodeArts 的既有约定同源。
+
+> **账号昵称不是「真实用户名回填」。** 账号条目的 `nickname` 取凭据里的
+> `user_id`，取不到就回退到 accountId —— 本步**没有**做任何「把昵称换成真实
+> 用户信息」的事，不要照此期待。PAT 的过期时间本地无从得知，故账号条目
+> **不写 `expiresAt`**、`status().expiresAt` **恒不返回** —— 宁可少显示一行，
+> 也不报一个假的过期。
+
+### 服务名：机械派生，刻意不声明
+
+`qoder` **无连字符**，`${product.id}Auth` 即 `qoderAuth`，本身就是一个合法的
+JS 标识符风格属性名 —— 故 `QoderProduct` **刻意不声明 `serviceName`**。
+
+这与 `trae-cn` → `traeCnAuth`（`src/trae-cn-product.ts` 显式给出）、
+`buddy-cn` → `buddyCnAuth`（`BuddyProduct` 的必填字段）是**两条不同的判据**：
+那两处是因为**带连字符的机械派生结果不是合法标识符风格**才必须显式声明，
+Qoder 恰恰相反 —— 它**没有**需要绕开的东西。给 Qoder 补一个 `serviceName`
+不会有任何好处，只会让人以为「所有 provider 都得声明」。
 

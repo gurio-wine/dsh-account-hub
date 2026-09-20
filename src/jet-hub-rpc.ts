@@ -18,6 +18,7 @@ import type { CodeArtsAuth } from './service.js'
 import type { BuddyAuth } from './buddy-auth.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
 import type { TraeCnAuth } from './trae-cn-auth.js'
+import type { QoderAuth } from './qoder-auth.js'
 import type { LobsteraiPendingLogin } from './lobsterai-oauth.js'
 import type { CodeartsPendingLogin } from './login.js'
 import { LOBSTERAI } from './lobsterai-product.js'
@@ -39,6 +40,9 @@ import {
 } from './lobsterai-credits.js'
 import { TRAE_CN } from './trae-cn-product.js'
 import { TRAE_CN_WORK } from './trae-cn-work-product.js'
+import { QODER } from './qoder-product.js'
+import { fetchQoderCreditBalance } from './qoder-credits.js'
+import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { isTraeCnJunkModelId } from './trae-cn-models.js'
 import type { TraeCnCredential, TraeCnPendingLogin } from './trae-cn-oauth.js'
 import type { TraeCnProduct } from './trae-cn-product.js'
@@ -536,9 +540,10 @@ export function registerJetHubRpc(
   buddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
   traeCn: TraeCnAuth,
+  qoder: QoderAuth,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn)
+    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder)
   })
 }
 
@@ -551,6 +556,7 @@ function registerJetHubEndpoints(
   buddy: BuddyAuth,
   lobsterai: LobsteraiAuth,
   traeCn: TraeCnAuth,
+  qoder: QoderAuth,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -835,6 +841,43 @@ function registerJetHubEndpoints(
             pendingTraeCnLogins.delete(id)
           })
           return { ok: true, value: { accountId: id, loginUrl: loginSession.loginUrl } }
+        } else if (provider === QODER.id) {
+          // Qoder 是**唯一的非浏览器登录形态**：用户粘贴一个 PAT，宿主当场打一次
+          // exchange 验证并落凭据。故这里**没有两段式**——不存在「等用户操作
+          // 10 分钟」的手势窗口，验证本身是一次即时请求（计划 §2 决策 1）。
+          //
+          // 三条契约：
+          //   1. **同步完成**：`loginWithPat` 内部是「前缀校验 → exchange → 落凭据
+          //      + 落账号」，返回时凭据已在盘上，客户端那套按「凭据可解析」判定的
+          //      `login.poll` 天然兼容（不需要为它改轮询逻辑）；
+          //   2. **PAT 绝不回显**：错误信息里不含 PAT 本体、长度或任何片段；
+          //   3. **失败即拒绝**：`loginWithPat` 抛出的原因（前缀不对 / exchange
+          //      401 判 PAT 失效 / 网络失败）原样透传。**不预先建占位账号** ——
+          //      与两段式那三个分支不同，这里失败时根本没有「后台第二段」会去
+          //      清理，先建占位就会留下一个永远没有凭据的幽灵账号。
+          const pat = typeof req.pat === 'string' ? req.pat : ''
+          try {
+            const result = await qoder.loginWithPat(pat, {
+              refName,
+              accountId: id,
+              pool,
+            })
+            // 账号池条目由 `loginWithPat` 落（`nickname` 取 PAT 对应的用户 id，
+            // 有则用）。它**刻意不写 `expiresAt`**：PAT 的过期时间本地无从得知，
+            // 而 jt 的 24h 只是运行时缓存的有效期 —— 写进账号卡片会让它在闲置
+            // 24h 后显示「已过期」，而实际上一次 getJobToken 就能自愈。
+            //
+            // `loginUrl` 对 Qoder 恒为空串（没有浏览器登录流程）。客户端按
+            // `loginUrl` 决定是否开窗，空串正好表达「无事可开」。
+            return { ok: true, value: { accountId: id, loginUrl: result.loginUrl } }
+          } catch (error) {
+            // 已经是**终态**：凭据没落盘、账号也没建，无残留可清。
+            // 抛出去由 RPC 层包成 `jet-hub/handler-failed`，客户端会把 message
+            // 原样展示给用户（`submitPat` 的 catch 分支就是这么写的）。
+            throw new Error(
+              `Qoder 登录失败：${error instanceof Error ? error.message : String(error)}`,
+            )
+          }
         } else {
           // 刻意**不做** `poolProviderFor()` 映射：`trae-cn-work` 没有独立登录，
           // 面板也不渲染「+ 新建账号」。若这里把它映射成 `trae-cn`，多出来的
@@ -911,6 +954,10 @@ function registerJetHubEndpoints(
               break
             case TRAE_CN.id:
               await traeCn.refreshAccountCredential(entry.credentialRef)
+              break
+            case QODER.id:
+              // 对 Qoder「刷新」= 重打一次 exchange 换新 jt（PAT 不变，随时可重打）。
+              await qoder.refreshAccountCredential(entry.credentialRef)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
@@ -1123,6 +1170,24 @@ function registerJetHubEndpoints(
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalance: (credential, product) =>
               fetchTraeCnCreditBalance(credential, product, pool, { onDebug: (msg) => ctx.logger?.info?.(msg) }),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
+        if (provider === QODER.id) {
+          // Qoder **只有一个池**（三池结构里另外两个本账号缺席，且它们同属这一个
+          // 端点的同一个数字口径），故没有任何选池映射 —— 与 Trae 系那条
+          // `traeCnPoolFor()` 刻意不同，不要为「形态对称」凭空造一个。
+          //
+          // 第二个实参传 `qoder`（QoderAuth 实例）：额度端点**只认 `jt-`**
+          // （PAT 打它回 401 `TOKEN_EXPIRE`），由 auth 负责换取与缓存。
+          const values = await collectCreditBalances<QoderCredential, QoderProduct>(accounts, QODER, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchBalance: (credential, product) =>
+              fetchQoderCreditBalance(credential, qoder, {
+                product,
+                onDebug: (msg) => ctx.logger?.info?.(msg),
+              }),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }

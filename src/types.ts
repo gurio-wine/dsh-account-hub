@@ -89,6 +89,18 @@ export interface RpcListAccountsResponse {
 
 export interface RpcCreateAccountRequest {
   provider: string
+  /**
+   * PAT 粘贴式登录（**只有 Qoder**）携带的个人访问令牌。
+   *
+   * 其余六个 provider 全是浏览器登录（两段式：宿主回 `loginUrl`、客户端开窗、
+   * 再轮询 `login.poll`），本字段缺席。Qoder 没有浏览器登录流程 ——
+   * 用户去官方 Integrations 页面签发 PAT 后粘贴回来，宿主当场打一次 exchange
+   * 验证并落凭据，**没有第二段**（不存在「等用户操作 10 分钟」的手势窗口）。
+   *
+   * ⚠️ 该字段是**凭据本体**：任何日志/错误信息都不得回显它（见
+   * `src/qoder-auth.ts` 的 `loginWithPat`）。
+   */
+  pat?: string
 }
 export interface RpcCreateAccountResponse {
   accountId: string

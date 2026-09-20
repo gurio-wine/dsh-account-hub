@@ -9,8 +9,10 @@ import { CodeArtsAuth } from '../../src/service.js'
 import { BuddyAuth } from '../../src/buddy-auth.js'
 import { LobsteraiAuth } from '../../src/lobsterai-auth.js'
 import { TraeCnAuth } from '../../src/trae-cn-auth.js'
+import { QoderAuth } from '../../src/qoder-auth.js'
 import { BUDDY } from '../../src/product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
+import { QODER } from '../../src/qoder-product.js'
 
 vi.mock('../../src/login.js', () => ({
   runLoginFlow: vi.fn(),
@@ -473,6 +475,95 @@ describe('Trae CN provider 注册（认证服务 + 模型路由）', () => {
     const ctx = createMockContext()
     apply(ctx as never)
     const stop = vi.spyOn(ctx.traeCnAuth, 'stop')
+    await ctx.fiber.dispose()
+    expect(stop).toHaveBeenCalled()
+  })
+})
+
+/**
+ * Qoder 是本插件**唯一的非浏览器登录形态**（PAT 粘贴），因此它的注册接线
+ * 有几处与另外六个 provider 刻意不同 —— 这一组把那些差异钉死。
+ */
+describe('Qoder provider 注册（认证服务 + 模型路由）', () => {
+  it('apply 时注册 qoder provider 路由与适配器', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.llm.registeredProviders).toContain('qoder')
+    expect(ctx.llm.adapters).toContain('qoder')
+  })
+
+  it('注册 qoder 的可配置 provider 目录项（含展示名）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'qoder')
+    expect(entry).toMatchObject({ provider: 'qoder', displayName: QODER.displayName })
+  })
+
+  // 与其余 provider 同理：settingsNs 未注册时，模型设置页会在
+  // refFor → deriveKeyRef(provider) 处以 `provider.toUpperCase is not a function`
+  // 崩溃。`qoder` 无连字符，namespace 是 `llm-qoder`。
+  it('qoder 的 settingsNs 为 llm-qoder，且对应 settings namespace 已注册', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'qoder')
+    expect(entry?.settingsNs).toBe('llm-qoder')
+    expect(ctx.settings.registeredNamespaces).toContain('llm-qoder')
+  })
+
+  it('暴露 qoderAuth 服务实例：服务名由产品 id **机械派生**（无连字符，无需 serviceName）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.qoderAuth).toBeInstanceOf(QoderAuth)
+    // 与 `trae-cn` → `traeCnAuth` 的**显式声明**是两条不同的判据：那条是因为
+    // 机械派生会得到非标识符风格的 `trae-cnAuth`，而 `qoder` 无连字符，
+    // `${id}Auth` 本身就是合法标识符 —— 故 `QoderProduct` 刻意没有
+    // `serviceName` 字段。这条断言是「不要为形态统一给它补一个字段」的闸。
+    expect(ctx.qoderAuth.name).toBe('qoderAuth')
+    expect(ctx.qoderAuth.product.id).toBe('qoder')
+    expect(ctx.qoderAuth.credentialRefName).toBe('QODER_PERSONAL_TOKEN')
+    expect((ctx.qoderAuth as unknown as { product: { serviceName?: unknown } }).product.serviceName)
+      .toBeUndefined()
+  })
+
+  it('与既有六个 provider 的服务实例两两不同（同名二次注册会抛错）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.qoderAuth).not.toBe(ctx.codeartsAuth)
+    expect(ctx.qoderAuth).not.toBe(ctx.buddyCnAuth)
+    expect(ctx.qoderAuth).not.toBe(ctx.buddyAuth)
+    expect(ctx.qoderAuth).not.toBe(ctx.lobsteraiAuth)
+    expect(ctx.qoderAuth).not.toBe(ctx.traeCnAuth)
+  })
+
+  it('qoderAuth 只读自己的凭据 ref（不串用其他 provider 凭据）', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // 只写入 Trae CN 的 ref：Qoder 必须报告未配置。
+    await ctx.credentials.set('TRAE_CN_ACCESS_TOKEN', JSON.stringify({
+      access_token: 'AT', refresh_token: 'RT', expires_at: String(Date.now() + 7_200_000),
+    }))
+    expect((await ctx.qoderAuth.status()).configured).toBe(false)
+
+    // Qoder 的凭据是 `{ access_token: <PAT> }`（PAT 存进 access_token）。
+    await ctx.credentials.set('QODER_PERSONAL_TOKEN', JSON.stringify({
+      access_token: 'pt-abc123', refresh_token: 'jrt-1',
+    }))
+    expect((await ctx.qoderAuth.status()).configured).toBe(true)
+  })
+
+  it('不注册任何 qoder 斜杠命令（入口在 Account Hub 的 PAT 表单）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const names = ctx.commands.definitions.map((d) => d.name)
+    for (const removed of ['qoder-login', 'qoder-status', 'qoder-refresh']) {
+      expect(names, removed).not.toContain(removed)
+    }
+  })
+
+  it('dispose 时停止 Qoder 的续期调度', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const stop = vi.spyOn(ctx.qoderAuth, 'stop')
     await ctx.fiber.dispose()
     expect(stop).toHaveBeenCalled()
   })

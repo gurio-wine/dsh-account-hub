@@ -7,10 +7,12 @@ import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerTraeCnLlm } from './trae-cn-adapter.js'
 import { fetchTraeCnWorkModels, registerTraeCnWorkLlm } from './trae-cn-work-adapter.js'
+import { registerQoderLlm } from './qoder-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
 import { LobsteraiAuth } from './lobsterai-auth.js'
 import { TraeCnAuth } from './trae-cn-auth.js'
+import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
@@ -18,9 +20,12 @@ import { BUDDY_CN, BUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE_CN } from './trae-cn-product.js'
 import { TRAE_CN_WORK } from './trae-cn-work-product.js'
+import { QODER } from './qoder-product.js'
+import { checkQoderQuotaExhausted } from './qoder-credits.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { TraeCnCredential } from './trae-cn-oauth.js'
+import type { QoderCredential } from './qoder-product.js'
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -211,8 +216,10 @@ export function apply(ctx: Context): void {
   // 第六个 namespace 是 Trae CN **Work**（`trae-cn-work`）—— 与 `trae-cn`
   // 是**两个 provider**（协议不同源、模型池不重合、扣不同积分池），
   // 但**共用同一批账号与凭据**（Work 无独立登录）。
+  // 第七个是 Qoder（`qoder`）—— 第六条协议线，登录形态是 PAT 粘贴。
   registerProviderSettings(
-    ctx, 'llm-buddy-cn', 'llm-buddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae-cn', 'llm-trae-cn-work',
+    ctx,
+    'llm-buddy-cn', 'llm-buddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae-cn', 'llm-trae-cn-work', 'llm-qoder',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -476,6 +483,73 @@ export function apply(ctx: Context): void {
     product: TRAE_CN_WORK,
   })
 
+  // ===== Qoder (PAT 粘贴式登录) 服务 =====
+  //
+  // 第六条协议线，与前五条**完全不同源**：没有浏览器 OAuth、没有本地回调
+  // 服务器、没有两段式登录。登录入口是「用户粘贴一个 PAT」，验证是一次**即时**
+  // exchange 请求（见 `src/qoder-auth.ts` 的模块头）。
+  //
+  // 服务名由产品 id **机械派生**为 `qoderAuth`：id `qoder` 无连字符，
+  // `${product.id}Auth` 即合法的标识符风格，故 `QoderProduct` **刻意不声明**
+  // `serviceName`。这与 `trae-cn` → `traeCnAuth` 的显式声明是**两条不同的
+  // 判据**（那条是因为机械派生会得到 `trae-cnAuth`），不要为「形态统一」给
+  // 无连字符的产品也加一个字段。
+  const qoder = new QoderAuth(ctx)
+  // 与 resolveCredential 共用同一个选号器：两者必须挑到**同一个**账号，
+  // 否则「刷新的是解析凭据时所用的那个账号」这条不变量会被打破
+  // （详因见 makeAccountPicker 的说明，回归测试在 lobsterai-wiring.spec.ts）。
+  const pickQoderAccount = makeAccountPicker(pool, QODER.id)
+  // 适配器与 quotaVerdict **共用同一个凭据解析器**：两处各写一份必然分叉
+  // （理由同上）。
+  const resolveQoderCredential = makeCredentialResolver<QoderCredential>(
+    ctx, pool, QODER.id, QODER.defaultCredentialRef,
+  )
+  registerQoderLlm(ctx, {
+    credentialRef: credentialRef(QODER.defaultCredentialRef),
+    // 只从 Qoder 自己的账号池取账号，回退到自己的单凭据 ref，
+    // 保证不会串用其它六条线的凭据。
+    // provider 实参用 QODER.id 而非字面量 'qoder'：写死字面量在改名/多产品
+    // 场景下会静默查不到账号（本插件在 workbuddy 上踩过同类坑）。
+    resolveCredential: resolveQoderCredential,
+    // 续期对 Qoder 就是**重打 exchange**（PAT 不变，随时可重打），不是
+    // 「refresh_token 换新」——见 `src/qoder-auth.ts` 的 refresh 说明。
+    refresh: async (model?: string) => {
+      // 与 resolveCredential 用**同一个**选号器与同一个 model：否则会出现
+      // 「解析到 B、却刷新了 A」，B 的过期 jt 永不更新（历史 S1 缺陷）。
+      const available = await pickQoderAccount(model)
+      if (available) await qoder.refreshAccountCredential(available.entry.credentialRef)
+      else await qoder.refresh()
+    },
+    // job token 提供者：chat 与额度端点**只认 `jt-`**（PAT 直打 chat 恒 401、
+    // 打额度端点回 401 `TOKEN_EXPIRE`），故必须注入。
+    // ⚠️ 省略时适配器会抛 `MISSING_CREDENTIAL` —— 那会把「没接线」这个明确的
+    // 配置错误伪装成「凭据失效」，让排查方向整个跑偏（见
+    // `QoderAdapterOptions.getJobToken` 的说明）。
+    getJobToken: (pat: string) => qoder.getJobToken(pat),
+    invalidateJobToken: (pat: string) => { qoder.invalidateJobToken(pat) },
+    // **402 的额度二次判别**：402 在本 provider 上有语义污染（quota=0 的账号上
+    // 无效模型名也回同一个 402 `code:116`），故「换号可救」必须由额度端点确证，
+    // 这是 402 通向「换号」的**唯一**一道门。
+    //
+    // 回调签名只带分类结果、不带凭据（该接口由步骤 2 定型），故这里在**被调用的
+    // 此刻**按同一条凭据解析路径取凭据 —— 与适配器 `stream()` 开头那次解析同源
+    // （都不传 model：此刻失败账号尚未写冷却标记，逐模型过滤反而会挑到另一个
+    // 账号，查到的额度就不是刚失败那个账号的）。
+    //
+    // 凭据取不到、或额度端点查不到时一律返回 `undefined` ⇒ 分类器保守判
+    // 「不换号」（`applyQoderQuotaVerdict` 的既定语义）。宁可直报，也不因为
+    // 一个模型名错误把 N 个账号的额度一起烧掉。
+    quotaVerdict: async () => {
+      const credential = await resolveQoderCredential()
+      if (credential === undefined || credential.access_token.length === 0) return undefined
+      return checkQoderQuotaExhausted(credential, qoder, {
+        onDebug: (message) => ctx.logger?.info?.(message),
+      })
+    },
+    accountPool: pool,
+    product: QODER,
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -496,6 +570,9 @@ export function apply(ctx: Context): void {
     try {
       await traeCn.refreshAll(pool)
     } catch { /* 静默 */ }
+    try {
+      await qoder.refreshAll(pool)
+    } catch { /* 静默 */ }
   }
 
   // 启动时如果有任何可续期账号，安排定期续期
@@ -511,6 +588,7 @@ export function apply(ctx: Context): void {
         buddy.stop()
         lobsterai.stop()
         traeCn.stop()
+        qoder.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -522,9 +600,10 @@ export function apply(ctx: Context): void {
     buddy.stop()
     lobsterai.stop()
     traeCn.stop()
+    qoder.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Account Hub RPC 注册 =====
-  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn)
+  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder)
   ctx.provide('accountPool', pool)
 }
