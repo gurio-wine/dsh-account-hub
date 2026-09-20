@@ -83,8 +83,25 @@ import {
   isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing,
 } from './sse.js'
 
-/** 本适配器注册的 provider 路由名（等价于 `QODER.id`）。 */
-export const PROVIDER = 'qoder'
+/**
+ * 本适配器**默认产品**（`QODER`）的 provider 路由名。
+ *
+ * ⚠️ **适配器实例实际使用的路由名是 `this.product.id`，不是本常量。**
+ * `QoderAdapter` 的一切按构造时传入的 `product` 现算：`providerInfo` 的兜底、
+ * `listModels` 播报的 `provider`、以及四处账号池查询（`findAccountIdByCredential`
+ * / `disabledModelsFor` / `getAvailableAccount` / `updateModelRateLimit`）全部走
+ * `this.product.id`；路由注册（{@link registerQoderLlm}）同样用 `product.id`。
+ * 故同一份适配器代码服务第二个 region（如 `qoder-cn`）时，本常量只描述
+ * **默认那一份**取值，不代表所有产品。
+ *
+ * 取值**派生自 `QODER.id` 而不是第二份 `'qoder'` 字面量**：产品配置
+ * （`src/qoder-product.ts` 的 `QoderProduct.id`）是 provider id 的唯一真相源，
+ * 这里再抄一遍就会在新增 region 时悄悄分叉。
+ *
+ * 与 `buddy-adapter.ts` 的 `PROVIDER` 同一形态 —— 那份同样在多产品下退化为
+ * 「历史常量」，只表示其中一个产品的取值（保留导出以兼容既有导入方）。
+ */
+export const PROVIDER = QODER.id
 
 /**
  * 单次请求最多换几个账号（含首次）。
@@ -1131,7 +1148,10 @@ export class QoderAdapter extends LlmAdapter {
     // 账号（否则每次请求都要先白跑一遍这些账号再换号）。
     const credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || credential.access_token.length === 0) {
-      throw new LlmError('qoder: no usable credential; paste a personal access token first', 'MISSING_CREDENTIAL')
+      throw new LlmError(
+        `${this.product.id}: no usable credential; paste a personal access token first`,
+        'MISSING_CREDENTIAL',
+      )
     }
 
     // 2. 记录当前账号（确证额度耗尽后可切换）。

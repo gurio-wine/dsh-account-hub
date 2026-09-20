@@ -421,7 +421,10 @@ export class QoderAuth extends Service {
   async loginWithPat(pat: string, options: QoderLoginOptions = {}): Promise<QoderLoginResult> {
     this.active = true
     const token = pat.trim()
-    if (!isQoderPersonalToken(token)) {
+    // 前缀由**当前产品**给出（默认参数只是国际版取值）：校验用一个前缀、
+    // 下面提示语里报另一个前缀，会让用户照着错的前缀去重新签发 —— 而两个
+    // region 的 PAT 并不通用（见 `docs/qoder-integration-research.md` §8）。
+    if (!isQoderPersonalToken(token, this.product.patPrefix)) {
       throw new Error(
         `PAT 格式不正确：应以 "${this.product.patPrefix}" 开头。`
         + `请在 ${this.product.patUrl} 重新签发后粘贴（页面关闭后不再显示，需当场复制）`,

@@ -23,6 +23,18 @@
  */
 
 // ── 端点基址 ──
+//
+// ⚠️ **本节的模块常量是「`QODER` 配置的取值来源」，不是消费点该 import 的东西。**
+// 每条协议线都可能存在**第二个 region**（Qoder CN 与 Qoder 是两套 host、
+// 账号与用量互不相通，见 `docs/qoder-integration-research.md` §8）。一旦某个
+// 消费点直接 import 这里的常量，它就被钉死在**国际版**那一个 host 上，
+// 而 CN 产品配置里改成别的值**不会有任何编译错误、也不会报错**——请求会
+// 静默打到错误的 region（拿国际版 host 打 CN 凭据，得到的是「凭据失效」的假象）。
+//
+// 故取值链只有一条：**产品配置字段（`QoderProduct.openapiBase` 等）← 本节的
+// 常量**，所有消费点一律走 `product.*`（`qoder-auth` / `qoder-adapter` /
+// `qoder-models` / `qoder-credits` 四处均已如此）。新增消费点时请照办，
+// 不要把本节的常量 import 出去。
 
 /**
  * OpenAPI 基址：换令牌（`jobToken/exchange`）与额度（`quota/usage`）端点。
@@ -224,11 +236,16 @@ function readNumber(source: Record<string, unknown>, key: string): number | unde
  * 前缀校验的意义是**在发请求之前**挡住「粘错东西」（粘了别家的 token、
  * 粘了 `dt-` 设备令牌、粘了半截），把网络往返换成一条可读提示。
  *
+ * ⚠️ `prefix` 必须由调用方按**当前产品**传入（`product.patPrefix`），
+ * 默认值只是国际版取值。理由是它与 {@link QoderAuth.loginWithPat} 的错误文案
+ * 必须同源：校验用一个前缀、提示语里报另一个前缀，用户会照着**错的**前缀
+ * 去重新签发 —— 而两个 region 的 PAT 不通用（§8）。
+ *
  * ⚠️ 调用方**不得**把入参回显进错误信息（PAT 是凭据。
  * 见 `QoderAuth.loginWithPat` 的提示语）。
  */
-export function isQoderPersonalToken(value: string): boolean {
-  return value.startsWith(QODER_PAT_PREFIX) && value.length > QODER_PAT_PREFIX.length
+export function isQoderPersonalToken(value: string, prefix: string = QODER_PAT_PREFIX): boolean {
+  return value.startsWith(prefix) && value.length > prefix.length
 }
 
 /** 从存储值解析凭据 JSON；解析失败返回 undefined。 */
