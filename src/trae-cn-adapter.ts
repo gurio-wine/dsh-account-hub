@@ -56,8 +56,10 @@ import {
   classifyTraeCnError,
   recordsTraeCnCooldown,
   shouldSwitchTraeCnAccount,
+  traeCnContextOverflowHint,
+  traeCnCreditsExhaustedHint,
 } from './trae-cn-errors.js'
-import type { TraeCnErrorAction } from './trae-cn-errors.js'
+import type { TraeCnErrorAction, TraeCnTerminalScope } from './trae-cn-errors.js'
 import { consumeTraeCnStream, serializeTraeCnMessages, traeCnErrorCodeForAction } from './trae-cn-sse.js'
 import type { TraeCnStreamOutcome } from './trae-cn-sse.js'
 
@@ -496,6 +498,16 @@ export class TraeCnAdapter extends LlmAdapter {
     let lastAction: TraeCnErrorAction = 'fail'
     let lastStatus = response.status
     let lastSseCode: string | undefined
+    /**
+     * 换号循环的**退出原因**，供终报文案决定主语。
+     *
+     * 留 `undefined` 的三种情形都是刻意的，此时终报**不得**谈「账号」
+     * （详见 `traeCnCreditsExhaustedHint` 的表格）：
+     * - 没有账号池（单凭据场景，压根没有「其它账号」这回事）；
+     * - 失败不是换号类（直报 / 退避）—— 循环本来就不该换号；
+     * - 已经透传出正文才失败 —— 降级为直报，与账号数量无关。
+     */
+    let terminalScope: TraeCnTerminalScope | undefined
 
     // 4. 换号循环。
     //
@@ -580,10 +592,21 @@ export class TraeCnAdapter extends LlmAdapter {
 
       if (!this.options.accountPool) break
       if (!shouldSwitchTraeCnAccount(lastAction)) break
-      if (round >= maxRotate) break
+      // 换号上限：**必须在这里记下退出原因**（见下面的 terminalScope）。
+      // 池里还有账号、只是我们不再试了 —— 终报文案不能说「全部账号都已耗尽」。
+      if (round >= maxRotate) {
+        terminalScope = 'rotate-cap'
+        break
+      }
 
+      // 走到这里就说明「池里没有下一个可试的账号了」：`getAvailableAccount` 返回空，
+      // 或返回的账号已在本轮试过（它被记了冷却标记后仍是排序第一时会出现）。
+      // 两种情况对用户都是「换号已到头」，与 `rotate-cap` 刻意区分。
       const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model, tried)
-      if (!next || tried.has(next.entry.id)) break
+      if (!next || tried.has(next.entry.id)) {
+        terminalScope = 'pool-exhausted'
+        break
+      }
       tried.add(next.entry.id)
       accountId = next.entry.id
       response = await this.send(next.credential as TraeCnCredential, body, options)
@@ -594,13 +617,17 @@ export class TraeCnAdapter extends LlmAdapter {
     //
     // 两条路径的错误码来源不同，不能混用：
     // - **无业务码**（HTTP 层失败）→ 按状态码映射（401→AUTH、429/5xx→可重试）；
-    // - **有业务码**（流内业务失败）→ 按业务码映射（`4006` → CONTEXT_WINDOW_EXCEEDED
-    //   触发上下文压缩，其余 fail → INVALID_REQUEST）。若这里误用状态码，
-    //   一个「请求超长」的业务错误会被映射成 `HTTP_200`，既不可重试也不触发压缩，
-    //   用户只看到一句无意义的错误码。
+    // - **有业务码**（流内业务失败）→ 按业务码映射（`4006` / `4022` →
+    //   CONTEXT_WINDOW_EXCEEDED 触发上下文压缩，其余 fail → INVALID_REQUEST）。
+    //   若这里误用状态码，一个「请求超长」的业务错误会被映射成 `HTTP_200`，
+    //   既不可重试也不触发压缩，用户只看到一句无意义的错误码。
     if (lastSseCode !== undefined) {
       throw new LlmError(
-        this.withOffCatalogHint(lastMessage, options.model, lastSseCode),
+        this.withOffCatalogHint(lastMessage, options.model, lastSseCode)
+          + traeCnContextOverflowHint(lastSseCode)
+          // 池名传 `'通用积分'`：IDE 路径只扣通用池（`endpoint=0`），
+          // 与 `traeCnPoolFor()` 给 Trae CN 面板选的池一致。
+          + traeCnCreditsExhaustedHint(lastSseCode, '通用积分', terminalScope, 'exhausted-verified'),
         traeCnErrorCodeForAction(lastAction, lastSseCode),
       )
     }

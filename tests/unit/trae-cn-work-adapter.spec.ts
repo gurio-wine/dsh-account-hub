@@ -1305,6 +1305,75 @@ describe('TraeCnWorkAdapter 换号', () => {
     expect(attempt).toBe(3)
     expect(calls.filter((c) => c.init?.method === 'POST' && c.url.endsWith(TRAE_CN_WORK_SESSIONS_PATH))).toHaveLength(3)
   })
+
+  it('**全部账号 4008 → 终报可读，但措辞保守**（Work 码表未标定，不复述「已耗尽」）', async () => {
+    // 与 IDE 路径共用同一个终报提示函数（账号是同批的、用户下一步动作相同），
+    // 但 `semantics` 传 'exhaustion-unverified'：Work 码表整体未标定，
+    // 那里收 4008 进额度表时就写明「尚未实测」。故**不能**把 IDE 路径的
+    // 单变量结论（积分已耗尽）当事实复述到这条路径上。
+    const errorSse = workSse([{ event: 'error', data: { code: 4008, message: 'quota exceeded' } }])
+    const { adapter } = makeAdapter(threeStageResponder(errorSse), {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        // 池里再没有下一个 → pool-exhausted。
+        getAvailableAccount: async () => null,
+      } as never,
+    })
+    const { error } = await collect(adapter, generateOptions())
+    // 上游原文保留。
+    expect(error?.message).toMatch(/quota exceeded/)
+    expect(error?.message).toMatch(/code=4008/)
+    // 可操作指引在（换号已试遍 + 下一步）。
+    expect(error?.message).toMatch(/全部账号的 Trae CN Work 积分均已用尽或受限/)
+    expect(error?.message).toMatch(/请充值或等待额度周期重置/)
+    // ⚠️ 反向断言：**不得**复述 IDE 路径那句「已耗尽 / 不是频率限流」——
+    // Work 侧没有证据支撑这个结论。
+    expect(error?.message).not.toMatch(/均已耗尽/)
+    expect(error?.message).not.toMatch(/这不是频率限流/)
+    // 池名是 Work 池（与 traeCnPoolFor() 给本面板选的池一致），不是通用池。
+    expect(error?.message).not.toMatch(/通用积分/)
+    expect(error?.code).toBe('RATE_LIMIT')
+  })
+
+  it('**池键仍是 trae-cn**：终报改进不影响共享账号池的查询口径', async () => {
+    const errorSse = workSse([{ event: 'error', data: { code: 4008, message: 'quota' } }])
+    const getAvailableAccount = vi.fn(async () => null)
+    const { adapter } = makeAdapter(threeStageResponder(errorSse), {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        getAvailableAccount,
+      } as never,
+    })
+    await collect(adapter, generateOptions())
+    // ⚠️ 必须是 'trae-cn'（账号条目的 provider 字段），不是 'trae-cn-work'。
+    expect(getAvailableAccount).toHaveBeenCalledWith('trae-cn', expect.anything(), expect.any(Set))
+  })
+
+  it('**部分账号可用时仍正常换号**（Work 侧反向回归）', async () => {
+    let attempt = 0
+    const errorSse = workSse([{ event: 'error', data: { code: 4008, message: 'quota' } }])
+    const okSse = workSse([{ event: 'plan_item', data: realPlanItem('好了', 'r') }, { event: 'done', data: {} }])
+    const getAvailableAccount = vi.fn(async () => ({
+      entry: { id: 'acc-2', provider: 'trae-cn' },
+      credential: makeCredential({ access_token: 'AT-2' }),
+    }))
+    const { adapter } = makeAdapter(
+      threeStageResponder(() => { attempt += 1; return attempt === 1 ? errorSse : okSse }),
+      {
+        accountPool: {
+          findAccountIdByCredential: async () => 'acc-1',
+          updateModelRateLimit: async () => {},
+          getAvailableAccount,
+        } as never,
+      },
+    )
+    const { chunks, error } = await collect(adapter, generateOptions())
+    expect(error).toBeUndefined()
+    expect(textOf(chunks)).toBe('好了')
+    expect(getAvailableAccount).toHaveBeenCalled()
+  })
 })
 
 describe('TraeCnWorkAdapter 凭据', () => {

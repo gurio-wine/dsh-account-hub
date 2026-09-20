@@ -84,6 +84,14 @@ import {
   shouldSwitchTraeCnWorkAccount,
 } from './trae-cn-work-errors.js'
 import type { TraeCnWorkErrorAction } from './trae-cn-work-errors.js'
+// ⚠️ **跨 provider 复用 IDE 路径的终报提示函数**（这是刻意的，不是顺手 import）：
+// 两个 provider 共用同一批账号（`TRAE_CN_ACCOUNT_*`），「全部账号都试完了、
+// 用户该去充值」这句话对两条路径是同一件事，没有理由写两份措辞。
+// 而**码表本身不可复用**（Work 未标定，见 `trae-cn-work-errors.ts` 模块头），
+// 故这里只借「文案生成」这一个纯函数，不借 `classifyTraeCnError` 的任何判定。
+// 证据强度的差异由 `semantics` 实参显式承担（传 `'exhaustion-unverified'`）。
+import { traeCnCreditsExhaustedHint } from './trae-cn-errors.js'
+import type { TraeCnTerminalScope } from './trae-cn-errors.js'
 import {
   consumeTraeCnWorkStream,
   normalizeTraeCnWorkModelName,
@@ -465,6 +473,12 @@ export class TraeCnWorkAdapter extends LlmAdapter {
     let lastAction: TraeCnWorkErrorAction = 'fail'
     let lastStatus = 0
     let lastSseCode: string | undefined
+    /**
+     * 换号循环的**退出原因**，供终报文案决定主语（见
+     * `traeCnCreditsExhaustedHint` 的表格）。留 `undefined` 的三种情形与 IDE
+     * 路径完全一致：没有池 / 非换号类失败 / 已产出正文后降级为直报。
+     */
+    let terminalScope: TraeCnTerminalScope | undefined
 
     // 3. 换号循环。
     //
@@ -545,12 +559,21 @@ export class TraeCnWorkAdapter extends LlmAdapter {
 
       if (!this.options.accountPool) break
       if (!shouldSwitchTraeCnWorkAccount(lastAction)) break
-      if (round >= maxRotate) break
+      // 换号上限：**必须在这里记下退出原因**（终报文案的主语由它决定，
+      // 见 `traeCnCreditsExhaustedHint`）。池里还有账号、只是我们不再试了。
+      if (round >= maxRotate) {
+        terminalScope = 'rotate-cap'
+        break
+      }
 
       const next = await this.options.accountPool.getAvailableAccount(
         this.product.poolProviderId, options.model, tried,
       )
-      if (!next || tried.has(next.entry.id)) break
+      // 池里没有下一个可试的账号（返回空，或返回的已被本轮试过）。
+      if (!next || tried.has(next.entry.id)) {
+        terminalScope = 'pool-exhausted'
+        break
+      }
       tried.add(next.entry.id)
       accountId = next.entry.id
       credential = next.credential as TraeCnCredential
@@ -558,8 +581,19 @@ export class TraeCnWorkAdapter extends LlmAdapter {
 
     // 4. 试遍候选（或本就没有池、或已产出过内容不能再换号）：抛出**最后一次**的
     // 真实原因，不吞诊断信息。
+    //
+    // ⚠️ 终报文案**与 IDE 路径共用同一个提示函数**（账号是同批的、用户的下一步
+    // 动作也相同），但 `semantics` 传 `'exhaustion-unverified'`：Work 码表整体
+    // 未标定，`4008` 在这里**没有实测证据**，故只说「用尽或受限」而不复述
+    // 「积分已耗尽」—— 详见 `TraeCnQuotaSemantics`。
+    // 池名传 `'Work 积分'`：与 `traeCnPoolFor()` 给本面板选的池一致（Work 池）。
     if (lastSseCode !== undefined) {
-      throw new LlmError(lastMessage, traeCnWorkErrorCodeForAction(lastAction))
+      throw new LlmError(
+        lastMessage + traeCnCreditsExhaustedHint(
+          lastSseCode, 'Work 积分', terminalScope, 'exhaustion-unverified',
+        ),
+        traeCnWorkErrorCodeForAction(lastAction),
+      )
     }
     throw new LlmError(lastMessage, actionErrorCode(lastAction, lastStatus), { status: lastStatus })
   }

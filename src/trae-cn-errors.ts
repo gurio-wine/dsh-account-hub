@@ -43,8 +43,13 @@ export type TraeCnErrorAction =
 /**
  * 换号码：限流类。
  *
- * - `4008` / `4021` / `5003`：请求频率/并发限额；
- * - `977`：服务端限流（客户端侧表现为「请求过于频繁」类）。
+ * - `4021` / `5003`：请求频率/并发限额；
+ * - `977`：服务端限流（客户端侧表现为「请求过于频繁」类）；
+ * - `4008`：⚠️ **实测语义是「通用积分池耗尽」，不是频率限额**（2026-09-21
+ *   单变量取证，见 {@link TRAE_CN_QUOTA_EXHAUSTED_CODES}）。它**刻意留在本表**：
+ *   动作（换号）与徽章（记冷却）和限流码完全一致，语义差别只体现在**终报文案**
+ *   上（用户需要知道「等一会儿」不会好）。把它移表不改变任何行为，只会让既有
+ *   测试里「限流码集合」的断言与真机事实打架 —— 纯噪音。
  *
  * 这一类换号的意义最直白：**限额是账号级的**，换一个账号就能继续。
  */
@@ -58,6 +63,38 @@ export const TRAE_CN_RATE_LIMIT_CODES: readonly number[] = [4008, 4021, 5003, 97
  * 但两者在**动作**上一致 —— 都换号。
  */
 export const TRAE_CN_QUOTA_CODES: readonly number[] = [4200, 4201, 4202, 4203]
+
+/**
+ * 「**积分已耗尽**」的业务码（`4008`，2026-09-21 单变量定案）。
+ *
+ * ## 为什么它是独立一张表，而不是并进限流表
+ *
+ * `4008` 此前被当作「请求频率限额」（它也确实躺在
+ * {@link TRAE_CN_RATE_LIMIT_CODES} 里，且**继续留在那里**）。真机取证推翻了
+ * 那个语义：
+ *
+ * - 余额端点确认某账号**通用池 `remain=0`** 之后，该账号**连 4 KB 小请求**
+ *   都回 `4008`（`"Your requests have exceeded the quota."`），**190 ms 即回**，
+ *   且**20 分钟不自愈**；
+ * - 同一时刻**健康账号**（`remain 2334.95`）连续 **8 个请求全成功**。
+ *
+ * ⇒ 与请求频率、字节量、并发**全都无关**，是**配额耗尽**。这也是它跟
+ * `4200`–`4203`（{@link TRAE_CN_QUOTA_CODES}）应当被分开叙述的原因：那四个码
+ * 从未实测，而 `4008` 有单变量证据。⚠️ 两张表**名字相邻但语义不同**，不要合并：
+ * `TRAE_CN_QUOTA_CODES` 是「配额类动作码」，本表是「**已验证为耗尽**的码」，
+ * 后者的唯一消费者是终报文案（见 {@link traeCnCreditsExhaustedHint}）。
+ *
+ * ## 动作与徽章都**不变**（这正是它同时留在限流表里的原因）
+ *
+ * 换号依然正确（每个账号的池是独立的），记冷却徽章也依然正确（等周期重置）。
+ * 本表的**唯一消费者是终报文案**：全部账号都耗尽时，用户必须看到
+ * 「积分已耗尽」而不是「请求过于频繁」—— 后者会让他去等一个永远不会到来的
+ * 重置时刻，或者反复重试同一个注定失败的请求。
+ *
+ * 判定用「是否在这张耗尽表里」而不是「是否不在限流表里」，故将来若再拿到
+ * 别的耗尽码（例如 `4200` 被实测确认），只需加进本表，无需改任何调用点。
+ */
+export const TRAE_CN_CREDITS_EXHAUSTED_CODES: readonly number[] = [4008]
 
 /**
  * 换号码：**账号失效**（`1001` / `1002` / `4010` / `4014`）。
@@ -121,12 +158,106 @@ export const TRAE_CN_QUEUE_CODES: readonly number[] = [4000005, 4050, 4051, 4052
  *
  * - `4001`：参数错误；
  * - `4006`：请求超长（上下文超限）；
- * - `4023`：模型不存在。
+ * - `4023`：模型不存在；
+ * - `4022`：⚠️ **上下文窗口溢出**（2026-09-21 单变量定案）—— 与 `4006` **同类
+ *   但不同成因**，见 {@link TRAE_CN_CONTEXT_OVERFLOW_CODES}。它同样直报，且
+ *   同样映射 `CONTEXT_WINDOW_EXCEEDED`（触发 DSH 的自动压缩重试）。
  *
- * 三者都是**确定性**失败：同样的请求换任何账号都会得到同一个结果，
+ * 四者都是**确定性**失败：同样的请求换任何账号都会得到同一个结果，
  * 换号与退避都只是浪费往返，必须立刻把原因交给用户/模型。
+ *
+ * ⚠️ **「未知码一律直报不猜动作」这条原则与 `4022` 的关系**（防后人误读）：
+ * `4022` **不是未知码**。它此前不在任何表里，走的是第 4 条「未知码直报」的
+ * 保守默认 —— 那条默认的前提是「码的语义未定，先直报把真机样本逼出来」。本次
+ * 已经拿到**单变量定案**（见 {@link TRAE_CN_CONTEXT_OVERFLOW_CODES} 的阈值），
+ * 语义从「未知」变成「已知」，故按 4006 同款处理。**该原则本身一个字未改**：
+ * 尚未取证的业务码仍然一律直报、不猜动作。
  */
-export const TRAE_CN_FATAL_CODES: readonly number[] = [4001, 4006, 4023]
+export const TRAE_CN_FATAL_CODES: readonly number[] = [4001, 4006, 4023, 4022]
+
+/**
+ * 「**上下文窗口溢出**」业务码：`4006` 与 `4022`。
+ *
+ * ## 为什么两个码都要，而不是只留一个
+ *
+ * 它们是**两种不同的超限**，真机各有一份证据：
+ *
+ * | 码 | 真机语义 | 证据形态 |
+ * |---|---|---|
+ * | `4006` | 请求超长 | 表内既有条目（`prompt too long` 文案） |
+ * | `4022` | **prompt token 超过上游上限** | HTTP 200 + SSE 流内 `event:error` 帧，`{"code":4022,"message":"We're sorry, your prompt tokens have exceeded the maximum limit."}` |
+ *
+ * ## `4022` 的阈值（精确钳制，2026-09-21）
+ *
+ * 同一个请求只改 prompt token 数：
+ *
+ * - **998 161 token → 成功**；
+ * - **1 002 248 token → 失败**（`4022`）。
+ *
+ * ⇒ 边界就在 **≈ 1 000 000 token** 附近（模型窗口约 1M）。**同请求降 token 即
+ * 成功、与字节量无关、与账号无关** —— 这正是「上下文溢出」而不是「账号问题」
+ * 的定义。另有一条排除性证据：`4 KB → 1.5 MB` 十一档字节矩阵**全部 HTTP 200
+ * 正常收尾**，故**不存在字节墙**，`4022` 只可能由 token 数触发。
+ *
+ * ## 为什么必须映射成 `CONTEXT_WINDOW_EXCEEDED`（而不是普通直报）
+ *
+ * 因为那是**宿主唯一的补救路径**：DSH 对 `failure.code === CONTEXT_WINDOW_EXCEEDED`
+ * 的失败会**自动压缩上下文并重试**（`isContextWindowExceededError` /
+ * `CONTEXT_WINDOW_EXCEEDED_CODE`，另见 `buddy-adapter.ts` 同款接线）。若按普通
+ * `fail` → `INVALID_REQUEST` 直报，用户拿到的是一条**致命错误**：既不会压缩、
+ * 也不会重试，1M token 的长会话从此**彻底不可用**，而它其实只需压缩一次即可
+ * 继续。故这是一个**功能性必需**的映射，不是措辞偏好。
+ *
+ * ## 与「未知码不猜动作」的关系
+ *
+ * `4022` **不是未知码**（见 {@link TRAE_CN_FATAL_CODES} 的说明）：它是**已单变量
+ * 定案**的窗口溢出码，阈值、排除项、同请求对照三件证据齐备。
+ * 不猜动作 ≠ 拿到证据后仍不动作。
+ */
+export const TRAE_CN_CONTEXT_OVERFLOW_CODES: readonly number[] = [4006, 4022]
+
+/**
+ * 本次取证的窗口溢出码（`4022`）。
+ *
+ * 单独起一个常量而不是在代码里写 `4022` 字面量，是因为它有一个**专属**行为：
+ * 只有它会在终报文案上追加中文说明（见 {@link traeCnContextOverflowHint}）。
+ * 写成字面量的话，「为什么 4006 没有这句」这个问题就只能靠读上下文猜。
+ */
+export const TRAE_CN_WINDOW_OVERFLOW_CODE = 4022
+
+/**
+ * `4022`（上下文窗口溢出）在错误文案后追加的中文说明。
+ *
+ * ## 为什么只给 `4022` 加、不给 `4006` 加
+ *
+ * 两个码的**映射完全相同**（都进 `CONTEXT_WINDOW_EXCEEDED`），但本次只新增
+ * `4022` 的说明：`4006` 的文案已是既成行为，改它属于**未经要求的变更** ——
+ * 一个已有真机历史的码，其用户可见文案要改应当有它自己的理由与验证。
+ * `tests/unit/trae-cn-adapter.spec.ts` 有一条断言反向钉死「`4006` 的文案里
+ * 没有这句话」，防后人「顺手统一」。
+ *
+ * ## 为什么这句话必须有
+ *
+ * `CONTEXT_WINDOW_EXCEEDED` 的效果是**宿主自动压缩上下文并重试**，这对用户是
+ * 一件「什么都没做，它自己好了」的事；不说明的话，用户看到上游那句
+ * `your prompt tokens have exceeded the maximum limit` 只会以为会话废了，
+ * 从而手动去开新会话（丢掉全部历史）—— 而正确做法是**什么都不做，等它压缩完**。
+ */
+export const TRAE_CN_CONTEXT_OVERFLOW_HINT =
+  '（上下文超出上游上限，DSH 将自动压缩上下文后重试；无需手动开新会话）'
+
+/**
+ * 若业务码是 {@link TRAE_CN_WINDOW_OVERFLOW_CODE}，返回中文说明；否则返回空串。
+ *
+ * 上游原文**必须保留**（调用方是在原文后面拼接，不是替换）：真机排障要靠它
+ * 与字节文档对上号。本函数的返回值永远以空串或一整句括号说明收尾，
+ * 调用方可以无条件用 `+` 拼接而不产生悬挂空格。
+ */
+export function traeCnContextOverflowHint(code: TraeCnErrorCode | undefined): string {
+  return normalizeTraeCnCode(code) === TRAE_CN_WINDOW_OVERFLOW_CODE
+    ? TRAE_CN_CONTEXT_OVERFLOW_HINT
+    : ''
+}
 
 /** 上述四类换号码的并集（供实现处一次性判「是否换号类」）。 */
 export const TRAE_CN_SWITCH_CODES: readonly number[] = [
@@ -257,3 +388,142 @@ export function recordsTraeCnCooldown(code: TraeCnErrorCode | undefined): boolea
     || inCodes(TRAE_CN_QUOTA_CODES, normalized)
     || inCodes(TRAE_CN_RISK_CONTROL_CODES, normalized)
 }
+
+/**
+ * 终报文案：换号循环**试不下去了**之后，追加给用户的那句「到底怎么了」。
+ *
+ * ## 为什么需要它（修复的缺陷）
+ *
+ * 换号循环试遍候选后抛的是**最后一次**失败的真实原因，形如
+ * `trae-cn: Your requests have exceeded the quota. (code=4008)`。这句话本身
+ * 没错，但它有一个致命的**语境缺失**：用户不知道这是**所有账号都这样**
+ * （⇒ 换号已无意义，需要充值/等重置）还是**碰巧这一个账号这样**
+ * （⇒ 再点一次可能就好了）。同一句 `4008` 在两种语境下该做的事完全不同。
+ *
+ * 更糟的是措辞方向：`4008` 实测语义是**积分耗尽**（见
+ * {@link TRAE_CN_CREDITS_EXHAUSTED_CODES}），而它此前与 `4021`/`5003`/`977`
+ * 同列在「限流码」表里，用户读到的上游文案也常是频率类措辞 —— 于是他会
+ * **反复重试或干等**一个永远不会到来的时刻，而正确动作是**去充值或换一个
+ * 还有积分的账号**。
+ *
+ * ## 为什么按码分流，而不是对全部失败都说「积分耗尽」
+ *
+ * 只有**已实测确认**是耗尽语义的码（本表）才说这句话。其余失败（未知码、
+ * 账号失效、风控、HTTP 层）保持原样 —— 给一个「参数错误」追加「积分已耗尽」
+ * 是把用户引向错误的解法，比不说更糟。这与
+ * {@link recordsTraeCnCooldown} 「徽章只覆盖有明确等待语义的码」是同一条原则。
+ *
+ * ## 池归属由调用方以**数据**传入，不在本函数里写死
+ *
+ * `poolLabel` 是「哪个积分池被耗尽」的可读名（如 `'通用积分'`）。刻意做成参数
+ * 而不是常量，因为两条 Trae CN 路径的事实强度不同：
+ * `trae-cn`（IDE 路径）的 `4008` = **通用池**耗尽，有单变量实测证据；
+ * `trae-cn-work` 的 `4008` **未被实测**（Work 码表整体未标定）。若这里写死
+ * 「通用积分已耗尽」，Work 路径会把它当作既成事实复述 —— 而那正是本项目
+ * 反复禁止的「把未经验证的假设当事实」。Work 传 `'Work 积分'` 时同理。
+ *
+ * ## `scope` 决定主语，**绝不能一律说「全部账号」**
+ *
+ * 换号循环有三条退出路径，只有一条能支撑「全部账号」这句话：
+ *
+ * | scope | 含义 | 文案主语 |
+ * |---|---|---|
+ * | `'pool-exhausted'` | 池里**再没有**可试的账号了 | **全部账号** |
+ * | `'rotate-cap'` | 换号次数达上限（`TRAE_CN_MAX_ROTATE`）就停了 | **已尝试的账号**（并声明池中可能还有未试的） |
+ * | `undefined` | 没有账号池 / 非换号类失败 / 已产出正文 | **不追加**（此时谈「账号」是编造） |
+ *
+ * 反例说明为什么必须分开：池里有 5 个账号、换号上限是 3 —— 若 cap 路径也报
+ * 「全部账号已耗尽」，用户会去给 5 个账号全部充值，而其中 2 个可能根本没问题。
+ *
+ * ## 「等待」与「耗尽」的区分（刻意保留两种措辞）
+ *
+ * 码在 {@link TRAE_CN_CREDITS_EXHAUSTED_CODES} 里 → 「已**耗尽**」（确定性，
+ * 不会自己好）；在 {@link TRAE_CN_RATE_LIMIT_CODES} /
+ * {@link TRAE_CN_QUOTA_CODES} 里但**不在**耗尽表 → 「**仍在冷却或限额中**」
+ * （可能自愈，`Account Hub` 的徽章会显示重置时刻）。两者都告诉用户
+ * 「不是这一个账号的问题」，但只有前者会说「等也没用」。
+ *
+ * ⚠️ **`rotate-cap` 只与「耗尽」措辞组合**：cap 是「我提前停了」，与「仍在冷却中」
+ * 组合会得到「已尝试的账号都在冷却中（池中可能还有未尝试的）」—— 逻辑没错但
+ * 信息量为负（用户在冷却语境下本来就会再试），故该组合**返回空串**。
+ *
+ * ## `semantics`：同厂商同码，两条路径的**证据强度不同**
+ *
+ * `trae-cn` / `trae-cn-work` 共用同一批账号（故共用本函数），但 `4008` 的语义
+ * **只在 IDE 路径上实测过**（{@link TRAE_CN_CREDITS_EXHAUSTED_CODES} 的证据来自
+ * SOLO 通道）；Work 的码表整体未标定（见 `trae-cn-work-errors.ts` 的模块头），
+ * 那里把 `4008` 收进额度表时就写明「**尚未实测**」。故 Work 路径**不能**复述
+ * 「积分已耗尽」这个结论 —— 那正是本项目反复禁止的「把未经验证的假设当事实」。
+ *
+ * 但**可操作的指引是同一条**（换号已试遍、需充值或等重置），故两条路径共用同一
+ * 函数，只是诊断措辞分叉：已确证的说「已耗尽」，未确证的诚实地说
+ * 「**已用尽或受限**」（涵盖两种可能，不替上游下结论）。
+ *
+ * @param code - 最后一次失败的业务码（原始形态，数字或字符串）。
+ * @param poolLabel - 被耗尽/受限的积分池可读名（如 `'通用积分'`）。
+ * @param scope - 换号循环的退出原因（见 {@link TraeCnTerminalScope}）；
+ *   `undefined` 表示「没有池 / 不该谈账号」，此时一律返回空串。
+ * @param semantics - 该路径上「耗尽」语义的证据强度（见
+ *   {@link TraeCnQuotaSemantics}）。
+ * @returns 追加到错误文案末尾的一句中文说明；无话可说时返回**空串**
+ *   （调用方据此决定是否拼接，不留悬挂空格）。
+ */
+export function traeCnCreditsExhaustedHint(
+  code: TraeCnErrorCode | undefined,
+  poolLabel: string,
+  scope: TraeCnTerminalScope | undefined,
+  semantics: TraeCnQuotaSemantics,
+): string {
+  const normalized = normalizeTraeCnCode(code)
+  if (normalized === undefined || scope === undefined) return ''
+
+  const exhausted = inCodes(TRAE_CN_CREDITS_EXHAUSTED_CODES, normalized)
+  const limited = inCodes(TRAE_CN_RATE_LIMIT_CODES, normalized)
+    || inCodes(TRAE_CN_QUOTA_CODES, normalized)
+  // 其余码（未知码 / 账号失效 / 风控 / 直报类）：**刻意不加** ——
+  // 给一个「参数错误」追加「积分已耗尽」会把用户引向错误的解法。
+  if (!exhausted && !limited) return ''
+  // cap + 冷却：见上方 ⚠️。
+  if (scope === 'rotate-cap' && !exhausted) return ''
+
+  const atPoolEnd = scope === 'pool-exhausted'
+  const subject = atPoolEnd
+    ? `全部账号的 Trae CN ${poolLabel}`
+    : `已尝试的账号的 Trae CN ${poolLabel}`
+  const tail = atPoolEnd ? '' : '（换号次数已达上限，池中可能还有未尝试的账号）'
+
+  if (exhausted) {
+    const diagnosis = semantics === 'exhausted-verified'
+      ? '均已耗尽：换号已无济于事，请充值或等待额度周期重置；这不是频率限流，稍后重试不会自愈'
+      : '均已用尽或受限：换号已无济于事，请充值或等待额度周期重置'
+    return `（${subject}${diagnosis}）${tail}`
+  }
+  return `（${subject}均在冷却或限额中：可在 Account Hub 查看重置时刻，稍后重试）`
+}
+
+/**
+ * 「为什么这轮试不下去了」——决定终报文案的主语（见
+ * {@link traeCnCreditsExhaustedHint}）。
+ *
+ * 由**适配器的换号循环**在退出点判定后传入，而不是由提示函数自己猜：
+ * 只有循环知道自己是走到了哪一条 `break`。
+ */
+export type TraeCnTerminalScope =
+  /** 池里再没有可试的账号（`getAvailableAccount` 返回空 / 候选已被 `tried` 排除）。 */
+  | 'pool-exhausted'
+  /** 换号次数到达上限就停了，池中**可能还有**未尝试的账号。 */
+  | 'rotate-cap'
+
+/**
+ * 「积分耗尽」这一结论在**当前路径**上的证据强度（见
+ * {@link traeCnCreditsExhaustedHint} 的 `semantics` 小节）。
+ *
+ * 刻意做成必填参数而不是默认值：默认值会让新增的调用方（尤其是将来的第三条
+ * Trae CN 路径）在**没想过这个问题**的情况下继承「已确证」的措辞，而它们在
+ * 自己那条协议线上多半没有证据。宁可在编译期逼一次。
+ */
+export type TraeCnQuotaSemantics =
+  /** 该码的耗尽语义在**本路径**上已单变量实测（`trae-cn` 的 `4008`）。 */
+  | 'exhausted-verified'
+  /** 未实测（`trae-cn-work`：码表整体未标定）—— 只能说「用尽或受限」。 */
+  | 'exhaustion-unverified'

@@ -58,7 +58,11 @@ import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import {
   isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing,
 } from './sse.js'
-import { classifyTraeCnError } from './trae-cn-errors.js'
+import {
+  TRAE_CN_CONTEXT_OVERFLOW_CODES,
+  classifyTraeCnError,
+  normalizeTraeCnCode,
+} from './trae-cn-errors.js'
 import type { TraeCnErrorAction, TraeCnErrorCode } from './trae-cn-errors.js'
 
 /** 元数据帧的事件名候选（`metadata` 为 Rust 侧名，`meta` 为 JS 侧名）。 */
@@ -207,15 +211,24 @@ function pickMessage(source: Record<string, unknown>): string {
  *   两者的区别由**适配器**处理（换号循环 vs 直接抛出），错误码只表达
  *   「这是可重试的限流类失败」。发明两个新码会让 DSH 的重试层认不出来，
  *   退避就成了空话。
- * - `fail` 且码为 `4006`（请求超长）→ `CONTEXT_WINDOW_EXCEEDED`：触发 DSH 的
- *   上下文自动压缩恢复；其余 → `INVALID_REQUEST`。
+ * - `fail` 且码命中 {@link TRAE_CN_CONTEXT_OVERFLOW_CODES}（`4006` 请求超长、
+ *   `4022` 上下文窗口溢出）→ `CONTEXT_WINDOW_EXCEEDED`：触发 DSH 的上下文自动
+ *   压缩恢复；其余 → `INVALID_REQUEST`。
+ *
+ * ## 为什么判定走码表 + {@link normalizeTraeCnCode}，而不是内联比较
+ *
+ * 原实现是内联的 `numeric === 4006`，本次扩到两个码时改为**与分类器同源**的
+ * 归一化 + 码表查询。理由不是整洁，是**防分叉**：分类器那边判「是不是直报类」
+ * 用的是 `normalizeTraeCnCode`（它拒绝 `"code=4008"` 这类诊断文本），若这里
+ * 保留另一份内联解析，两处对同一个码的认知迟早不一致 —— 本仓库已有
+ * `isModelInCatalog` / `functionForModel` 同源同口径的先例。
  */
 export function traeCnErrorCodeForAction(action: TraeCnErrorAction, code?: TraeCnErrorCode): string {
   if (action === 'switch-account' || action === 'backoff') return 'RATE_LIMIT'
-  const numeric = typeof code === 'number'
-    ? code
-    : (typeof code === 'string' && /^-?\d+$/.test(code.trim()) ? Number(code.trim()) : undefined)
-  if (numeric === 4006) return 'CONTEXT_WINDOW_EXCEEDED'
+  const numeric = normalizeTraeCnCode(code)
+  if (numeric !== undefined && TRAE_CN_CONTEXT_OVERFLOW_CODES.includes(numeric)) {
+    return 'CONTEXT_WINDOW_EXCEEDED'
+  }
   return 'INVALID_REQUEST'
 }
 

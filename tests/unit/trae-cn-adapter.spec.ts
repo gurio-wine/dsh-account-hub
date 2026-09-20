@@ -39,18 +39,22 @@ import {
 } from '../../src/trae-cn-models.js'
 import type { TraeCnModelEntry } from '../../src/trae-cn-models.js'
 import {
-  classifyTraeCnError,
-  normalizeTraeCnCode,
-  recordsTraeCnCooldown,
-  shouldSwitchTraeCnAccount,
-  isTraeCnBackoff,
   TRAE_CN_ACCOUNT_INVALID_CODES,
   TRAE_CN_BACKOFF_CODES,
+  TRAE_CN_CONTEXT_OVERFLOW_CODES,
+  TRAE_CN_CREDITS_EXHAUSTED_CODES,
   TRAE_CN_FATAL_CODES,
   TRAE_CN_QUEUE_CODES,
   TRAE_CN_QUOTA_CODES,
   TRAE_CN_RATE_LIMIT_CODES,
   TRAE_CN_RISK_CONTROL_CODES,
+  classifyTraeCnError,
+  normalizeTraeCnCode,
+  recordsTraeCnCooldown,
+  shouldSwitchTraeCnAccount,
+  isTraeCnBackoff,
+  traeCnContextOverflowHint,
+  traeCnCreditsExhaustedHint,
 } from '../../src/trae-cn-errors.js'
 import {
   TRAE_CN_CHAT_PATH,
@@ -310,8 +314,72 @@ describe('Trae CN 错误码分类：HTTP 兜底（无业务码时）', () => {
   })
 })
 
-describe('Trae CN 冷却徽章判据', () => {
-  it('限流 / 额度 / 风控码记徽章', () => {
+describe('Trae CN 终报文案（积分耗尽 vs 限流冷却）', () => {
+  it('**4008 是「积分耗尽」**，不是频率限流（2026-09-21 单变量定案）', () => {
+    // 归在池耗尽表里，同时仍留在限流表（动作与徽章不变，只影响文案）。
+    expect(TRAE_CN_CREDITS_EXHAUSTED_CODES).toContain(4008)
+    expect(TRAE_CN_RATE_LIMIT_CODES).toContain(4008)
+    // 诚实性原则：4021/5003/977 没有被实测为耗尽，**不得**混进耗尽表。
+    for (const code of [4021, 5003, 977]) {
+      expect(TRAE_CN_CREDITS_EXHAUSTED_CODES).not.toContain(code)
+    }
+  })
+
+  it('池已试遍 + 4008 → 「全部账号…已耗尽」+ 下一步 + 「等不会自愈」', () => {
+    const hint = traeCnCreditsExhaustedHint(4008, '通用积分', 'pool-exhausted', 'exhausted-verified')
+    expect(hint).toMatch(/全部账号的 Trae CN 通用积分均已耗尽/)
+    expect(hint).toMatch(/请充值或等待额度周期重置/)
+    expect(hint).toMatch(/这不是频率限流，稍后重试不会自愈/)
+  })
+
+  it('**换号达上限 → 主语降级**，不得谎称「全部账号」', () => {
+    const hint = traeCnCreditsExhaustedHint(4008, '通用积分', 'rotate-cap', 'exhausted-verified')
+    expect(hint).toMatch(/已尝试的账号的 Trae CN 通用积分均已耗尽/)
+    expect(hint).toMatch(/换号次数已达上限，池中可能还有未尝试的账号/)
+    expect(hint).not.toMatch(/全部账号的/)
+  })
+
+  it('**限流冷却（非耗尽）措辞不同**：说「冷却或限额中」而不断言耗尽', () => {
+    const hint = traeCnCreditsExhaustedHint(4007, '通用积分', 'pool-exhausted', 'exhausted-verified')
+    // 4007 是退避表里的码，不在限流/额度表 ⇒ 不提账号池。
+    expect(hint).toBe('')
+    const limited = traeCnCreditsExhaustedHint(4021, '通用积分', 'pool-exhausted', 'exhausted-verified')
+    expect(limited).toMatch(/均在冷却或限额中/)
+    expect(limited).toMatch(/可在 Account Hub 查看重置时刻/)
+    expect(limited).not.toMatch(/均已耗尽/)
+  })
+
+  it('cap + 冷却 → 空串（信息量为负，刻意不说）', () => {
+    expect(traeCnCreditsExhaustedHint(4021, '通用积分', 'rotate-cap', 'exhausted-verified')).toBe('')
+  })
+
+  it('**未取证路径不复述「已耗尽」**（Work 的 4008 无实测证据）', () => {
+    const hint = traeCnCreditsExhaustedHint(4008, 'Work 积分', 'pool-exhausted', 'exhaustion-unverified')
+    expect(hint).toMatch(/均已用尽或受限/)
+    expect(hint).toMatch(/请充值或等待额度周期重置/)
+    expect(hint).not.toMatch(/均已耗尽/)
+    expect(hint).not.toMatch(/这不是频率限流/)
+  })
+
+  it('不该谈账号的三种情形一律返回空串（不留悬挂括号）', () => {
+    // 没有池（scope undefined）
+    expect(traeCnCreditsExhaustedHint(4008, '通用积分', undefined, 'exhausted-verified')).toBe('')
+    // 业务码缺失
+    expect(traeCnCreditsExhaustedHint(undefined, '通用积分', 'pool-exhausted', 'exhausted-verified')).toBe('')
+    // 非额度类码（直报 / 未知 / 账号失效 / 风控）
+    for (const code of [4001, 4006, 4022, 4023, 1001, 4011, 99999]) {
+      expect(traeCnCreditsExhaustedHint(code, '通用积分', 'pool-exhausted', 'exhausted-verified'), String(code))
+        .toBe('')
+    }
+  })
+
+  it('池名是实参（换池名不改判定，防写死）', () => {
+    expect(traeCnCreditsExhaustedHint(4008, 'Work 积分', 'pool-exhausted', 'exhausted-verified'))
+      .toMatch(/Trae CN Work 积分/)
+  })
+})
+
+describe('Trae CN 冷却徽章判据', () => {  it('限流 / 额度 / 风控码记徽章', () => {
     for (const code of [...TRAE_CN_RATE_LIMIT_CODES, ...TRAE_CN_QUOTA_CODES, ...TRAE_CN_RISK_CONTROL_CODES]) {
       expect(recordsTraeCnCooldown(code)).toBe(true)
     }
@@ -341,6 +409,65 @@ describe('Trae CN 动作 → harness 错误码', () => {
   it('4006（请求超长）映射为 CONTEXT_WINDOW_EXCEEDED（触发上下文压缩）', () => {
     expect(traeCnErrorCodeForAction('fail', 4006)).toBe('CONTEXT_WINDOW_EXCEEDED')
     expect(traeCnErrorCodeForAction('fail', '4006')).toBe('CONTEXT_WINDOW_EXCEEDED')
+  })
+
+  it('**4022（上下文窗口溢出）与 4006 同路**：CONTEXT_WINDOW_EXCEEDED（触发上下文压缩）', () => {
+    // 2026-09-21 单变量定案：prompt token ≈ 1M 时 HTTP 200 + 流内 event:error
+    // 4022（998 161 成功 / 1 002 248 失败；同请求降 token 即成功、与字节和账号无关）。
+    // 它此前落「未知码」路径 → fail → INVALID_REQUEST（致命、不触发压缩），
+    // 长会话因此彻底不可用 —— 这条断言钉死它与 4006 同款处理。
+    expect(traeCnErrorCodeForAction('fail', 4022)).toBe('CONTEXT_WINDOW_EXCEEDED')
+    expect(traeCnErrorCodeForAction('fail', '4022')).toBe('CONTEXT_WINDOW_EXCEEDED')
+    // 与 4006 同表：两者是「同类不同成因」的超限，映射必须一致。
+    expect(TRAE_CN_CONTEXT_OVERFLOW_CODES).toContain(4006)
+    expect(TRAE_CN_CONTEXT_OVERFLOW_CODES).toContain(4022)
+  })
+
+  it('4022 是**已定案**的直报类码，不再走「未知码」路径', () => {
+    // 「未知业务码一律直报不猜动作」这条原则**未被绕过**：4022 已从「未知」变成
+    // 「已知」（阈值 + 排除项 + 同请求对照三件证据齐备），故按已知码处理。
+    expect(TRAE_CN_FATAL_CODES).toContain(4022)
+    expect(classifyTraeCnError({ httpStatus: 200, sseErrorCode: 4022 })).toBe('fail')
+    expect(classifyTraeCnError({ httpStatus: 200, sseErrorCode: '4022' })).toBe('fail')
+    // 不换号、不退避（确定性失败：同样的请求换任何账号都溢出）。
+    expect(shouldSwitchTraeCnAccount(classifyTraeCnError({ sseErrorCode: 4022 }))).toBe(false)
+    expect(isTraeCnBackoff(classifyTraeCnError({ sseErrorCode: 4022 }))).toBe(false)
+    // 不记冷却徽章：上下文溢出与账号/模型额度无关，记「限流至 …」是虚假信息。
+    expect(recordsTraeCnCooldown(4022)).toBe(false)
+  })
+
+  it('4022 的中文说明只给 4022，**4006 刻意不加**（反向锁死，防「顺手统一」）', () => {
+    expect(traeCnContextOverflowHint(4022)).toMatch(/上下文超出上游上限/)
+    expect(traeCnContextOverflowHint(4022)).toMatch(/自动压缩/)
+    expect(traeCnContextOverflowHint('4022')).toMatch(/上下文超出上游上限/)
+    // 4006 的文案是既成行为，本次不动它。
+    expect(traeCnContextOverflowHint(4006)).toBe('')
+    // 其余码一律不加（拼接处才不会出现悬挂括号）。
+    expect(traeCnContextOverflowHint(4001)).toBe('')
+    expect(traeCnContextOverflowHint(undefined)).toBe('')
+  })
+
+  it('**加入 4022 不改变其它任何码的分类**（既有码逐一复验）', () => {
+    // 换号类：一字未动
+    for (const code of [...TRAE_CN_RATE_LIMIT_CODES, ...TRAE_CN_QUOTA_CODES,
+      ...TRAE_CN_ACCOUNT_INVALID_CODES, ...TRAE_CN_RISK_CONTROL_CODES]) {
+      expect(classifyTraeCnError({ httpStatus: 200, sseErrorCode: code }), String(code)).toBe('switch-account')
+    }
+    // 退避类：一字未动
+    for (const code of [...TRAE_CN_BACKOFF_CODES, ...TRAE_CN_QUEUE_CODES]) {
+      expect(classifyTraeCnError({ httpStatus: 200, sseErrorCode: code }), String(code)).toBe('backoff')
+    }
+    // 直报类：新增 4022 之外的三个仍原样
+    for (const code of [4001, 4006, 4023]) {
+      expect(classifyTraeCnError({ httpStatus: 200, sseErrorCode: code }), String(code)).toBe('fail')
+      expect(traeCnErrorCodeForAction('fail', code), String(code))
+        .toBe(code === 4006 ? 'CONTEXT_WINDOW_EXCEEDED' : 'INVALID_REQUEST')
+    }
+    // **4022 的邻码不受牵连**（4020/4021/4023/4024）：4021 仍换号，其余仍走各自路径。
+    expect(classifyTraeCnError({ sseErrorCode: 4021 })).toBe('switch-account')
+    expect(traeCnErrorCodeForAction('fail', 4020)).toBe('INVALID_REQUEST')
+    expect(traeCnErrorCodeForAction('fail', 4023)).toBe('INVALID_REQUEST')
+    expect(traeCnErrorCodeForAction('fail', 4024)).toBe('INVALID_REQUEST')
   })
 
   it('其余直报映射为 INVALID_REQUEST', () => {
@@ -1297,6 +1424,160 @@ describe('TraeCnAdapter 流内错误与换号', () => {
     expect(error?.message).toMatch(/code=4008/)
     // 首账号 + 最多 (MAX_ROTATE - 1) 次换号 = 3 次请求。
     expect(calls).toHaveLength(3)
+  })
+
+  it('**全部账号 4008 耗尽 → 终报明说「积分已耗尽」**（不再只有限流措辞）', async () => {
+    // 修复的缺陷：换号循环试遍后抛的是最后一次的真实原因，用户看不出
+    // 「所有账号都这样」（⇒ 充值/等重置）还是「就这一个账号这样」（⇒ 再试）。
+    // 而 4008 实测是**积分耗尽**（通用池 remain=0 时连 4 KB 小请求都 190ms 回它），
+    // 说成「请求过于频繁」会让用户去等一个永远不会到来的时刻。
+    const { adapter } = makeAdapter(() => sseResponse(errorStream(4008, 'Your requests have exceeded the quota.')), {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        // 池里**再没有**下一个账号 → 退出原因应为 pool-exhausted。
+        getAvailableAccount: async () => null,
+      } as never,
+    })
+    const { error } = await collect(adapter, generateOptions())
+    // 上游原文**必须保留**（真机排障要靠它与字节文档对上号）。
+    expect(error?.message).toMatch(/Your requests have exceeded the quota\./)
+    expect(error?.message).toMatch(/code=4008/)
+    // 中文终报：明确指出是积分耗尽 + 全部账号 + 给出下一步。
+    expect(error?.message).toMatch(/全部账号的 Trae CN 通用积分均已耗尽/)
+    expect(error?.message).toMatch(/请充值或等待额度周期重置/)
+    // 关键的一句：它不是频率限流，等不会好。这是用户此前最容易被误导的点。
+    expect(error?.message).toMatch(/这不是频率限流，稍后重试不会自愈/)
+    // 错误码仍是可重试的 RATE_LIMIT（换号机制与 DSH 重试层语义都未改动）。
+    expect(error?.code).toBe('RATE_LIMIT')
+  })
+
+  it('**换号达上限（池里还有账号）→ 终报不谎称「全部账号」**', async () => {
+    // 池里有更多账号、只是换号次数到顶了就停 —— 此时说「全部账号已耗尽」会让
+    // 用户去给每个账号充值，而其中一些可能根本没问题。主语必须降级。
+    const { adapter, calls } = makeAdapter(() => sseResponse(errorStream(4008, 'quota')), {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        // 永远返回一个新的可用账号：池「looks」无穷，故退出只可能是 round cap。
+        getAvailableAccount: async () => ({
+          entry: { id: `acc-${Math.random()}`, provider: 'trae-cn' },
+          credential: makeCredential({ access_token: 'AT-x' }),
+        }),
+      } as never,
+    })
+    const { error } = await collect(adapter, generateOptions())
+    expect(calls).toHaveLength(3)
+    // 必须**不**出现「全部账号」这个断言，改说「已尝试的账号」+ 声明池中可能还有。
+    expect(error?.message).not.toMatch(/全部账号的/)
+    expect(error?.message).toMatch(/已尝试的账号的 Trae CN 通用积分均已耗尽/)
+    expect(error?.message).toMatch(/换号次数已达上限，池中可能还有未尝试的账号/)
+  })
+
+  it('**部分账号可用时仍正常换号**（终报改进不干扰换号主路径）', async () => {
+    // 反向回归：终报文案只影响「全都失败」的出口，换号本身一行未动。
+    const getAvailableAccount = vi.fn(async () => ({
+      entry: { id: 'acc-2', provider: 'trae-cn' },
+      credential: makeCredential({ access_token: 'AT-2' }),
+    }))
+    let attempt = 0
+    const { adapter, calls } = makeAdapter(() => {
+      attempt += 1
+      // 第 1 个账号 4008 耗尽 → 换号 → 第 2 个账号正常返回。
+      return attempt === 1
+        ? sseResponse(errorStream(4008, 'Your requests have exceeded the quota.'))
+        : sseResponse(textStream('好了'))
+    }, {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        getAvailableAccount,
+      } as never,
+    })
+    const { chunks, error } = await collect(adapter, generateOptions())
+    expect(error).toBeUndefined()
+    expect(calls).toHaveLength(2)
+    expect(getAvailableAccount).toHaveBeenCalledWith('trae-cn', 'glm-5.2', expect.any(Set))
+    expect(chunks.some((c) => (c as { type: string }).type === 'text-delta')).toBe(true)
+  })
+
+  it('**没有账号池时不谈「账号」**（单凭据场景不得编造池状态）', async () => {
+    const { adapter } = makeAdapter(() => sseResponse(errorStream(4008, 'quota')))
+    const { error } = await collect(adapter, generateOptions())
+    expect(error?.code).toBe('RATE_LIMIT')
+    expect(error?.message).toMatch(/code=4008/)
+    // 没有池 ⇒ 不存在「全部/已尝试的账号」这回事，不得追加任何池结论。
+    expect(error?.message).not.toMatch(/全部账号的/)
+    expect(error?.message).not.toMatch(/已尝试的账号的/)
+    expect(error?.message).not.toMatch(/均已耗尽/)
+  })
+
+  it('**非额度类失败不追加池结论**（4023 模型不存在 ≠ 账号问题）', async () => {
+    const { adapter } = makeAdapter(() => sseResponse(errorStream(4023, '模型不存在')), {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        getAvailableAccount: async () => null,
+      } as never,
+    })
+    const { error } = await collect(adapter, generateOptions())
+    expect(error?.message).toMatch(/模型不存在/)
+    expect(error?.message).not.toMatch(/积分/)
+  })
+
+  it('**已产出正文后失败也不追加池结论**（降级直报，与账号数量无关）', async () => {
+    const body = traeSse([
+      { event: 'output', data: { response: '半截' } },
+      { event: 'error', data: { code: 4008, message: 'quota' } },
+    ])
+    const { adapter } = makeAdapter(() => sseResponse(body), {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        getAvailableAccount: async () => null,
+      } as never,
+    })
+    const { error } = await collect(adapter, generateOptions())
+    expect(error?.message).toMatch(/quota/)
+    expect(error?.message).not.toMatch(/全部账号的/)
+  })
+
+  it('**4022 端到端**：错误码为 CONTEXT_WINDOW_EXCEEDED 且文案含上游原文 + 中文说明', async () => {
+    const upstream = "We're sorry, your prompt tokens have exceeded the maximum limit."
+    const { adapter } = makeAdapter(() => sseResponse(errorStream(4022, upstream)))
+    const { error } = await collect(adapter, generateOptions())
+    // 宿主据此压缩上下文并重试 —— 这是 1M token 长会话唯一的补救路径。
+    expect(error?.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    expect(error?.message).toMatch(/code=4022/)
+    expect(error?.message).toMatch(/exceeded the maximum limit/)
+    expect(error?.message).toMatch(/上下文超出上游上限/)
+    expect(error?.message).toMatch(/自动压缩/)
+  })
+
+  it('**4022 不换号**（与账号无关的确定性失败）', async () => {
+    const getAvailableAccount = vi.fn(async () => ({
+      entry: { id: 'acc-2', provider: 'trae-cn' },
+      credential: makeCredential({ access_token: 'AT-2' }),
+    }))
+    const { adapter, calls } = makeAdapter(() => sseResponse(errorStream(4022, 'too long')), {
+      accountPool: {
+        findAccountIdByCredential: async () => 'acc-1',
+        updateModelRateLimit: async () => {},
+        getAvailableAccount,
+      } as never,
+    })
+    const { error } = await collect(adapter, generateOptions())
+    expect(calls).toHaveLength(1)
+    expect(getAvailableAccount).not.toHaveBeenCalled()
+    expect(error?.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+  })
+
+  it('**4006 的文案仍然没有那句中文说明**（反向：本次只动 4022）', async () => {
+    const { adapter } = makeAdapter(() => sseResponse(errorStream(4006, 'prompt too long')))
+    const { error } = await collect(adapter, generateOptions())
+    expect(error?.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    expect(error?.message).toMatch(/prompt too long/)
+    expect(error?.message).not.toMatch(/上下文超出上游上限/)
   })
 
   it('**排队码（4000005）不换号**：只发一次请求，抛可重试错误', async () => {
