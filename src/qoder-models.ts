@@ -1,5 +1,5 @@
 /**
- * Qoder（国际版）模型目录：动态拉取 + 静态兜底 + 12h 缓存。
+ * Qoder 模型目录：动态拉取 + 静态兜底 + 12h 缓存（**国际版与 CN 共用**）。
  *
  * ## 为什么单独成模块
  *
@@ -35,21 +35,53 @@
  *
  * ## roster 会浮动 → 绝不硬编码全表
  *
- * 实测目录与官方 CLI 表、国内版表**三者都不一致**（目录里没有 `lite`、
+ * 实测目录与官方 CLI 表、国内版表**三者都不一致**（国际版目录里没有 `lite`、
  * 没有 `Kimi-K2.7-Code`、没有 `Qwen3.6-Flash`、没有 `MiniMax-M2.7`）。故静态表
  * 只放**本插件确实要在目录不可用时也能播报**的极少项，不做全表镜像。
  *
+ * ## CN 目录（真机 14 项快照）的两点差异
+ *
+ * CN 目录与国际版**字段同构**，差别只在内容：
+ *
+ * 1. **14 项全部 `is_enabled:true`**（国际版 17 项里只有 2 项 true）——
+ *    「只播报 `is_enabled` 项」这条规则不变，但在 CN 上等于**整表播报**；
+ * 2. **id 集合不同**：有 `q37fmodel` / `gm51model`，**没有** `ultimate` /
+ *    `performance` / `efficient` / `smodel` / `cmodel` 这些 tier 项，
+ *    也**没有 `lite`**。
+ *
+ * 解析器（{@link parseQoderDirectory}）**不做任何按 region 的分支** —— 两个
+ * 目录的「读哪些字段、怎么读」逐条相同，差异全在响应内容里。
+ *
  * ## `lite` 的特殊处理（**两条路径不对称，是刻意的**）
  *
- * `lite` 不在官方目录里，但 T2/T3 实测它是 **quota=0 账号上唯一能回 200 的模型**
- * （免费遗留路径，上游路由到 `qwen3-coder-plus`）。它的处理规则：
+ * `lite` 不在**国际版**官方目录里，但 T2/T3 实测它是该 region 的 quota=0 账号上
+ * **唯一能回 200 的模型**（免费遗留路径，上游路由到 `qwen3-coder-plus`）。
+ * 它的处理规则：
  *
  * - **动态目录成功时「不并入」lite** —— 目录是「官方认可集」，把 lite 并进去
  *   等于**伪造官方认可**，用户会以为官方仍在提供它；
  * - **目录整体失败回退静态表时 lite 自然在列** —— 此时没有任何官方数据可用，
  *   把实测可用的 lite 列出来是「尽力而为」而不是「声称官方支持」。
  *
+ * ⚠️ **CN 完全不适用这条**：CN 目录（14 项）与 CN 账号侧都没有 `lite` 的任何
+ * 证据，故 {@link QODER_CN_FALLBACK_MODELS} **不含它**。两个 region 的差别
+ * 不需要额外分支：`lite` 落在哪张静态表里，就决定了它是否被认可。
+ *
  * 该不对称由 {@link effectiveQoderCatalog} 一处收敛，不要在别处再写一份判断。
+ *
+ * ## 兜底表**按 product 分**（两个 region 的可用集不同）
+ *
+ * 静态兜底表不是「一套表两个 region 共用」，而是每个产品一份：
+ *
+ * | 产品 | 兜底表 | 项数 |
+ * |---|---|---|
+ * | {@link QODER} | {@link QODER_FALLBACK_MODELS} | 3（含 `lite`） |
+ * | {@link QODER_CN} | {@link QODER_CN_FALLBACK_MODELS} | 2（**不含 `lite`**） |
+ *
+ * ⚠️ **CN 兜底表刻意不含 `lite`**：CN 目录 14 项里没有它，「免费遗留路径」是
+ * **国际版账号侧**的实测现象，没有任何 CN 证据。把国际版的遗留项混进 CN 兜底，
+ * 产出的是一个**必然不可调**的选项（用户选中即失败，且失败原因与模型名毫无
+ * 关联）—— 那比少列一项糟得多。反向也成立：国际版兜底表**逐字节不变**。
  */
 
 import {
@@ -57,7 +89,7 @@ import {
   qoderPatHeaders,
 } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
-import { QODER } from './qoder-product.js'
+import { QODER, QODER_CN } from './qoder-product.js'
 
 // ── 常量 ──
 
@@ -170,6 +202,51 @@ export const QODER_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
   },
 ]
 
+/**
+ * **CN** 静态兜底表 —— **2 项**：`qmodel_38max` + `qfmodel`。
+ *
+ * 两个 id 与 {@link QODER_FALLBACK_MODELS} 的前两项**同名**（CN 快照里这两项
+ * 同样 `is_enabled:true`，且档位声明逐字段相同），故字段值照抄那一对。
+ *
+ * ⚠️ **不含 `lite`**（理由见模块头）：CN 目录没有它，也没有任何 CN 侧的可用性
+ * 证据。CN 目录的**其他 12 项**同样不进兜底表 —— 它们虽然 `is_enabled:true`，
+ * 但 roster 会浮动，而静态表的定位是「目录不可用时的极小可用集」，不是镜像
+ * （与国际版同一取舍，见 {@link QODER_FALLBACK_MODELS} 的说明）。
+ */
+export const QODER_CN_FALLBACK_MODELS: readonly QoderFallbackModel[] = [
+  {
+    id: 'qmodel_38max',
+    name: 'Qwen3.8-Max',
+    supportsImages: true,
+    contextWindow: 200_000,
+    reasoningEfforts: ['xhigh', 'low', 'medium'],
+    defaultReasoningEffort: 'medium',
+  },
+  {
+    id: 'qfmodel',
+    name: 'Qwen3.8-Flash',
+    supportsImages: true,
+    contextWindow: 200_000,
+    reasoningEfforts: ['xhigh', 'low', 'medium'],
+    defaultReasoningEffort: 'medium',
+  },
+]
+
+/**
+ * 取某产品的静态兜底表。
+ *
+ * **判据只看 `id === 'qoder-cn'`**（显式列举，不做「非 qoder 即 CN」的反向推断）：
+ * 第三个 region 落地时，那条反向推断会**静默**把新 region 也指向 CN 表。
+ *
+ * ⚠️ 本函数同时是「该产品认不认 `lite`」的**唯一真相源**：`lite` 只在国际版
+ * 表里，故 CN 下它按表外模型处理（`resolveModel` 不给展示名、失败时补
+ * 「不在目录」提示）。**不要再写一个独立的 `recognizesLite` 谓词** —— 两份
+ * 判据会分叉，而分叉的后果是 CN 上凭空多出一个必然不可调的选项。
+ */
+export function qoderFallbackModels(product: QoderProduct = QODER): readonly QoderFallbackModel[] {
+  return product.id === QODER_CN.id ? QODER_CN_FALLBACK_MODELS : QODER_FALLBACK_MODELS
+}
+
 // ── 目录条目 ──
 
 /**
@@ -200,12 +277,16 @@ export interface QoderModelEntry {
 }
 
 /**
- * 静态兜底表 → 目录条目。
+ * 静态兜底表 → 目录条目（**按 product**）。
  *
- * 这是「目录失败时」的播报来源，**含 `lite`**（见模块头的两条路径不对称）。
+ * 这是「目录失败时」的播报来源：国际版含 `lite`、CN 不含
+ * （见 {@link qoderFallbackModels} 与模块头的两条路径不对称）。
+ *
+ * `product` 缺省为国际版 —— 与 `fallbackQoderCatalog()` 原有的零参调用形态
+ * 兼容（既有调用点与既有测试一行不改）。
  */
-export function fallbackQoderCatalog(): QoderModelEntry[] {
-  return QODER_FALLBACK_MODELS.map((model) => ({
+export function fallbackQoderCatalog(product: QoderProduct = QODER): QoderModelEntry[] {
+  return qoderFallbackModels(product).map((model) => ({
     id: model.id,
     name: model.name,
     enabled: true,
@@ -227,10 +308,15 @@ export function fallbackQoderCatalog(): QoderModelEntry[] {
  *
  * 传空数组（拉取失败 / 无 `is_enabled` 项）即回退 —— 与「失败不写缓存」配套：
  * 失败根本不会进缓存，故 `undefined` 与 `[]` 在这里等价处理。
+ *
+ * `product` 决定回退**哪一张**静态表（CN 不含 `lite`），缺省为国际版。
  */
-export function effectiveQoderCatalog(remote: readonly QoderModelEntry[] | undefined): QoderModelEntry[] {
+export function effectiveQoderCatalog(
+  remote: readonly QoderModelEntry[] | undefined,
+  product: QoderProduct = QODER,
+): QoderModelEntry[] {
   if (remote !== undefined && remote.length > 0) return [...remote]
-  return fallbackQoderCatalog()
+  return fallbackQoderCatalog(product)
 }
 
 // ── 目录解析 ──
@@ -445,7 +531,8 @@ export async function fetchQoderDirectory(
  *
  * 分开的原因是 trae-cn 已验证的行为约定：**一次网络抖动不该把目录打回静态表**。
  * 若只留一个「过期即 undefined」的读口，TTL 到点后的那次失败刷新会让目录
- * 从「上次成功的完整目录」直接掉到 3 项静态表 —— 用户看到模型列表突然变短。
+ * 从「上次成功的完整目录」直接掉到静态表（国际版 3 项 / CN 2 项）——
+ * 用户看到模型列表突然变短。
  *
  * ## 失败不写缓存
  *

@@ -258,7 +258,7 @@ export interface QoderAuthOptions {
   fetcher?: typeof fetch
   /** 产品配置；默认 {@link QODER}。 */
   product?: QoderProduct
-  /** 服务名覆盖（默认由产品 id 派生为 `qoderAuth`）。 */
+  /** 服务名覆盖（默认取 `product.serviceName`，产品未声明时按 `${id}Auth` 派生）。 */
   serviceName?: string
 }
 
@@ -345,8 +345,11 @@ export class QoderAuth extends Service {
 
   constructor(ctx: Context, private readonly options: QoderAuthOptions = {}) {
     const product = options.product ?? QODER
-    // 产品 id `qoder` 无连字符，`${id}Auth` 机械派生即合法的 JS 标识符风格。
-    super(ctx, options.serviceName ?? `${product.id}Auth`)
+    // 服务名：产品配置显式给出（带连字符的 id，如 `qoder-cn` → `qoderCnAuth`），
+    // 无该字段时按 `${id}Auth` 机械派生（`qoder` 无连字符，派生结果
+    // `qoderAuth` 本身就是合法标识符风格 —— 这是 `QoderProduct.serviceName`
+    // 那条判据的两面）。构造选项里的 `serviceName` 仍可整体覆盖（多实例测试用）。
+    super(ctx, options.serviceName ?? product.serviceName ?? `${product.id}Auth`)
     this.product = product
     this.credentialRefName = this.product.defaultCredentialRef
   }

@@ -1,5 +1,5 @@
 /**
- * Qoder（国际版）LLM 适配器。
+ * Qoder LLM 适配器（**国际版与 CN 共用同一份实现**）。
  *
  * 骨架取自 `src/trae-cn-adapter.ts`（本插件已验证的换号循环与流消费模式），
  * 但**协议差异全部重写**。Qoder 与 Trae CN 在 chat 面几乎处处相反：
@@ -38,7 +38,8 @@
  *
  * `listModels` / `resolveModel` 从**动态目录**（`GET /api/v1/cloud/models`，
  * 只认 PAT）取数，拉取成功时只播报 `is_enabled === true` 的项；目录不可用时
- * 回退静态兜底表（含 `lite`）。12h TTL 缓存，**失败不写缓存**。
+ * 回退**本产品**的静态兜底表（国际版 3 项含 `lite` / CN 2 项不含）。
+ * 12h TTL 缓存，**失败不写缓存**。
  *
  * ⚠️ **`resolveModel` 对表外模型不抛错**（与其余六个 provider 一致）：DSH 约定
  * 「`listModels` 结果仅供参考，模型目录不构成路由白名单」，抛错会让历史会话里
@@ -60,7 +61,7 @@ import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk, TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
-import { QODER, QODER_CHAT_PATH, qoderJobTokenHeaders } from './qoder-product.js'
+import { QODER, QODER_CHAT_PATH, qoderClientType, qoderJobTokenHeaders } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import {
   QODER_OFF_CATALOG_HINT,
@@ -115,13 +116,50 @@ const QODER_MAX_ROTATE = 3
 const QODER_COOLDOWN_MS = 3_600_000
 
 /**
- * 流内错误帧的固定文案前缀。
+ * 官方逃生阀环境变量：覆盖 **chat** 主机的 host 部分。
  *
- * 单独抽出来是因为它有**两个**消费者：错误消息正文与
- * {@link qoderHarnessErrorCode} 的上下文超限判定 —— 两处若各写一份，
- * 改一处忘一处会让「请求超长」不再触发 DSH 的上下文压缩。
+ * 语义照官方 CN CLI（本插件不发明新开关）：官方支持用该环境变量把 chat 请求
+ * 指向别的主机（自建网关 / 代理 / 灰度环境）。
+ *
+ * ⚠️ **只影响 chat**：`openapiBase`（exchange / quota）与 `modelsBase`（目录）
+ * **不受影响** —— 官方语义就是替换模型服务主机，把另外两条控制面也一并改掉
+ * 会让「只换 chat 出口」的用法直接失效（且失败形态是「凭据失效」，难诊断）。
+ *
+ * ⚠️ **两个 region 都生效**（不按 product 分）：它是环境级逃生阀，不是产品配置。
  */
-const QODER_STREAM_LABEL = 'qoder: 上游流内错误'
+const QODER_MODEL_SERVER_HOST_ENV = 'QODER_MODEL_SERVER_HOST'
+
+/**
+ * 应用 {@link QODER_MODEL_SERVER_HOST_ENV} 覆盖（仅 host 部分）。
+ *
+ * **请求时读取**（不是构造时缓存）：逃生阀的语义就是「运行时可切」——
+ * 进程启动后再设环境变量也应生效，故不能像模块常量那样在 import 时定型。
+ *
+ * 取值按官方语义只认「主机」：`host` 或 `host:port`。额外容忍两种书写——
+ * - 带 scheme（`http://host`）：**显式 scheme 优先**。这是有意的超集：裸主机名
+ *   在官方语义里没有 scheme 可继承，只能沿用原基址的 `https`；而写全
+ *   `http://localhost:8080` 的人几乎一定是在指向本地代理，把它悄悄升级成
+ *   https 会得到一个 TLS 失败，排查方向完全跑偏。
+ * - 带路径 / 查询串：**一律丢弃**。路径恒为 {@link QODER_CHAT_PATH}，
+ *   否则「覆盖主机」会顺带改掉端点路径，与变量名和官方语义都不符。
+ *
+ * 空串 / 全空白视为**未设置**（与其它 provider 读环境变量的口径一致：
+ * 空值不是有效覆盖）。
+ *
+ * @param chatBase - `product.chatBase`（如 `https://api2-v2.qoder.sh`）。
+ */
+export function resolveQoderChatBase(chatBase: string): string {
+  const raw = process.env[QODER_MODEL_SERVER_HOST_ENV]
+  if (typeof raw !== 'string' || raw.trim().length === 0) return chatBase
+  const declaredScheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(raw.trim())?.[1]
+  const withoutScheme = raw.trim().replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '')
+  const authority = withoutScheme.split(/[/?#]/, 1)[0] ?? ''
+  if (authority.length === 0) return chatBase
+  // scheme：显式给出的优先，否则沿用原基址（逃生阀只换主机，不该顺带把 https
+  // 降级成 http）。
+  const scheme = declaredScheme ?? /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(chatBase)?.[1] ?? 'https'
+  return `${scheme}://${authority}`
+}
 
 /** 安全读取 `Error.message`。 */
 function errorMessage(error: unknown): string {
@@ -374,8 +412,11 @@ function contentToText(content: unknown): string {
  * ```
  *
  * - `messages` / `tools` **原样透传**（标准 OpenAI 格式，**逐项不改写**）；
- * - `metadata.context.client_type: "qodercli"` 是**出站身份标识**（与 buddy 的
- *   `X-Product-Code` 同类，腾讯/Qoder 后台按它归因用量），**一字符都不能动**；
+ * - `metadata.context.client_type` 是**出站身份标识**（与 buddy 的
+ *   `X-Product-Code` 同类，Qoder 后台按它归因用量），**一字符都不能动**。
+ *   取值由 `product.clientType` 给出、缺省回退 `'qodercli'`（见
+ *   {@link qoderClientType}）：国际版不声明该字段 ⇒ 仍是 `'qodercli'`，
+ *   请求体**逐字节不变**；CN 声明 `'5'`（官方 CN CLI 的默认值）。
  * - `stream` **恒为 true**：本适配器只走流式路径（`stream_options` 同发）。
  *
  * ## `reasoning_effort` 透传不拦截
@@ -384,8 +425,12 @@ function contentToText(content: unknown): string {
  * 首版策略与 trae-cn 的「未验证不盲改」同则：调用方给了就下发，**不主动补档**
  * （DSH 已按 `reasoning.defaultEffort` 在省略时补好，适配器再补一次会与 DSH
  * 的口径分叉）。
+ *
+ * @param options - harness 的生成选项。
+ * @param product - 产品配置；**缺省用国际版**，使既有调用点（与既有测试）
+ *                  一行不改即得到与接入 CN 前逐字节相同的请求体。
  */
-export function buildQoderChatBody(options: GenerateOptions): string {
+export function buildQoderChatBody(options: GenerateOptions, product: QoderProduct = QODER): string {
   const messages = serializeQoderMessages(options.messages)
   if (options.system !== undefined && options.system.length > 0) {
     messages.unshift({ role: 'system', content: options.system })
@@ -395,7 +440,7 @@ export function buildQoderChatBody(options: GenerateOptions): string {
     messages,
     stream: true,
     stream_options: { include_usage: true },
-    metadata: { context: { client_type: 'qodercli' } },
+    metadata: { context: { client_type: qoderClientType(product) } },
   }
   // `tools` 原样透传：Qoder 网关接受 OpenAI 原生 tools 数组（T2 实测）。
   if (options.tools !== undefined && options.tools.length > 0) body.tools = options.tools
@@ -954,6 +999,9 @@ export class QoderAdapter extends LlmAdapter {
    * `is_enabled === true` 的项」，故拿到非空动态目录时**直接播报它**，不并入
    * 静态项（`lite` 因此只在目录失败时出现 —— 那条不对称是刻意的）。
    *
+   * ⚠️ 回退的是**本产品**的静态表（`this.product`）：CN 那张不含 `lite`
+   * （CN 目录与账号侧都没有它的证据，见 `qoder-models.ts` 模块头）。
+   *
    * 黑名单在**播报前**过滤（`disabledModelsFor`）：黑名单是黑名单制（键存在且为
    * `true` 才隐藏），每次调用实时读，改开关后无需重建适配器。它**只影响播报、
    * 不影响路由**（见 {@link resolveModel}）。
@@ -991,7 +1039,8 @@ export class QoderAdapter extends LlmAdapter {
    * 发起请求且没有恢复入口：
    *
    * - 历史会话里保存的旧模型 id（roster 浮动，昨天可用的今天可能不在表里）；
-   * - 目录拉取失败时回退的静态表只有 3 项，而账号其实能用别的模型。
+   * - 目录拉取失败时回退的静态表只有极少数项（国际版 3 项 / CN 2 项），
+   *   而账号其实能用别的模型。
    *
    * 故表外 id **原样路由**，由上游回 402/`invalid_model_error`，届时
    * {@link withOffCatalogHint} 补一句可读提示 —— 与 trae-cn 的 `4001` 提示同源同则。
@@ -999,11 +1048,12 @@ export class QoderAdapter extends LlmAdapter {
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     await this.ensureCatalog()
     // **两级查找**（与 trae-cn 的 `catalogEntries() ?? fallbackIndex` 同构）：
-    // 生效目录优先，未命中再查静态兜底表。第二级不是冗余 —— `lite` 按设计
-    // **不在动态目录里**（见 `qoder-models.ts` 模块头），只有静态表能给它展示名；
-    // 少了这级，`lite` 在目录成功时会退化成「名字就是 id」。
+    // 生效目录优先，未命中再查**本产品**的静态兜底表。第二级不是冗余 —— 国际版的
+    // `lite` 按设计**不在动态目录里**（见 `qoder-models.ts` 模块头），只有静态表
+    // 能给它展示名；少了这级，`lite` 在目录成功时会退化成「名字就是 id」。
+    // CN 的静态表没有 `lite` ⇒ CN 下这级对它自然不命中（按表外处理，是有意的）。
     const entry = this.catalogEntries().find((candidate) => candidate.id === model)
-      ?? fallbackQoderCatalog().find((candidate) => candidate.id === model)
+      ?? fallbackQoderCatalog(this.product).find((candidate) => candidate.id === model)
     const resolved: LlmResolvedModelInfo = {
       provider,
       id: model,
@@ -1073,9 +1123,9 @@ export class QoderAdapter extends LlmAdapter {
     }
   }
 
-  /** 当前生效的目录（动态优先，失败/空回退静态表）。 */
+  /** 当前生效的目录（动态优先，失败/空回退本产品的静态表）。 */
   private catalogEntries(): readonly QoderModelEntry[] {
-    return effectiveQoderCatalog(this.catalog.entries())
+    return effectiveQoderCatalog(this.catalog.entries(), this.product)
   }
 
   /**
@@ -1084,12 +1134,16 @@ export class QoderAdapter extends LlmAdapter {
    * ## 两道都要过：目录已确证 + 不是我们已知可用的 id
    *
    * 1. **只在动态目录已成功拉到**（`catalog.entries()` 有值）时才敢谈「不在目录中」
-   *    —— 那时目录是权威的完整集，表外即真的不可用。回退静态表时我们只有 3 项
-   *    （账号实际能用的远不止这些），对任何别的模型说「不在目录」都是**错的**。
-   * 2. **静态兜底表里的 id 恒不算「表外」**（含 `lite`）。`lite` 按设计不在动态
-   *    目录里，却是 quota=0 账号上**唯一实测可用**的模型（T2/T3）—— 对它说
-   *    「已不在可用目录中，请重选」会把用户从唯一能用的模型上劝走，是**有害**的
-   *    误导。同理两个目录项也已确证官方启用。
+   *    —— 那时目录是权威的完整集，表外即真的不可用。回退静态表时我们只有极少数
+   *    项（国际版 3 / CN 2，账号实际能用的远不止这些），对任何别的模型说
+   *    「不在目录」都是**错的**。
+   * 2. **本产品静态兜底表里的 id 恒不算「表外」**。国际版下这一条为 `lite` 而设：
+   *    它按设计不在动态目录里，却是 quota=0 账号上**唯一实测可用**的模型
+   *    （T2/T3）—— 对它说「已不在可用目录中，请重选」会把用户从唯一能用的模型上
+   *    劝走，是**有害**的误导。同理两个目录项也已确证官方启用。
+   *    ⚠️ **CN 下这张表不含 `lite`**，于是 CN 上 `lite` 会正常被判为表外 ——
+   *    这是**刻意**的（CN 目录与账号侧都没有它的任何证据，见 `qoder-models.ts`
+   *    模块头）。两个 region 的差别不需要额外分支：它由「查哪张表」自然导出。
    *
    * 任一条件不满足即返回 false（不补提示）：宁可少说一句，也不给误导性建议。
    */
@@ -1097,7 +1151,7 @@ export class QoderAdapter extends LlmAdapter {
     const remote = this.catalog.entries()
     if (remote === undefined) return false
     if (remote.some((candidate) => candidate.id === model)) return false
-    if (fallbackQoderCatalog().some((candidate) => candidate.id === model)) return false
+    if (fallbackQoderCatalog(this.product).some((candidate) => candidate.id === model)) return false
     return true
   }
 
@@ -1169,7 +1223,7 @@ export class QoderAdapter extends LlmAdapter {
       }
     }
 
-    const body = buildQoderChatBody(options)
+    const body = buildQoderChatBody(options, this.product)
 
     // ⚠️ **刻意不在这里拉目录**（只读已就绪的缓存）。
     //
@@ -1476,8 +1530,20 @@ export class QoderAdapter extends LlmAdapter {
     // 注意：不用 `new Headers(...)` —— Headers 构造器会丢弃/规范化部分头，
     // 普通对象逐字传递（与 credits 模块一致），避免两处请求头形态不一致。
     const headers = qoderJobTokenHeaders(jobToken, this.product, 'text/event-stream')
+    // Cosy 头：**只在产品声明了 `cosyVersion` 时才发**（CN 特有）。国际版不声明
+    // ⇒ 零头变化。两处口径同源（`product.cosyVersion`），不要在这里再写一份判断。
+    //
+    // ⚠️ `Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不发**：官方对它们是
+    // 条件性发送，本插件不猜机器身份（见 `QoderProduct.cosyVersion` 的注释）。
+    if (this.product.cosyVersion !== undefined) {
+      headers['Cosy-ClientType'] = qoderClientType(this.product)
+      headers['Cosy-Version'] = this.product.cosyVersion
+    }
+    // chat 主机：**每次请求时**读 `QODER_MODEL_SERVER_HOST`（逃生阀语义 = 运行时可切，
+    // 故不能在构造时缓存）。只覆盖 chat，openapi / models 两条控制面不受影响。
+    const chatBase = resolveQoderChatBase(this.product.chatBase)
     try {
-      return await this.fetchImpl(`${this.product.chatBase}${QODER_CHAT_PATH}`, {
+      return await this.fetchImpl(`${chatBase}${QODER_CHAT_PATH}`, {
         method: 'POST',
         headers,
         body,

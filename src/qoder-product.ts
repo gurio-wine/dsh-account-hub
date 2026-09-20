@@ -1,5 +1,14 @@
 /**
- * Qoder（国际版）provider 产品配置 + 协议常量 + 凭据结构与纯函数。
+ * Qoder provider 产品配置 + 协议常量 + 凭据结构与纯函数（**两个 region**：
+ * 国际版 {@link QODER} 与国内版 {@link QODER_CN}）。
+ *
+ * ## 两个 region 是同一份协议的两套 host
+ *
+ * 真机探测已确证 Qoder CN 与国际版**同协议双 region**：exchange / quota /
+ * models 三个端点的错误信封逐字节同构、PAT 前缀同为 `pt-`、目录字段同构。
+ * 故差异**全部收敛在 {@link QoderProduct} 的字段值**里，实现只有一份
+ * （`qoder-auth` / `qoder-adapter` / `qoder-models` / `qoder-credits` 四处
+ * 一律按传入的 `product` 现算）。每个字段的证据强度已在下方常量处逐条标注。
  *
  * ## 为什么本文件同时承载「配置」与「协议纯函数」
  *
@@ -34,7 +43,18 @@
 // 故取值链只有一条：**产品配置字段（`QoderProduct.openapiBase` 等）← 本节的
 // 常量**，所有消费点一律走 `product.*`（`qoder-auth` / `qoder-adapter` /
 // `qoder-models` / `qoder-credits` 四处均已如此）。新增消费点时请照办，
-// 不要把本节的常量 import 出去。
+// 不要把本节的常量 import 出去。CN 的基址同理：常量名带 `_CN_` 后缀，
+// 只被 `QODER_CN` 消费。
+//
+// ## CN 基址的证据强度（**逐个不同，不要一概而论**）
+//
+// | 常量 | 验证状态 |
+// |---|---|
+// | `QODER_CN_OPENAPI_BASE` | ✅ 真机实测 200 |
+// | `QODER_CN_MODELS_BASE` | ✅ 真机实测 200 |
+// | `QODER_CN_CHAT_BASE` | 🔴 **源码定案、未实测**（探测时整机 503，见该常量注释） |
+// | `QODER_CN_PAT_URL` | 官方 CN 文档明写 |
+// | `QODER_CN_USER_AGENT` | ⚠️ 从 CN CLI 包名 + 版本推断，未实测 |
 
 /**
  * OpenAPI 基址：换令牌（`jobToken/exchange`）与额度（`quota/usage`）端点。
@@ -69,6 +89,50 @@ export const QODER_MODELS_BASE = 'https://api.qoder.com'
  */
 export const QODER_USER_AGENT = 'qoder/1.1.16'
 
+// ── CN（国内版）基址 ──
+
+/**
+ * **CN** OpenAPI 基址：换令牌（`jobToken/exchange`）与额度（`quota/usage`）。
+ *
+ * ✅ 真机实测 200。
+ */
+export const QODER_CN_OPENAPI_BASE = 'https://openapi.qoder.com.cn'
+
+/**
+ * **CN** chat 基址：OpenAI 兼容的 `/model/v1/chat/completions`。
+ *
+ * 🔴 **源码定案、真机未验证**：取值为官方 CN CLI
+ * （`@qodercn-ai/qoderclicn@1.1.58`）里的选区常量
+ * `CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"` —— `_o` 为真走
+ * `gateway.qoder.com.cn`（CN），为假走国际版。
+ *
+ * ⚠️ **探测时该主机整机 503**（阿里云 ALB 无健康后端；官方 CN CLI 同样打不通），
+ * 故无法用一次真实请求把它从「源码候选」升格为「实测值」。实现**照常按此值**
+ * 构造，错误自然直报上游 —— 不要因为「测不通」就改成国际版 host：那会把
+ * 「上游暂时不可用」伪装成「凭据失效」，方向完全错。
+ *
+ * ⚠️ 另注意它与国际版不同**不带** `-v2` 段（`api2-v2.qoder.sh` vs
+ * `gateway.qoder.com.cn`）—— 不要按「同形替换」去猜。
+ */
+export const QODER_CN_CHAT_BASE = 'https://gateway.qoder.com.cn'
+
+/**
+ * **CN** 模型目录基址：`GET /api/v1/cloud/models`。
+ *
+ * ✅ 真机实测 200（14 项，**全部** `is_enabled:true`）。
+ */
+export const QODER_CN_MODELS_BASE = 'https://api.qoder.com.cn'
+
+/**
+ * **CN** User-Agent。
+ *
+ * ⚠️ **未验证**：由 CN CLI 包名（`@qodercn-ai/qoderclicn`）+ 版本号 `1.1.58`
+ * 推断成 `qodercn/1.1.58`，与国际版的 `qoder/<版本>` 同构。chat 主机 503
+ * 期间**无法 A/B**，故只能按此形态发。它与 `clientType` 一样属**出站身份标识**，
+ * 真机可用后若被证伪，只改这一处常量即可。
+ */
+export const QODER_CN_USER_AGENT = 'qodercn/1.1.58'
+
 // ── PAT ──
 
 /** PAT 前缀（官方文档：`QODER_PAT="pt-your-token-here"`）。 */
@@ -81,6 +145,15 @@ export const QODER_PAT_PREFIX = 'pt-'
  * 用户必须先在这个页面拿到 PAT 才能粘贴进来。
  */
 export const QODER_PAT_URL = 'https://qoder.com/account/integrations'
+
+/**
+ * **CN** PAT 签发页。
+ *
+ * 官方 CN 文档明写 `qoder.cn/account/integrations`（与国际版同路径、不同域名）。
+ * 两个 region 的 PAT **不通用**，故该 URL 必须随产品切换 —— 把用户送到国际版
+ * 签发页，他拿到的 PAT 在 CN 上会被判「凭据失效」。
+ */
+export const QODER_CN_PAT_URL = 'https://qoder.cn/account/integrations'
 
 // ── 端点路径 ──
 
@@ -462,23 +535,39 @@ export function qoderJobTokenHeaders(
 // ── 产品配置 ──
 
 /**
- * Qoder 产品配置。
+ * Qoder 产品配置（一份配置描述一个 region）。
  *
  * 与 `BuddyProduct` / `LobsteraiProduct` / `TraeCnProduct` 平行，字段全部为
  * Qoder 实际需要的。
  *
- * **刻意没有 `serviceName` 字段**：产品 id 为 `qoder`（无连字符），
- * `${id}Auth` 机械派生即合法标识符 `qoderAuth`，与 `LobsteraiProduct` 同形。
- * 需要显式 `serviceName` 的只有 id 带连字符的产品（`trae-cn` → `traeCnAuth`、
- * `buddy-cn` → `buddyCnAuth`），它们的机械派生会得到非标识符风格的
- * `trae-cnAuth` / `buddy-cnAuth`。新增 provider 时请守住这条判据，
- * 不要为了「形态统一」给无连字符的产品也加一个字段。
+ * ## `serviceName` 是**可选**字段，判据是「机械派生合不合法」
+ *
+ * 服务名默认由产品 id 派生（`${id}Auth`）。`qoder`（无连字符）机械派生得到
+ * `qoderAuth`，**本身就是合法的 JS 标识符风格**，故 {@link QODER} **刻意不声明**
+ * 该字段 —— 这是 AGENTS.md「LLM Provider 约定」里钉死的**反面判据**。
+ * 需要显式声明的只有 id 带连字符的产品：`trae-cn` → `traeCnAuth`、
+ * `buddy-cn` → `buddyCnAuth`，以及本 region 的 `qoder-cn` → `qoderCnAuth`
+ * （机械派生会得到非标识符风格的 `qoder-cnAuth`）。
+ *
+ * ⚠️ **判据是「派生结果合不合法」，不是「所有 provider 都得声明」**：为了
+ * 「形态统一」给无连字符的产品也补一个字段，会让这条判据失去判别力。
+ *
+ * ## 三个出站身份字段（`clientType` / `cosyVersion` / `userAgent`）
+ *
+ * 它们与 buddy 的 `X-Product-Code` 同类 —— **后台按它们归因用量，一字符都不能改**。
+ * 缺省语义见各字段注释。
  */
 export interface QoderProduct {
   /** provider 标识：注册到 `ctx.llm` 的路由名，也是账号列表的 provider 字段值。 */
-  id: 'qoder'
+  id: 'qoder' | 'qoder-cn'
   /** 设置页 / 模型选择器展示名。 */
   displayName: string
+  /**
+   * cordis 服务名（`ctx.<serviceName>`）；**缺省时由产品 id 机械派生 `${id}Auth`**。
+   *
+   * 只在「机械派生结果不是合法标识符风格」时才声明（见接口头的判据）。
+   */
+  serviceName?: string
   /** OpenAPI 基址（换令牌 / 额度）。 */
   openapiBase: string
   /** chat 基址（OpenAI 兼容对话）。 */
@@ -495,15 +584,52 @@ export interface QoderProduct {
   defaultCredentialRef: string
   /** 账号池凭据 ref 前缀。 */
   accountCredentialRefPrefix: string
+  /**
+   * chat 请求体 `metadata.context.client_type` 的取值。
+   *
+   * **缺省回退 `'qodercli'`**（见 {@link qoderClientType}）—— 国际版的实测可用值，
+   * 故 {@link QODER} 不必显式填写、行为逐字节不变。
+   *
+   * CN 取 `'5'`：来自官方 CN CLI 的 `kg()` 默认值
+   * `process.env.CLIENT_TYPE ?? "5"`（⚠️ **源码值，未实测**）。
+   */
+  clientType?: string
+  /**
+   * Cosy 头版本号（`Cosy-Version`）；**存在时才发 Cosy 头**。
+   *
+   * CN 特有：官方 CN CLI 在 chat 请求上带 `Cosy-ClientType`（= `clientType`）
+   * 与 `Cosy-Version`（= CLI 版本 `1.1.58`）。国际版**不发**（现有实现实测可用），
+   * 故 {@link QODER} 不填该字段 ⇒ 零头变化。
+   *
+   * ⚠️ **`Cosy-MachineOS` / `Cosy-MachineHostname` 刻意不实现**：官方对这两个头是
+   * **条件性**发送（读到机器信息才发），本插件**不猜机器身份** —— 与其发一个
+   * 编造的主机名，不如不发（缺头比错头安全：错头会被后台当真记进设备维度）。
+   */
+  cosyVersion?: string
 }
 
 /**
- * Qoder provider 配置。
+ * chat 请求体的 `metadata.context.client_type` 取值（缺省回退）。
+ *
+ * 单独抽成函数是让「缺省」这条语义**只有一处**：国际版
+ * （{@link QODER} 不声明 `clientType`）与显式声明 `'qodercli'` 必须得到
+ * **逐字节相同**的请求体，两处各写一份字符串就会在将来分叉。
+ */
+export function qoderClientType(product: QoderProduct): string {
+  return product.clientType ?? 'qodercli'
+}
+
+/**
+ * Qoder（**国际版**）provider 配置。
  *
  * 与其它五条协议线**完全不同源**：没有浏览器 OAuth，登录形态是
  * **PAT 粘贴**（PAT → exchange → jt → Bearer）。故不注册回调服务器、
  * 不做两段式登录（`account.create` 收到 PAT 后当场 exchange 验证即可返回，
  * 不存在「等用户操作 10 分钟」的窗口）。
+ *
+ * ⚠️ **本配置刻意不声明 `clientType`**（缺省即国际版实测值 `'qodercli'`）——
+ * 与 `serviceName` 同一判据：只在「缺省不成立」时才填字段。这样国际版的
+ * 出站请求体与本 region 落地前**逐字节相同**（有单测钉死）。
  */
 export const QODER: QoderProduct = {
   id: 'qoder',
@@ -518,8 +644,61 @@ export const QODER: QoderProduct = {
   accountCredentialRefPrefix: QODER_ACCOUNT_REF_PREFIX,
 }
 
-/** 全部 Qoder 产品配置（当前只有一个，保留数组以便将来扩展，如国内版 `qoder-cn`）。 */
-export const ALL_QODER_PRODUCTS: readonly QoderProduct[] = [QODER]
+/**
+ * Qoder **CN（国内版）** provider 配置。
+ *
+ * ## 与国际版的关系：同协议、双 region
+ *
+ * 真机探测确证两者**同协议**：exchange / quota / models 的错误信封逐字节同构、
+ * PAT 前缀同为 `pt-`、目录字段同构。故本配置不引入任何新代码路径，
+ * 只是**另一组 host + 另一组出站身份值**。
+ *
+ * ⚠️ **两个 region 的账号、用量、PAT 互不相通**：拿国际版 host 打 CN 凭据
+ * （或反之）得到的是「凭据失效」的假象。故所有基址都必须走 `product.*`。
+ *
+ * ## 逐字段的证据强度（不要当成同等可信）
+ *
+ * | 字段 | 取值 | 状态 |
+ * |---|---|---|
+ * | `openapiBase` | `openapi.qoder.com.cn` | ✅ 实测 200 |
+ * | `modelsBase` | `api.qoder.com.cn` | ✅ 实测 200 |
+ * | `chatBase` | `gateway.qoder.com.cn` | 🔴 源码定案（官方 CN CLI 选区常量）；探测时整机 503 |
+ * | `patUrl` | `qoder.cn/account/integrations` | 官方 CN 文档明写 |
+ * | `userAgent` | `qodercn/1.1.58` | ⚠️ 由包名 + 版本推断，未实测 |
+ * | `clientType` | `"5"` | ⚠️ 源码值（CN CLI `kg()` 默认），未实测 |
+ * | `cosyVersion` | `1.1.58` | 同 `userAgent` 的版本来源（CN CLI 版本） |
+ *
+ * ## `serviceName` 必须显式声明
+ *
+ * id `qoder-cn` **带连字符**，`${id}Auth` 机械派生会得到非标识符风格的
+ * `qoder-cnAuth` ⇒ 显式给 `qoderCnAuth`（与 `trae-cn` / `buddy-cn` 同一先例）。
+ * 这正是接口头那条判据的**正面用例**（`qoder` 是反面用例）。
+ *
+ * ## 凭据隔离
+ *
+ * `QODER_CN_ACCOUNT` / `QODER_CN_PERSONAL_TOKEN` 与其它 provider 完全隔离。
+ * 带连字符的 provider id 在 `src/jet-hub-rpc.ts` 的 `accountCredentialRefName`
+ * 里会被 `toUpperCase().replace(/-/g, '_')` 转成 `QODER_CN_ACCOUNT_*`——
+ * 与本配置的前缀**逐字符一致**（该转换机制已存在，本段无需改动）。
+ */
+export const QODER_CN: QoderProduct = {
+  id: 'qoder-cn',
+  displayName: 'Qoder CN',
+  serviceName: 'qoderCnAuth',
+  openapiBase: QODER_CN_OPENAPI_BASE,
+  chatBase: QODER_CN_CHAT_BASE,
+  modelsBase: QODER_CN_MODELS_BASE,
+  userAgent: QODER_CN_USER_AGENT,
+  patPrefix: QODER_PAT_PREFIX,
+  patUrl: QODER_CN_PAT_URL,
+  defaultCredentialRef: 'QODER_CN_PERSONAL_TOKEN',
+  accountCredentialRefPrefix: 'QODER_CN_ACCOUNT',
+  clientType: '5',
+  cosyVersion: '1.1.58',
+}
+
+/** 全部 Qoder 产品配置（国际版在前，`QODER` 恒为首项）。 */
+export const ALL_QODER_PRODUCTS: readonly QoderProduct[] = [QODER, QODER_CN]
 
 /**
  * 按 provider id 取 Qoder 产品配置；未知 id 返回 undefined。
