@@ -38,6 +38,22 @@
 
 Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Trae CN Work **与 Trae CN 是同一批账号**故签到只在后者提供；Qoder 与 Qoder CN **都不提供**（国际版无此活动、CN **疑似有但端点未知**，见能力矩阵表）。Trae CN 的签到与余额**前后端及宿主接线均已就绪**（`src/trae-cn-credits.ts` + 客户端能力矩阵 + `jet-hub-rpc.ts` 三处分支与 `traeCn` 实例传参）。T5 / T7 已真机校准；**T9 已于 2026-09-20 第三次修正**（原「不校验设备号形态」的推论被单变量 A/B 推翻，真根因是设备身份）。见「积分能力必须在请求前判定」与 README 的「Trae CN provider」章节。**八个 provider 都有 Account Hub 面板**（Trae CN Work 那条见下节，Qoder 与 Qoder CN 那两条见 README 的「Qoder provider」）。
 
+### Qoder 国际版（`qoder`）—— chat 250 的两条硬事实
+
+⚠️ **`tools` 必须包裹成 OpenAI 标准形态（2026-09-21 真机报障根因）**：`buildQoderChatBody` 必须把 harness 的
+`ToolSchema`（`{name,description,parameters}`）翻译成 `{type:'function',function:{…}}` 再发（`serializeQoderTools`）。
+**原样透传会让非 `lite` 模型恒回 HTTP 200 流内 `provider_error`**（用户可见 `Qoder 上游返回包装码 provider_error
+（未能从 details 中二次解析出真码）：Error in upstream response` + harness 码 `INVALID_REQUEST`），details 原文
+`'function' is a required property, expected an object - 'tools.0'`。⚠️ **`lite` 是唯一两种形态都不报错的模型**
+（走上游宽松兼容路径）—— 这正是它逃过 T2 的原因（T2 发的是手写 OpenAI 形态，不是 `GenerateOptions.tools` 的形态）。
+包裹后 `qmodel`/`gmodel`/`dmodel`/`lite` 实测仍回标准结构化 `tool_calls`，其余六个 provider 也都是这么包的（Qoder 曾是唯一例外）。
+
+⚠️ **`provider_error` 的真因在 `details`，且有多种形态**：`details.error.code`（T3 原形态）、**整段带 `data: ` 前缀的
+SSE 帧原文**、只有 `details.error.message`/根层 `message`（无 code）、`details.error.code` 是业务文本（如 `"1210"`）。
+`parseQoderWrappedDetail` 必须**既认码也认文案**（只认码会让多数形态退化成「未能从 details 中二次解析出真码」）；
+**流内** `provider_error` 帧的真因同样只在 `details` 里 —— 故 `parseQoderStreamErrorPayload` 带出 `details`、
+适配器流内分支必须把它作为 `body` 传给分类器（此前两者都缺，是真因被藏的次要成因）。
+
 ### Qoder CN（`qoder-cn`）—— 第二 region 的两条要点
 
 `qoder-cn`（显示名 **Qoder CN**）与 `qoder`（国际版）**同协议双 region**：exchange / quota / models 三个端点的错误信封逐字节同构、PAT 前缀同为 `pt-`、目录字段同构，故**代码只有一份**（`src/qoder*.ts` 按传入的 `product` 现算），差异全部收敛在 `src/qoder-product.ts` 的两份 `QoderProduct` 配置里。

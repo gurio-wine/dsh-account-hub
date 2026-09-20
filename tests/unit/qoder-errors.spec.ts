@@ -347,6 +347,111 @@ describe('Qoder 形态 C（400 provider_error）', () => {
 
     expect(result.wrappedCode).toBeUndefined()
   })
+
+  it('details 是流内 error 帧原文（带 `data: ` 前缀）时也能解出真码', () => {
+    // ⚠️ 真机实测（2026-09-21，`qmodel` + Raw 形态 tools）：details 的值竟是
+    // **一整个 SSE 帧的原文**（`data: {"error":{…}}`，末尾还带两个换行），
+    // 不是纯 JSON —— `JSON.parse` 必然抛异常。
+    // 原文：details = 'data: {"error":{"code":"invalid_parameter_error",…},"id":"chatcmpl-…"}\n\n'
+    const body = JSON.stringify({
+      code: 'provider_error',
+      message: 'Error in upstream response',
+      type: 'provider_error',
+      details: 'data: {"error":{"code":"invalid_parameter_error","param":null,'
+        + '"message":"\'function\' is a required property, expected an object - \'tools.0\'",'
+        + '"type":"invalid_request_error"},"id":"chatcmpl-0643bca2-…"}\n\n',
+    })
+
+    const result = classifyQoderError({
+      httpStatus: 400, code: 'provider_error', message: 'Error in upstream response', body,
+    })
+
+    expect(result.wrappedCode).toBe('invalid_parameter_error')
+    expect(result.message).toContain('invalid_parameter_error')
+  })
+
+  it('details.error 没有 code 时，从 details.error.message 里榨出上游真因', () => {
+    // ⚠️ 真机实测的**第二种新形态**：不同上游后端填 details 的字段各不相同，
+    // `details.error.code` 经常缺席，真因只在 `error.message` 里：
+    //   kmodel：{"error":{"message":"Invalid request: unknown tool type: , currently only
+    //            function and plugin are supported","type":"invalid_request_error"}}
+    //   mmodel：{"type":"error","error":{"type":"bad_request_error","message":"invalid params,
+    //            invalid tool type:  (2013)","http_code":"400"},"request_id":"…"}
+    // 旧解析器只认 `error.code` / 根层 `code`，于是这两种都退化成
+    // 「未能从 details 中二次解析出真码」—— 真因被藏进壳里（用户报障的次要成因）。
+    const kmodelDetails = '{"error":{"message":"Invalid request: unknown tool type: , '
+      + 'currently only function and plugin are supported","type":"invalid_request_error"}}'
+    const mmodelDetails = '{"type":"error","error":{"type":"bad_request_error","message":'
+      + '"invalid params, invalid tool type:  (2013)","http_code":"400"},"request_id":"06fee2f9"}'
+
+    // 每个 fixture 断言它**自己**那句真因（两者文案不同，不能共用一条 substring）。
+    const cases: ReadonlyArray<{ details: string; reason: string }> = [
+      { details: kmodelDetails, reason: 'unknown tool type' },
+      { details: mmodelDetails, reason: 'invalid tool type' },
+    ]
+
+    for (const testCase of cases) {
+      const body = JSON.stringify({
+        code: 'provider_error',
+        message: 'Error in upstream response',
+        type: 'provider_error',
+        details: testCase.details,
+      })
+      const result = classifyQoderError({
+        httpStatus: 400, code: 'provider_error', message: 'Error in upstream response', body,
+      })
+
+      // 没有数字/字符串业务码可给时**不编造码**（wrappedCode 保持 undefined），
+      // 但真因必须透出到用户文案里。
+      expect(result.wrappedCode, testCase.details).toBeUndefined()
+      expect(result.message, testCase.details).toContain(testCase.reason)
+      expect(result.message, testCase.details).not.toContain('未能从 details 中二次解析出真因')
+    }
+  })
+
+  it('details.error.code 是业务文本（如 "1210"）时照常解出并透出文案', () => {
+    // gmodel 真机原文：details.error.code = "1210"，message 是中文。
+    const body = JSON.stringify({
+      code: 'provider_error', message: 'Error in upstream response', type: 'provider_error',
+      details: '{"error":{"code":"1210","message":"API 调用参数有误，请检查文档。"}}',
+    })
+    const result = classifyQoderError({
+      httpStatus: 400, code: 'provider_error', message: 'Error in upstream response', body,
+    })
+
+    expect(result.wrappedCode).toBe('1210')
+    expect(result.message).toContain('1210')
+    expect(result.message).toContain('请检查文档')
+  })
+
+  it('流内 provider_error 帧的 details 同样能被解出（帧解析器不得丢弃它）', () => {
+    // ⚠️ **用户报障的次要成因**：流内 error 帧走 `parseQoderStreamErrorPayload`，
+    // 而它只读 code/message，**把 details 整个丢掉**；适配器调用分类器时也没传
+    // body（`qoder-adapter.ts` 的流内分支）—— 于是流内 provider_error 的真因
+    // 永远显示成「未能从 details 中二次解析出真码」。
+    // 真机原文（HTTP 200 流内，`kmodel`）：
+    const payload = JSON.parse(
+      '{"code":"provider_error","message":"Error in upstream response",'
+      + '"request_id":"4e15912aef3c-70db-8684-97c3-6a154c09","type":"provider_error",'
+      + '"details":"{\\"error\\":{\\"message\\":\\"Invalid request: unknown tool type: , '
+      + 'currently only function and plugin are supported\\",\\"type\\":\\"invalid_request_error\\"}}"}',
+    ) as unknown
+
+    const frame = parseQoderStreamErrorPayload(payload)
+    expect(frame.code).toBe('provider_error')
+    // 帧解析结果必须带上 details（新字段），适配器才能把它交给分类器做二次解析。
+    expect(frame.details).toContain('unknown tool type')
+
+    const result = classifyQoderError({
+      httpStatus: 200,
+      code: frame.code,
+      message: frame.message,
+      source: 'chat',
+      ...frame.details === undefined ? {} : { body: frame.details },
+    })
+    expect(result.message).toContain('unknown tool type')
+    expect(result.message).not.toContain('未能从 details 中二次解析出真码')
+  })
 })
 
 // ── 7. parseQoderWrappedDetailCode ─────────────────────────────────────────

@@ -144,7 +144,22 @@ describe('buildQoderChatBody', () => {
     expect(body.stream_options).toEqual({ include_usage: true })
   })
 
-  it('messages / tools 原样透传（不做任何形态改写）', () => {
+  it('tools 包裹成 OpenAI 标准形态 `{type:function,function:{…}}`（真机报障根因，见下）', () => {
+    // ⚠️ 曾经的实现是「原样透传」（`expect(body.tools).toEqual(tools)`），
+    // 那是**错的**：harness 的 `ToolSchema` 是 `{name,description,parameters}`，
+    // 而 Qoder 的 chat 端点要的是 OpenAI 标准 `{type:'function',function:{…}}`。
+    //
+    // 真机证据（2026-09-21，国际版 PAT 实测，全程走本函数构造请求）：
+    //   同一请求唯一变量 = tools 形态，模型 `qmodel`（Qwen3.7-Plus）：
+    //   - Raw 透传 → HTTP 200 流内 `provider_error`，
+    //     details 原文：`'function' is a required property, expected an object - 'tools.0'`
+    //     用户可见：`Qoder 上游返回包装码 provider_error（未能从 details 中二次解析出真码）：
+    //               Error in upstream response` + harness 码 INVALID_REQUEST（即用户报障原文）
+    //   - OpenAI 标准包裹 → `[DONE]=true` 正常收尾
+    //   其余模型同型：`kmodel`（`unknown tool type: , currently only function and plugin
+    //   are supported`）、`dmodel`（`tools[0].type: unknown variant ... expected function`）、
+    //   `mmodel` / `gmodel`（`invalid tool type`、`API 调用参数有误`）全部只在 Raw 形态下失败。
+    //   `lite` 走宽松路径两种形态都成功 —— 所以这个缺陷只在非 lite 模型上暴露。
     const tools = [{
       name: 'read',
       description: '读文件',
@@ -152,10 +167,22 @@ describe('buildQoderChatBody', () => {
     }]
     const options = generateOptions({ tools })
     const body = JSON.parse(buildQoderChatBody(options)) as Record<string, unknown>
-    // 逐字段深比较：tools 与 harness 给的对象**完全相同**（Qoder 收 OpenAI 原生数组）。
-    expect(body.tools).toEqual(tools)
+    expect(body.tools).toEqual([{
+      type: 'function',
+      function: {
+        name: 'read',
+        description: '读文件',
+        parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+      },
+    }])
+    // messages 仍然原样透传（这条没变，也不要顺手改）。
     const messages = body.messages as Array<Record<string, unknown>>
     expect(messages[0]).toEqual({ role: 'user', content: 'hi' })
+  })
+
+  it('tools 为空数组时不下发该字段（包裹逻辑不得凭空造出空 tools）', () => {
+    const body = JSON.parse(buildQoderChatBody(generateOptions({ tools: [] }))) as Record<string, unknown>
+    expect('tools' in body).toBe(false)
   })
 
   it('system 作为首条 system 消息前置', () => {

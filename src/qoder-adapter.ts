@@ -401,6 +401,57 @@ function contentToText(content: unknown): string {
 }
 
 /**
+ * 把 harness 的 `ToolSchema[]` 翻译成 **OpenAI 标准 tools 数组**。
+ *
+ * ## 为什么必须包裹（真机报障根因，2026-09-21）
+ *
+ * harness 的 `ToolSchema` 是 `{name, description, parameters}` —— **不是** OpenAI
+ * 的 `{type:'function', function:{…}}`。曾经这里把它们**原样透传**，注释还写着
+ * 「Qoder 网关接受 OpenAI 原生 tools 数组（T2 实测）」——T2 测的是**它自己手写的
+ * OpenAI 形态**，不是 `GenerateOptions.tools` 的形态，于是这条注释把「透传」
+ * 这个错误结论合法化了。
+ *
+ * 真机证据（国际版 PAT，全程走本文件的 {@link buildQoderChatBody} 构造请求；
+ * 唯一变量 = tools 形态，模型 `qmodel` / Qwen3.7-Plus）：
+ *
+ * | tools 形态 | 结果 |
+ * |---|---|
+ * | Raw 透传（曾经） | HTTP 200 + **流内 `provider_error`**，用户可见文本即报障原文：<br>`Qoder 上游返回包装码 provider_error（未能从 details 中二次解析出真码）：Error in upstream response`（harness 码 `INVALID_REQUEST`） |
+ * | OpenAI 标准包裹（现在） | `[DONE]=true`，正常收尾 |
+ * | 不下发 tools | `[DONE]=true`，正常收尾 |
+ *
+ * `details` 里上游把话说明白了（各上游后端文案不同，都指向同一个错）：
+ * `'function' is a required property, expected an object - 'tools.0'`（`qmodel`）、
+ * `Invalid request: unknown tool type: , currently only function and plugin are supported`
+ * （`kmodel`）、`tools[0].type: unknown variant ..., expected function`（`dmodel`）、
+ * `invalid params, invalid tool type: (2013)`（`mmodel`）。
+ *
+ * ⚠️ **`lite` 是唯一两种形态都不报错的模型**（它走上游的宽松兼容路径），所以这个
+ * 缺陷只在**非 lite 模型**上暴露 —— 这也是它没在 T2 那轮被发现的原因。
+ *
+ * 包裹后**功能未受损**：`qmodel` / `gmodel` / `dmodel` / `lite` 四个模型实测仍回
+ * 标准结构化 `tool_calls`（`read_file` + `{"path": "a.txt"}`），T2 的结论成立。
+ *
+ * 与其余六个 provider 的做法一致（`buddy-adapter.ts` / `llm-adapter.ts` /
+ * `lobsterai-adapter.ts` 都是这么包的）——本 provider 此前是唯一的例外。
+ *
+ * `type` 恒为 `'function'`：harness 只表达函数型工具，而 Qoder 上游的
+ * `unknown tool type` 报错正说明该字段**必填且值必须是 `function`**。
+ */
+function serializeQoderTools(
+  tools: readonly { name: string; description: string; parameters: Record<string, unknown> }[],
+): Array<Record<string, unknown>> {
+  return tools.map((tool) => ({
+    type: 'function' as const,
+    function: {
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters,
+    },
+  }))
+}
+
+/**
  * 构造 chat 请求体（**导出的纯函数，便于逐字段单测**）。
  *
  * ## 实测定案的形态（T1/T2）
@@ -411,7 +462,9 @@ function contentToText(content: unknown): string {
  *   "metadata": { "context": { "client_type": "qodercli" } } }
  * ```
  *
- * - `messages` / `tools` **原样透传**（标准 OpenAI 格式，**逐项不改写**）；
+ * - `messages` **原样透传**（标准 OpenAI 格式，**逐项不改写**）；
+ * - `tools` **必须包裹成 OpenAI 标准形态** —— 这一条是 2026-09-21 真机报障的
+ *   根因修复，证据与形态见 {@link serializeQoderTools}；
  * - `metadata.context.client_type` 是**出站身份标识**（与 buddy 的
  *   `X-Product-Code` 同类，Qoder 后台按它归因用量），**一字符都不能动**。
  *   取值由 `product.clientType` 给出、缺省回退 `'qodercli'`（见
@@ -442,8 +495,10 @@ export function buildQoderChatBody(options: GenerateOptions, product: QoderProdu
     stream_options: { include_usage: true },
     metadata: { context: { client_type: qoderClientType(product) } },
   }
-  // `tools` 原样透传：Qoder 网关接受 OpenAI 原生 tools 数组（T2 实测）。
-  if (options.tools !== undefined && options.tools.length > 0) body.tools = options.tools
+  // `tools` **包裹后再发**（原样透传是真机报障根因，见 serializeQoderTools）。
+  if (options.tools !== undefined && options.tools.length > 0) {
+    body.tools = serializeQoderTools(options.tools)
+  }
   // `tool_choice`：⚠️ `GenerateOptions` **没有**这个字段（DSH 不表达强制工具选择），
   // 故这里没有东西可转发。保留这次防御性读取，是为了让「将来 DSH 加上该字段」
   // 与「有人从旁路塞进来」两种情况都不至于静默丢掉强制选择语义。
@@ -629,6 +684,12 @@ export async function* consumeQoderStream(
               ...frame.code === undefined ? {} : { code: frame.code },
               message: frame.message,
               source: 'chat',
+              // ⚠️ **流内分支同样要传 `details`**：`provider_error` 帧的外层 message
+              // 恒是无信息量的 `"Error in upstream response"` / `"All models failed"`，
+              // 真因只在 `details` 里。此前这里没传 body，于是流内 provider_error
+              // 永远显示「未能从 details 中二次解析出真码」—— 用户报障的次要成因
+              // （真机实测：`kmodel` 的 details 明说 `unknown tool type`）。
+              ...frame.details === undefined ? {} : { body: frame.details },
               ...options.afterJobTokenRetry === undefined
                 ? {}
                 : { afterJobTokenRetry: options.afterJobTokenRetry },

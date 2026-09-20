@@ -128,6 +128,19 @@ export interface QoderStreamErrorFrame {
   code?: QoderErrorCode
   /** 人类可读文案。 */
   message: string
+  /**
+   * `details` 字段原文（有则带）。
+   *
+   * ⚠️ **`provider_error` 流内帧的真因只在这里**：外层 `message` 恒为
+   * `"Error in upstream response"` / `"All models failed"` 这类无信息量的泛化文案，
+   * 上游后端真正说了什么（`'function' is a required property, expected an object -
+   * 'tools.0'` 等）全部藏在 `details` 里。帧解析器**必须**把它带出来，否则适配器
+   * 的流内分支就只能输出「未能从 details 中二次解析出真码」。
+   *
+   * 保持**原文**（不在这里解析）：二次解析是 {@link parseQoderWrappedDetailCode}
+   * 的职责，两处各写一份必然分叉。
+   */
+  details?: string
   /** 帧 id（`chatcmpl-…` / `request_id`），仅供日志。 */
   frameId?: string
 }
@@ -222,6 +235,83 @@ function readText(value: unknown): string | undefined {
 }
 
 /**
+ * `details` 的二次解析结果。
+ *
+ * 真机实测（2026-09-21）表明不同上游后端往 `details` 里填的字段**各不相同**，
+ * 只有「码」一个出口会让大多数形态的真因丢失 —— 故两个字段分开承载：
+ * 有码给码，没码就把上游自己的话（`reason`）透出来。
+ */
+export interface QoderWrappedDetail {
+  /** 真码（`.error.code` → 根层 `.code`）；解析不出时 undefined。 */
+  code?: string
+  /** 上游自己的文案（`.error.message` → 根层 `.message`）；解析不出时 undefined。 */
+  reason?: string
+}
+
+/**
+ * 剥掉 `details` 里可能套着的一层 SSE 帧外壳。
+ *
+ * ⚠️ **真机实测的怪形态**：`details` 的值有时是**一整个 SSE 帧的原文**
+ * （`data: {"error":{…}}`，末尾还带换行），而不是纯 JSON —— 直接 `JSON.parse`
+ * 必然抛异常，真码就此丢失。实测原文（`qmodel` + Raw 形态 tools）：
+ *
+ * ```text
+ * data: {"error":{"code":"invalid_parameter_error","param":null,
+ *   "message":"'function' is a required property, expected an object - 'tools.0'",
+ *   "type":"invalid_request_error"},"id":"chatcmpl-0643bca2-…"}
+ * ```
+ *
+ * 只取**第一个** `data:` 行的载荷：`details` 里塞完整流是上游的实现细节，
+ * 而错误帧恒在首个数据帧里。
+ */
+function unwrapSseDataLine(text: string): string {
+  for (const line of text.split('\n')) {
+    const trimmed = line.trimStart()
+    if (trimmed.startsWith('data:')) return trimmed.slice('data:'.length).trim()
+  }
+  return text.trim()
+}
+
+/**
+ * 从 `details`（字符串化 JSON 或对象）里二次解析真码与上游文案。
+ *
+ * ## 三类实测形态（全部真机取证，2026-09-21）
+ *
+ * | 形态 | `details` 原文（节选） | 解析结果 |
+ * |---|---|---|
+ * | T3 原形态 | `{"error":{"message":"…","type":"…","param":null,"code":"invalid_parameter_error"},"id":"chatcmpl-…"}` | `code` |
+ * | SSE 帧套壳 | `data: {"error":{"code":"invalid_parameter_error",…}}`（带换行） | `code`（剥壳后） |
+ * | **无码形态** | `{"error":{"message":"Invalid request: unknown tool type: , …","type":"invalid_request_error"}}` / `{"type":"error","error":{"type":"bad_request_error","message":"invalid params, invalid tool type:  (2013)","http_code":"400"}}` | 只有 `reason` |
+ * | 根层文案 | `{"message":"Access to Anthropic models is not allowed for this account."}` | 只有 `reason` |
+ *
+ * 解析规则（顺序即优先级，**只返回非空字符串**，数字归一成字符串）：
+ * 码取 `error.code` → 根层 `code`；文案取 `error.message` → 根层 `message`。
+ *
+ * ⚠️ **解析失败、不是对象、字段全缺一律返回空对象** —— 宁可说「没解析出来」，
+ * 也不把包装码 `provider_error` 当成真码。
+ *
+ * @param details - `details` 字段的值（字符串化 JSON、对象，或任何别的东西）。
+ */
+export function parseQoderWrappedDetail(details: unknown): QoderWrappedDetail {
+  let value = details
+  if (typeof details === 'string') {
+    value = tryParseJson(details)
+    // 第一次解析失败时才剥 SSE 外壳（正常 JSON 里不会有 `data:` 前导行，
+    // 故这个兜底不会改变既有形态的解析结果）。
+    if (value === undefined) value = tryParseJson(unwrapSseDataLine(details))
+  }
+  if (!isRecord(value)) return {}
+  const nested = isRecord(value.error) ? value.error : undefined
+  const code = (nested === undefined ? undefined : readCodeText(nested.code)) ?? readCodeText(value.code)
+  const reason = (nested === undefined ? undefined : readText(nested.message))
+    ?? readText(value.message)
+  return {
+    ...code === undefined ? {} : { code },
+    ...reason === undefined ? {} : { reason },
+  }
+}
+
+/**
  * 从 `details`（字符串化 JSON 或对象）里二次解析真码。
  *
  * 形态 C 的实测原文里，400 的外层码是包装码 `provider_error`，**真码**
@@ -238,23 +328,14 @@ function readText(value: unknown): string | undefined {
  * 与 `.code`，**只返回非空字符串**（数字归一成字符串）。解析失败、不是对象、
  * 找不到字段一律 undefined —— 宁可说「没解析出来」，也不把包装码当成了真码。
  *
+ * ⚠️ 本函数是 {@link parseQoderWrappedDetail} 的**码视图**（只取 `code`）：
+ * 需要上游文案的调用方请直接用那个函数，两者的解析规则**只有一处实现**。
+ *
  * @param details - `details` 字段的值（字符串化 JSON、对象，或任何别的东西）。
  * @returns 真码字符串；无法解析时 undefined。
  */
 export function parseQoderWrappedDetailCode(details: unknown): string | undefined {
-  let value = details
-  if (typeof value === 'string') {
-    value = tryParseJson(value)
-  }
-  if (!isRecord(value)) return undefined
-  // 形态 C 的主路径：details.error.code。
-  const nested = value.error
-  if (isRecord(nested)) {
-    const code = readCodeText(nested.code)
-    if (code !== undefined) return code
-  }
-  // 次路径：有的实现把真码直接放在 details.code。
-  return readCodeText(value.code)
+  return parseQoderWrappedDetail(details).code
 }
 
 /**
@@ -288,8 +369,17 @@ export function parseQoderStreamErrorPayload(payload: unknown): QoderStreamError
     return { message: 'unknown error' }
   }
   const frameId = readText(payload.id) ?? readText(payload.request_id)
-  const withFrameId = <T extends QoderStreamErrorFrame>(frame: T): T =>
-    frameId === undefined ? frame : { ...frame, frameId }
+  // `details` 原样带出（字符串或对象都收）：`provider_error` 流内帧的真因只在那里，
+  // 丢了它适配器就只能报「未能从 details 中二次解析出真码」（用户报障的次要成因）。
+  const rawDetails = payload.details
+  const details = typeof rawDetails === 'string' && rawDetails.length > 0
+    ? rawDetails
+    : isRecord(rawDetails) ? JSON.stringify(rawDetails) : undefined
+  const withMeta = <T extends QoderStreamErrorFrame>(frame: T): T => ({
+    ...frame,
+    ...frameId === undefined ? {} : { frameId },
+    ...details === undefined ? {} : { details },
+  })
 
   const nested = payload.error
   if (isRecord(nested)) {
@@ -300,7 +390,7 @@ export function parseQoderStreamErrorPayload(payload: unknown): QoderStreamError
       ?? readText(payload.msg)
       ?? 'unknown error'
     const code = readRawCode(nested.code)
-    return withFrameId(code === undefined ? { message } : { code, message })
+    return withMeta(code === undefined ? { message } : { code, message })
   }
 
   // 形态 B：code / message 平铺在根层。
@@ -309,26 +399,31 @@ export function parseQoderStreamErrorPayload(payload: unknown): QoderStreamError
     ?? readText(payload.error)
     ?? 'unknown error'
   const code = readRawCode(payload.code)
-  return withFrameId(code === undefined ? { message } : { code, message })
+  return withMeta(code === undefined ? { message } : { code, message })
 }
 
 /**
- * 从响应体原文里捞出 `provider_error` 的真码。
+ * 从响应体原文里捞出 `provider_error` 的真码与上游文案。
  *
- * 两种输入形态都要认：**整个响应体**（形态 C，真码在 `details` 字段里）与
- * **`details` 本身**（调用方已剥掉外层）。⚠️ 不能直接把整个响应体喂给
- * {@link parseQoderWrappedDetailCode} —— 那会读到外层的 `.code`
- * 并返回包装码 `provider_error` 冒充真码。
+ * 三种输入形态都要认：**整个响应体**（形态 C，真因在 `details` 字段里）、
+ * **`details` 本身**（调用方已剥掉外层）、以及**流内帧的 `details` 原文**
+ * （`parseQoderStreamErrorPayload` 带出来的那个字符串）。
+ *
+ * ⚠️ 不能直接把整个响应体喂给 {@link parseQoderWrappedDetail} —— 那会读到外层的
+ * `.code` 并返回包装码 `provider_error` 冒充真码。
  */
-function extractWrappedDetailCode(body: string | undefined): string | undefined {
-  if (body === undefined) return undefined
+function extractWrappedDetail(body: string | undefined): QoderWrappedDetail {
+  if (body === undefined) return {}
   const parsed = tryParseJson(body)
-  if (parsed === undefined) return undefined
-  if (!isRecord(parsed)) return parseQoderWrappedDetailCode(parsed)
-  if (parsed.details !== undefined) return parseQoderWrappedDetailCode(parsed.details)
-  const direct = parseQoderWrappedDetailCode(parsed)
+  if (parsed === undefined) {
+    // 不是 JSON：可能就是一个裸的 `details` 字符串（流内帧路径）。
+    return parseQoderWrappedDetail(body)
+  }
+  if (!isRecord(parsed)) return parseQoderWrappedDetail(parsed)
+  if (parsed.details !== undefined) return parseQoderWrappedDetail(parsed.details)
+  const direct = parseQoderWrappedDetail(parsed)
   // 剥过外层但仍含包装码时，说明真码确实没带出来 —— 不要返回包装码。
-  return direct === QODER_PROVIDER_ERROR_CODE ? undefined : direct
+  return direct.code === QODER_PROVIDER_ERROR_CODE ? { ...direct, code: undefined } : direct
 }
 
 /** 上游文案；缺失或全空白时给一句占位，避免出现「：」后面空一截的文案。 */
@@ -465,12 +560,17 @@ export function classifyQoderError(input: QoderErrorInput): QoderErrorClassifica
     })
   }
 
-  // 4. provider_error 包装码：真码在字符串化的 details 里。
+  // 4. provider_error 包装码：真因在 details 里（真码或上游文案，见 extractWrappedDetail）。
   if (typeof code === 'string' && code.trim() === QODER_PROVIDER_ERROR_CODE) {
-    const wrappedCode = extractWrappedDetailCode(input.body)
-    const wrappedText = wrappedCode === undefined
-      ? '未能从 details 中二次解析出真码'
-      : `真码为 ${wrappedCode}`
+    const { code: wrappedCode, reason } = extractWrappedDetail(input.body)
+    // 三段可选信息按「有则带」拼装：真码 → 上游文案 → 兜底的「没解析出来」。
+    // 曾经只认真码，于是三种实测形态里的两种（`details.error` 无 code、`details`
+    // 只有 message）全部退化成「未能从 details 中二次解析出真码」—— 上游明明把
+    // 原因写在 details 里，却对用户说没解析出来（用户报障的次要成因）。
+    const parts: string[] = []
+    if (wrappedCode !== undefined) parts.push(`真码为 ${wrappedCode}`)
+    if (reason !== undefined) parts.push(`上游详情：${reason}`)
+    const wrappedText = parts.length > 0 ? parts.join('；') : '未能从 details 中二次解析出真因'
     return buildClassification(input, {
       action: 'fail',
       ...(wrappedCode === undefined ? {} : { wrappedCode }),

@@ -19,7 +19,7 @@
 | 凭据结构 | **PAT（长期存储）+ jt-（运行时换取缓存，24h）+ jrt-（可选持久化，48h）** |
 | 换令牌端点 | `POST https://openapi.qoder.sh/api/v1/jobToken/exchange`，body `{"personal_token":"<PAT>"}`（⚠️ 键名必须 snake_case，camelCase 回 400） |
 | chat 端点 | `POST https://api2-v2.qoder.sh/model/v1/chat/completions`，`Authorization: Bearer jt-…`（PAT 直打必 401，令牌形态类拒绝；`api.qoder.com/v1` 已否证） |
-| chat body | 标准 OpenAI 格式，messages/tools 原样透传；带 `"metadata":{"context":{"client_type":"qodercli"}}`；UA `qoder/1.1.16` |
+| chat body | 标准 OpenAI 格式，messages 原样透传；**tools 必须包裹成 `{type:'function',function:{…}}`**（2026-09-21 真机报障根因，见 §0「工具调用事实」）；带 `"metadata":{"context":{"client_type":"qodercli"}}`；UA `qoder/1.1.16` |
 | 模型目录端点 | `GET https://api.qoder.com/api/v1/cloud/models` + `Bearer <PAT>`（⚠️ 目录只认 PAT，quota 只认 jt-，两处凭据不同源） |
 | 额度端点 | `GET https://openapi.qoder.sh/api/v2/quota/usage` + `Bearer jt-…` |
 | 响应形态 | 标准 OpenAI；`model` 字段回显传入值，真实模型在 `raw_usage.model`；`usage` 无 credits 字段 |
@@ -33,7 +33,7 @@
 - **两类都绝不出 `[DONE]`** → `[DONE]` 是唯一成功收尾判据；没等到 `[DONE]` 的流不许当优雅结束
 - **`stream:true` 会把 400 变成 200 流内错误**（同一坏 body 非流式 400、流式 200）→ 流式路径必须实现流内错误解析，不能只看状态码
 - 流内 error 帧带 `event: error` 行 + `data:` 行，规范 SSE 累积器可干净处理（勘误 v2：不需要无前缀兜底）
-- 错误体 schema 三处不一致：402 `code` 是**数字** `116` 且文本在 `error` 字段；401 **无 code**（`{"error":"unauthorized"}`）；400 `provider_error` 是包装码，真码在字符串化的 `details` 里；同一错误可能发 2 遍（两个不同 chatcmpl id，只取首帧）
+- 错误体 schema 三处不一致：402 `code` 是**数字** `116` 且文本在 `error` 字段；401 **无 code**（`{"error":"unauthorized"}`）；400 `provider_error` 是包装码，真因在 `details` 里（**既有真码也有上游文案，形态不止一种**，见「工具调用事实」末两条）；同一错误可能发 2 遍（两个不同 chatcmpl id，只取首帧）
 - 401 两种可区分：`TOKEN_INVALID`/`invalid apikey`（类型错）vs `TOKEN_EXPIRE`/`token is not active`（真失效）
 - 402 语义污染：quota=0 时无效模型名也回 402 `code:116`（网关先扣费检查）→ **402 不得硬编码为「换号可救」**；配合额度查询结果二次判别
 - **成功流 usage 帧裸 LF 注入**（真实缺陷，7 次成功流 5 次中招）：大 usage 帧中段被插入一个 0x0A；恢复规则（3/3 验证）：data 行与紧随的下一行（非空、非 `data:` 开头）**无分隔符直接拼接**（`L1+L2` OK，`L1+"\n"+L2` FAIL）
@@ -42,6 +42,16 @@
 
 - 标准结构化 `tool_calls`（非流式 `message.tool_calls`、流式 `delta.tool_calls` 增量分片），arguments 为 JSON 字符串 → **协议层无障碍**
 - ⚠️ forced `tool_choice` 时 `finish_reason` 是 `"stop"` 而非 `"tool_calls"`（auto 才是）→ 聚合逻辑看 delta 本身，不靠 finish_reason
+- ⚠️ **T2 的 tools 入参形态曾被误读（2026-09-21 真机报障纠正）**：T2 当年发的是**手写的 OpenAI 标准形态** `{type:'function',function:{…}}`，而 harness 的
+  `GenerateOptions.tools` 是 `ToolSchema` 形态 `{name,description,parameters}` —— 适配器据此写下「原样透传」是**错的**，
+  真机上非 `lite` 模型会回 HTTP 200 流内 `provider_error`（用户可见：`Qoder 上游返回包装码 provider_error（未能从 details 中二次解析出真码）：
+  Error in upstream response`，harness 码 `INVALID_REQUEST`），details 原文 `'function' is a required property, expected an object - 'tools.0'`。
+  **必须包裹后再发**（`serializeQoderTools`）；包裹后 `qmodel`/`gmodel`/`dmodel`/`lite` 仍回标准结构化 `tool_calls`，T2 结论本身成立。
+  `lite` 是唯一两种形态都不报错的模型（走上游宽松兼容路径），故该缺陷只在非 `lite` 模型上暴露，这是它当年漏检的原因。
+- ⚠️ **`provider_error` 的 `details` 有多种形态**（2026-09-21 真机）：`details.error.code`（T3 原形态）、**整段带 `data: ` 前缀的 SSE 帧原文**、
+  只有 `details.error.message` / 根层 `message`（无任何 code）、`details.error.code` 为业务文本（如 `"1210"`）。
+  解析器（`parseQoderWrappedDetail`）必须**既认码也认文案**，否则大多数形态都会退化成「未能从 details 中二次解析出真码」；
+  **流内** `provider_error` 帧的真因同样只在 `details` 里，故 `parseQoderStreamErrorPayload` 必须带出 `details`、适配器流内分支必须把它传给分类器。
 
 ### 模型目录事实（T1 实测，17 项快照）
 

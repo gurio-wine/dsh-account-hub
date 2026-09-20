@@ -2141,10 +2141,28 @@ CN 的地方外，两个 region 行为一致。
 
 ### chat 与流式：标准 OpenAI 协议，但收尾判据只有一条
 
-**chat 是标准 OpenAI 协议**：`messages` / `tools` **原样透传，没有任何出站改名**
+**chat 是标准 OpenAI 协议**：`messages` **原样透传，没有任何出站改名**
 （与 Trae CN 的 SOLO 通道刻意相反）。两点必须保留：带
 `metadata.context.client_type: "qodercli"`（**出站身份标识，一字符不能动**）、
 UA `qoder/1.1.16`；`stream` **恒为 true**。
+
+⚠️ **`tools` 必须包裹成 OpenAI 标准形态，不能原样透传**（2026-09-21 真机报障纠正）：
+harness 的 `ToolSchema` 是 `{name, description, parameters}`，而本端点要的是
+`{type:'function', function:{…}}`。**原样透传会让非 `lite` 模型恒回 HTTP 200 流内
+`provider_error`**，用户看到的就是：
+
+```
+本轮运行失败 Qoder 上游返回包装码 provider_error（未能从 details 中二次解析出真码）：Error in upstream response
+INVALID_REQUEST
+```
+
+`details` 里上游把话说明白了：`'function' is a required property, expected an object -
+'tools.0'`（`qmodel`）、`Invalid request: unknown tool type: , currently only function and
+plugin are supported`（`kmodel`）、`tools[0].type: unknown variant ..., expected function`
+（`dmodel`）。**`lite` 是唯一两种形态都不报错的模型**（走上游宽松兼容路径），所以这个
+缺陷只在非 `lite` 模型上暴露 —— 当年 T2 漏检正是因为它发的是**手写的 OpenAI 形态**，
+而不是 `GenerateOptions.tools` 的形态。包裹后功能未受损：`qmodel` / `gmodel` / `dmodel` /
+`lite` 实测仍回标准结构化 `tool_calls`。
 
 **三条流式硬事实**（T3 实测矩阵）：
 
@@ -2160,7 +2178,8 @@ UA `qoder/1.1.16`；`stream` **恒为 true**。
    `JSON.parse(L1 + "\n" + L2)` 失败（那个 LF 不属于原文）。
 
 **工具调用**：标准结构化 `tool_calls`（非流式 `message.tool_calls`、流式
-`delta.tool_calls` 增量分片），arguments 是 JSON 字符串 —— **协议层无障碍**。
+`delta.tool_calls` 增量分片），arguments 是 JSON 字符串 —— **协议层无障碍**
+（⚠️ 前提是 `tools` 已按上面的标准形态包裹；未包裹时上游直接拒绝整个请求）。
 ⚠️ 但 forced `tool_choice` 时 `finish_reason` 是 **`"stop"` 而不是 `"tool_calls"`**
 （auto 才是），故聚合逻辑**只看 delta 本身，不看 `finish_reason`**。
 
@@ -2171,8 +2190,24 @@ UA `qoder/1.1.16`；`stream` **恒为 true**。
 | `402` + `code:116` | **额度类候选**（`quotaCandidate`），动作仍是直报 —— 必须由额度端点**二次判别**后才允许换号 |
 | chat `401 {"error":"unauthorized"}`（**无业务码**） | 先当「`jt-` 过期」：**静默重换一次 exchange 再试**；仍 401 才判 PAT 失效 |
 | 额度端点 `401 TOKEN_EXPIRE` / `TOKEN_INVALID` | 分别映射「重换 `jt-`」与「重新粘贴 PAT」（靠文案分型） |
-| 流内 error 帧 | **直报业务码**：`invalid_parameter_error` / `invalid_model_error` / `provider_error`（**包装码**，真码在字符串化的 `details` 里，需二次解析） |
+| 流内 error 帧 | **直报业务码**：`invalid_parameter_error` / `invalid_model_error` / `provider_error`（**包装码**，真因在 `details` 里，需二次解析） |
 | 未收到 `[DONE]` | 报 `TRANSPORT`，**不静默成功** |
+
+⚠️ **`provider_error` 的 `details` 有四种实测形态**（2026-09-21 真机），解析器
+（`parseQoderWrappedDetail`）**既认码也认文案**，否则多数形态会退化成
+「未能从 details 中二次解析出真码」这个把真因藏起来的说法：
+
+| `details` 形态 | 解析结果 |
+|---|---|
+| `{"error":{…,"code":"invalid_parameter_error"},"id":"…"}`（T3 原形态） | 真码 |
+| `data: {"error":{…}}`（**整段带 `data: ` 前缀的 SSE 帧原文**，末尾还带换行） | 真码（剥壳后） |
+| `{"error":{"message":"…","type":"invalid_request_error"}}`（**无 code**） | 只有上游文案 |
+| `{"error":{"code":"1210","message":"API 调用参数有误，请检查文档。"}}` | 真码 + 上游文案 |
+
+⚠️ **流内** `provider_error` 帧的真因同样只在 `details` 里（外层 `message` 恒是无信息量的
+`"Error in upstream response"` / `"All models failed"`），故 `parseQoderStreamErrorPayload`
+带出 `details`、适配器流内分支把它作为 `body` 交给分类器 —— 这两处此前都缺，
+是「真因被藏」的次要成因。
 
 ⚠️ **`402 + code:116` 在本 provider 上有语义污染**：quota=0 的账号上，**无效模型名
 也回同一个 402 `code:116`**（网关先做扣费检查）。故它**只是候选**，绝不硬编码成
