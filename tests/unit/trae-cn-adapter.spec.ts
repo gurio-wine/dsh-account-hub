@@ -57,6 +57,9 @@ import {
   traeCnCreditsExhaustedHint,
 } from '../../src/trae-cn-errors.js'
 import {
+  TRAE_CN_AGENT_MODELS_API_BASE,
+  TRAE_CN_AGENT_MODELS_PATH,
+  TRAE_CN_AGENT_MODELS_QUERY,
   TRAE_CN_CHAT_PATH,
   TRAE_CN_IDE_API_BASE,
   TRAE_CN_IDE_APP_ID,
@@ -2118,10 +2121,17 @@ describe('Trae CN 目录拉取（fetchTraeCnDirectory，零网络）', () => {
     }), { status: 200, headers: { 'Content-Type': 'application/json' } })
   }
 
-  it('两个 function 各拉一次，body 是实测定案的固定形态', async () => {
+  it('两个 function 各拉一次，body 是实测定案的固定形态（另加一次 agent 组档位 GET）', async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = []
     const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
       calls.push({ url: String(url), init })
+      // 档位端点（`GET`，**无 body**）：本用例不关心档位，回一个合法的空本组即可
+      // —— 档位数据源的解析/合并/降级由 `trae-cn-agent-tiers.spec.ts` 专门覆盖。
+      if (String(url).startsWith(TRAE_CN_AGENT_MODELS_API_BASE)) {
+        return new Response(JSON.stringify({ code: 0, data: { list: [{ function: 'solo_agent_remote', models: [] }] } }), {
+          status: 200,
+        })
+      }
       const fn = (JSON.parse(String(init?.body)) as { function: string }).function
       return fn === TRAE_CN_SOLO_REMOTE_FUNCTION
         ? directoryResponse(['glm-5.3', 'glm-5.2'])
@@ -2129,7 +2139,12 @@ describe('Trae CN 目录拉取（fetchTraeCnDirectory，零网络）', () => {
     }) as unknown as typeof fetch
 
     const entries = await fetchTraeCnDirectory(makeCredential(), { fetchImpl: fetcher })
-    expect(calls).toHaveLength(2)
+    // IDE 目录端点仍是**两次 POST**（一个 function 一次，顺序不变）；
+    // 第三次是档位数据源的 agent 组 GET（与目录同一刷新周期）。
+    const directoryCalls = calls.filter((call) => call.url === `${TRAE_CN_IDE_API_BASE}${TRAE_CN_MODELS_PATH}`)
+    expect(directoryCalls).toHaveLength(2)
+    expect(calls[2]!.url).toBe(`${TRAE_CN_AGENT_MODELS_API_BASE}${TRAE_CN_AGENT_MODELS_PATH}${TRAE_CN_AGENT_MODELS_QUERY}`)
+    expect(calls[2]!.init?.method).toBe('GET')
     expect(calls[0]!.url).toBe(`${TRAE_CN_IDE_API_BASE}${TRAE_CN_MODELS_PATH}`)
     expect(calls[0]!.init?.method).toBe('POST')
     // body 的固定字段逐项锁死（`function` 按轮次变化，其余恒为这些值）。

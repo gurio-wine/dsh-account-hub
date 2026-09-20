@@ -406,6 +406,71 @@ export const TRAE_CN_CHAT_PATH = '/api/agent/v3/llm_utils_chat'
  */
 export const TRAE_CN_MODELS_PATH = '/api/ide/v1/get_detail_param'
 
+/**
+ * **agent 池目录**基址（`GET /api/remote/v1/models`，**编译期常量**）。
+ *
+ * ## 为什么本 provider 需要第二个目录端点
+ *
+ * IDE 目录端点（{@link TRAE_CN_MODELS_PATH}）自 2026-09-21 起**对可调模型不再
+ * 下发 `context_window_tokens.max`**（只剩 `custom_model_*` BYOK 项带 max，而那
+ * 14 项被账号私有 BYOK 过滤网剔除）⇒ 档位列在真机上**无数据可渲染**，
+ * `07dde5d` 建好的 dev/Max 档位链路（解析 → RPC → UI → `resolveModel` 覆盖）
+ * 空转。本端点是**同一批上游数据**的另一面：它按 agent 分组列出各模型的
+ * `max_mode` 与 `context_window_tokens.max`（真机实测 `solo_agent_remote` 组
+ * 10 个 id 为 `max_mode:true` + `max:1000000`）。
+ *
+ * ⚠️ 档位**只用来补 `maxContextWindow`**（一个纯声明值，出站请求体一个字段都
+ * 不动）；模型 roster 仍以 IDE 目录为唯一来源 —— 本组独有的 id（如
+ * `Doubao-Seed-Code`）**必须被忽略**，加进选择器就是必然 `4001` 的选项。
+ *
+ * ## ⚠️ 本 host 是第三个 Trae CN 域名，不可与另外三个互换
+ *
+ * | 常量 | 值 | 归属 |
+ * |---|---|---|
+ * | {@link TRAE_CN_API_BASE} | `api.trae.cn` | 签到 / 续期 / 余额 |
+ * | {@link TRAE_CN_IDE_API_BASE} | `trae-api-cn.mchost.guru` | SOLO 通道 chat 与 IDE 目录 |
+ * | **本常量** | **`solo.trae.cn`** | **agent 池目录（档位数据源）** |
+ * | `TRAE_CN_WORK_API_BASE`（work-product） | `work.trae.cn` | TraeWork 网页 RPC |
+ *
+ * ⚠️ 它与 `work.trae.cn` 上的同名路径（`/api/remote/v1/models`）**不是同一个
+ * 服务**：Work 侧那条要带 `?functions=…&show_custom_model=true` 并且必须带
+ * SOLO 网关头；本侧实测**头只需 5 个**（oauth 模块的 `traeCnAccessHeaders`：
+ * 三个等值 token 头 + `Accept` + `Content-Type`），多带 SOLO 网关头**不需要**。
+ */
+export const TRAE_CN_AGENT_MODELS_API_BASE = 'https://solo.trae.cn'
+
+/**
+ * agent 池目录路径（拼在 {@link TRAE_CN_AGENT_MODELS_API_BASE} 之后）。
+ *
+ * 响应形态 `{data:{list:[{function, models:[…]}]}}` —— 与 TraeWork 的同名端点
+ * **逐字段同构**（两条协议线各自独立解析，见 `src/trae-cn-models.ts` 的
+ * `parseTraeCnAgentTiers`）。
+ */
+export const TRAE_CN_AGENT_MODELS_PATH = '/api/remote/v1/models'
+
+/**
+ * agent 池目录的 `functions` 参数值 —— **必须是 agent 池，不是 IDE 池**。
+ *
+ * 该端点的分组由 query 决定：不带 `functions` 时回的是**另一个池**
+ * （TraeWork 侧实测为 `solo_coder`，同名 id 的窗口都不同）。本 provider 取
+ * `solo_agent_remote`，因为只有它的 `max_mode` / `context_window_tokens.max`
+ * 被实测证明与 IDE 侧那 10 个 id 对得上（2026-09-21 真机核对）。
+ *
+ * ⚠️ 与 `TRAE_CN_WORK_MODELS_FUNCTIONS`（work-product）**字面量恰好相同**
+ * （同一个 `function` 名），但**两条协议线各自声明、互不 import** ——
+ * 上游改动其中一条不应牵动另一条，且两侧的 host / 头 / 解析器全都不同。
+ */
+export const TRAE_CN_AGENT_MODELS_FUNCTIONS = 'solo_agent_remote'
+
+/**
+ * agent 池目录的 query 串。
+ *
+ * ⚠️ **刻意不带 `show_custom_model=true`**：那会把账号私有 BYOK 项
+ * （`custom_model_*`，三方 key 存在该账号服务端）一起拉回来，而它们在本侧
+ * 全被过滤网剔除、对档位毫无用处。真机实测配方就是本串。
+ */
+export const TRAE_CN_AGENT_MODELS_QUERY = `?functions=${TRAE_CN_AGENT_MODELS_FUNCTIONS}`
+
 /** 控制面请求超时（毫秒）；流式对话请求不适用。 */
 export const TRAE_CN_REQUEST_TIMEOUT_MS = 30_000
 

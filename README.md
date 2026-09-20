@@ -1298,7 +1298,7 @@ IDE 通道对我方新池请求的恒定回复。归**可重试**（退避）而
 | 端点 | `POST /api/ide/v1/get_detail_param`（同一网关，与 chat **同源凭据与头**） |
 | body | `{function, config_names:null, need_prompt:false, current_config_info:null, poly_prompt:true, mode_type:null, agent_type:null}` |
 | function | CN 区**两个都拉**：`solo_work_remote`（优先）与 `solo_work_lite`，取并集 |
-| 解析 | `config_info_list[].config_name` / `display_config.display_name` / `model_detail_list[0].prompt_max_tokens`（回退 `context_window_tokens.dev`）与 `.max_tokens` |
+| 解析 | `config_info_list[].config_name` / `display_config.display_name` / `model_detail_list[0].prompt_max_tokens`（回退 `context_window_tokens.dev`）与 `.max_tokens`。⚠️ `context_window_tokens.max` **已对可调模型停发**，档位改由 agent 池目录提供（见下第 8 条） |
 | 缓存 | 12h TTL（参照 LobsterAI 的 `clientVersion` 缓存先例）；**失败不写缓存**，下次调用重试 |
 | 回退 | 目录整体不可用 → 现行 11 项静态表（`TRAE_CN_FALLBACK_MODELS`） |
 
@@ -1338,7 +1338,14 @@ IDE 通道对我方新池请求的恒定回复。归**可重试**（退避）而
    （如旧表里的 `Doubao-Seed-Code`），选中即路由失败；
 7. **多模态标记与思考档位由静态表补齐**（目录端点两个都不提供，见下）：只对
    **静态表已有的 id** 补值、**不新增条目**。不补的话，同一模型在「目录成功」与
-   「目录失败」两条路径下会报出不同模态、且档位**整行消失**，是自相矛盾。
+   「目录失败」两条路径下会报出不同模态、且档位**整行消失**，是自相矛盾；
+8. **档位（dev/Max）来自 agent 池目录**（2026-09-21 换轨）：`GET https://solo.trae.cn/api/remote/v1/models?functions=solo_agent_remote`
+   的 `max_mode` + `context_window_tokens.max`。⚠️ IDE 目录端点**已对可调模型停发
+   max**（只剩 `custom_model_*` BYOK 项带，而那些项在第 4 条就出局）⇒ 档位列原本
+   在真机上**没有数据可渲染**。规则同样是**只补不增**：只给本目录**已有**的条目补
+   `maxContextWindow`，agent 组独有的 id（如 `Doubao-Seed-Code`）**一律忽略**；
+   该端点失败/超时/无本组 ⇒ 本次刷新**没有档位**，目录本身照常返回。
+   细节见下文「上下文窗口：dev / Max 档位可选」。
 
 > **过滤后的规模（2026-09-20 取证，真实 roster 逐项核对）**：
 > `40（并集）− 5（内部）− 14（custom）− 8（invisible）= 13 项`。
@@ -1414,6 +1421,14 @@ provider **只走 SOLO**：
 id 形态极不规则（`qwen-3.7-plus` 带连字符、`minimax-m3` 全小写）——**任何规整化
 都会让请求打到不存在的模型上**，故原样保留。
 
+⚠️ **表里的 `dev/max` 两列都是 2026-09-18 的快照，且都已漂移**（2026-09-21 复测）：
+动态目录现在给 `glm-5.3` 的 `prompt_max_tokens` 是 **168000**（`context_window_tokens.dev`
+是 **200000**），而 **max 列上游已对可调模型停发**（只剩 `custom_model_*` BYOK 项带，
+那些项会被过滤网剔除）。本表**刻意不跟着改**：它只在动态目录整体失败时顶替，目录
+成功时这些值根本不参与，而「跟着上游改静态表」是一条没有终点的路 —— 这里登记漂移
+事实，比维护一份永远滞后的副本诚实。**Max 档的实时来源**已改为 agent 池目录，
+见下文「上下文窗口：dev / Max 档位可选」。
+
 ⚠️ **`minimax-m3` 的多模态标记已由 `✓` 修正为 `✗`（2026-09-20）**：原值照抄的是
 **旧 IDE 通道** `chat_v3` 缓存，而 SOLO 目录端点实测 `display_config.multimodal:false`
 （remote / lite 两条 function 上分别是 `false` / `true`，合并规则取 **remote 优先**
@@ -1428,7 +1443,9 @@ id 形态极不规则（`qwen-3.7-plus` 带连字符、`minimax-m3` 全小写）
 
 - 上下文窗口取 **dev 档**（如 `262144/1048576` → 262144）：它是客户端默认实际
   使用的窗口。max 档（多数 1048576）是理论上限，按它声明会让 DSH 的上下文压缩
-  迟迟不触发；动态目录同口径取 `prompt_max_tokens`（回退 `context_window_tokens.dev`）；
+  迟迟不触发；动态目录同口径取 `prompt_max_tokens`（回退 `context_window_tokens.dev`）。
+  ⚠️ 静态表**一律不带 Max 档** ⇒ 静态路径下没有档位 UI（这是设计）；2026-09-21 起
+  Max 档由 agent 池目录**实时**提供，见下文「上下文窗口」小节；
 - `inputModalities` **按模型给**：多模态项（原 16 项里 12 项、**现存 11 项里 6 项**
   —— 被剔除的 5 项恰好全是多模态项，另 1 项是上面的 `minimax-m3` 修正）输出
   `['text','image']`，其余 `['text']`。
@@ -1559,39 +1576,56 @@ serde 字段块里两者**并列存在**，印证这是「两套账号体系各�
 > 占位（`projectImagesForTextModel`）；抛错是防「绕过路由层直接调 `stream()`」
 > 的最后一道防线。两处**不要「顺手」改成一致**。
 
-### 上下文窗口：dev / Max 档位可选（2026-09-21）
+### 上下文窗口：dev / Max 档位可选（2026-09-21，数据源同日换轨）
 
-Trae CN 的动态目录对**部分**模型下发两档上下文窗口（`context_window_tokens` 的
-`dev` / `max`，实测样例 `glm-5.3: dev 119040 / max 1048576`）。默认只声明 `dev` 档 ——
-而声明值决定宿主**何时自动压缩上下文**（阈值 `0.8 × 窗口`）与压缩后的保留量，
-所以长会话在声明 119K 时会比实际需要更早被压缩。
+Trae CN 的模型目录对**部分**模型公布两档上下文窗口（`dev` / `max`）。默认只声明 `dev` 档 ——
+声明值决定宿主**何时自动压缩上下文**（阈值 `0.8 × 窗口`）与压缩后的保留量，
+所以在 dev 档较小（如 168K）时，长会话会比实际需要更早被压缩。
+
+⚠️ **档位数据的来源在 2026-09-21 换过一次轨**（用户视角不变，仍是下面那个单选列）：
+
+| | 来源 | 现状 |
+|---|---|---|
+| 旧 | IDE 目录 `POST /api/ide/v1/get_detail_param` 的 `context_window_tokens.max` | **已停发**：实测现在只有 `custom_model_*` BYOK 项带 max，而那些项会被过滤网剔除 ⇒ 档位列在真机上没有数据 |
+| 新 | agent 池目录 `GET https://solo.trae.cn/api/remote/v1/models?functions=solo_agent_remote` 的 `max_mode` + `context_window_tokens.max` | **现行数据源**（同一批 Trae 账号、同一个模型族的另一个池视图） |
+
+合并规则三条：**只补不增**（只给 IDE 目录里**已有**的条目补 Max 档；agent 组独有的 id
+如 `Doubao-Seed-Code` **一律忽略** —— 加进选择器就是一个必然 `4001` 的选项）；
+**只在 Max 严格大于该模型实际生效的 dev 档时才收**；**档位拉取失败只是没有档位**
+（等于本次改动之前的行为），**绝不拖垮目录本身**。
+
+⚠️ **README 早前记的数已漂移**：`glm-5.3: 119040/1048576` 是 2026-09-18 的快照；
+2026-09-21 复测同一模型的 `prompt_max_tokens` 已是 **168000**、`context_window_tokens.dev`
+是 **200000**，而 agent 组公布的 Max 是 **1000000**。Trae 的 roster 与这些数字**都会漂**，
+不要当常量用（静态回退表刻意不跟着改，见下）。
 
 **在哪选**：Account Hub → **Trae CN** 面板 → 点「显示列表」。**有 Max 档的模型行**右侧
 会多出一组单选：
 
 | 选项 | 声明的窗口 |
 |---|---|
-| **默认 119040** | 目录的 dev 档（默认） |
-| **Max 1M** | 该模型目录公布的 Max 档 |
+| **默认档** | 该模型目录的 dev 档（如 `glm-5.3` 是 168000），默认 |
+| **Max 档** | agent 组公布的最大档（如 `glm-5.3` 是 1M） |
 
-没有 Max 档的模型（含 Work 面板的全部模型、以及任何「两档同值」的模型）**不显示这一列**。
+没有 Max 档的模型**不显示这一列**：Work 面板的全部模型、任何「两档同值」的模型，
+以及 agent 组里 `max_mode:false` 的那几项（真机为 `Doubao-Seed-2.1-Turbo` /
+`kimi-k2.7-code` / `kimi-k2.6`）。
 
 **效果**：切换只改变「我们向对话宿主声明的窗口大小」，**发给上游的请求内容一个字节都不变**
 （Trae 的 chat 请求体里本来就没有档位字段）。选 Max 后压缩阈值按 Max 计算，长会话不再被
 过早压缩；上游仍按请求的真实长度服务，**它自己的硬限（约 1M token）不会因为我们声明得更大而放宽**。
 
-**两条要知道的边界**：
+**三条要知道的边界**：
 
 - **只能选目录公布的档位**。界面上的两个值就是目录给的两个值；任何其它数字（包括手改
   `settings.yaml`）都不会生效 —— 适配器读取时会再判一次「这个值是否精确等于该模型的 Max 档」，
   不命中就**静默退回默认档**。这是刻意的：编造的窗口会直接改写宿主的压缩时机。
 - **目录浮动后旧选择自动失效**。Trae 的模型 roster 与档位会变（实测过 41 → 40 项的浮动）。
-  模型下线、Max 档改值、或某一版目录不再下发 `max` 时，之前存的档位**自动退回默认档**，
+  模型下线、Max 档改值、或某一版目录不再公布 `max` 时，之前存的档位**自动退回默认档**，
   不会报错、也不会拿旧数字继续声明。
-- **目录拉取失败时没有档位可选**。静态回退表（11 项）**刻意不带 Max 档**：我们手上的
-  1M 证据是**网关级**的钳制实验（约 1M token 触发 `4022`），它说不出「哪几个模型公布了两档、
-  各自是多少」。把 1M 摊派到 11 项上就是编造，故静态路径下这一列**不渲染** ——
-  等目录恢复（12h TTL 内会自动重试）档位就回来了。
+- **目录拉取失败时没有档位可选**。档位与目录**共用同一次刷新**（12h TTL）：目录整体落空时
+  适配器回退静态回退表（11 项），而那张表**刻意不带 Max 档** —— 静态路径下没有 agent 组的
+  roster 依据，把「某个池公布的 1M」摊派到这 11 项上就是编造。等目录恢复档位就回来了。
 
 ### 签到与积分余额
 

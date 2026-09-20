@@ -26,6 +26,15 @@
  * 旧记载「模型目录刻意走静态表、远端不可接」**已作废**：当时试的是
  * `model_list` / `batch_get_detail_param` 等端点，它们确实只回旧池；真正可用的是
  * **`POST /api/ide/v1/get_detail_param`**，按 `function` 分别拉取后取并集。
+ *
+ * ## 档位（dev/Max）的数据源已换成 remote v1 的 agent 组（2026-09-21）
+ *
+ * `get_detail_param` 曾对部分模型下发 `context_window_tokens:{dev,max}`，但**现在
+ * 只对 `custom_model_*` BYOK 项下发 max**（那些项全被过滤网剔除）⇒ 档位列在真机上
+ * 没有数据。本模块因此在同一刷新周期里**额外**拉一次 `GET /api/remote/v1/models`
+ * 的 `solo_agent_remote` 组，把它的 `max_mode` / `context_window_tokens.max`
+ * 合并进 IDE 目录条目（**只补 `maxContextWindow`，绝不新增条目**）。
+ * 详见 {@link parseTraeCnAgentTiers} 与 {@link applyTraeCnAgentTiers}。
  */
 
 import { randomUUID } from 'node:crypto'
@@ -33,6 +42,10 @@ import { traeCnAccessHeaders } from './trae-cn-oauth.js'
 import type { TraeCnCredential } from './trae-cn-oauth.js'
 import { TRAE_CN_DEVICE_TYPE, TRAE_CN_OS_VERSION } from './trae-cn-credits.js'
 import {
+  TRAE_CN_AGENT_MODELS_API_BASE,
+  TRAE_CN_AGENT_MODELS_FUNCTIONS,
+  TRAE_CN_AGENT_MODELS_PATH,
+  TRAE_CN_AGENT_MODELS_QUERY,
   TRAE_CN_IDE_API_BASE,
   TRAE_CN_IDE_APP_ID,
   TRAE_CN_IDE_VERSION_TYPE,
@@ -379,6 +392,19 @@ export interface TraeCnFallbackModel {
  * {@link applyTraeCnStaticMetadata} 要消灭的那种自相矛盾。
  *
  * 其余 10 项静态值与目录实测**逐项一致**（取证二次核对，2026-09-20），只改这一项。
+ *
+ * ## ⚠️ `contextWindow` 是 2026-09-18 的快照，**已经漂移**（2026-09-21 复测）
+ *
+ * 本表的值照抄自当时真机目录的 `prompt_max_tokens`（如 `glm-5.3` = `119040`）。
+ * 复测时同一字段已变成 `168000`，而 `context_window_tokens.dev` 是 `200000`
+ * —— 即**上游确实在调这个数**。本表**刻意不跟着改**：
+ *
+ * 1. 它只在动态目录整体失败时顶替，而动态目录成功时本条的值根本不参与（目录优先）；
+ * 2. 「跟着上游改静态表」是一条没有终点的路 —— 今天抄 `168000`，明天还会漂；
+ *    这里登记漂移事实，比维护一个永远滞后的副本诚实。
+ *
+ * 真正需要跟上游走的**档位**（Max）已改由 agent 组目录实时提供，见
+ * {@link parseTraeCnAgentTiers}。
  */
 export const TRAE_CN_FALLBACK_MODELS: readonly TraeCnFallbackModel[] = [
   { id: 'Doubao-Seed-Evolving', name: 'Seed-Evolving', supportsImages: true, contextWindow: 262_144, maxTokens: 64_000 },
@@ -414,15 +440,27 @@ export interface TraeCnModelEntry {
   /** 上下文窗口（目录给的 dev 档 / `prompt_max_tokens`）。缺省 = 未提供。 */
   contextWindow?: number
   /**
-   * 上下文窗口的 **Max 档**（目录 `context_window_tokens.max`）。
+   * 上下文窗口的 **Max 档**（两个来源，见下）。
    *
    * ⚠️ **只在严格大于 {@link contextWindow} 时才写入**（见 {@link parseTraeCnDirectory}）：
    * `max <= dev`（含 `max` 为 0 / 缺失 / 与 dev 相等）一律视为**没有 Max 档** ——
    * Work 侧实测就是 `{dev: 184000, max: 184000}` 这种「两档同值」的形态，
    * 收下它会渲染出一个切过去毫无效果的档位。
    *
-   * 缺省 = 无 Max 档或目录未下发。用户可选的档位因此**永远精确等于目录公布的档位之一**，
-   * 声明值只有 dev / max 两种可能（见 `TraeCnAdapter.resolveModel` 的预算覆盖）。
+   * 缺省 = 无 Max 档或两个来源都没给。用户可选的档位因此**永远精确等于上游公布的
+   * 档位之一**，声明值只有 dev / max 两种可能（见 `TraeCnAdapter.resolveModel`
+   * 的预算覆盖）。
+   *
+   * ## 两个来源（2026-09-21 起）
+   *
+   * | 来源 | 字段 | 现状 |
+   * |---|---|---|
+   * | IDE 目录条目自身 | `context_window_tokens.max` | ⚠️ **上游已停发**（只剩 `custom_model_*` BYOK 项带 max，而那些项全被过滤网剔除） |
+   * | agent 组档位表 | `GET /api/remote/v1/models?functions=solo_agent_remote` 的 `max_mode` + `context_window_tokens.max` | **现行来源**，见 {@link applyTraeCnAgentTiers} |
+   *
+   * 合并顺序：目录自身的值优先（同池、更权威），agent 组只补**空缺**的条目 ——
+   * 与「目录优先、静态表补缺」的既有口径同向。上游若恢复在 IDE 目录下发 max，
+   * 这条路径自动让位，无需改代码。
    */
   maxContextWindow?: number
   /** 最大输出 token（**只记录，不 materialize**，见 TraeCnFallbackModel.maxTokens）。 */
@@ -457,14 +495,20 @@ export interface TraeCnModelEntry {
  *
  * ## ⚠️ 静态路径**一律不产出 `maxContextWindow`**（这是设计，不是遗漏）
  *
- * 手上有 Max 档的旁证只有一条：`4022` 的钳制实验（998 161 token 成功 /
- * 1 002 248 token 失败 ⇒ 上游硬限约 1M）。那是**网关级**的容量证据，不是
- * **逐模型**的档位表 —— 它说不出「哪几个模型公布了两档、各自 Max 是多少」。
- * 静态表本身也没有任何一行带 `ctx(max)` 的原始记录。
+ * **逐模型**的档位表确实存在了（agent 组目录，见 {@link parseTraeCnAgentTiers}），
+ * 但它**只在 IDE 目录刷新成功的那一个周期里被拉取**：本函数是纯函数（不联网），
+ * 而目录整体失败时适配器直接回退到这里，`fetchTraeCnDirectory` 也会短路掉那次
+ * 档位请求（那时没有任何条目可补，两边都拉不到）。
  *
- * 把「1M」按网关结论摊派到 11 项上，就是**编造**：用户会看到一个切过去
- * 未必被上游接受的档位，而本项目对未取证的东西一律不猜。故静态路径下
- * **11 项都没有档位 UI**（目录拉取成功时才有），宁缺毋编。
+ * 于是静态路径下**11 项都没有档位 UI**，这是刻意接受的：把 agent 组的 max 摊派到
+ * 本表上，等于让「一个没拿到 roster 的降级路径」去声明档位 —— 而本表与 agent 组
+ * 的 roster 并不逐项对应（该组带 `Doubao-Seed-Code`，本表没有它；反向也有
+ * `minimax-m3` 这类不在该组的项）。**宁缺毋编**：无档位 = 声明 dev 档 = 本次改动
+ * 之前的行为，而错档位会直接改写宿主的压缩时机。
+ *
+ * ⚠️ 顺带说明为什么**不能**拿 4022 的钳制实验（998 161 token 成功 / 1 002 248
+ * 失败 ⇒ 上游硬限约 1M）给本表摊派 1M：那是**网关级**的容量证据，说不出
+ * 「哪几个模型公布了两档、各自 Max 是多少」。
  */
 export function fallbackTraeCnCatalog(): TraeCnModelEntry[] {
   return TRAE_CN_FALLBACK_MODELS.map((model) => ({
@@ -571,6 +615,12 @@ export function applyTraeCnStaticMetadata(entries: readonly TraeCnModelEntry[]):
  *   **Max 档**另读 `context_window_tokens.max`，且只在**严格大于**上面那个 dev 档时才收
  *   （`max <= dev`（含 0 与两档同值）、max 缺失、dev 档本身缺失，都视为无 Max 档，
  *   理由见 `TraeCnModelEntry.maxContextWindow`）；
+ *
+ *   ⚠️ **上游已对可调模型停发 max**（2026-09-21）：复测时只有 `custom_model_*`
+ *   BYOK 项带 `max:1048576`，而那些项马上会被过滤网剔除 ⇒ **本函数在当前 roster 上
+ *   读不出任何档位**。档位改由 agent 组目录补入（`applyTraeCnAgentTiers`），
+ *   本条读取路径**刻意保留**：上游若恢复下发，它与 agent 组的「目录优先」判据
+ *   会自动接上，无需改代码。
  * - 输出上限：`model_detail_list[0].max_tokens`；
  * - 思考档位：`reasoning_effort_config`（`support_thinking === true` 且 `options`
  *   是非空字符串数组才声明，`default_level` 不在 options 内时只丢默认档）；
@@ -758,12 +808,227 @@ export interface TraeCnDirectoryOptions {
   signal?: AbortSignal
 }
 
+// ── agent 组档位（dev/Max 的数据源）──
+
+/**
+ * agent 池目录里的**一个模型的档位**（{@link parseTraeCnAgentTiers} 的值形态）。
+ */
+export interface TraeCnAgentTier {
+  /**
+   * 上游是否对该模型发布了 Max 档（`max_mode === true`）。
+   *
+   * ⚠️ **本字段是必要条件，不是冗余信息**：真机上 `max_mode:false` 的三项
+   * （`Doubao-Seed-2.1-Turbo` / `kimi-k2.7-code` / `kimi-k2.6`）的
+   * `context_window_tokens.max` 恰好是 `0` —— 只看数值读不出「有没有档位」，
+   * 语义全在本开关上。故 {@link applyTraeCnAgentTiers} 判的是
+   * **`maxMode === true` 且 `max > 生效档`**，两条缺一不可。
+   *
+   * 把它留在值对象里（而不是解析时就丢掉 false 项）是为了让「上游说这个模型
+   * 没有档位」与「上游压根没列这个模型」在测试和排障时可区分。
+   */
+  maxMode: boolean
+  /** `context_window_tokens.max`（正有限数才收；`0` / 缺失即缺省）。 */
+  max?: number
+}
+
+/** {@link fetchTraeCnAgentTiers} 的入参。 */
+export interface TraeCnAgentTierOptions {
+  /** 注入 fetch（测试用）。 */
+  fetchImpl?: typeof fetch
+  /** 覆盖基址（默认 {@link TRAE_CN_AGENT_MODELS_API_BASE}）。 */
+  apiBase?: string
+  /** 取消信号。 */
+  signal?: AbortSignal
+}
+
+/**
+ * 解析 agent 池目录，取出 `模型 id → 档位` 的表。
+ *
+ * ## 响应形态（真机实测，2026-09-21）
+ *
+ * ```json
+ * {"code":0,"data":{"list":[{"function":"solo_agent_remote","models":[
+ *   {"name":"glm-5.3","display_name":"GLM-5.3","max_mode":true,
+ *    "context_window_tokens":{"dev":200000,"max":1000000}, …}]}]}}
+ * ```
+ *
+ * 与 `src/trae-cn-work-adapter.ts` 的 `locateWorkModelArray` **同族端点、逐字段
+ * 同构**（两条 Trae 协议线打的是同一个 `/api/remote/v1/models`，只是 host、
+ * query、头集与解析全部分开）—— 故这里**只参考其字段语义，不 import 复用**：
+ * AGENTS.md 对这两条协议线有明确纪律，且两侧的取组规则**刻意不同**（见下）。
+ *
+ * ## 取组纪律：只认 `function === solo_agent_remote`，绝不跨组拼接
+ *
+ * ⚠️ **刻意不复刻 Work 侧的第 2 条容忍分支**（「没命中本组但只有一组时也用」）：
+ * 那边容忍是为了「服务端忽略 query 时目录仍可用」，而本侧的失败代价只是
+ * **没有档位**（等价于本次改动之前的状态，静默降级），跨池取值的代价却是把
+ * **另一个池的档位**灌进 IDE 目录 —— 用户会看到一个本池未必认的窗口并选中它。
+ * 宁可无档位，也不跨池。组不存在 / 本组 `models` 非数组 → 空表。
+ *
+ * ## 字段判据
+ *
+ * - id 取 **`name`**（真机的模型 id 就在 `name` 里，`display_name` 是给人看的
+ *   展示名）；非字符串 / 空串跳过；
+ * - `maxMode`：`max_mode === true`，其余（`false` / 缺失 / 非布尔）一律 `false`；
+ * - `max`：`context_window_tokens.max`，与目录侧**同一口径**（{@link readPositive}：
+ *   正有限数才收）。`context_window_tokens.dev` **刻意不读** —— 本表只负责补
+ *   Max 档，dev 档的权威来源仍是 IDE 目录条目自己的 `contextWindow`。
+ *
+ * @param body - 响应体（任意形态；非对象 / 缺 data / 缺 list / 无本组都返回空表）。
+ */
+export function parseTraeCnAgentTiers(body: unknown): Map<string, TraeCnAgentTier> {
+  const tiers = new Map<string, TraeCnAgentTier>()
+  const models = locateAgentTierModels(body)
+  if (models === undefined) return tiers
+  for (const item of models) {
+    const record = asRecord(item)
+    if (record === undefined) continue
+    const id = readString(record.name)
+    if (id === undefined) continue
+    const max = readPositive(asRecord(record.context_window_tokens)?.max)
+    tiers.set(id, {
+      maxMode: record.max_mode === true,
+      ...max === undefined ? {} : { max },
+    })
+  }
+  return tiers
+}
+
+/**
+ * 在 `{data:{list:[{function, models:[…]}]}}` 里找出 **`solo_agent_remote` 那组**
+ * 的模型数组；没有该组（或形态不符）返回 undefined。
+ *
+ * 只认实测形态，**不做信封猜测**（不试 `data` 直接是数组、`data.models` 是数组
+ * 等从未观测到的形态）：上游真改版时，「没有档位」（回到本次改动前的行为）
+ * 比「猜对形状但读错字段」更容易诊断。
+ */
+function locateAgentTierModels(body: unknown): readonly unknown[] | undefined {
+  const data = asRecord(asRecord(body)?.data)
+  const list = data?.list
+  if (!Array.isArray(list)) return undefined
+  for (const group of list) {
+    const record = asRecord(group)
+    if (record === undefined) continue
+    // 严格等于本组：`function` 缺失 / 是别的池 → 继续找（找不到就是空表）。
+    if (record.function !== TRAE_CN_AGENT_MODELS_FUNCTIONS) continue
+    const models = record.models
+    return Array.isArray(models) ? models : undefined
+  }
+  return undefined
+}
+
+/**
+ * 把 agent 组档位**补进** IDE 目录条目（`maxContextWindow`）。
+ *
+ * ## 三条判据（缺一不可）
+ *
+ * 1. `maxMode === true` —— 上游明说该模型有 Max 档；
+ * 2. `max > entry.contextWindow` —— 严格大于**实际生效的 dev 档**。这里的
+ *    `contextWindow` 已经是解析侧算好的 `prompt_max_tokens ?? context_window_tokens.dev`
+ *    （见 {@link parseTraeCnDirectory}），故直接比它就是「与生效档比」，
+ *    不需要、也不该再去读原始字段；
+ * 3. `entry.contextWindow !== undefined` —— 没有比较基准的条目**跳过**
+ *    （`max` 是不是「更大」无从判断）。
+ *
+ * ## 只补，不增、不覆盖
+ *
+ * - **绝不新增条目**：agent 组里有 IDE roster 没有的 id（真机如
+ *   `Doubao-Seed-Code`），把它加进目录就是给用户一个必然 `4001` 的选项。
+ *   本函数只遍历**目录自己的条目**、按 id 查表，天然不可能新增。
+ * - **已带 `maxContextWindow` 的条目不覆盖**：那说明 IDE 目录自己下发了 max
+ *   （上游恢复发布的情形），而**同池的值比跨池的值权威** —— 与
+ *   {@link applyTraeCnStaticMetadata} 对 `supportsImages` 的「目录已表态就不覆盖」
+ *   同向。合并顺序上也因此在静态元数据补齐**之后**执行。
+ *
+ * ## 失败方向
+ *
+ * `tiers` 为空表（拉取失败 / 无本组）时逐项原样返回 —— 等价于本次改动之前，
+ * 即「无档位 UI」而不是「错误档位」。
+ */
+export function applyTraeCnAgentTiers(
+  entries: readonly TraeCnModelEntry[],
+  tiers: ReadonlyMap<string, TraeCnAgentTier>,
+): TraeCnModelEntry[] {
+  return entries.map((entry) => {
+    const tier = tiers.get(entry.id)
+    if (tier === undefined || tier.maxMode !== true) return entry
+    const max = tier.max
+    const dev = entry.contextWindow
+    // 无 max / 无比较基准 / 不大于生效档 / 目录自己已发布档位 ⇒ 一律不动。
+    if (max === undefined || dev === undefined) return entry
+    if (max <= dev || entry.maxContextWindow !== undefined) return entry
+    return { ...entry, maxContextWindow: max }
+  })
+}
+
+/**
+ * 拉取 agent 池目录并解析出档位表（`GET /api/remote/v1/models?functions=solo_agent_remote`）。
+ *
+ * ## 请求配方（真机实测，2026-09-21）
+ *
+ * | 项 | 值 |
+ * |---|---|
+ * | URL | `https://solo.trae.cn/api/remote/v1/models?functions=solo_agent_remote` |
+ * | 方法 | `GET` |
+ * | 头 | **只有 5 个**：{@link traeCnAccessHeaders}（三个等值 token 头 + `Accept` + `Content-Type`） |
+ * | 凭据 | 与 IDE 目录**同源同一个已解析账号**（同一刷新周期内不二次选号） |
+ *
+ * ⚠️ **头刻意只有这 5 个**：与 IDE 目录 / chat 用的 {@link traeCnSoloHeaders}
+ * （十来个头，含 SOLO 代际版本码与追踪头）**不是**同一套 —— 本端点实测不需要
+ * SOLO 网关头，多带不是「更保险」而是把请求形态改成未被验证的组合。
+ *
+ * ## 失败一律静默降级（**绝不抛**）
+ *
+ * 抛错 / 非 2xx / 响应不是 JSON / 无本组 → **空表**。调用方（
+ * {@link fetchTraeCnDirectory}）据此保持目录本身照常返回：**档位拉取失败绝不
+ * 能拖垮目录**，否则一次档位端点的抖动会让整个模型目录退回静态表。
+ *
+ * ⚠️ **失败不写进任何缓存判据**：目录缓存（适配器的 12h TTL）只记「目录成功」
+ * 这一次，档位的重试由下一次目录刷新自然带上（见
+ * `TraeCnAdapter.ensureRemoteModels`）—— 在那里加一个「档位失败就提早重试」的
+ * 分支，等于让两个数据源的成功与否互相牵制。
+ */
+export async function fetchTraeCnAgentTiers(
+  credential: TraeCnCredential,
+  options: TraeCnAgentTierOptions = {},
+): Promise<Map<string, TraeCnAgentTier>> {
+  const fetcher = options.fetchImpl ?? fetch
+  const apiBase = options.apiBase ?? TRAE_CN_AGENT_MODELS_API_BASE
+  try {
+    const response = await fetcher(
+      `${apiBase}${TRAE_CN_AGENT_MODELS_PATH}${TRAE_CN_AGENT_MODELS_QUERY}`,
+      {
+        method: 'GET',
+        // Accept 默认即 application/json，无需第二参（与目录请求显式传值不同：
+        // traeCnSoloHeaders 的默认 accept 是 text/event-stream，必须覆盖）。
+        headers: traeCnAccessHeaders(credential),
+        ...options.signal === undefined ? {} : { signal: options.signal },
+      },
+    )
+    if (!response.ok) return new Map()
+    return parseTraeCnAgentTiers(await response.json())
+  } catch {
+    return new Map()
+  }
+}
+
 /**
  * 拉取动态模型目录（CN 区两个 function 各一次，取并集）。
  *
  * 用**与 chat 完全相同的凭据与网关头**（{@link traeCnSoloHeaders}）——真机实测该
  * 端点带鉴权即 200，且不消耗积分。单个 function 失败**不阻断**另一个：目录是
  * 「尽力而为」的数据，整体落空时适配器回退静态表。
+ *
+ * ## 档位合并（与目录**同一刷新周期**）
+ *
+ * 目录条目合并并补齐静态元数据后，再补一次 agent 组档位
+ * （{@link fetchTraeCnAgentTiers} + {@link applyTraeCnAgentTiers}）。三件事刻意
+ * 收在本函数里，好处是**适配器的缓存与 TTL 逻辑一行不用改**：档位与目录共用
+ * 同一次刷新、同一个 12h 周期、同一份「成功才写缓存」判据。
+ *
+ * ⚠️ 目录整体落空时**直接返回空数组**、不再打档位端点：调用方此时回退静态表，
+ * 而静态回退表**一律不带档位**（理由见 {@link fallbackTraeCnCatalog}），拉回来的
+ * 档位无处可补 —— 那一次请求纯属浪费。
  */
 export async function fetchTraeCnDirectory(
   credential: TraeCnCredential,
@@ -791,7 +1056,17 @@ export async function fetchTraeCnDirectory(
     }
   }
 
-  return applyTraeCnStaticMetadata(mergeTraeCnDirectory(groups, remoteSucceeded))
+  const entries = applyTraeCnStaticMetadata(mergeTraeCnDirectory(groups, remoteSucceeded))
+  // 目录整体落空 ⇒ 调用方回退静态表（那张表一律不带档位），档位端点不必再打。
+  if (entries.length === 0) return entries
+  // 档位：同一周期、同一凭据、**失败静默**（空表 ⇒ 逐项原样返回，等价于本次
+  // 改动之前的行为）。刻意串行而不是与目录并发：目录是顺序两个 function 拉的，
+  // 加一个并发分支只省一次 RTT，却让「目录为空则跳过档位」这条短路无从表达。
+  const tiers = await fetchTraeCnAgentTiers(credential, {
+    ...options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl },
+    ...options.signal === undefined ? {} : { signal: options.signal },
+  })
+  return applyTraeCnAgentTiers(entries, tiers)
 }
 
 // ── 网关头 ──
