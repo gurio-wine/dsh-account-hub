@@ -189,6 +189,8 @@ describe('buddy model config parsing', () => {
   it('parses cli agent models from the enterprise models endpoint', () => {
     // 企业模型端点（/console/enterprises/personal/models）用 `cli` agent
     // 承载可选模型清单，且 data.models 带完整元数据（含 /v3/config 没有的 GPT 系列）。
+    // ⚠️ 这里刻意保留**旧形态响应**（只有 maxInputTokens、无 contextWindow 档位对）：
+    // 解析结果必须与口径变更前逐字节一致 —— 单档模型的 maxInputTokens 就是窗口。
     const models = parseModelsFromConfig({
       data: {
         agents: [
@@ -257,8 +259,9 @@ describe('buddy model config parsing', () => {
   })
 
   it('attaches maxInputTokens from data.models as contextWindow', () => {
-    // /v3/config data.models[].maxInputTokens 是模型上下文窗口的权威来源
-    // （对齐 deveco-code-rust parse_models_from_config）。
+    // ⚠️ 本用例走的是**回退分支**：这批 data.models 条目**不带 `contextWindow`
+    // 档位对**，属单档模型，maxInputTokens 即真实服务窗口，故照收。
+    // （带档位对时的口径见下面「默认档优先」那组用例。）
     // data.models 中未被 craft 引用但可对话的条目也会被补进列表（如 unknown-model）。
     const models = parseModelsFromConfig({
       data: {
@@ -277,6 +280,110 @@ describe('buddy model config parsing', () => {
       { id: 'unknown-model', name: 'unknown-model', contextWindow: 8192 },
       { id: 'bad-entry', name: 'bad-entry' },
     ])
+  })
+
+  // ── 上下文窗口取值口径：默认档（defaultLength）优先 ──
+  //
+  // 2026-09-20 真机取证：Buddy 系对「1M 但默认档更小」的模型成对下发
+  // `contextWindow: {defaultLength, supportedLengths}`（supportedLengths 最大档
+  // 恒为 1M，defaultLength 是 200K–400K 的档位）。**我方 chat 请求体不带任何档位
+  // 字段 → 上游按 defaultLength 服务**，故声明值必须取默认档：照抄最大档会让宿主
+  // 的压缩阈值（0.8 × 窗口）永远追不上真实窗口，长会话撞上游硬限即死。
+  describe('上下文窗口取默认档（contextWindow.defaultLength）', () => {
+    it('带档位对时取 defaultLength，而不是 maxInputTokens', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['glm-5.3', 'deepseek-v4.1-flash', 'minimax-m3'] }],
+          models: [
+            // 真机形态：最大档 1M，默认档 300K。
+            { id: 'glm-5.3', maxInputTokens: 1048576, contextWindow: { defaultLength: 300000, supportedLengths: [300000, 1048576] } },
+            { id: 'deepseek-v4.1-flash', maxInputTokens: 1048576, contextWindow: { defaultLength: 300000, supportedLengths: [300000, 1048576] } },
+            // 默认档与最大档不同源（minimax-m3 实测 [300K, 512K]）。
+            { id: 'minimax-m3', maxInputTokens: 524288, contextWindow: { defaultLength: 300000, supportedLengths: [300000, 524288] } },
+          ],
+        },
+      })
+      expect(models.map((m) => m.contextWindow)).toEqual([300_000, 300_000, 300_000])
+    })
+
+    it('国际版的 200K / 400K 默认档同样生效', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['hy4-preview', 'gpt-6-astra'] }],
+          models: [
+            { id: 'hy4-preview', maxInputTokens: 1048576, contextWindow: { defaultLength: 200000, supportedLengths: [200000, 1048576] } },
+            { id: 'gpt-6-astra', maxInputTokens: 1048576, contextWindow: { defaultLength: 400000, supportedLengths: [400000, 1048576] } },
+          ],
+        },
+      })
+      expect(models.map((m) => m.contextWindow)).toEqual([200_000, 400_000])
+    })
+
+    it('不带 contextWindow 字段的条目保持 maxInputTokens（单档模型无档位可选）', () => {
+      // 真机：国际版 9 个 1M 模型（gpt-5.6-*、gpt-5.5、gemini-3.5-flash、
+      // glm-5.3、glm-5.2、kimi-k3）都不带该字段。无字段即无档位，maxInputTokens
+      // 就是服务窗口，**不能砍** —— 砍了等于谎报容量。
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['gpt-5.6-sol', 'gemini-3.5-flash'] }],
+          models: [
+            { id: 'gpt-5.6-sol', maxInputTokens: 1048576, supportsImages: true },
+            { id: 'gemini-3.5-flash', maxInputTokens: 1048576 },
+          ],
+        },
+      })
+      expect(models.map((m) => m.contextWindow)).toEqual([1_048_576, 1_048_576])
+    })
+
+    it('defaultLength 非法时回退 maxInputTokens（不声明非法档）', () => {
+      // 0 / 负数 / 非数字 / 空对象 / 非对象 一律视为未下发档位。
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['a', 'b', 'c', 'd', 'e', 'f'] }],
+          models: [
+            { id: 'a', maxInputTokens: 1048576, contextWindow: { defaultLength: 0 } },
+            { id: 'b', maxInputTokens: 1048576, contextWindow: { defaultLength: -1 } },
+            { id: 'c', maxInputTokens: 1048576, contextWindow: { defaultLength: '300000' } },
+            { id: 'd', maxInputTokens: 1048576, contextWindow: {} },
+            { id: 'e', maxInputTokens: 1048576, contextWindow: null },
+            { id: 'f', maxInputTokens: 1048576, contextWindow: 300000 },
+          ],
+        },
+      })
+      expect(models.map((m) => m.contextWindow)).toEqual([1_048_576, 1_048_576, 1_048_576, 1_048_576, 1_048_576, 1_048_576])
+    })
+
+    it('defaultLength 非法且 maxInputTokens 也非法时不声明窗口', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['bad', 'worse'] }],
+          models: [
+            { id: 'bad', maxInputTokens: 0, contextWindow: { defaultLength: 0 } },
+            { id: 'worse', maxInputTokens: Number.POSITIVE_INFINITY, contextWindow: { defaultLength: Number.NaN } },
+          ],
+        },
+      })
+      expect(models).toEqual([
+        { id: 'bad', name: 'bad' },
+        { id: 'worse', name: 'worse' },
+      ])
+    })
+
+    it('解析 supportedLengths 之外不发明字段（不选档）', () => {
+      // supportedLengths 只描述可选档位；本模块刻意不解析它 —— 选档属于出站协议
+      // 变更（见 AGENTS.md 的 Buddy 章节）。这里钉死「解析结果里只有 contextWindow」。
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['glm-5.3'] }],
+          models: [{
+            id: 'glm-5.3',
+            maxInputTokens: 1048576,
+            contextWindow: { defaultLength: 300000, supportedLengths: [300000, 1048576] },
+          }],
+        },
+      })
+      expect(models[0]).toEqual({ id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 300_000 })
+    })
   })
 
   it('appends models from data.models that craft does not reference', () => {

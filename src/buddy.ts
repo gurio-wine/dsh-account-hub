@@ -418,7 +418,13 @@ export function displayNameForModel(id: string): string {
 export interface BuddyRemoteModel {
   id: string
   name: string
-  /** 上下文窗口（data.models[].maxInputTokens，模型自身配置）；远端未下发时缺省。 */
+  /**
+   * 上下文窗口：**上游实际按它服务的档位**，即 `contextWindow.defaultLength`
+   * （默认档）；远端未下发档位对时回退 `maxInputTokens`（单档模型的最大档
+   * 就是它真实提供的窗口）。两者都没有时缺省。
+   *
+   * ⚠️ 不是 `maxInputTokens` 的照抄 —— 详见 {@link parseModelMeta} 的口径说明。
+   */
   contextWindow?: number
   /** 是否接受图片输入（data.models[].supportsImages）。 */
   supportsImages?: boolean
@@ -432,7 +438,9 @@ export interface BuddyRemoteModel {
  * 从 /v3/config 响应解析可用的对话模型。
  *
  * 响应结构：{data: {agents: [{name: "craft", models: ["auto", ...]}, ...],
- *                     models: [{id, name, maxInputTokens, supportsImages, reasoning: {...}}],
+ *                     models: [{id, name, maxInputTokens,
+ *                               contextWindow?: {defaultLength, supportedLengths},
+ *                               supportsImages, reasoning: {...}}],
  *                     productFeaturesConfig?: {ModelTrialBanner: {banners: [{targetModelId}]}}}}
  *
  * 解析策略（顺序即优先级）：
@@ -567,14 +575,33 @@ function isChatModel(id: string, meta: Record<string, unknown> | undefined): boo
 /**
  * 提取单个 data.models[] 条目的上下文窗口与对话能力。
  *
- * 上下文窗口只保留正数（与 Rust 端一致）。能力字段只在远端**显式**下发时保留：
- * 缺失即 undefined，交由适配器的静态兜底表决定，而不是猜成 false。
+ * ⚠️ **上下文窗口的取值口径是 `contextWindow.defaultLength`（默认档），不是
+ * `maxInputTokens`（最大档）** —— 这是 2026-09-20 真机取证后修正的口径：
+ *
+ * - 远端对「1M 但默认档更小」的那批模型成对下发
+ *   `contextWindow: {defaultLength, supportedLengths}`，`supportedLengths`
+ *   的最大档恒为 1M、`defaultLength` 是 200K–400K 之间的档位；
+ * - **我方的 chat 请求体不含任何档位字段**（全仓 grep 证实），因此**上游按
+ *   `defaultLength` 服务** —— 声明值必须对着真实服务窗口算；
+ * - 宿主用这个声明值算自动压缩阈值（0.8 × 窗口）：照抄最大档会让阈值
+ *   （0.8 × 1M = 800K token）永远追不上真实窗口（200K–400K），长会话必然在
+ *   压缩触发之前撞上游硬限。
+ *
+ * 不带 `contextWindow` 字段的是**单档模型**，`maxInputTokens` 即真实服务窗口，
+ * 故它是回退值而非被取代值。非正整数（0 / 负数 / 非数字）一律视为非法，同样
+ * 回退 —— 与「只保留正数」的既有口径一致。
+ *
+ * 另注：`supportedLengths` 只描述可选档位，本模块**刻意不解析**它 —— 我们不
+ * 选档（选档属于出站协议变更，见 AGENTS.md 的 Buddy 章节）。
+ *
+ * 能力字段只在远端**显式**下发时保留：缺失即 undefined，交由适配器的静态
+ * 兜底表决定，而不是猜成 false。
  */
 function parseModelMeta(record: Record<string, unknown> | undefined): Omit<BuddyRemoteModel, 'id' | 'name'> {
   if (record === undefined) return {}
   const meta: Omit<BuddyRemoteModel, 'id' | 'name'> = {}
-  const limit = record.maxInputTokens
-  if (typeof limit === 'number' && Number.isFinite(limit) && limit > 0) meta.contextWindow = limit
+  const limit = readDefaultContextLength(record) ?? readPositiveLimit(record.maxInputTokens)
+  if (limit !== undefined) meta.contextWindow = limit
   if (typeof record.supportsImages === 'boolean') meta.supportsImages = record.supportsImages
   const reasoning = record.reasoning
   if (typeof reasoning === 'object' && reasoning !== null) {
@@ -590,4 +617,22 @@ function parseModelMeta(record: Record<string, unknown> | undefined): Omit<Buddy
     }
   }
   return meta
+}
+
+/**
+ * 读取 `contextWindow.defaultLength`（模型的**默认档**上下文长度）。
+ *
+ * 形如 `{defaultLength: 300000, supportedLengths: [300000, 1000000]}`。
+ * 只接受正整数：0 / 负数 / 非数字 / 字段缺失都返回 undefined，由调用方回退到
+ * `maxInputTokens` —— 宁可声明最大档，也不要声明一个上游不会服务的非法档。
+ */
+function readDefaultContextLength(record: Record<string, unknown>): number | undefined {
+  const window = record.contextWindow
+  if (typeof window !== 'object' || window === null) return undefined
+  return readPositiveLimit((window as Record<string, unknown>).defaultLength)
+}
+
+/** 正有限数才收（0 / 负数 / NaN / Infinity / 非 number 一律 undefined）。 */
+function readPositiveLimit(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
 }

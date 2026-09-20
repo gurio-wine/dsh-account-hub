@@ -85,8 +85,10 @@ export const DEFAULT_MODEL = 'deepseek-v4-flash'
 
 /**
  * 模型上下文窗口（对齐 Rust BuddyProvider::context_limit 的静态 fallback 表；
- * 权威来源是 /v3/config data.models[].maxInputTokens，由 fetchRemoteModels
- * 动态拉取后经 resolveRemoteContextWindow 优先采用，此表仅作远端不可用时的兜底）。
+ * 权威来源是 /v3/config 的**默认档**上下文窗口 —— `data.models[].contextWindow.defaultLength`
+ * （缺失时才回退 `maxInputTokens`，见 `src/buddy.ts` 的 parseModelMeta），
+ * 由 fetchRemoteModels 动态拉取后经 remoteContextWindows 优先采用，
+ * 此表仅作远端不可用时的兜底）。
  */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['deepseek-v4-flash', 1_000_000],
@@ -465,7 +467,7 @@ export class BuddyAdapter extends LlmAdapter {
   private remoteModels: BuddyRemoteModel[] | undefined
   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
-  /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
+  /** 远端下发的模型上下文窗口（默认档 `contextWindow.defaultLength`，缺失回退 `maxInputTokens`）。 */
   private remoteContextWindows: ReadonlyMap<string, number> = new Map()
   /**
    * 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。
@@ -515,7 +517,7 @@ export class BuddyAdapter extends LlmAdapter {
   /**
    * 懒加载远端模型目录（仅拉取一次）。listModels 与 resolveModel 共用：
    * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样
-   * 触发一次远端拉取，保证 /v3/config 的 maxInputTokens 能生效。
+   * 触发一次远端拉取，保证远端的上下文窗口（默认档）能生效。
    */
   private async ensureRemoteModels(): Promise<void> {
     if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
@@ -525,6 +527,8 @@ export class BuddyAdapter extends LlmAdapter {
         // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
         // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
         // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
+        // ⚠️ 窗口口径是**默认档**（defaultLength），不是 maxInputTokens —— 见
+        // `src/buddy.ts` 的 parseModelMeta：我方请求不带档位，上游按默认档服务。
         const reconciled = this.reconcileWithFallback(models)
         this.remoteModels = reconciled
         this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
@@ -651,7 +655,7 @@ export class BuddyAdapter extends LlmAdapter {
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     await this.ensureRemoteModels()
-    // 三级查找：远端 maxInputTokens → 产品兜底表 → 通用静态表
+    // 三级查找：远端默认档窗口 → 产品兜底表 → 通用静态表
     // （对齐 Rust context_limit_for_model 的两级查找，多一层产品级）。
     const contextWindow = this.remoteContextWindows.get(model)
       ?? this.productFallbackContextWindows.get(model)

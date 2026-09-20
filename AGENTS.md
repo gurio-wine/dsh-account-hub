@@ -36,6 +36,16 @@
 
 ⚠️ **「客户端模型池（IDE 代际）」≠「SOLO 网关配置表」**（理解「少模型」报障的关键区分）：客户端能显示的模型受**本地 vscdb 缓存**影响（旧 `chat_v3` 16 项，独有 `Doubao-Seed-Code` / `glm-5.3-flash` / `deepseek-v4.1-flash` / `kimi-k2.8-preview` / `qwen3.8-flash`），而**请求只认 SOLO 表**（网关按 `config_name` 在它自己那张表里找配置，找不到即 `4001`，与客户端 UI 显示什么无关）。**SOLO 表才是本 provider 的权威可用集**，故 5 项剔除已二次确认**非误伤**；反向也成立 —— `kimi-k2.7-code` / `kimi-k2.6` 只在 SOLO 表、不在旧客户端池，是**正常可调项必须保留**。
 
+### Buddy 系（`buddy-cn` / `buddy`）—— 上下文窗口取值口径（2026-09-20 真机定案）
+
+⚠️ **上下文窗口声明值取「默认档」`contextWindow.defaultLength`，不是 `maxInputTokens`**：远端对「1M 但默认档更小」的模型**成对下发** `contextWindow: {defaultLength, supportedLengths}` —— `supportedLengths` 的**最大档恒为 1M，默认档落在 200K–400K**。真机快照（2026-09-20）：`buddy-cn`（企业端点，30 条）的 `hy4-preview` / `glm-5.3` / `glm-5.3-flash` / `glm-5.2` / `kimi-k3-1` / `kimi-k2.8-preview` / `deepseek-v4-flash` / `deepseek-v4.1-flash` / `deepseek-v4-pro` / `hy4-preview-x` 默认档全部 **300K**（`[300K, 1M]`），`minimax-m3` 也是 **300K**（`[300K, 512K]`）；`buddy`（`/v3/config`，22 条）的 `hy4-preview` 默认 **200K**、`kimi-k2.8-preview`/`deepseek-v4.1-flash`/`deepseek-v4.1-flash-sg`/`hy4-preview-f` 默认 **300K**、`gpt-6-astra` 默认 **400K**。
+
+⚠️ **关键事实：我方的 chat 请求体不含任何档位字段**（全仓 grep 证实，150 处命中全是响应解析或 `resolveModel` 声明）⇒ **上游按 `defaultLength` 服务**。这正是缺陷所在：`parseModelMeta` 原先只读 `maxInputTokens`（最大档）→ 宿主压缩阈值 = `0.8 × 1M = 800K` token，而真实服务窗口只有 200K–400K ⇒ **压缩永远追不上，长会话撞上游硬限即死**。**修法就是取值口径本身**：`src/buddy.ts` 的 `parseModelMeta` 改为**优先 `contextWindow.defaultLength`（正整数才收），缺失才回退 `maxInputTokens`**；宿主侧只有**单一** contextWindow 消费入口（压缩阈值 + ContextMeter 显示共用一个声明值），**不存在「显示窗口」与「压缩窗口」两条通道**，故不要另造字段。⚠️ **不要改动请求体形态去「选档」** —— 那属于**出站协议变更**，超出本次范围（连 `supportedLengths` 都刻意不解析）。带 `contextWindow` 字段的恰好就是「1M 但默认档更小」的那批；**不带字段的是单档模型**，`maxInputTokens` 即真实服务窗口，故它是**回退值而非被取代值**。
+
+⚠️ **静态兜底表（`src/product.ts` 的 `fallbackModels`）语义已同步为「默认档兜底」**：远端优先仍是现状，静态表只在凭据失效 / 拉取失败时顶替。已实测到默认档的条目兜底值同步为默认档 —— CN 的 1M 系 → `300_000`（含 `minimax-m3`，**不是**它的最大档 512K）；国际版 `hy4-preview-f` / `deepseek-v4.1-flash` → `300_000`、`gpt-6-astra` → `400_000`。⚠️ **未定性条目一律不动**：国际版 **8 个「1M 且无 `contextWindow` 字段」**的模型（`gpt-5.6-sol` / `-terra` / `-luna`、`gpt-5.5`、`gemini-3.5-flash`、`glm-5.3`、`glm-5.2`、`kimi-k3`）**保持 1M** —— 无字段即无档位可选，`maxInputTokens` 就是服务窗口，**砍它等于谎报容量**；非 1M 条目（`hy3` 192K、`glm-5.1` 200K、`kimi-k2.6` 256K 等）全部不动。表头注释已改写，并标明「2026-09-20 真机快照，**会漂移**」。⚠️ 改这张表必须**逐条自查 diff**：`tests/unit/product.spec.ts` 已按「1M 条目集合恰好等于未定性清单」的**集合相等**断言钉死，多改一个（漏改）或少改一个（误砍）都会炸。
+
+⚠️ **静态表 1M 与远端 `maxInputTokens` 双向一致（CN 14/14、国际版 19/19），不是错收** —— 问题只在**取哪一档**。改口径时不要顺手「修正」那些 1M 值，它们对着最大档本来就是对的。
+
 Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Trae CN Work **与 Trae CN 是同一批账号**故签到只在后者提供；Qoder 与 Qoder CN **都不提供**（国际版无此活动、CN **疑似有但端点未知**，见能力矩阵表）。Trae CN 的签到与余额**前后端及宿主接线均已就绪**（`src/trae-cn-credits.ts` + 客户端能力矩阵 + `jet-hub-rpc.ts` 三处分支与 `traeCn` 实例传参）。T5 / T7 已真机校准；**T9 已于 2026-09-20 第三次修正**（原「不校验设备号形态」的推论被单变量 A/B 推翻，真根因是设备身份）。见「积分能力必须在请求前判定」与 README 的「Trae CN provider」章节。**八个 provider 都有 Account Hub 面板**（Trae CN Work 那条见下节，Qoder 与 Qoder CN 那两条见 README 的「Qoder provider」）。
 
 ### Qoder 国际版（`qoder`）—— chat 250 的三条硬事实

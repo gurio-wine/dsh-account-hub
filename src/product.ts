@@ -50,7 +50,20 @@
 export interface BuddyFallbackModel {
   id: string
   name: string
-  /** 上下文窗口（对应远端 `maxInputTokens`）。 */
+  /**
+   * 上下文窗口 —— **默认档**，即上游实际服务的那个窗口。
+   *
+   * ⚠️ 语义已从「照抄远端 `maxInputTokens`（最大档）」改为「**默认档**兜底」
+   * （2026-09-20 真机快照）：远端对「1M 但默认档更小」的模型成对下发
+   * `contextWindow: {defaultLength, supportedLengths}`，而我方 chat 请求体
+   * **不带任何档位字段**，故上游按 `defaultLength` 服务；声明值跟着最大档写
+   * 会让宿主的自动压缩阈值（0.8 × 窗口）永远追不上真实窗口。远端可用时本表
+   * 不参与（远端优先），它只在凭据失效 / 拉取失败时顶替。
+   *
+   * 档位数据会漂移，本表是快照而非契约；拿不到档位的模型（远端无
+   * `contextWindow` 字段，即单档模型）保持 `maxInputTokens`，因为那**就是**
+   * 它的服务窗口。
+   */
   contextWindow?: number
   /** 是否接受图片输入（对应远端 `supportsImages`）。 */
   supportsImages?: boolean
@@ -180,10 +193,19 @@ export interface BuddyProduct {
  * 远端 `data.models` 里另有一批 `code=11102 service info not found` 的条目
  * （glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5/k2.8-preview、hunyuan-* 等），
  * 列进选择器只会让用户选中后报错，故一律不收录。
+ *
+ * ⚠️ `contextWindow` 是**默认档**兜底（不是 `maxInputTokens`）：2026-09-20 真机
+ * 快照显示本表里全部 1M 条目（hy4-preview / glm-5.3 / glm-5.3-flash / glm-5.2 /
+ * kimi-k3-1 / deepseek-v4.1-flash / deepseek-v4-pro）远端下发的
+ * `contextWindow.defaultLength` 都是 **300K**（`supportedLengths` = [300K, 1M]），
+ * `minimax-m3` 是 300K（[300K, 512K]）。故本表按默认档写；未实测到档位的条目
+ * （hy3 / hy3-x / glm-5.1 / glm-5v-turbo / kimi-k2.7 / kimi-k2.6）**保持原值不动**
+ * —— 它们不是 1M 条目，没有「最大档 vs 默认档」之分。档位数据会漂移，本表是
+ * 快照而非契约；远端可用时以远端为准（见 `BuddyAdapter.reconcileWithFallback`）。
  */
 const BUDDY_CN_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   {
-    id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
+    id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 300_000, supportsImages: true,
     reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
   },
   {
@@ -195,31 +217,31 @@ const BUDDY_CN_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
   },
   {
-    id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
+    id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 300_000, supportsImages: true,
     reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
   },
   {
-    id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', contextWindow: 1_000_000, supportsImages: true,
+    id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', contextWindow: 300_000, supportsImages: true,
     reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high',
   },
   {
-    id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
+    id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 300_000, supportsImages: true,
     reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
   },
   {
-    id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImages: true,
+    id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 300_000, supportsImages: true,
     reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
   },
   {
-    id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, supportsImages: true,
+    id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 300_000, supportsImages: true,
     reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
   },
   { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
   { id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 300_000, supportsImages: true, reasoningEfforts: ['medium'] },
   { id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
   { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 300_000, supportsImages: true, reasoningEfforts: ['medium'] },
 ]
 
 export const BUDDY_CN: BuddyProduct = {
@@ -251,6 +273,15 @@ export const BUDDY_CN: BuddyProduct = {
  * 即 IDE 模型选择器实际展示的清单与元数据。
  *
  * 顺序即 IDE 的展示顺序（`cli` agent 白名单顺序），不要随意重排。
+ *
+ * ⚠️ `contextWindow` 是**默认档**兜底（不是 `maxInputTokens`）：2026-09-20 真机
+ * `/v3/config` 快照里 `hy4-preview-f` / `deepseek-v4.1-flash` 的
+ * `contextWindow.defaultLength` 是 **300K**、`gpt-6-astra` 是 **400K**
+ * （`hy4-preview` 是 200K，但它不在本表）。⚠️ **其余 8 个 1M 条目一律保持 1M**
+ * （`gpt-5.6-sol` / `-terra` / `-luna`、`gpt-5.5`、`gemini-3.5-flash`、`glm-5.3`、
+ * `glm-5.2`、`kimi-k3`）：真机确认它们**不带 `contextWindow` 字段**，即**单档
+ * 模型** —— 没有「最大档 vs 默认档」之分，`maxInputTokens` 就是服务窗口，砍它
+ * 等于谎报容量。非 1M 条目（`gpt-5.4` 272K、`kimi-k2.6` 256K 等）同样不动。
  */
 const BUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   { id: 'default-model', name: 'Auto', contextWindow: 176_000, supportsImages: true },
@@ -259,16 +290,16 @@ const BUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   { id: 'primary-model', name: 'Primary', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['high'] },
   { id: 'deep-model', name: 'Deep', contextWindow: 176_000, supportsImages: true },
   {
-    id: 'hy4-preview-f', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
+    id: 'hy4-preview-f', name: 'Hy4 preview', contextWindow: 300_000, supportsImages: true,
     reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
   },
   {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
     reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
   },
-  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high' },
+  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 300_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high' },
   {
-    id: 'gpt-6-astra', name: 'GPT-6-Astra', contextWindow: 1_000_000, supportsImages: true,
+    id: 'gpt-6-astra', name: 'GPT-6-Astra', contextWindow: 400_000, supportsImages: true,
     reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
   },
   {

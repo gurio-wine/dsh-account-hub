@@ -114,6 +114,63 @@ describe('产品配置', () => {
     expect(wb?.reasoningEfforts).toContain(wb?.defaultReasoningEffort)
   })
 
+  it('兜底目录的 contextWindow 是**默认档**（2026-09-20 真机快照），不是 maxInputTokens', () => {
+    // 远端对「1M 但默认档更小」的模型成对下发
+    // `contextWindow: {defaultLength, supportedLengths}`（supportedLengths 最大档
+    // 恒为 1M），而我方 chat 请求体**不带任何档位字段** → 上游按 defaultLength
+    // 服务。兜底表必须照默认档写：照抄最大档会让宿主的压缩阈值
+    // （0.8 × 窗口）永远追不上真实窗口（200K–400K），长会话撞上游硬限即死。
+    //
+    // ⚠️ 逐条钉死，任何一条被改错都等于谎报一个模型的容量。
+    const cnWindow = (id: string) => BUDDY_CN.fallbackModels!.find((m) => m.id === id)?.contextWindow
+    const intlWindow = (id: string) => BUDDY.fallbackModels!.find((m) => m.id === id)?.contextWindow
+
+    // Buddy CN：1M 系全部为 300K（supportedLengths [300K, 1M]）；
+    // minimax-m3 同为 300K（[300K, 512K]，**不是**它的最大档 512K）。
+    for (const id of ['hy4-preview', 'deepseek-v4.1-flash', 'deepseek-v4-pro', 'glm-5.3', 'glm-5.3-flash', 'glm-5.2', 'kimi-k3-1', 'minimax-m3']) {
+      expect(cnWindow(id), `buddy-cn/${id}`).toBe(300_000)
+    }
+    // 国际版：hy4-preview-f / deepseek-v4.1-flash = 300K、gpt-6-astra = 400K。
+    expect(intlWindow('hy4-preview-f')).toBe(300_000)
+    expect(intlWindow('deepseek-v4.1-flash')).toBe(300_000)
+    expect(intlWindow('gpt-6-astra')).toBe(400_000)
+  })
+
+  it('未定性条目的窗口一律不动（不许错位，也不许砍单档模型）', () => {
+    // ① 非 1M 条目：本来就没有「最大档 vs 默认档」之分，保持原值。
+    const cnWindow = (id: string) => BUDDY_CN.fallbackModels!.find((m) => m.id === id)?.contextWindow
+    expect(cnWindow('hy3')).toBe(192_000)
+    expect(cnWindow('hy3-x')).toBe(192_000)
+    expect(cnWindow('glm-5.1')).toBe(200_000)
+    expect(cnWindow('glm-5v-turbo')).toBe(200_000)
+    expect(cnWindow('kimi-k2.7')).toBe(256_000)
+    expect(cnWindow('kimi-k2.6')).toBe(256_000)
+    // ② 国际版的非 1M 条目（含抽象别名档）。
+    const intlWindow = (id: string) => BUDDY.fallbackModels!.find((m) => m.id === id)?.contextWindow
+    for (const [id, expected] of [
+      ['default-model', 176_000], ['fast-model', 200_000], ['balanced-model', 256_000],
+      ['primary-model', 272_000], ['deep-model', 176_000], ['hy3', 192_000],
+      ['gpt-5.4', 272_000], ['gpt-5.3-codex', 272_000], ['kimi-k2.6', 256_000],
+    ] as const) {
+      expect(intlWindow(id), `buddy/${id}`).toBe(expected)
+    }
+  })
+
+  it('国际版未被定性的 1M 条目全部保持 1M（无 contextWindow 字段 ⇒ 单档模型）', () => {
+    // 真机取证：这些条目**不带 `contextWindow` 字段** ⇒ 单档模型，没有档位可选，
+    // `maxInputTokens` 就是服务窗口。砍它等于谎报容量，故一律保持 1M。
+    // （真机下发过档位对的三项是 hy4-preview-f / deepseek-v4.1-flash / gpt-6-astra，
+    //  已在上一条用例里按默认档钉死；其余 1M 条目一个都不许动。）
+    const untouchedOneMeg = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gemini-3.5-flash', 'glm-5.3', 'glm-5.2', 'kimi-k3']
+    for (const id of untouchedOneMeg) {
+      expect(BUDDY.fallbackModels!.find((m) => m.id === id)?.contextWindow, `buddy/${id}`).toBe(1_000_000)
+    }
+    // 反向防线（比逐条断言更强）：国际版**所有** 1M 条目的集合必须恰好等于上表 ——
+    // 多一个（漏改的）或少一个（误砍的）都会在这里炸。
+    const oneMeg = BUDDY.fallbackModels!.filter((m) => m.contextWindow === 1_000_000).map((m) => m.id).sort()
+    expect(oneMeg).toEqual([...untouchedOneMeg].sort())
+  })
+
   it('兜底目录不含非对话模型与实测不可用的内部别名', () => {
     const banned = ['o4-mini', 'nes-1.1', 'nes-1.2', 'completion-1.0', 'codewise-jump', 'hunyuan-image-alpha']
     for (const product of [BUDDY_CN, BUDDY]) {

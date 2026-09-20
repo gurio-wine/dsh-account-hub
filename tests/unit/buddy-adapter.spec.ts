@@ -137,25 +137,32 @@ describe('BuddyAdapter', () => {
   })
 
   it('resolveModel reports the known context window', async () => {
+    // deepseek-v4-flash 不在产品兜底表里（CN 表用 deepseek-v4.1-flash /
+    // deepseek-v4-pro），走通用静态表 CONTEXT_WINDOWS；该表尚未按默认档口径
+    // 重校准（本次范围外），故此处仍是 1M。
     const resolved = await makeAdapter().resolveModel('buddy-cn', 'deepseek-v4-flash')
     expect(resolved).toMatchObject({ provider: 'buddy-cn', id: 'deepseek-v4-flash', context: { contextWindow: 1_000_000 } })
   })
 
-  it('resolveModel matches the Rust fallback table for glm and hy models', async () => {
-    // 对齐 deveco-code-rust BuddyProvider::context_limit 静态 fallback：
-    // glm-5.3-flash 1M（此前误配 200k，导致 web 上下文表显示 ~200K）。
+  it('resolveModel matches the product fallback table (default-tier windows)', async () => {
+    // ⚠️ 兜底表的 `contextWindow` 语义是**默认档**（2026-09-20 真机快照）：
+    // 远端对「1M 但默认档更小」的模型下发 contextWindow.defaultLength，
+    // 而我方请求不带档位、上游按默认档服务。CN 的 1M 系 = 300K，
+    // minimax-m3 也是 300K（[300K, 512K]）；非 1M 条目（glm-5.1 200K /
+    // kimi-k2.6 256K）不动。
     const adapter = makeAdapter()
-    expect((await adapter.resolveModel('buddy-cn', 'glm-5.3-flash')).context).toEqual({ contextWindow: 1_000_000 })
-    expect((await adapter.resolveModel('buddy-cn', 'glm-5.3')).context).toEqual({ contextWindow: 1_000_000 })
-    expect((await adapter.resolveModel('buddy-cn', 'glm-5.2')).context).toEqual({ contextWindow: 1_000_000 })
+    expect((await adapter.resolveModel('buddy-cn', 'glm-5.3-flash')).context).toEqual({ contextWindow: 300_000 })
+    expect((await adapter.resolveModel('buddy-cn', 'glm-5.3')).context).toEqual({ contextWindow: 300_000 })
+    expect((await adapter.resolveModel('buddy-cn', 'glm-5.2')).context).toEqual({ contextWindow: 300_000 })
     expect((await adapter.resolveModel('buddy-cn', 'glm-5.1')).context).toEqual({ contextWindow: 200_000 })
-    expect((await adapter.resolveModel('buddy-cn', 'minimax-m3')).context).toEqual({ contextWindow: 512_000 })
+    expect((await adapter.resolveModel('buddy-cn', 'minimax-m3')).context).toEqual({ contextWindow: 300_000 })
     expect((await adapter.resolveModel('buddy-cn', 'kimi-k2.6')).context).toEqual({ contextWindow: 256_000 })
   })
 
-  it('resolveModel prefers the remote maxInputTokens over the static table', async () => {
-    // /v3/config data.models[].maxInputTokens 是权威来源（对齐 Rust
-    // context_limit_for_model 两级查找）：远端下发值覆盖静态 fallback。
+  it('resolveModel prefers the remote window over the static table', async () => {
+    // 远端是权威来源（对齐 Rust context_limit_for_model 两级查找）：远端下发值
+    // 覆盖静态 fallback。口径是**默认档**（src/buddy.ts 的 parseModelMeta 已把
+    // defaultLength 解析进 contextWindow），适配器只负责「远端优先」。
     const adapter = makeAdapter({
       fetchRemoteModels: async () => [{ id: 'glm-5.3-flash', name: 'GLM-5.3 Flash', contextWindow: 1_048_576 }],
     })
@@ -168,7 +175,22 @@ describe('BuddyAdapter', () => {
       fetchRemoteModels: async () => [{ id: 'glm-5.3-flash', name: 'GLM-5.3 Flash' }],
     })
     const resolved = await adapter.resolveModel('buddy-cn', 'glm-5.3-flash')
-    expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
+    expect(resolved.context).toEqual({ contextWindow: 300_000 })
+  })
+
+  it('远端默认档窗口端到端生效（不取最大档）', async () => {
+    // 端到端口径防线：/v3/config 的 `contextWindow.defaultLength` 经
+    // parseModelsFromConfig → reconcileWithFallback → resolveModel 一路到
+    // 宿主声明值。真机形态：最大档 1M、默认档 300K，请求不带档位字段。
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [{
+        id: 'glm-5.3-flash',
+        name: 'GLM-5.3 Flash',
+        contextWindow: 300_000,
+      }],
+    })
+    const resolved = await adapter.resolveModel('buddy-cn', 'glm-5.3-flash')
+    expect(resolved.context).toEqual({ contextWindow: 300_000 })
   })
 
   it('resolveModel omits context for unknown models', async () => {
@@ -265,7 +287,8 @@ describe('BuddyAdapter', () => {
     expect(call.model).toMatchObject({
       provider: 'buddy-cn',
       id: 'hy4-preview',
-      context: { contextWindow: 1_000_000 },
+      // 默认档口径：hy4-preview 远端 defaultLength = 300K（非最大档 1M）。
+      context: { contextWindow: 300_000 },
       inputModalities: ['text', 'image'],
     })
     expect(typeof call.stream).toBe('function')
@@ -1727,6 +1750,7 @@ describe('BuddyAdapter 模型黑名单', () => {
     // ……但仍可解析元数据（DSH 契约要求目录缺省不构成请求拒绝）
     const resolved = await adapter.resolveModel('buddy-cn', 'glm-5.2')
     expect(resolved.id).toBe('glm-5.2')
-    expect(resolved.context?.contextWindow).toBe(1_000_000)
+    // 兜底表口径是默认档（CN 的 1M 系 → 300K）。
+    expect(resolved.context?.contextWindow).toBe(300_000)
   })
 })
