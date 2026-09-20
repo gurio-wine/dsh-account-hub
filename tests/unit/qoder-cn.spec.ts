@@ -54,6 +54,13 @@ import {
 } from '../../src/qoder-adapter.js'
 import type { QoderAdapterOptions } from '../../src/qoder-adapter.js'
 import { QoderAuth } from '../../src/qoder-auth.js'
+import {
+  classifyQoderError,
+  isQoderBackoff,
+  qoderHarnessErrorCode,
+  recordsQoderCooldown,
+  shouldSwitchQoderAccount,
+} from '../../src/qoder-errors.js'
 import { accountCredentialRefName } from '../../src/jet-hub-rpc.js'
 
 // ── 夹具 ──
@@ -158,13 +165,15 @@ describe('QODER_CN 配置逐字段', () => {
     expect(QODER_CN.displayName).toBe('Qoder CN')
   })
 
-  it('三个基址：openapi / models 实测值，chat 为官方 CN CLI 源码值（🔴 未实测）', () => {
+  it('三个基址：openapi / models 实测值，chat host 为官方 CN CLI 源码值', () => {
     expect(QODER_CN.openapiBase).toBe('https://openapi.qoder.com.cn')
     expect(QODER_CN_OPENAPI_BASE).toBe('https://openapi.qoder.com.cn')
     expect(QODER_CN.modelsBase).toBe('https://api.qoder.com.cn')
     expect(QODER_CN_MODELS_BASE).toBe('https://api.qoder.com.cn')
     // 🔴 chat 主机来自官方 CN CLI 的 `CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`。
-    // **故意把「它是源码值」写进断言**：探测时该主机整机 503，无真机证据。
+    // **故意把「它是源码值」写进断言**：该 host 上的 `/model/v1/chat/completions`
+    // 不存在（ALB 按路径级恒 503 —— 见下面 I 节的定性），故这一项**永远不会**有真机证据。
+    // 常量本身仍被保留：逃生阀与未来协议变化要用它。
     expect(QODER_CN.chatBase).toBe('https://gateway.qoder.com.cn')
     expect(QODER_CN_CHAT_BASE).toBe('https://gateway.qoder.com.cn')
   })
@@ -189,10 +198,17 @@ describe('QODER_CN 配置逐字段', () => {
     expect(QODER_CN.patUrl).not.toBe(QODER.patUrl)
   })
 
-  it('userAgent 为 `qodercn/<CN CLI 版本>`（⚠️ 推断值）', () => {
-    expect(QODER_CN.userAgent).toBe('qodercn/1.1.58')
-    expect(QODER_CN_USER_AGENT).toBe('qodercn/1.1.58')
+  it('userAgent 为 `qoder/<CN CLI 版本>`（⚠️ 官方源码模板，与 region 无关）', () => {
+    // ⚠️ 曾经写成 `qodercn/1.1.58` —— 那是把 **npm 包名**（`@qodercn-ai/qoderclicn`）
+    // 当成了产品名而推断出的错值。官方 `openApiJsonApiRequest` 用的是
+    // `` `qoder/${version}` `` 模板，**与 region 无关**，故 CN 与国际版同形。
+    expect(QODER_CN.userAgent).toBe('qoder/1.1.58')
+    expect(QODER_CN_USER_AGENT).toBe('qoder/1.1.58')
     expect(QODER.userAgent).toBe('qoder/1.1.16')
+    // 两个 region 的 UA **前缀相同**（同形不同版本号）—— 这条反向锁死
+    // 「不要为 CN 另发明一个前缀」，与 cn 的 client_type / Cosy 头那类差异不同。
+    expect(QODER_CN.userAgent.startsWith('qoder/')).toBe(true)
+    expect(QODER.userAgent.startsWith('qoder/')).toBe(true)
   })
 
   it('clientType 为 `"5"`（⚠️ 官方 CN CLI 的 kg() 默认值，未实测）', () => {
@@ -740,5 +756,146 @@ describe('ALL_QODER_PRODUCTS 与 qoderProductById', () => {
         expect(product.serviceName, product.id).toBeUndefined()
       }
     }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// I. CN 的 chat 503 定性：路径不存在 ⇒ 直报，不退避、不换号
+//
+// 二次取证定案（2026-09-21）：`gateway.qoder.com.cn` 上
+// `/model/v1/chat/completions` **不存在**，ALB 按路径级恒 503（与凭据/头/出口
+// 无关，也不会恢复）。故对 CN 退避重试是纯粹的误导 —— 永远不可能成功。
+// 国际版的 503 维持退避语义不变（对它而言瞬时故障是真实可能，实测可用）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('chat 503 按 region 分流的定性（路径不存在 vs 瞬时故障）', () => {
+  it('**CN 的 503 直报**：fail、不退避、不换号、不记徽章', () => {
+    const result = classifyQoderError({
+      httpStatus: 503, message: '<html>503 Service Temporarily Unavailable</html>', product: QODER_CN,
+    })
+
+    expect(result.action).toBe('fail')
+    expect(isQoderBackoff(result.action)).toBe(false)
+    expect(shouldSwitchQoderAccount(result.action)).toBe(false)
+    expect(recordsQoderCooldown(result)).toBe(false)
+    // 关键：**不能**是 RATE_LIMIT —— 那正是「可重试」的信号，会让 DSH 白白退避重试。
+    expect(qoderHarnessErrorCode(result)).toBe('INVALID_REQUEST')
+  })
+
+  it('CN 的 503 文案点名真因：路径不存在 + WASM 签名门槛 + PAT 过不去', () => {
+    const result = classifyQoderError({ httpStatus: 503, message: 'upstream unavailable', product: QODER_CN })
+
+    // 三个事实都要在文案里，否则用户只会看到一句「503」而无从判断该不该重试。
+    expect(result.message).toContain('gateway.qoder.com.cn')
+    expect(result.message).toContain('/model/v1/chat/completions')
+    expect(result.message).toContain('不存在')
+    expect(result.message).toContain('agent_chat_generation')
+    expect(result.message).toContain('签名')
+    expect(result.message).toContain('PAT')
+    // 并明确告知**不会重试**，以及控制面不受影响（避免用户以为整个 provider 挂了）。
+    expect(result.message).toContain('不会重试')
+    // 上游原文原样保留（诊断线索不该被处置文案冲掉）。
+    expect(result.message).toContain('upstream unavailable')
+  })
+
+  it('**国际版的 503 仍退避重试同一账号**（反向回归：CN 分支没波及它）', () => {
+    const result = classifyQoderError({ httpStatus: 503, message: 'gateway hiccup', product: QODER })
+
+    expect(result.action).toBe('backoff')
+    expect(isQoderBackoff(result.action)).toBe(true)
+    expect(shouldSwitchQoderAccount(result.action)).toBe(false)
+    expect(recordsQoderCooldown(result)).toBe(false)
+    expect(qoderHarnessErrorCode(result)).toBe('RATE_LIMIT')
+    // 文案不得出现 CN 那套「路径不存在」的定性。
+    expect(result.message).not.toContain('不存在')
+  })
+
+  it('**省略 product 时按国际版处理**（缺省语义，既有调用点零变化）', () => {
+    const omitted = classifyQoderError({ httpStatus: 503, message: 'gateway hiccup' })
+    const explicit = classifyQoderError({ httpStatus: 503, message: 'gateway hiccup', product: QODER })
+
+    expect(omitted.action).toBe('backoff')
+    expect(omitted).toEqual(explicit)
+  })
+
+  it('CN 的**其余** 5xx / 429 / 408 维持退避（判据只认 503，不宽一格）', () => {
+    // 实测只覆盖了 503 这一个状态码。把判据放大成「CN 的 5xx 一律结构性失败」
+    // 会把「上游真的抖了一下」也说成不可恢复 —— 那是用户无法自行分辨的假信息。
+    for (const status of [500, 502, 504, 429, 408]) {
+      const result = classifyQoderError({ httpStatus: status, message: 'hiccup', product: QODER_CN })
+      expect(result.action, String(status)).toBe('backoff')
+      expect(qoderHarnessErrorCode(result), String(status)).toBe('RATE_LIMIT')
+    }
+  })
+
+  it('CN 的 503 只在 **chat** 线上直报；额度线（source=quota）不受影响', () => {
+    // 该定性说的是「chat 路径不存在」—— 额度端点（openapi.qoder.com.cn）实测正常，
+    // 它的 503 仍是普通的瞬时故障。
+    const quota = classifyQoderError({ httpStatus: 503, message: 'hiccup', source: 'quota', product: QODER_CN })
+
+    expect(quota.action).toBe('backoff')
+  })
+
+  it('CN 的 503 带业务码时**不**走结构性分支（业务码优先于状态码）', () => {
+    // 有业务码说明请求确实到了应用层，不是 ALB 的路径级拒绝 —— 该走码的判定。
+    const result = classifyQoderError({
+      httpStatus: 503, code: 'some_business_code', message: 'boom', product: QODER_CN,
+    })
+
+    expect(result.action).toBe('fail')
+    expect(result.message).toContain('some_business_code')
+    expect(result.message).not.toContain('agent_chat_generation')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// J. 适配器端到端：CN 503 的**行为**（不换号、错误码不可重试）
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('适配器：CN 的 chat 503 不退避不换号，国际版仍退避', () => {
+  /** 造一个 503 的 HTML 响应（ALB 错误页形态：非 JSON、无业务码）。 */
+  function albResponse(): Response {
+    return new Response('<html><body>503 Service Temporarily Unavailable</body></html>', {
+      status: 503, headers: { 'content-type': 'text/html' },
+    })
+  }
+
+  /** 跑一次 stream，返回抛出的错误（或 null）。 */
+  async function errorOf(adapter: QoderAdapter, options: never): Promise<Error | null> {
+    try {
+      for await (const _chunk of adapter.stream(options)) { /* noop */ }
+      return null
+    } catch (caught) {
+      return caught as Error
+    }
+  }
+
+  it('CN：抛 INVALID_REQUEST（**不可重试**），且一次都不问账号池', async () => {
+    let poolCalls = 0
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: (async () => albResponse()) as unknown as typeof fetch,
+      accountPool: {
+        getAvailableAccount: async () => { poolCalls += 1; return undefined },
+        findAccountIdByCredential: async () => 'acct-1',
+      } as never,
+    }))
+    const error = await errorOf(adapter, generateOptions())
+
+    expect(error).toBeInstanceOf(Error)
+    expect((error as unknown as { code?: string }).code).toBe('INVALID_REQUEST')
+    // 不换号：ALB 的路径级拒绝与账号无关，换 N 个账号只会得到 N 个同样的 503。
+    expect(poolCalls).toBe(0)
+    expect(error!.message).toContain('agent_chat_generation')
+  })
+
+  it('国际版：同一份 503 响应仍抛 RATE_LIMIT（可重试，回归保护）', async () => {
+    const adapter = new QoderAdapter(adapterOptions({
+      product: QODER,
+      fetchImpl: (async () => albResponse()) as unknown as typeof fetch,
+    }))
+    const error = await errorOf(adapter, generateOptions())
+
+    expect((error as unknown as { code?: string }).code).toBe('RATE_LIMIT')
+    expect(error!.message).not.toContain('不存在')
   })
 })

@@ -401,13 +401,17 @@ function isCredentialExpiredError(error: unknown): boolean {
 }
 
 /** 把额度端点的失败响应压成一条分类结果（401 的两类分型都在 `classifyQoderError` 里）。 */
-function classifyQuotaFailure(status: number, rawText: string): QoderErrorClassification {
+function classifyQuotaFailure(status: number, rawText: string, product: QoderProduct = QODER): QoderErrorClassification {
   return classifyQoderError({
     httpStatus: status,
     source: 'quota',
     message: summarizeQoderErrorBody(rawText),
     // 分类器会在 `details` 里二次解析真码，故要给它**原文**而不是压平的摘要。
     body: rawText.slice(0, QODER_ERROR_BODY_LIMIT),
+    // region 上下文：当前按 region 分流的分支只作用于 chat（`source === 'chat'`），
+    // 额度线不受影响；传下去是为了让两个 region 的分类入参形态一致，
+    // 免得将来只在 chat 线上有 region 信息、额度线却拿不到。
+    product,
   })
 }
 
@@ -452,7 +456,7 @@ export async function fetchQoderQuotaUsage(
         ok: false,
         message: `PAT 已失效或不被接受，请重新粘贴：${error instanceof Error ? error.message : String(error)}`,
         // 走同一张分类表：quota 端点的 401 分型是 `credentialInvalid`。
-        classification: classifyQuotaFailure(401, error instanceof Error ? error.message : String(error)),
+        classification: classifyQuotaFailure(401, error instanceof Error ? error.message : String(error), product),
       }
     }
     // 传输层失败：**不**分类成 401（断网不等于凭据失效）。
@@ -487,7 +491,7 @@ export async function fetchQoderQuotaUsage(
     }
 
     if (!response.ok) {
-      const classification = classifyQuotaFailure(response.status, rawText)
+      const classification = classifyQuotaFailure(response.status, rawText, product)
       // 401 TOKEN_EXPIRE：jt 过期，丢弃缓存重换一次 —— 只重试一次。
       if (classification.jobTokenExpired && attempt === 0) {
         options.onDebug?.(`[qoder] 额度端点 401 TOKEN_EXPIRE（HTTP ${response.status}），丢弃 jt 缓存后重试一次`)
@@ -499,7 +503,7 @@ export async function fetchQoderQuotaUsage(
             return {
               ok: false,
               message: `PAT 已失效或不被接受，请重新粘贴：${error instanceof Error ? error.message : String(error)}`,
-              classification: classifyQuotaFailure(401, error instanceof Error ? error.message : String(error)),
+              classification: classifyQuotaFailure(401, error instanceof Error ? error.message : String(error), product),
             }
           }
           return { ok: false, message: `重换 Qoder job token 失败：${error instanceof Error ? error.message : String(error)}` }

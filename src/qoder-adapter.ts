@@ -529,6 +529,14 @@ export interface QoderStreamOptions {
    * （见 `qoder-errors.ts` 的 401 分支）。
    */
   afterJobTokenRetry?: boolean
+  /**
+   * 产品配置（**region 上下文**），透传给错误分类器。
+   *
+   * 分类器按它分流「同一状态码在两个 region 语义不同」的那一条 —— 当前仅
+   * CN 的 chat 503（路径不存在 ⇒ 直报，见 `qoder-errors.ts` 的 7a 条）。
+   * 省略时分类器按国际版处理，故既有调用点行为不变。
+   */
+  product?: QoderProduct
 }
 
 /** 一次 chat 请求的消费结果（供适配器做换号与收尾判定）。 */
@@ -684,6 +692,9 @@ export async function* consumeQoderStream(
               ...frame.code === undefined ? {} : { code: frame.code },
               message: frame.message,
               source: 'chat',
+              // region 上下文：CN 的 chat 503 是「路径不存在」而非瞬时故障，
+              // 分类器据此直报（见 qoder-errors.ts 的 7a 条）。
+              ...options.product === undefined ? {} : { product: options.product },
               // ⚠️ **流内分支同样要传 `details`**：`provider_error` 帧的外层 message
               // 恒是无信息量的 `"Error in upstream response"` / `"All models failed"`，
               // 真因只在 `details` 里。此前这里没传 body，于是流内 provider_error
@@ -898,6 +909,7 @@ async function* consumeQoderJson(
       message: frame.message,
       source: 'chat',
       body: rawText,
+      ...options.product === undefined ? {} : { product: options.product },
       ...options.afterJobTokenRetry === undefined ? {} : { afterJobTokenRetry: options.afterJobTokenRetry },
     })
     return {
@@ -1445,6 +1457,9 @@ export class QoderAdapter extends LlmAdapter {
       source: 'chat',
       body,
       afterJobTokenRetry,
+      // region 上下文：CN 的 chat 503 是「路径不存在」（ALB 按路径级拒绝），
+      // 直报而非退避 —— 这是本 provider 唯一按 region 分流的分类分支。
+      product: this.product,
     })
     return this.confirmQuota(classification)
   }
@@ -1488,6 +1503,7 @@ export class QoderAdapter extends LlmAdapter {
       httpStatus: response.status,
       timeouts: { firstFrameMs: resolveFirstFrameTimeoutMs(), chunkMs: resolveChunkTimeoutMs() },
       afterJobTokenRetry,
+      product: this.product,
       ...options.signal === undefined ? {} : { signal: options.signal },
     })
     try {

@@ -2304,20 +2304,40 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
 |---|---|---|
 | 换 job token / 额度 | `openapi.qoder.com.cn` | ✅ 真机实测 200 |
 | 模型目录 | `api.qoder.com.cn` | ✅ 真机实测 200 |
-| chat | `gateway.qoder.com.cn` | 🔴 **源码定案、真机未验证** |
+| chat | `gateway.qoder.com.cn` | 🔴 host 是官方源码值，但**该路径不存在** —— chat 对 PAT **结构性不可用**（见下） |
 
-⚠️ **chat 基址当前是 503**：`gateway.qoder.com.cn` 取值为官方 CN CLI
-（`@qodercn-ai/qoderclicn@1.1.58`）里的选区常量
-`CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`，但**探测时该主机整机 503**
-（阿里云 ALB 无健康后端，官方 CN CLI 同样打不通）。实现**照常按此值构造**，
-错误自然直报上游 —— 阿里云侧恢复后**无需改代码即可用**。
+⚠️ **CN 的 chat 不是「上游未就绪」，而是路径不存在 —— 不会恢复，也不需要等**。
 
-> **绝不要因为「测不通」就把它改成国际版 host**：那会把「上游暂时不可用」
-> 伪装成「凭据失效」，方向完全错。CN 目录与额度两条线**都实测 200**，
-> 只有 chat 这一条卡在上游。
+二次取证定案（2026-09-21，真机矩阵 + 用户机器上官方 Qoder CN IDE 0.3.4 的
+`qodercli.log` 佐证）：
+
+1. **503 是路径级的**：`/model/v1/chat/completions` 在 CN 的 `gateway.qoder.com.cn`
+   上**不存在**。ALB 对「该路径 × 任意方法 × 任意头」恒 503——无 `Authorization`、
+   垃圾 `jt-`、空 Bearer 四种组合返回的 alb 错误页**逐字节相同**；而**同 host** 的
+   `/api/v2/config/getDataPolicy` 返回**应用层** 401/400（证明路径活着）。
+   故与凭据、请求头、网络出口**全都无关**，**不会自行恢复**。
+2. **官方客户端的 chat 走另一条路径**：`/algo/api/v2/service/pro/sse/agent_chat_generation`
+   （`qodercli.log` 实录 POST 该路径 200）。
+3. **那条通道有 WASM 签名门槛**：官方请求由 `qoder_auth_wasm` 的
+   `prepareInferRequest` 生成，构造需要 `machineId` + `cosyVersion` +
+   **`userInfoJson` 里的登录用户密钥**。用有效 `jt-` 直接打会得到 200 + SSE，
+   但**帧内**是 `{"code":"101","message":"Signature invalid"}`。
+   **PAT 型凭据给不出用户密钥 ⇒ 永远过不去。**
+
+⇒ **CN 的 chat 对本插件的登录形态（PAT）结构性不可用**，不是待恢复的瞬时故障。
+故 host 常量**保留**（逃生阀与未来协议变化仍用它），但错误分类**按 region 分流**：
+CN 的 chat 503 **直报、不退避、不换号**（退避重试一个不可能成功的请求纯属误导），
+国际版的 503 维持「网关瞬时故障 → 退避重试同一账号」不变。
+
+> **绝不要因为「打不通」就把它改成国际版 host**：实测 **CN 的 `jt-` 打国际版
+> chat 会回 401**（两区令牌互不承认），于是「路径不存在」会被**伪装成
+> 「凭据失效」**，把用户引向反复重贴 PAT 的死路。
+>
+> **控制面不受影响**：CN 的目录（14 项）与额度两条线**都实测 200**，
+> 换令牌（exchange）也正常 —— 只有 chat 这一条对 PAT 走不通。
 
 **逃生阀**：`QODER_MODEL_SERVER_HOST` 环境变量可覆盖 chat 的 host（含显式 scheme），
-用于阿里云侧就绪后，或者你想临时指向另一个网关时：
+用于指向自建网关或本地抓包调试：
 
 ```powershell
 # 只覆盖 host（scheme 缺省时按 https 处理）
@@ -2325,6 +2345,10 @@ $env:QODER_MODEL_SERVER_HOST = 'gateway.qoder.com.cn'
 # 也可以写全 scheme（自建反代 / 本地抓包调试）
 $env:QODER_MODEL_SERVER_HOST = 'http://127.0.0.1:8080'
 ```
+
+⚠️ **对 CN 而言逃生阀与「chat 不可用」无关**：改 host **不会**让 CN 的 chat 活过来
+——路径不存在是 CN 网关侧的事实，换个出口打同一个路径仍是 503。它真正有用的场景是
+**官方将来补上 OpenAI 兼容端点**、或你自建了带签名的反代。
 
 三条语义（与官方 CN CLI 一致，本插件不发明新开关）：
 
@@ -2338,14 +2362,21 @@ $env:QODER_MODEL_SERVER_HOST = 'http://127.0.0.1:8080'
 - 该变量作用于**两个 region**（它是「本机怎么连上游」的运行期开关，不是 region 配置）；
   不设它时一律走 `product.chatBase`。
 
-**CN 的两项出站身份标识**（⚠️ **均为源码值、未实测**，真机可用后若被证伪只改配置）：
+**CN 的三项出站身份标识**：
 
+- **UA** = `qoder/1.1.58`（⚠️ 官方源码模板 `` `qoder/${版本}` ``，**与 region 无关**）
+  —— 版本号取自官方 CN CLI。⚠️ 曾经写成 `qodercn/1.1.58`：那是把 **npm 包名**
+  `@qodercn-ai/qoderclicn` 当成了产品名而推断出的**错值**，已按官方源码校正；
 - `client_type: "5"` —— chat 请求体 `metadata.context.client_type`，取自官方 CN CLI
   的 `kg()` 默认值 `process.env.CLIENT_TYPE ?? "5"`（国际版是 `qodercli`）；
 - **Cosy 头**（`Cosy-ClientType` = `clientType`、`Cosy-Version` = `1.1.58`）——
   仅 CN 发（国际版不发，现有实现实测可用）。⚠️ `Cosy-MachineOS` /
   `Cosy-MachineHostname` **刻意不实现**：官方对这两个头是**条件性**发送，
   本插件**不猜机器身份** —— 缺头比错头安全（错头会被后台当真记进设备维度）。
+
+⚠️ 三者的证据强度都**只是源码值**：CN 的 chat 路径不存在（见上），
+**没有任何一个能在真机上 A/B 验证**。它们与 `Cosy-Version` 一样属「按官方源码
+照抄、无法验收」的一类 —— 真机可用后若被证伪，只改 `src/qoder-product.ts` 一处。
 
 **CN 目录是 14 项快照**（国际版是 17 项、且只有 2 项 `is_enabled`）：
 

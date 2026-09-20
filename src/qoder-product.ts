@@ -52,9 +52,9 @@
 // |---|---|
 // | `QODER_CN_OPENAPI_BASE` | ✅ 真机实测 200 |
 // | `QODER_CN_MODELS_BASE` | ✅ 真机实测 200 |
-// | `QODER_CN_CHAT_BASE` | 🔴 **源码定案、未实测**（探测时整机 503，见该常量注释） |
+// | `QODER_CN_CHAT_BASE` | 🔴 **host 是官方源码值，但该路径不存在**（chat 对 PAT 结构性不可用，见该常量注释） |
 // | `QODER_CN_PAT_URL` | 官方 CN 文档明写 |
-// | `QODER_CN_USER_AGENT` | ⚠️ 从 CN CLI 包名 + 版本推断，未实测 |
+// | `QODER_CN_USER_AGENT` | ⚠️ 官方源码模板 `` `qoder/${version}` ``，未实测（chat 打不通，无从 A/B） |
 
 /**
  * OpenAPI 基址：换令牌（`jobToken/exchange`）与额度（`quota/usage`）端点。
@@ -101,15 +101,41 @@ export const QODER_CN_OPENAPI_BASE = 'https://openapi.qoder.com.cn'
 /**
  * **CN** chat 基址：OpenAI 兼容的 `/model/v1/chat/completions`。
  *
- * 🔴 **源码定案、真机未验证**：取值为官方 CN CLI
- * （`@qodercn-ai/qoderclicn@1.1.58`）里的选区常量
- * `CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"` —— `_o` 为真走
- * `gateway.qoder.com.cn`（CN），为假走国际版。
+ * 🔴 **该路径在 CN 上不存在 —— 不是「未就绪」，而是结构性不可用。**
  *
- * ⚠️ **探测时该主机整机 503**（阿里云 ALB 无健康后端；官方 CN CLI 同样打不通），
- * 故无法用一次真实请求把它从「源码候选」升格为「实测值」。实现**照常按此值**
- * 构造，错误自然直报上游 —— 不要因为「测不通」就改成国际版 host：那会把
- * 「上游暂时不可用」伪装成「凭据失效」，方向完全错。
+ * host 本身取自官方 CN CLI（`@qodercn-ai/qoderclicn@1.1.58`）的选区常量
+ * `CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`（`_o` 为真走 CN）——
+ * 那一半是**官方源码值**，没有问题。问题在**路径**：
+ *
+ * ## 二次取证定案（2026-09-21，真机矩阵 + 官方客户端佐证）
+ *
+ * 1. **503 是路径级的**：`/model/v1/chat/completions` 在该 host 上**不存在**。
+ *    ALB 对「该路径 × 任意方法 × 任意头」恒 503（无 `Authorization`、垃圾 `jt-`、
+ *    空 Bearer 四种组合返回的 alb 错误页**逐字节相同**）；同 host 的
+ *    `/api/v2/config/getDataPolicy` 返回**应用层** 401/400（证明路径活着）。
+ *    故与凭据、出口、host 全部无关，**也不会「恢复」**。
+ * 2. **官方客户端的真实 chat 通道是另一条路径**：
+ *    `/algo/api/v2/service/pro/sse/agent_chat_generation`（用户机器上 Qoder CN
+ *    IDE 0.3.4 的 `qodercli.log` 实录 POST 该路径 200）。
+ * 3. **该通道有 WASM 签名门槛**：官方请求由 `qoder_auth_wasm` 的
+ *    `prepareInferRequest` 生成（构造需 `machineId` + `cosyVersion` +
+ *    **`userInfoJson` 里的登录用户密钥**）。用有效 `jt-` 直打会得到 200 + SSE，
+ *    但帧内是 `{"code":"101","message":"Signature invalid"}`。
+ *    **PAT 型凭据给不出用户密钥 ⇒ PAT 形态永远过不去。**
+ *
+ * 结论：CN 的 chat 对**本插件的登录形态（PAT）结构性不可用**，不是待恢复的
+ * 瞬时故障。国际版（{@link QODER_CHAT_BASE}）**完全正常**（同一套实现实测 200
+ * 标准 OpenAI JSON），是本次取证的控制组。
+ *
+ * ## 为什么仍保留本常量与其路径
+ *
+ * 字段本身**不做改动**，理由有二：**逃生阀** {@link resolveQoderChatBase}
+ * （`QODER_MODEL_SERVER_HOST`）需要一个可被覆盖的默认 host；且上游协议将来
+ * 若变化（或 CN 补上 OpenAI 兼容端点），改这一处即可生效。
+ *
+ * ⚠️ **绝不因为「打不通」就把它改成国际版 host** —— 禁令仍然成立，且理由更硬：
+ * 实测**CN 的 `jt-` 打国际版 chat 会回 401**（两区令牌互不承认），于是
+ * 「路径不存在」会被伪装成**「凭据失效」**，把用户引向反复重贴 PAT 的死路。
  *
  * ⚠️ 另注意它与国际版不同**不带** `-v2` 段（`api2-v2.qoder.sh` vs
  * `gateway.qoder.com.cn`）—— 不要按「同形替换」去猜。
@@ -126,12 +152,15 @@ export const QODER_CN_MODELS_BASE = 'https://api.qoder.com.cn'
 /**
  * **CN** User-Agent。
  *
- * ⚠️ **未验证**：由 CN CLI 包名（`@qodercn-ai/qoderclicn`）+ 版本号 `1.1.58`
- * 推断成 `qodercn/1.1.58`，与国际版的 `qoder/<版本>` 同构。chat 主机 503
- * 期间**无法 A/B**，故只能按此形态发。它与 `clientType` 一样属**出站身份标识**，
- * 真机可用后若被证伪，只改这一处常量即可。
+ * ⚠️ **未实测**（chat 路径不存在，无从 A/B），但**形态已按官方源码校正**：
+ * 官方 CN CLI 的 `openApiJsonApiRequest` 用的是模板 `` `qoder/${版本}` `` ——
+ * 与 region **无关**。此前写成 `qodercn/1.1.58` 是**推断错值**（把 npm 包名
+ * `@qodercn-ai/qoderclicn` 当成了产品名），已改为与国际版同形的 `qoder/<版本>`。
+ * 版本号 `1.1.58` 仍取自 CN CLI 的版本（{@link QODER_CN} 的 `cosyVersion` 同源）。
+ *
+ * 它与 `clientType` 一样属**出站身份标识**，真机可用后若被证伪只改这一处常量。
  */
-export const QODER_CN_USER_AGENT = 'qodercn/1.1.58'
+export const QODER_CN_USER_AGENT = 'qoder/1.1.58'
 
 // ── PAT ──
 
@@ -662,9 +691,9 @@ export const QODER: QoderProduct = {
  * |---|---|---|
  * | `openapiBase` | `openapi.qoder.com.cn` | ✅ 实测 200 |
  * | `modelsBase` | `api.qoder.com.cn` | ✅ 实测 200 |
- * | `chatBase` | `gateway.qoder.com.cn` | 🔴 源码定案（官方 CN CLI 选区常量）；探测时整机 503 |
+ * | `chatBase` | `gateway.qoder.com.cn` | 🔴 host 是官方源码值，但 **`/model/v1/chat/completions` 在该 host 上不存在**（ALB 恒 503）⇒ chat 对 PAT 结构性不可用，见该常量注释 |
  * | `patUrl` | `qoder.cn/account/integrations` | 官方 CN 文档明写 |
- * | `userAgent` | `qodercn/1.1.58` | ⚠️ 由包名 + 版本推断，未实测 |
+ * | `userAgent` | `qoder/1.1.58` | ⚠️ 官方源码模板 `` `qoder/${版本}` ``（与 region 无关）；版本号取自 CN CLI，未实测 |
  * | `clientType` | `"5"` | ⚠️ 源码值（CN CLI `kg()` 默认），未实测 |
  * | `cosyVersion` | `1.1.58` | 同 `userAgent` 的版本来源（CN CLI 版本） |
  *

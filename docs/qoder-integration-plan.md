@@ -120,7 +120,7 @@
 | provider id / 显示名 | `qoder-cn` / **Qoder CN**（带连字符 ⇒ **必须**显式声明 `serviceName: 'qoderCnAuth'`，机械派生会得到非法的 `qoder-cnAuth`） |
 | CN OpenAPI | `openapi.qoder.com.cn` —— ✅ 真机实测 200 |
 | CN 模型目录 | `api.qoder.com.cn` —— ✅ 真机实测 200（**14 项快照，全部 `is_enabled:true`**；短别名 id 体系；**无 `lite`**） |
-| CN chat | `gateway.qoder.com.cn` —— 🔴 **源码定案、真机未验证**：取自官方 CN CLI（`@qodercn-ai/qoderclicn@1.1.58`）的选区常量 `CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`；**探测时该主机整机 503**（阿里云 ALB 无健康后端，官方 CN CLI 同样打不通）。⚠️ 与国际版**不带 `-v2` 段**，不要按同形替换去猜 |
+| CN chat | `gateway.qoder.com.cn` —— 🔴 host 取值为官方 CN CLI（`@qodercn-ai/qoderclicn@1.1.58`）的选区常量 `CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`，但 **`/model/v1/chat/completions` 在该 host 上不存在**（见文末「双 region 扩展」的二次取证）。⚠️ 与国际版**不带 `-v2` 段**，不要按同形替换去猜 |
 | `client_type` | CN 取 **`"5"`**（官方 CN CLI 的 `kg()` 默认值 `process.env.CLIENT_TYPE ?? "5"`）⚠️ 源码值，未实测 |
 | Cosy 头 | CN 发 `Cosy-ClientType`（= `clientType`）与 `Cosy-Version`（`1.1.58`）⚠️ 未实测；`Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**（官方条件性发送，本插件不猜机器身份） |
 | 签到 | 矩阵仍是 `dailyCheckin: false`，但理由是**「端点未知、未验证」**（CLI2API 的 `RegionDescriptor` 只在 cn 挂 Checkin），**不是**「没有权益」—— 拿到端点后翻 `true`，届时需补 `credits.status` / `credits.claimAll` 的 `qoder-cn` 分支 |
@@ -138,9 +138,42 @@
 ⚠️ **只影响 chat**（`openapiBase` / `modelsBase` 两条控制面不受影响）、路径与查询串
 一律丢弃（路径恒为 `/model/v1/chat/completions`）、**显式 scheme 优先**（裸主机名沿用
 原基址的 `https`，写 `http://` 就按 http 发）、**请求时读取**（不是启动时定型）、
-作用于两个 region。用于阿里云侧就绪后或临时指向别的网关；不设时一律走 `product.chatBase`。
-⚠️ **绝不因为「测不通」就把它改成国际版 host** —— 那会把「上游暂时不可用」伪装成
-「凭据失效」。
+作用于两个 region。用于临时指向别的网关或本地抓包调试；不设时一律走 `product.chatBase`。
+⚠️ **但改 host 并不会让 CN 的 chat 活过来** —— 路径不存在是 CN 网关侧的事实（见下节）。
+⚠️ **绝不因为「打不通」就把它改成国际版 host** —— 那会把「路径不存在」伪装成
+「凭据失效」（实测 CN 的 `jt-` 打国际版 chat 回 401，两区令牌互不承认）。
+
+### 二次取证：CN 的 chat 定性翻转（2026-09-21）
+
+**本节的结论推翻了此前「阿里云侧未就绪、恢复后无需改代码」的定性 —— 那是错误事实。**
+
+触发点：用户在 Qoder CN 官方客户端实测**发消息成功**（`qodercli.log` 佐证），
+与我方「整机 503」的观测矛盾，于是重做取证。
+
+| # | 事实 | 证据 |
+|---|---|---|
+| 1 | **503 是路径级的**，该路径在 CN **不存在** | ALB 对 `/model/v1/chat/completions` × 任意方法 × 任意头（无 `Authorization` / 垃圾 `jt-` / 空 Bearer / 带有效 `jt-`）恒 503，**alb 错误页逐字节相同**；**同 host** 的 `/api/v2/config/getDataPolicy` 返回**应用层** 401/400（路径活着）⇒ 与凭据、出口、host 全无关 |
+| 2 | **官方客户端的真实 chat 通道是另一条路径** | `/algo/api/v2/service/pro/sse/agent_chat_generation` —— 用户机器上 Qoder CN IDE 0.3.4 的 `qodercli.log` 实录 POST 该路径 **200**；`endpoint-cache.json` 物证 inferEndpoints 单候选 = `gateway.qoder.com.cn` |
+| 3 | **该通道有 WASM 签名门槛** | 官方请求由 `qoder_auth_wasm` 的 `prepareInferRequest` 生成（构造需 `machineId` + `cosyVersion` + **`userInfoJson` 登录用户密钥**）；用有效 `jt-` 直接打 → **200 + SSE，但帧内** `{"code":"101","message":"Signature invalid"}` |
+| 4 | **PAT 形态结构性不可用** | 结论由 1+3 推出：路径不存在，而唯一活着的通道要登录用户密钥，**PAT 给不出** ⇒ 不是待恢复的瞬时故障 |
+| 5 | **国际版完全正确（控制组）** | `api2-v2.qoder.sh` + `/model/v1/chat/completions` + `jt-` 实测 **200 标准 OpenAI JSON**；CN 的 `jt-` 打国际版 → **401**（两区令牌互不承认，再确认） |
+| 6 | **UA 是推断错值，已校正** | 官方 `openApiJsonApiRequest` 用 `` `qoder/${版本}` ``，**与 region 无关** ⇒ CN 应为 `qoder/1.1.58`，此前的 `qodercn/1.1.58` 是把 npm 包名 `@qodercn-ai/qoderclicn` 当产品名 |
+
+**落地改动**（提交 `本次提交`）：
+
+- `src/qoder-product.ts`：`QODER_CN_USER_AGENT` → `'qoder/1.1.58'`；chat 基址注释按上表重写
+  （**常量与路径本身保留** —— 逃生阀与未来协议变化仍需要它）；
+- `src/qoder-errors.ts`：新增 `QoderErrorInput.product`（region 上下文，判据**显式列举
+  `=== QODER_CN.id`**，不做「非国际版即 CN」的反向推断，对齐 `qoderFallbackModels`
+  先例）；`classifyQoderError` 第 7a 条：**CN 的 chat 503 → `'fail'` 直报**
+  （不退避、不换号、不记徽章、harness 码 `INVALID_REQUEST`）；**判据只认 503**，
+  其余 5xx / 429 / 408 维持通用退避；**国际版 503 语义逐字节不变**（`backoff` → `RATE_LIMIT`）；
+- `src/qoder-adapter.ts`：三个分类调用点透传 `product`（`QoderStreamOptions` 新增该字段）；
+- 测试：`tests/unit/qoder-cn.spec.ts` 新增 I/J 两节（CN 直报 + 文案三要素 + **国际版 503
+  反向回归** + 省略 product 的缺省语义 + 其余状态码不宽判 + 适配器端到端不换号），既有
+  `qoder-errors.spec.ts` 的 backoff 断言**一条未动、全部仍绿**。
+
+**不做的事**（用户另行拍板）：不实现 WASM 签名器、不加 `chatPath` 字段、不实现 device flow 登录。
 
 ### 三段提交
 
@@ -148,7 +181,14 @@
 |---|---|---|
 | A | 产品配置 + 协议字段参数化（`QODER_CN`、`clientType` / `cosyVersion`） | `221d309` |
 | B | 宿主接线（`src/index.ts` 注册第二个 `QoderAuth` 实例与适配器；`jet-hub-rpc.ts` 的 `account.create` / `credits.balances` / `account.refresh` 三分支 + `qoderRegionFor()`；`credits.status` / `claimAll` 结构性拒绝） | `88ad3d2` |
-| C | 客户端面板 + 文档收尾（`PROVIDERS` 第八条、`PAT_LOGIN_PROVIDERS` 第二个 region、能力矩阵行、测试与 README/AGENTS 同步） | **本次提交** |
+| C | 客户端面板 + 文档收尾（`PROVIDERS` 第八条、`PAT_LOGIN_PROVIDERS` 第二个 region、能力矩阵行、测试与 README/AGENTS 同步） | `本次提交` |
 
-⚠️ **两端仍未真机验收**（CN 与国际版一样）：chat 主机 503 期间无法端到端验证，
-`client_type` / Cosy 头 / `QODER_CN_USER_AGENT` 三个出站身份值是源码推断值。
+### 验收状态（按 region 分开看，不要合并叙述）
+
+- **国际版**：✅ 真机验收可用（`api2-v2.qoder.sh` + `/model/v1/chat/completions` 实测 200
+  标准 OpenAI JSON），chat / 目录 / 额度三条线都在跑；
+- **CN**：目录（14 项）与额度两条线 ✅ 实测 200；**chat 结构性不可用**（PAT 形态过不了
+  官方 agent 通道的 WASM 签名门槛），故**没有**「等上游恢复」这条路径 —— 这是本次
+  二次取证翻转掉的旧叙述；
+- `client_type` / Cosy 头 / `QODER_CN_USER_AGENT` 三个出站身份值**仍无从 A/B**
+  （chat 路径不存在），只能是官方源码值。

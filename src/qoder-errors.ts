@@ -38,6 +38,14 @@
  * | `backoff` | **不换号**，退避重试同一账号 | DSH 的重试层（抛可重试错误码） |
  * | `fail` | 直接报错给用户 | 适配器抛出带原始 code/message 的错误 |
  *
+ * ⚠️ **`5xx → backoff` 有一条被实测推翻的例外：CN 的 chat 503**。它不是网关
+ * 抖动，而是**路径不存在**（`gateway.qoder.com.cn` 上 `/model/v1/chat/completions`
+ * 被 ALB 按路径级拒绝，恒 503，与凭据/头/出口无关）。对 CN 退避重试等于**永远
+ * 重试一个不可能成功的请求**，故 {@link classifyQoderError} 按 region 分流：
+ * CN 的 chat 503 直报 `'fail'`，**国际版的 503 维持 `'backoff'` 不变**
+ * （对它而言瞬时故障是真实可能，实测可用）。分流判据见
+ * {@link QoderErrorInput.product}。
+ *
  * ## 两段式判定：先分类，再由额度端点确证
  *
  * {@link classifyQoderError} 只能看到**错误本身**，看不到账号的额度。因此对
@@ -49,6 +57,9 @@
  */
 
 import { CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError } from '@deepseek-ai/dsh-llm'
+
+import { QODER, QODER_CN } from './qoder-product.js'
+import type { QoderProduct } from './qoder-product.js'
 
 /**
  * 失败处置动作。
@@ -92,6 +103,20 @@ export interface QoderErrorInput {
    * 为 true 时 chat 端点的 401 由「jt 过期」升级为「凭据失效」。
    */
   afterJobTokenRetry?: boolean
+  /**
+   * 出错的产品配置（**region 上下文**）；省略视为国际版 {@link QODER}。
+   *
+   * ⚠️ **只用于「同一状态码在两个 region 语义不同」的分流**，当前仅一处：
+   * CN 的 chat `503` 是**路径不存在**（ALB 按路径级恒 503）而非网关抖动，
+   * 必须直报而非退避重试（见模块头注释）。
+   *
+   * 判据**显式列举 `=== QODER_CN.id`**，不做「非国际版即 CN」的反向推断
+   * —— 第三个 region 落地时反向推断会把它**静默**归到 CN 的分支上
+   * （与 `qoder-models.ts` 的 `qoderFallbackModels` 同一先例、同一理由）。
+   *
+   * 缺省即国际版，故既有调用点（与既有断言）语义逐字节不变。
+   */
+  product?: QoderProduct
 }
 
 /** 额度二次判别的结论（步骤 4 接入时由 quota 端点填充）。 */
@@ -152,6 +177,7 @@ const HTTP_PAYMENT_REQUIRED = 402
 const HTTP_FORBIDDEN = 403
 const HTTP_REQUEST_TIMEOUT = 408
 const HTTP_TOO_MANY_REQUESTS = 429
+const HTTP_SERVICE_UNAVAILABLE = 503
 
 /**
  * 额度类候选码（402 上的数字码）。
@@ -483,8 +509,13 @@ function buildClassification(input: QoderErrorInput, seed: QoderClassificationSe
  *    —— 流内错误**绝不转成优雅结束**（那会让 DSH 报「Stream ended without
  *    finish_reason」，真因丢失）。
  * 6. **403** → `credentialInvalid`。
- * 7. **无业务码时的 HTTP 兜底**：`429` / `408` / `5xx` → `'backoff'`；
- *    其余（含 400、以及 code 不是 116 的 402）→ `'fail'`。
+ * 7. **无业务码时的 HTTP 兜底**：
+ *    7a. **CN 的 chat 503** → `'fail'` 直报（路径不存在，见模块头注释；**不重试、
+ *        不换号**）—— 这一条**必须排在通用兜底之前**，否则会被 7b 的
+ *        `5xx → backoff` 吃掉；
+ *    7b. 其余 `429` / `408` / `5xx` → `'backoff'`（**国际版 503 走这条**，
+ *        语义与本条落地前逐字节相同）；
+ *    7c. 其余（含 400、以及 code 不是 116 的 402）→ `'fail'`。
  * 8. **未知业务码一律 `'fail'`**，文案带上原始码与原文 —— 不猜动作。
  *
  * 为什么业务码优先于状态码：`stream:true` 会把同一个坏 body 从 400 变成
@@ -600,6 +631,33 @@ export function classifyQoderError(input: QoderErrorInput): QoderErrorClassifica
 
   // 7. 无业务码时的 HTTP 兜底。
   if (!hasCode) {
+    // 7a. **CN 的 chat 503 是结构性失败，不是瞬时故障**（2026-09-21 二次取证定案）。
+    //
+    // `gateway.qoder.com.cn` 上 `/model/v1/chat/completions` **不存在**：ALB 对该
+    // 路径「任意方法 × 任意头」**恒 503**（alb 错误页逐字节相同）；同 host 的
+    // `/api/v2/config/getDataPolicy` 却回应用层 401/400（证明路径活着）。
+    // 官方的 chat 走 `/algo/api/v2/service/pro/sse/agent_chat_generation`，
+    // 且带 WASM 签名（`prepareInferRequest` 需要登录用户密钥）—— PAT 给不出。
+    //
+    // ⇒ 退避重试**永远不可能成功**，只会让用户白等一轮又一轮；必须直报，
+    //    并说清「这不是你的凭据或网络的问题」。
+    //
+    // ⚠️ **判据只认 503**（实测到的那一个状态码）：其余 4xx/5xx 的语义未被本次
+    // 取证覆盖，一律留给下面的通用兜底 —— 判据宽一格就会把「上游真的抖了一下」
+    // 也说成「结构性不可用」，而那是用户无法自行分辨的假信息。
+    if (status === HTTP_SERVICE_UNAVAILABLE && source === 'chat'
+      && (input.product?.id ?? QODER.id) === QODER_CN.id) {
+      return buildClassification(input, {
+        action: 'fail',
+        message: `Qoder CN 的 chat 通道（${QODER_CN.chatBase}）不提供 OpenAI 兼容端点：`
+          + `该路径（/model/v1/chat/completions）在 CN 网关不存在，ALB 按路径级拒绝并恒回 `
+          + `HTTP ${status}（与凭据、请求头、网络出口均无关，也不会自行恢复）。`
+          + `官方客户端走带 WASM 签名的 agent 通道（/algo/api/v2/service/pro/sse/agent_chat_generation），`
+          + `PAT 形态无法通过该签名门槛。故本 provider 的 chat 对 CN 结构性不可用，`
+          + `不会重试也不会切换账号；余额 / 模型目录 / 换令牌等控制面功能不受影响。`
+          + `上游原文：${upstream}`,
+      })
+    }
     if (status === HTTP_TOO_MANY_REQUESTS || status === HTTP_REQUEST_TIMEOUT
       || (status !== undefined && status >= 500)) {
       return buildClassification(input, {
