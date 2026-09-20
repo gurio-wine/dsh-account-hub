@@ -183,10 +183,14 @@ const STYLES = `
 .dim-jh-modalBody { flex: 1 1 auto; min-height: 0; margin-top: 10px; overflow-y: auto; }
 .dim-jh-modalBody .dim-jh-empty { padding: 24px; }
 
-/* 每行一个模型：左侧名称 + id，右侧开关 */
+/* 每行一个模型：左侧名称 + id，右侧开关（Trae CN 再多一列窗口档位） */
 .dim-jh-modelList { display: grid; gap: 2px; }
-.dim-jh-modelRow { display: flex; align-items: center; gap: 12px; padding: 7px 8px; border-radius: 8px; cursor: pointer; transition: background .15s ease; }
+.dim-jh-modelRow { display: flex; align-items: center; gap: 12px; padding: 7px 8px; border-radius: 8px; transition: background .15s ease; }
 .dim-jh-modelRow:hover { background: var(--dsw-alias-bg-layer-2, #f7f8fa); }
+/* ⚠️ 行根节点是 div，label 只包住「名称 + 开关」那一半：档位 radio 必须
+   在 label 之外，否则点档位会连带激活 label 的隐式控件（那个显示开关）。
+   ⚠️ 本文件整体是一个 JS 模板字符串：注释里绝不能出现反引号（会提前闭合模板）。 */
+.dim-jh-modelMain { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 12px; cursor: pointer; }
 /* 已关闭的模型整体降透明度：一眼能看出哪些被隐藏了 */
 .dim-jh-modelRow[data-disabled="true"] .dim-jh-modelInfo { opacity: 0.5; }
 .dim-jh-modelInfo { flex: 1 1 auto; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
@@ -200,6 +204,13 @@ const STYLES = `
 .dim-jh-switch:checked::after { transform: translateX(14px); }
 .dim-jh-switch:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 30%, transparent); }
 .dim-jh-switch:disabled { opacity: 0.5; cursor: default; }
+
+/* 上下文窗口档位（Trae CN）：两个原生 radio + 文案，标签即点击热区 */
+.dim-jh-modelTier { flex: none; display: flex; align-items: center; gap: 10px; }
+.dim-jh-tierOption { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #4e5969); white-space: nowrap; cursor: pointer; }
+.dim-jh-tierOption input { margin: 0; accent-color: #1677ff; cursor: pointer; }
+.dim-jh-tierOption input:disabled { cursor: default; }
+.dim-jh-tierOption input:disabled + span { opacity: 0.5; }
 `
 
 let injected = false

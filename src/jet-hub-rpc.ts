@@ -8,7 +8,7 @@
  *           account.refresh / account.retest / account.retestAll /
  *           account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
- *           model.list / model.setDisabled
+ *           model.list / model.setDisabled / model.setContextBudget
  */
 
 import type { Context } from '@deepseek-ai/cordis'
@@ -44,6 +44,7 @@ import { QODER, QODER_CN, qoderProductById } from './qoder-product.js'
 import { fetchQoderCreditBalance } from './qoder-credits.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { isTraeCnJunkModelId } from './trae-cn-models.js'
+import type { TraeCnContextTier } from './trae-cn-adapter.js'
 import type { TraeCnCredential, TraeCnPendingLogin } from './trae-cn-oauth.js'
 import type { TraeCnProduct } from './trae-cn-product.js'
 import {
@@ -85,8 +86,11 @@ import type {
   RpcCreditsBalancesResponse,
   RpcModelListRequest,
   RpcModelListResponse,
+  RpcModelListEntry,
   RpcModelSetDisabledRequest,
   RpcModelSetDisabledResponse,
+  RpcModelSetContextBudgetRequest,
+  RpcModelSetContextBudgetResponse,
 } from './types.js'
 
 /** Account Hub RPC API 路径 */
@@ -571,11 +575,34 @@ function llmServiceOf(ctx: Context): { listModels(provider: string): Promise<Arr
 }
 
 /**
+ * 逐模型**上下文窗口档位**的来源（目前只有 `TraeCnAdapter` 实现它）。
+ *
+ * ## 为什么由调用方注入，而不是 RPC 自己去捞
+ *
+ * 目录的持有者是**适配器实例**（它带 12h TTL 缓存、远端优先、失败回退静态表）。
+ * `ctx.llm.listModels()` 帮不上忙：`LlmRuntime.listModels` 会把适配器返回的条目
+ * **重建**成 `{provider, id, name, description?, inputModalities?}`，任何额外字段都
+ * 在那一层被丢掉（已读 `lib/types/index.js` 确认），所以窗口档位不可能搭它的车。
+ * 而 `ctx` 上也没有「按 provider 取适配器」的入口。最省事、也最不可能撒谎的做法，
+ * 就是让组装方（`src/index.ts`）把 `registerTraeCnLlm` 返回的实例直接交过来。
+ *
+ * 结构类型而非 import 适配器类：RPC 层只消费这一个方法。
+ */
+export interface ContextTierSource {
+  /** 当前生效目录的逐模型档位（id → dev / Max）。 */
+  contextTiers(): Promise<ReadonlyMap<string, TraeCnContextTier>>
+}
+
+/**
  * 注册 Account Hub 管理 API 端点。
  *
  * `connection` 服务只存在于 Web bundle；这里用**惰性注入**而非插件级静态
  * `inject`，因此在 headless / CLI profile 下本模块正常加载、只是不注册端点，
  * 而不是把整个插件树卡在 pending（那会让 profile 启动直接失败）。
+ *
+ * @param contextTiers - 可选的窗口档位来源（见 {@link ContextTierSource}）。
+ *        省略时 `model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝 ——
+ *        这是 headless / 测试场景的既定降级，不是缺陷。
  */
 export function registerJetHubRpc(
   ctx: Context,
@@ -587,9 +614,12 @@ export function registerJetHubRpc(
   traeCn: TraeCnAuth,
   qoder: QoderAuth,
   qoderCn: QoderAuth,
+  contextTiers?: ContextTierSource,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn)
+    registerJetHubEndpoints(
+      connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTiers,
+    )
   })
 }
 
@@ -604,6 +634,7 @@ function registerJetHubEndpoints(
   traeCn: TraeCnAuth,
   qoder: QoderAuth,
   qoderCn: QoderAuth,
+  contextTiers: ContextTierSource | undefined,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -1362,9 +1393,37 @@ function registerJetHubEndpoints(
         const listedIds = new Set(models.map((model) => model.id))
         const filteredOut = Object.keys(disabledMap)
           .filter((id) => disabledMap[id] === true && !listedIds.has(id) && !junkBackfilled(id))
+        // 逐模型窗口档位：**只有 Trae CN 有**（其余 provider 的适配器不产出窗口元数据，
+        // 也没人把 `contextTiers` 交进来）。缺省即「不渲染档位列」。
+        //
+        // 读失败**不影响列表本身**：档位是附加信息，拿不到就不渲染那一列，
+        // 而不是让整个「显示列表」报错（用户会以为模型目录没了）。
+        let tiers: ReadonlyMap<string, TraeCnContextTier> | undefined
+        if (req.provider === TRAE_CN.id && contextTiers !== undefined) {
+          try {
+            tiers = await contextTiers.contextTiers()
+          } catch (error) {
+            ctx.logger?.warn?.(`[jet-hub] 读取 ${req.provider} 窗口档位失败（不影响模型列表）: ${String(error)}`)
+          }
+        }
+        // ⚠️ 窗口字段只加在**目录里的模型**上：被适配器过滤掉、由上面回填的条目
+        // 已经不在当前目录里，既没有档位可言，其残留预算也不该在这里显示
+        // （`model.setContextBudget` 对它们一律拒绝，两边口径一致）。
+        const withWindows = (entry: { id: string; name: string; disabled: boolean }): RpcModelListEntry => {
+          if (tiers === undefined) return entry
+          const tier = tiers.get(entry.id)
+          if (tier === undefined) return entry
+          const budget = pool.contextBudget(req.provider, entry.id)
+          return {
+            ...entry,
+            ...tier.contextWindow === undefined ? {} : { contextWindow: tier.contextWindow },
+            ...tier.maxContextWindow === undefined ? {} : { maxContextWindow: tier.maxContextWindow },
+            ...budget === undefined ? {} : { contextBudget: budget },
+          }
+        }
         const value: RpcModelListResponse = {
           models: [
-            ...models.map((model) => ({
+            ...models.map((model) => withWindows({
               id: model.id,
               name: model.name,
               disabled: disabledMap[model.id] === true,
@@ -1422,6 +1481,76 @@ function registerJetHubEndpoints(
           disabledModels: pool.listDisabledModels(req.provider),
         }
         return { ok: true, value }
+      }
+
+      // 设置某个模型的**上下文窗口档位**（dev / Max）。
+      //
+      // ⚠️ **纯声明值切换**：只改「我们向 DSH 声明的窗口」，出站请求体一个字段都不动
+      // （Trae 的 chat 体里本来就没有档位字段，见 `TraeCnAdapter.effectiveContextWindow`）。
+      // 声明值决定宿主的压缩阈值（`0.8 × 窗口`）与压缩后的保留预算。
+      //
+      // 校验全部在这里做：只有本层同时握着「目录公布的档位」与「用户提交的值」。
+      // 适配器读取时会**再判一次**是否精确命中 Max 档，两道判据同向 ——
+      // 即便有人绕过这里写入编造值，最坏也只是静默退回默认档。
+      case 'model.setContextBudget': {
+        const req = payload as RpcModelSetContextBudgetRequest
+        if (typeof req.provider !== 'string' || typeof req.model !== 'string' || req.model.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 与 model 必填' } }
+        }
+        // 目前只有 Trae CN 有逐模型档位：Work 侧目录实测 `dev == max`（无档位可选），
+        // 其余 provider 的适配器根本不产出窗口元数据。对它们直接拒绝，
+        // 而不是静默写下一个永远不生效的值。
+        if (req.provider !== TRAE_CN.id || contextTiers === undefined) {
+          return {
+            ok: false,
+            error: { code: 'bad-request', message: `provider 不支持上下文窗口档位: ${req.provider}` },
+          }
+        }
+        const tiers = await contextTiers.contextTiers()
+        const tier = tiers.get(req.model)
+        const fallback = tier?.contextWindow
+        const max = tier?.maxContextWindow
+        // 目录里没有该模型，或该模型没声明窗口（含静态回退表路径：它一律不带 Max 档，
+        // 连 `contextWindow` 也可能因为目录未达而缺失）——都无法判档位，拒绝。
+        if (fallback === undefined) {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: `模型 ${req.model} 当前目录未声明上下文窗口，无法设置档位`,
+            },
+          }
+        }
+        // 错误信息里**带上实际可用的档位值**：用户提交了一个编造数字时，
+        // 他需要看到的是「有哪些档位可选」，而不是一句「参数非法」。
+        const available = max === undefined
+          ? `${fallback}（默认）`
+          : `${fallback}（默认）/ ${max}（Max）`
+        // 恢复默认：`window` 省略，或恰好等于 dev 档。两者都清除预算（**不是**写入 dev）。
+        if (req.window === undefined || req.window === fallback) {
+          await pool.writeContextBudget(req.provider, req.model, undefined)
+          ctx.logger.info(`[jet-hub] ${req.provider}/${req.model} 上下文窗口档位恢复默认（${fallback}）`)
+          const restored: RpcModelSetContextBudgetResponse = { provider: req.provider, model: req.model }
+          return { ok: true, value: restored }
+        }
+        // 只接受**精确等于**目录公布的 Max 档；max 缺失时任何非 dev 值都拒绝。
+        if (max === undefined || req.window !== max) {
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: `不支持 ${String(req.window)}：模型 ${req.model} 可用档位为 ${available}`,
+            },
+          }
+        }
+        await pool.writeContextBudget(req.provider, req.model, max)
+        ctx.logger.info(`[jet-hub] ${req.provider}/${req.model} 上下文窗口档位设为 ${max}`)
+        const applied: RpcModelSetContextBudgetResponse = {
+          provider: req.provider,
+          model: req.model,
+          contextBudget: max,
+        }
+        return { ok: true, value: applied }
       }
 
       default:

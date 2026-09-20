@@ -12,11 +12,23 @@ import type { ProviderAccountEntry } from '../../src/types.js'
  */
 function createMockContext(
   initialAccounts: ProviderAccountEntry[] = [],
-  options: { staleReads?: boolean; initialDisabledModels?: Record<string, Record<string, boolean>> } = {},
+  options: {
+    staleReads?: boolean
+    initialDisabledModels?: Record<string, Record<string, boolean>>
+    initialContextBudgets?: Record<string, Record<string, number>>
+    initialSchemaVersion?: number
+  } = {},
 ) {
-  let stored: { accounts?: ProviderAccountEntry[]; disabledModels?: Record<string, Record<string, boolean>> } = {
+  let stored: {
+    accounts?: ProviderAccountEntry[]
+    disabledModels?: Record<string, Record<string, boolean>>
+    contextBudgets?: Record<string, Record<string, number>>
+    schemaVersion?: number
+  } = {
     accounts: initialAccounts,
     ...options.initialDisabledModels !== undefined ? { disabledModels: options.initialDisabledModels } : {},
+    ...options.initialContextBudgets !== undefined ? { contextBudgets: options.initialContextBudgets } : {},
+    ...options.initialSchemaVersion !== undefined ? { schemaVersion: options.initialSchemaVersion } : {},
   }
   // 滞后读：get() 返回的这个值只在"下一次 replace 之后"才追平
   let visible = stored
@@ -30,6 +42,8 @@ function createMockContext(
       replace: async (value: {
         accounts?: ProviderAccountEntry[]
         disabledModels?: Record<string, Record<string, boolean>>
+        contextBudgets?: Record<string, Record<string, number>>
+        schemaVersion?: number
       }) => {
         if (options.staleReads) {
           // 模拟滞后：get() 始终慢一拍，本次写入要等下一次 replace 才可见
@@ -660,5 +674,174 @@ describe('AccountPool 模型黑名单', () => {
     const pool = new AccountPool({ get: () => undefined, logger: { warn: () => {}, info: () => {} } } as never)
     await pool.setModelDisabled('buddy-cn', 'glm-5.2', true)
     expect(pool.disabledModelsFor('buddy-cn').has('glm-5.2')).toBe(true)
+  })
+})
+
+/**
+ * 逐模型上下文窗口预算（Trae CN 的 dev / Max 档位选择）。
+ *
+ * 语义核心与黑名单**同构**：它跟账号列表、黑名单、数据版本号住在同一个
+ * settings namespace 里，而 `replace()` 是**整体替换** —— 四件套任何一个写操作
+ * 都必须携带另外三个，漏一个就会在下次别的写入里被静默清空。
+ *
+ * 与黑名单唯一的不同：这里的值是**数字**（窗口 token 数），且「删除键」与
+ * 「写入某个值」必须可区分（`undefined` = 恢复默认档，而不是写 0）。
+ */
+describe('AccountPool 上下文窗口预算', () => {
+  it('未配置时读不到任何预算（默认档）', () => {
+    const pool = new AccountPool(createMockContext() as never)
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBeUndefined()
+  })
+
+  it('写入后能按 provider + 模型读出', async () => {
+    const pool = new AccountPool(createMockContext() as never)
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
+
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
+    // 黑名单制同款：没写过的键读出来是 undefined（= 默认档），而不是 0。
+    expect(pool.contextBudget('trae-cn', 'glm-5.2')).toBeUndefined()
+    expect(pool.contextBudget('trae-cn-work', 'glm-5.3')).toBeUndefined()
+  })
+
+  it('写 `undefined` = **删除该键**（恢复默认档），且表空时 provider 整体消失', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', undefined)
+
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBeUndefined()
+    // 不留 `{ 'trae-cn': {} }` 这类无意义噪音。
+    expect(ctx.replacePayloads.at(-1)!.contextBudgets).toEqual({})
+  })
+
+  it('不同 provider / 不同模型互不影响（只改单个键）', async () => {
+    const pool = new AccountPool(createMockContext() as never)
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
+    await pool.writeContextBudget('trae-cn', 'glm-5.2', 262_144)
+    await pool.writeContextBudget('buddy-cn', 'glm-5.2', 300_000)
+
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
+    expect(pool.contextBudget('trae-cn', 'glm-5.2')).toBe(262_144)
+    expect(pool.contextBudget('buddy-cn', 'glm-5.2')).toBe(300_000)
+  })
+
+  it('从已有配置载入预算（配置里已有档位时，重启后不丢）', () => {
+    const pool = new AccountPool(createMockContext([], {
+      initialContextBudgets: { 'trae-cn': { 'glm-5.3': 1_048_576 } },
+    }) as never)
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
+  })
+
+  it('配置文件里的脏数据被忽略而不是抛错（0 / 负数 / 字符串 / 非法结构）', () => {
+    const pool = new AccountPool(createMockContext([], {
+      initialContextBudgets: {
+        'trae-cn': { good: 1_048_576, zero: 0, negative: -1, text: '1048576', nan: Number.NaN } as never,
+        broken: ['glm-5.3'] as never,
+      },
+    }) as never)
+    expect(pool.contextBudget('trae-cn', 'good')).toBe(1_048_576)
+    // 非正数不是「很小的窗口」，是无效声明 —— 与适配器侧 readPositive 同口径丢弃。
+    for (const bad of ['zero', 'negative', 'text', 'nan']) {
+      expect(pool.contextBudget('trae-cn', bad), bad).toBeUndefined()
+    }
+    // 结构非法的 provider 整层丢弃。
+    expect(pool.contextBudget('broken', 'glm-5.3')).toBeUndefined()
+  })
+
+  /**
+   * 四件套互带：账号 / 黑名单 / 上下文预算 / 数据版本号。
+   *
+   * 三个方向各测一次（写账号、写黑名单、写预算），每个方向都断言**另外三个**
+   * 都还在载荷里。
+   */
+  it('写账号列表时不会抹掉预算与黑名单', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
+    await pool.setModelDisabled('trae-cn', 'kimi-k3', true)
+    await pool.addAccount({
+      id: 'trae-1', provider: 'trae-cn', nickname: 'T', enabled: true,
+      credentialRef: 'TRAE_CN_ACCOUNT_1', createdAt: Date.now(), refreshable: true,
+    })
+
+    const last = ctx.replacePayloads.at(-1)!
+    expect(last.contextBudgets).toEqual({ 'trae-cn': { 'glm-5.3': 1_048_576 } })
+    expect(last.disabledModels).toEqual({ 'trae-cn': { 'kimi-k3': true } })
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
+  })
+
+  it('写黑名单时不会抹掉预算', async () => {
+    const ctx = createMockContext()
+    const pool = new AccountPool(ctx as never)
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
+    await pool.setModelDisabled('trae-cn', 'kimi-k3', true)
+
+    expect(ctx.replacePayloads.at(-1)!.contextBudgets).toEqual({ 'trae-cn': { 'glm-5.3': 1_048_576 } })
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
+  })
+
+  it('写预算时不会抹掉账号列表、黑名单与版本号', async () => {
+    const ctx = createMockContext([], {
+      initialDisabledModels: { 'trae-cn': { 'kimi-k3': true } },
+      initialSchemaVersion: 1,
+    })
+    const pool = new AccountPool(ctx as never)
+    await pool.addAccount({
+      id: 'trae-2', provider: 'trae-cn', nickname: 'T2', enabled: true,
+      credentialRef: 'TRAE_CN_ACCOUNT_2', createdAt: Date.now(), refreshable: true,
+    })
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
+
+    const last = ctx.replacePayloads.at(-1)!
+    expect(last.accounts).toHaveLength(1)
+    expect(last.disabledModels).toEqual({ 'trae-cn': { 'kimi-k3': true } })
+    expect(last.schemaVersion).toBe(1)
+  })
+
+  /**
+   * 回归（与 `setModelDisabled` 同款陷阱）：`writeContextBudget` 是**不经过读路径**
+   * 的直接写入入口。它若忘了先 `ensureLoaded()`，整表 replace 会把还没载入的
+   * 账号、黑名单与数据版本号一起覆盖成空。
+   */
+  it('首次写入前先 ensureLoaded：不会把配置里已有的账号 / 黑名单 / 版本号清空', async () => {
+    const ctx = createMockContext([
+      {
+        id: 'trae-9', provider: 'trae-cn', nickname: 'T9', enabled: true,
+        credentialRef: 'TRAE_CN_ACCOUNT_9', createdAt: Date.now(), refreshable: true,
+      },
+    ], {
+      initialDisabledModels: { 'trae-cn': { 'kimi-k3': true } },
+      initialSchemaVersion: 1,
+    })
+    const pool = new AccountPool(ctx as never)
+    // 刻意**不先读**任何东西，直接写预算。
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
+
+    const last = ctx.replacePayloads.at(-1)!
+    expect(last.accounts).toHaveLength(1)
+    expect(last.disabledModels).toEqual({ 'trae-cn': { 'kimi-k3': true } })
+    expect(last.schemaVersion).toBe(1)
+  })
+
+  /**
+   * 回归：一次性改名迁移走 `replaceAll`（原子写账号 + 黑名单 + 版本号）。
+   * 它必须**原样带上预算**——预算不是迁移对象，但同属一个 namespace，
+   * 漏带会让迁移顺手清空用户的档位选择。
+   */
+  it('`replaceAll`（改名迁移）不会清空已有的预算', async () => {
+    const ctx = createMockContext([], {
+      initialContextBudgets: { 'trae-cn': { 'glm-5.3': 1_048_576 } },
+    })
+    const pool = new AccountPool(ctx as never)
+    await pool.replaceAll([], {}, 1)
+
+    expect(ctx.replacePayloads.at(-1)!.contextBudgets).toEqual({ 'trae-cn': { 'glm-5.3': 1_048_576 } })
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
+  })
+
+  it('无 settings scope 时降级为内存态，不抛错', async () => {
+    const pool = new AccountPool({ get: () => undefined, logger: { warn: () => {}, info: () => {} } } as never)
+    await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
+    expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
   })
 })

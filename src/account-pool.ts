@@ -27,11 +27,31 @@ export const JET_HUB_NS = 'jet-hub'
  */
 export type ModelDisableMap = Record<string, Record<string, boolean>>
 
+/**
+ * 逐模型的**上下文窗口预算**：provider id → 模型 id → 窗口 token 数。
+ *
+ * ## 语义（与「专家设置」严格区分）
+ *
+ * 这里的值**不是用户可以自由填的数字**，而是「该模型目录公布过的档位之一」——
+ * 由 `model.setContextBudget` 校验后写入（见 `src/jet-hub-rpc.ts`），适配器读取时
+ * 还要**再判一次**「它是否精确等于该模型当前目录的 Max 档」（见
+ * `TraeCnAdapter.resolveModel` 的预算覆盖）。
+ *
+ * 两道判据都指向同一件事：**用户设置永远不能编造窗口**。目录 roster 浮动后
+ * 旧预算自动失效（退回默认档），而不是拿一个模型已经不认的数字去声明窗口 ——
+ * 声明值决定宿主的压缩阈值（`0.8 × 窗口`），编造值会静默改写用户的压缩时机。
+ *
+ * 缺省 = 全部模型用**默认档**（目录的 dev 档）。
+ */
+export type ContextBudgetMap = Record<string, Record<string, number>>
+
 /** 账号池在 settings 中存储的值结构。 */
 interface JetHubSettingsValue {
   accounts?: ProviderAccountEntry[]
   /** 模型黑名单（见 {@link ModelDisableMap}）。 */
   disabledModels?: ModelDisableMap
+  /** 逐模型上下文窗口预算（见 {@link ContextBudgetMap}）。 */
+  contextBudgets?: ContextBudgetMap
   /** 数据版本号，供一次性迁移 short-circuit（见 provider-rename-migration.ts）。 */
   schemaVersion?: number
 }
@@ -85,6 +105,10 @@ const jetHubSchema = Schema.object({
   // 为什么带 `.default({})`：namespace 首次注册时配置文件里没有该字段，
   // 没有默认值的话 `scope.get()` 会返回 undefined，需在读取处层层判空。
   disabledModels: Schema.dict(Schema.any()).default({}),
+  // 逐模型上下文窗口预算（provider id → 模型 id → token 数）。与黑名单同理用
+  // `Schema.dict(Schema.any())`：key 是动态的 provider / 模型 id。
+  // **必须带 `.default({})`**：namespace 首次注册时配置里没有该字段。
+  contextBudgets: Schema.dict(Schema.any()).default({}),
   // 数据版本号。`0` = 旧命名（buddy=中国版 / workbuddy=国际版）尚未迁移；
   // 见 {@link JET_HUB_SCHEMA_VERSION}。**必须带 default**：老配置文件里没有
   // 这个字段，缺失时按 0 处理才等价于「迁移尚未执行」。
@@ -125,6 +149,29 @@ function sanitizeDisabledModels(raw: unknown): ModelDisableMap {
 }
 
 /**
+ * 把 settings 里读到的原始值归一化为 {@link ContextBudgetMap}。
+ *
+ * 与 {@link sanitizeDisabledModels} 同一取舍：配置文件可能被手工编辑过，任何
+ * 一层不是对象就丢弃那一层，不抛错。**只收正的有限数**——0 / 负数 / `NaN` /
+ * 字符串一律视为脏值丢弃（一个非正数的窗口不是「很小的窗口」，是无效声明；
+ * 适配器侧的 `readPositive` 同口径，两处若不一致会出现「存下了却永远不生效」）。
+ */
+function sanitizeContextBudgets(raw: unknown): ContextBudgetMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: ContextBudgetMap = {}
+  for (const [provider, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const perProvider: Record<string, number> = {}
+    for (const [modelId, budget] of Object.entries(value as Record<string, unknown>)) {
+      if (typeof budget === 'number' && Number.isFinite(budget) && budget > 0) perProvider[modelId] = budget
+    }
+    // 空表不保留（与黑名单同理：不留 `{ provider: {} }` 这类无意义噪音）。
+    if (Object.keys(perProvider).length > 0) result[provider] = perProvider
+  }
+  return result
+}
+
+/**
  * AccountPool —— 多账号管理核心
  *
  * 职责：
@@ -156,6 +203,13 @@ export class AccountPool {
    * resolved 快照在 replace() 后未必立即更新，因此加载一次后即以本副本为准）。
    */
   private modelCache: ModelDisableMap = {}
+  /**
+   * 逐模型上下文窗口预算的**权威进程内副本**（同 {@link cache} / {@link modelCache}）。
+   *
+   * ⚠️ 它与账号、黑名单、版本号是**同一个 namespace 的四件套**：任何一次写入都是
+   * 整体 replace，四者必须互相携带，漏一个就会在下次别的写入里被清空。
+   */
+  private budgetCache: ContextBudgetMap = {}
   /**
    * 数据版本号的**权威进程内副本**（同 {@link cache} / {@link modelCache}）。
    *
@@ -198,6 +252,9 @@ export class AccountPool {
     // 黑名单是后来才加入的字段：老配置文件里没有它，缺失时保持空表
     // （等价于"全部模型默认打开"），而不是报错或让整次载入失败。
     this.modelCache = sanitizeDisabledModels(value?.disabledModels)
+    // 上下文窗口预算同理（比黑名单更晚加入）：缺失时保持空表，
+    // 等价于"全部模型用默认档"。
+    this.budgetCache = sanitizeContextBudgets(value?.contextBudgets)
     // 版本号同理：老配置文件（或首次安装）没有该字段 → 按 0 处理，
     // 即「迁移尚未执行」。
     const version = value?.schemaVersion
@@ -237,12 +294,15 @@ export class AccountPool {
   }
 
   /**
-   * 一次性整体写入账号列表与模型黑名单（外加版本号）。
+   * 一次性整体写入账号列表、模型黑名单与上下文预算（外加版本号）。
    *
    * 为什么需要它：{@link writeAccounts} / {@link writeModels} 各自只接受
    * 自己那一半，调用方要先写一半再写另一半，中间崩溃会留下半迁移状态。
-   * 一次性迁移必须**原子**地落盘「账号 + 黑名单 + 版本号」三件套，
+   * 一次性迁移必须**原子**地落盘「账号 + 黑名单 + 上下文预算 + 版本号」四件套，
    * 故这里直接构造完整的 replace 载荷，只发一次写。
+   *
+   * ⚠️ **上下文预算原样带上**（不是本次迁移的对象，但同属一个 namespace）：
+   * 漏带会让改名迁移顺手清空用户的窗口档位选择。
    *
    * @param accounts - 新的账号列表。
    * @param disabledModels - 新的模型黑名单。
@@ -253,6 +313,10 @@ export class AccountPool {
     disabledModels: ModelDisableMap,
     schemaVersion: number = JET_HUB_SCHEMA_VERSION,
   ): Promise<void> {
+    // ⚠️ 必须先 ensureLoaded()：本方法只从调用方接收三件套，**上下文预算取自进程内
+    // 副本**（它不是迁移对象）。没载入就写，会把用户已有的档位选择覆盖成空。
+    // 同 `setModelDisabled` / `writeContextBudget` 的那条陷阱。
+    this.ensureLoaded()
     this.cache = accounts
     this.modelCache = disabledModels
     this.versionCache = schemaVersion
@@ -261,15 +325,20 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，数据迁移结果未持久化')
       return
     }
-    await this.scope.replace({ accounts, disabledModels, schemaVersion })
+    await this.scope.replace({
+      accounts,
+      disabledModels,
+      contextBudgets: this.budgetCache,
+      schemaVersion,
+    })
   }
 
   /**
    * 持久化账号列表（同时更新进程内权威副本）。
    *
-   * **必须连同黑名单与版本号一起写回**：settings 的 `replace()` 是整体替换，
-   * 只写 `{ accounts }` 会把同一 namespace 下的 `disabledModels` 抹掉，
-   * `schemaVersion` 同理会被重置为 0（于是改名迁移会在每次启动时重跑）。
+   * **必须连同黑名单、上下文预算与版本号一起写回**：settings 的 `replace()` 是整体替换，
+   * 只写 `{ accounts }` 会把同一 namespace 下的 `disabledModels` 与 `contextBudgets`
+   * 抹掉，`schemaVersion` 同理会被重置为 0（于是改名迁移会在每次启动时重跑）。
    */
   private async writeAccounts(accounts: ProviderAccountEntry[]): Promise<void> {
     this.cache = accounts
@@ -281,6 +350,7 @@ export class AccountPool {
     await this.scope.replace({
       accounts,
       disabledModels: this.modelCache,
+      contextBudgets: this.budgetCache,
       schemaVersion: this.versionCache,
     })
   }
@@ -319,10 +389,10 @@ export class AccountPool {
    */
   async setModelDisabled(provider: string, modelId: string, disabled: boolean): Promise<void> {
     // 必须先 ensureLoaded()：`writeModels` 会把 `loaded` 置 true 并整表写回，
-    // 若此时 `modelCache` / `versionCache` 还是构造初值，这次写入会**把它们
-    // 覆盖成空**——已有的黑名单与数据版本号一起丢（版本号丢失会让改名迁移在
-    // 每次启动重跑）。`writeAccounts` 的调用方都先读列表因而躲过了这一坑，
-    // 这里是唯一不经过读路径的直接写入入口。
+    // 若此时 `modelCache` / `cache` / `budgetCache` / `versionCache` 还是构造初值，
+    // 这次写入会**把它们覆盖成空**——已有的黑名单、账号列表、上下文预算与数据
+    // 版本号一起丢（版本号丢失会让改名迁移在每次启动重跑）。`writeAccounts` 的
+    // 调用方都先读列表因而躲过了这一坑，这里是唯一不经过读路径的直接写入入口。
     this.ensureLoaded()
     const next: ModelDisableMap = { ...this.modelCache }
     const perProvider = { ...(next[provider] ?? {}) }
@@ -341,10 +411,66 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，模型黑名单变更未持久化')
       return
     }
-    // 与 writeAccounts 对称：整体 replace 必须携带账号列表与版本号，否则会被清空。
+    // 与 writeAccounts 对称：整体 replace 必须携带账号列表、上下文预算与版本号，否则会被清空。
     await this.scope.replace({
       accounts: this.cache,
       disabledModels,
+      contextBudgets: this.budgetCache,
+      schemaVersion: this.versionCache,
+    })
+  }
+
+  /**
+   * 读取某模型的**上下文窗口预算**（未被设置过时为 `undefined` = 默认档）。
+   *
+   * 与 {@link disabledModelsFor} 同款：只读进程内权威副本，同步返回 —— 适配器在
+   * `resolveModel` 里同步调用它，写档位后无需重建适配器，下一次解析即生效。
+   */
+  contextBudget(provider: string, modelId: string): number | undefined {
+    this.ensureLoaded()
+    return this.budgetCache[provider]?.[modelId]
+  }
+
+  /**
+   * 写入/清除某模型的上下文窗口预算。
+   *
+   * 只改**单个键**（读 → 改 → 整体 replace），与 {@link setModelDisabled} 同款。
+   * `value === undefined` = **删除该键**（恢复默认档），而不是写一个 0 或 -1 的哨兵值：
+   * 「未设置」与「设成某个数」在读取侧必须是两种可区分的状态，写哨兵会让
+   * `contextBudget()` 的返回值语义分叉。
+   *
+   * ⚠️ 本方法**不做档位校验** —— 校验属于 RPC 层（它手上有目录）。
+   * 但读取侧（`TraeCnAdapter.resolveModel`）仍会再判一次「是否精确命中目录公布的档位」，
+   * 故即便有人绕过 RPC 写入一个编造值，最坏结果也只是静默退回默认档，不会改写声明窗口。
+   */
+  async writeContextBudget(provider: string, modelId: string, value: number | undefined): Promise<void> {
+    // 必须先 ensureLoaded()：`writeBudgets` 会把 `loaded` 置 true 并整表写回，
+    // 若此时 `budgetCache` / `cache` / `modelCache` / `versionCache` 还是构造初值，
+    // 这次写入会**把它们覆盖成空** —— 账号列表、黑名单与数据版本号一起丢
+    // （版本号丢失会让改名迁移在每次启动重跑）。同 `setModelDisabled`。
+    this.ensureLoaded()
+    const next: ContextBudgetMap = { ...this.budgetCache }
+    const perProvider = { ...(next[provider] ?? {}) }
+    if (value === undefined) delete perProvider[modelId]
+    else perProvider[modelId] = value
+    if (Object.keys(perProvider).length === 0) delete next[provider]
+    else next[provider] = perProvider
+    await this.writeBudgets(next)
+  }
+
+  /** 持久化上下文窗口预算（同时更新进程内权威副本）。 */
+  private async writeBudgets(contextBudgets: ContextBudgetMap): Promise<void> {
+    this.budgetCache = contextBudgets
+    this.loaded = true
+    if (!this.scope) {
+      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，上下文窗口预算变更未持久化')
+      return
+    }
+    // 与 writeAccounts / writeModels 对称：整体 replace 必须携带另外三件套，否则会被清空。
+    await this.scope.replace({
+      accounts: this.cache,
+      disabledModels: this.modelCache,
+      contextBudgets,
       schemaVersion: this.versionCache,
     })
   }

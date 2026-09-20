@@ -193,6 +193,21 @@ function resolveChunkTimeoutMs(): number {
   return Number.parseInt(process.env.DSH_TRAE_CN_SSE_CHUNK_TIMEOUT_MS ?? '', 10) || 120_000
 }
 
+/**
+ * 一个模型在**当前生效目录**里的上下文窗口档位。
+ *
+ * 只出现在 Trae CN（IDE 路径）：它走动态 `get_detail_param` 目录，部分模型下发
+ * `context_window_tokens: {dev, max}` 两档。其余 provider 的适配器不产出本结构，
+ * 故 Account Hub 的档位选择列**只会在 Trae CN 面板出现**（Work 侧实测 dev==max，
+ * 被解析侧判成「无 Max 档」，同样不渲染）。
+ */
+export interface TraeCnContextTier {
+  /** dev 档：目录公布的默认窗口（`prompt_max_tokens`，回退 `context_window_tokens.dev`）。 */
+  contextWindow?: number
+  /** Max 档：**仅当严格大于 dev 档**时才存在（见 `TraeCnModelEntry.maxContextWindow`）。 */
+  maxContextWindow?: number
+}
+
 /** `TraeCnAdapter` 的构造选项。 */
 export interface TraeCnAdapterOptions {
   credentialRef: CredentialRef
@@ -381,7 +396,12 @@ export class TraeCnAdapter extends LlmAdapter {
     }
     // 上下文窗口：动态目录给 `prompt_max_tokens`（回退 `context_window_tokens.dev`），
     // 静态表给真机 dev 档 —— 两者同口径（都是客户端默认实际使用的窗口）。
-    if (entry?.contextWindow !== undefined) resolved.context = { contextWindow: entry.contextWindow }
+    // 用户在 Account Hub 选了 Max 档时由 `effectiveContextWindow` 换成该模型的 Max 档
+    // （**纯声明值切换**：请求体一个字段都不动，见该方法说明）。
+    if (entry !== undefined) {
+      const effectiveWindow = this.effectiveContextWindow(entry, model)
+      if (effectiveWindow !== undefined) resolved.context = { contextWindow: effectiveWindow }
+    }
     // 思考档位：DSH 的「思考程度」选择器**唯一**的数据源就是本字段
     // （`resolveModel().reasoning`）——不声明时模型选择器里整行不渲染，
     // 用户只能看到「当前模型未提供推理等级」。档位数据来自真机 vscdb 的
@@ -402,6 +422,62 @@ export class TraeCnAdapter extends LlmAdapter {
       }
     }
     return resolved
+  }
+
+  /**
+   * 当前生效目录的逐模型上下文窗口档位（id → dev / Max）。
+   *
+   * 用途有两个，都必须与 `listModels` / `resolveModel` **同源同口径**：
+   * 1. Account Hub 的「显示列表」据此渲染档位单选列（只有 Max 档存在才渲染）；
+   * 2. `model.setContextBudget` 据此**校验**用户提交的 window（必须精确等于 dev 或 max 之一）。
+   *
+   * 三处读的都是同一个 {@link catalogEntries}，否则会出现「UI 上有 Max 档、
+   * 切过去却不生效」这种自相矛盾。
+   */
+  async contextTiers(): Promise<ReadonlyMap<string, TraeCnContextTier>> {
+    await this.ensureRemoteModels()
+    const tiers = new Map<string, TraeCnContextTier>()
+    for (const entry of this.catalogEntries()) {
+      if (entry.contextWindow === undefined && entry.maxContextWindow === undefined) continue
+      tiers.set(entry.id, {
+        ...entry.contextWindow === undefined ? {} : { contextWindow: entry.contextWindow },
+        ...entry.maxContextWindow === undefined ? {} : { maxContextWindow: entry.maxContextWindow },
+      })
+    }
+    return tiers
+  }
+
+  /**
+   * 该模型**本次应当声明的上下文窗口**（dev 档，或用户选中的 Max 档）。
+   *
+   * ## 机制：只有声明值会变，出站请求体一个字段都不动
+   *
+   * Trae 的 chat 请求体里**没有**任何档位字段（`buildTraeCnSoloBody` 的字段全集是
+   * `messages` / `model` / `config_name` / `function` / `stream` / `tools` /
+   * `temperature` / `max_tokens` / `stop` / `reasoning_effort_level`）。所谓「选 Max 档」
+   * 只是把**我们向 DSH 声明的窗口**从 dev 换成该模型自己公布的 Max ——
+   * 上游本来就按请求实际长度服务，声明值决定的是**宿主何时压缩**（阈值 `0.8 × 窗口`）
+   * 与压缩后的保留预算。因此本函数绝不产生任何出站差异。
+   *
+   * ## 判据：预算值必须**精确命中**目录公布的档位（两条缺一不可）
+   *
+   * 1. `maxContextWindow` 存在且**严格大于** dev 档（解析侧已保证，这里再判一次，
+   *    防手工构造的条目）；
+   * 2. 池里存的预算**恰好等于**那个 Max 档。
+   *
+   * 其余一切情况都退回 dev 档：未设置、预算 == dev、预算是编造值、
+   * 目录漂移后旧预算失效（模型下线或 Max 档改值）、以及 max 缺失的模型被写入任意预算。
+   * **编造值静默退回默认档是设计**，不是遗漏 —— 用户设置永远不能凭空造出一个
+   * 上游不认的窗口；而静默（不报错）是刻意的：回归默认档是安全方向，
+   * 报错只会让历史会话在目录浮动后突然打不开。
+   */
+  private effectiveContextWindow(entry: TraeCnModelEntry, model: string): number | undefined {
+    const dev = entry.contextWindow
+    if (dev === undefined) return undefined
+    const max = entry.maxContextWindow
+    if (max === undefined || max <= dev) return dev
+    const budget = this.options.accountPool?.contextBudget(this.product.id, model)
+    return budget === max ? max : dev
   }
 
   /**
@@ -888,11 +964,17 @@ interface ConsumeCell {
  * `llm-trae-cn`。`settingsNs` **必须**与 `src/index.ts` 的
  * `registerProviderSettings` 注册的 namespace 一致，否则模型设置页会因未注册
  * namespace 在 `refFor → deriveKeyRef(provider)` 处崩溃。
+ *
+ * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerJetHubRpc`，
+ *          供 Account Hub 读取逐模型的窗口档位（`contextTiers`）与校验用户选择。
+ *          适配器是**动态目录的唯一持有者**，RPC 层拿不到目录就只能靠猜。
  */
-export function registerTraeCnLlm(ctx: Context, options: TraeCnAdapterOptions): void {
+export function registerTraeCnLlm(ctx: Context, options: TraeCnAdapterOptions): TraeCnAdapter {
   const product = options.product ?? TRAE_CN
   ctx.llm.registerConfigurableProviders([
     { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([product.id], new TraeCnAdapter(options))
+  const adapter = new TraeCnAdapter(options)
+  ctx.llm.registerAdapter([product.id], adapter)
+  return adapter
 }

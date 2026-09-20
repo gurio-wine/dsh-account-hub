@@ -895,6 +895,123 @@ describe('TraeCnAdapter resolveModel', () => {
       .toEqual({ contextWindow: 204_800 })
   })
 
+  /**
+   * dev / Max 档位选择（Account Hub 的档位单选列）。
+   *
+   * 机制是**纯声明值切换**：只改我们向 DSH 声明的窗口（它决定宿主压缩阈值
+   * `0.8 × 窗口` 与压缩后的保留预算），出站请求体一个字段都不动 —— 这是红线，
+   * 由下面那条「逐字节比对两次请求体」的用例钉死。
+   *
+   * 判据是「预算值必须**精确命中**目录公布的 Max 档」：未设置、等于 dev、
+   * 编造值、目录漂移后旧值失效，四种情况一律静默退回 dev 档。
+   */
+  describe('上下文窗口档位（dev / Max）', () => {
+    /** 目录形态：一个两档模型 + 一个单档模型。 */
+    const catalog: TraeCnModelEntry[] = [
+      {
+        id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 119_040, maxContextWindow: 1_048_576,
+        function: TRAE_CN_SOLO_REMOTE_FUNCTION,
+      },
+      { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 200_000, function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+    ]
+
+    /** 构造一个「目录固定 + 池里带若干预算」的适配器。 */
+    function withBudget(budgets: Record<string, number>, responder = () => sseResponse(textStream('ok'))) {
+      return makeAdapter(responder, {
+        fetchRemoteModels: async () => catalog,
+        accountPool: {
+          contextBudget: (_provider: string, model: string) => budgets[model],
+          // 断言「出站请求体与档位无关」那条会真的走一遍 `stream()`；池里给出一个
+          // 能匹配到的账号 id，免得适配器每次都打一行「未匹配到账号池条目」的警告
+          // 把测试输出淹掉（那与档位无关）。
+          findAccountIdByCredential: async () => 'acct-1',
+        } as never,
+      })
+    }
+
+    it('预算 = 目录公布的 Max 档 → 声明 Max', async () => {
+      const { adapter } = withBudget({ 'glm-5.3': 1_048_576 })
+      expect((await adapter.resolveModel('trae-cn', 'glm-5.3')).context)
+        .toEqual({ contextWindow: 1_048_576 })
+    })
+
+    it('未设置 / 恰好等于 dev / 编造值 → 一律声明 dev', async () => {
+      for (const budgets of [{}, { 'glm-5.3': 119_040 }, { 'glm-5.3': 999_999_999 }]) {
+        const { adapter } = withBudget(budgets)
+        expect((await adapter.resolveModel('trae-cn', 'glm-5.3')).context, JSON.stringify(budgets))
+          .toEqual({ contextWindow: 119_040 })
+      }
+    })
+
+    it('**无 Max 档的模型**带任何预算都只声明 dev（不给不存在的档位）', async () => {
+      const { adapter } = withBudget({ 'kimi-k2.6': 1_048_576, 'glm-5.3': 200_000 })
+      expect((await adapter.resolveModel('trae-cn', 'kimi-k2.6')).context)
+        .toEqual({ contextWindow: 200_000 })
+      // 反证：同一适配器里两档模型仍能命中（否则上面可能因为「预算整个没读」而假通过）。
+      expect((await adapter.resolveModel('trae-cn', 'glm-5.3')).context)
+        .toEqual({ contextWindow: 119_040 })
+    })
+
+    it('**目录漂移后旧预算自动失效**（Max 档改值 → 静默退回 dev，不报错）', async () => {
+      // 用户按旧的 Max(524288) 选过档，上游后来把它改成 1048576：旧值不再命中。
+      const { adapter } = withBudget({ 'glm-5.3': 524_288 })
+      expect((await adapter.resolveModel('trae-cn', 'glm-5.3')).context)
+        .toEqual({ contextWindow: 119_040 })
+    })
+
+    it('**静态回退路径下预算永远不生效**（静态表不带 Max 档）', async () => {
+      const { adapter } = makeAdapter(() => sseResponse(''), {
+        accountPool: {
+          // 拿静态表的 dev 档当预算值也照样退回 dev：没有 maxContextWindow 就没有档位。
+          contextBudget: () => 119_040,
+        } as never,
+      })
+      expect((await adapter.resolveModel('trae-cn', 'glm-5.3')).context)
+        .toEqual({ contextWindow: 119_040 })
+    })
+
+    it('**出站请求体与档位无关**（红线：切换档位不改请求体一个字节）', async () => {
+      const options = generateOptions({ model: 'glm-5.3' })
+      const dev = withBudget({})
+      await collect(dev.adapter, options)
+      const max = withBudget({ 'glm-5.3': 1_048_576 })
+      await collect(max.adapter, options)
+      expect(dev.calls).toHaveLength(1)
+      expect(max.calls).toHaveLength(1)
+      expect(String(max.calls[0]!.init?.body)).toBe(String(dev.calls[0]!.init?.body))
+      // 反证：两条路径确实各自发了请求（不是「都没发」而恒等）。
+      expect(String(dev.calls[0]!.init?.body)).toContain('"config_name":"glm-5.3"')
+    })
+  })
+
+  describe('contextTiers（供 Account Hub 渲染与校验档位）', () => {
+    it('逐模型给 dev / Max；单档模型只带 dev', async () => {
+      const { adapter } = makeAdapter(() => sseResponse(''), {
+        fetchRemoteModels: async () => [
+          {
+            id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 119_040, maxContextWindow: 1_048_576,
+            function: TRAE_CN_SOLO_REMOTE_FUNCTION,
+          },
+          { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 200_000, function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+        ],
+      })
+      const tiers = await adapter.contextTiers()
+      expect(tiers.get('glm-5.3')).toEqual({ contextWindow: 119_040, maxContextWindow: 1_048_576 })
+      expect(tiers.get('kimi-k2.6')).toEqual({ contextWindow: 200_000 })
+      expect(tiers.get('kimi-k2.6')).not.toHaveProperty('maxContextWindow')
+    })
+
+    it('**静态回退路径下 11 项一个 Max 都没有**（模型自动无档位 UI，是预期行为）', async () => {
+      const { adapter } = makeAdapter(() => sseResponse(''))
+      const tiers = await adapter.contextTiers()
+      expect(tiers.size).toBe(TRAE_CN_FALLBACK_MODELS.length)
+      for (const [id, tier] of tiers) {
+        expect(tier, id).not.toHaveProperty('maxContextWindow')
+        expect(typeof tier.contextWindow, id).toBe('number')
+      }
+    })
+  })
+
   it('resolveModel 的 inputModalities 与 listModels **同源同口径**', async () => {
     const { adapter } = makeAdapter(() => sseResponse(''))
     // 两处不一致会让选择器显示「支持图片」而请求路径按纯文本处理（或反之）。
@@ -1814,9 +1931,82 @@ describe('Trae CN 目录解析（parseTraeCnDirectory）', () => {
       id: 'glm-5.3',
       name: 'GLM-5.3',
       contextWindow: 119_040,
+      // 实测样例的 Max 档（`context_window_tokens.max`）**严格大于** dev 档 → 收下。
+      maxContextWindow: 1_048_576,
       maxTokens: 64_000,
       function: 'solo_work_remote',
     }])
+  })
+
+  /**
+   * Max 档的收与不收。
+   *
+   * 收下一条「max <= dev」的条目，用户会看到一个切过去毫无效果的档位
+   * （Work 侧实测就是 `{dev: 184000, max: 184000}` 这种两档同值形态）；
+   * 收下一条 dev 缺失的条目，则会声明一个没有默认档可退的 Max。
+   * 故判据是**严格大于**，边界一个都不放过。
+   */
+  it('Max 档只在**严格大于** dev 档时收下（dev==max / 更小 / 0 / 缺失都不收）', () => {
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [
+        { config_name: 'a', context_window_tokens: { dev: 119_040, max: 1_048_576 } },
+        // Work 侧实测形态：两档同值。
+        { config_name: 'b', context_window_tokens: { dev: 184_000, max: 184_000 } },
+        // 脏数据：max 比 dev 小。
+        { config_name: 'c', context_window_tokens: { dev: 200_000, max: 100_000 } },
+        // max 为 0（实测真实下发过 `{dev: 200000, max: 0}`）。
+        { config_name: 'd', context_window_tokens: { dev: 200_000, max: 0 } },
+        // max 字段缺失。
+        { config_name: 'e', context_window_tokens: { dev: 200_000 } },
+        // dev 档本身缺失：没有可比对的基准，不收。
+        { config_name: 'f', context_window_tokens: { max: 1_048_576 } },
+        // 负数 / 字符串：`readPositive` 同口径，一律视为未声明。
+        { config_name: 'g', context_window_tokens: { dev: 1_000, max: -5 } },
+        { config_name: 'h', context_window_tokens: { dev: 1_000, max: '1048576' } },
+      ],
+    }, 'solo_work_remote')
+    const byId = new Map(parsed.map((e) => [e.id, e]))
+    // 反证：确实读到了 Max 字段（否则下面的循环可能因为整条链路失效而恒真）。
+    expect(byId.get('a')).toMatchObject({ contextWindow: 119_040, maxContextWindow: 1_048_576 })
+    for (const id of ['b', 'c', 'd', 'e', 'f', 'g', 'h']) {
+      expect(byId.get(id), id).not.toHaveProperty('maxContextWindow')
+    }
+    // dev 档本身仍然照常声明（不收 Max 不等于丢窗口）。
+    expect(byId.get('e')).toMatchObject({ contextWindow: 200_000 })
+    expect(byId.get('g')).toMatchObject({ contextWindow: 1_000 })
+  })
+
+  it('Max 的判据对着**实际生效的 dev 档**（`prompt_max_tokens` 覆盖 `context_window_tokens.dev`）', () => {
+    // 探针：`prompt_max_tokens`(300000) 才是实际生效的 dev 档，max(200000) 落在
+    // 两个候选 dev 值之间。若拿 `context_window_tokens.dev`(100000) 去比，
+    // 就会误收一个「其实不大于默认档」的 Max。
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [{
+        config_name: 'm',
+        model_detail_list: [{ prompt_max_tokens: 300_000 }],
+        context_window_tokens: { dev: 100_000, max: 200_000 },
+      }],
+    }, 'solo_work_remote')
+    expect(parsed[0]).toMatchObject({ id: 'm', contextWindow: 300_000 })
+    expect(parsed[0]).not.toHaveProperty('maxContextWindow')
+  })
+
+  it('静态回退表**一律不带 Max 档**（4022 钳制是网关级证据，不是逐模型的档位表）', () => {
+    const catalog = fallbackTraeCnCatalog()
+    // 反证：表非空，否则下面的循环恒真。
+    expect(catalog).toHaveLength(TRAE_CN_FALLBACK_MODELS.length)
+    expect(catalog.length).toBeGreaterThan(0)
+    for (const entry of catalog) {
+      expect(entry, entry.id).not.toHaveProperty('maxContextWindow')
+    }
+    // 反向也成立：静态表**不是**「整表没有窗口」，dev 档一个不少。
+    for (const entry of catalog) {
+      expect(typeof entry.contextWindow, entry.id).toBe('number')
+    }
+    // 静态表的源数据里也没有该字段（不是「映射时忘了带」而是「本来就不该有」）。
+    for (const model of TRAE_CN_FALLBACK_MODELS) {
+      expect(model, model.id).not.toHaveProperty('maxContextWindow')
+    }
   })
 
   it('上下文窗口回退 `context_window_tokens.dev`（缺 model_detail_list 时）', () => {
@@ -2424,7 +2614,7 @@ describe('registerTraeCnLlm', () => {
         registerAdapter: (providers: string[]) => { adapters.push(...providers) },
       },
     }
-    registerTraeCnLlm(ctx as never, {
+    const adapter = registerTraeCnLlm(ctx as never, {
       credentialRef: credentialRef('TRAE_CN_ACCESS_TOKEN'),
       resolveCredential: async () => undefined,
       refresh: async () => {},
@@ -2439,5 +2629,10 @@ describe('registerTraeCnLlm', () => {
       settingsPath: [],
     }])
     expect(adapters).toEqual(['trae-cn'])
+    // 返回值是**刚注册的那个适配器实例**：`src/index.ts` 把它转交给
+    // `registerJetHubRpc`（Account Hub 的窗口档位只能由目录持有者回答）。
+    // 返回 undefined 会让 `model.list` 永远没有档位列、`model.setContextBudget` 恒拒绝。
+    expect(adapter).toBeInstanceOf(TraeCnAdapter)
+    expect(typeof adapter.contextTiers).toBe('function')
   })
 })

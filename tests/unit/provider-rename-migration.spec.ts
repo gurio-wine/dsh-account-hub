@@ -583,7 +583,7 @@ describe('migrateProviderNames —— disabledModels 对调搬运', () => {
 })
 
 describe('迁移与存储契约', () => {
-  it('一次 replace 同时携带账号 / 黑名单 / 版本号（三者都不丢）', async () => {
+  it('一次 replace 同时携带账号 / 黑名单 / 上下文预算 / 版本号（四者都不丢）', async () => {
     const h = makeHarness({
       accounts: [makeEntry({ id: 'buddy-7b0c71b1', credentialRef: 'BUDDY_ACCOUNT_7B0C71B1' })],
       disabledModels: { buddy: { 'glm-5.2': true } },
@@ -596,7 +596,9 @@ describe('迁移与存储契约', () => {
     // 原子写：恰好一次 replace（不是「先写账号、再写黑名单」两趟）。
     expect(h.replacePayloads).toHaveLength(1)
     const payload = h.replacePayloads[0]!
-    expect(Object.keys(payload).sort()).toEqual(['accounts', 'disabledModels', 'schemaVersion'])
+    // `contextBudgets`（Trae CN 的 dev / Max 档位）**不是迁移对象**，但同属这个
+    // namespace，故必须原样随写带上 —— 漏带会让改名迁移顺手清空用户的档位选择。
+    expect(Object.keys(payload).sort()).toEqual(['accounts', 'contextBudgets', 'disabledModels', 'schemaVersion'])
     expect(payload.schemaVersion).toBe(JET_HUB_SCHEMA_VERSION)
   })
 

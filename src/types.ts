@@ -295,6 +295,29 @@ export interface RpcModelListEntry {
   name: string
   /** true = 已关闭（不出现在对话框的模型选择里）。 */
   disabled: boolean
+  /**
+   * 该模型**目录公布的默认窗口**（dev 档，token 数）。
+   *
+   * 只有 Trae CN 会带：它的动态目录对部分模型下发 `{dev, max}` 两档，其余
+   * provider 的适配器不产出窗口元数据。缺省 = 无窗口信息，UI 不渲染档位列。
+   */
+  contextWindow?: number
+  /**
+   * 该模型**目录公布的 Max 档**（token 数）。
+   *
+   * 只在**严格大于 {@link contextWindow}** 时出现（判据在目录解析侧），故 UI 用
+   * `maxContextWindow > contextWindow` 即可判定「这一行有没有档位可选」。
+   */
+  maxContextWindow?: number
+  /**
+   * 当前**已存储的预算值**（`undefined` = 用默认档）。
+   *
+   * 规格只点明了上面两个窗口字段，这个字段是为 UI 补的：档位单选需要知道
+   * 「现在选中的是哪一个」，否则每次打开面板都只能显示成默认档。
+   * 它要么等于 {@link contextWindow}（默认档）要么等于 {@link maxContextWindow}，
+   * 不会出现第三个值 —— 写入侧（`model.setContextBudget`）就是这么校验的。
+   */
+  contextBudget?: number
 }
 
 /** RPC: 列出某 provider 的模型响应 */
@@ -313,6 +336,27 @@ export interface RpcModelSetDisabledRequest {
 export interface RpcModelSetDisabledResponse {
   provider: string
   disabledModels: Record<string, boolean>
+}
+
+/**
+ * RPC: 设置某个模型的上下文窗口档位请求。
+ *
+ * `window` 必须是**该模型目录公布的档位之一**（dev 或 Max）。省略（或等于 dev）
+ * = **恢复默认档**（清除预算），而不是「设成 dev」—— 两者在存储上刻意区分
+ * （见 `AccountPool.writeContextBudget`）。
+ */
+export interface RpcModelSetContextBudgetRequest {
+  provider: string
+  model: string
+  window?: number
+}
+
+/** RPC: 设置上下文窗口档位响应（回传写入后的预算值，`undefined` = 已恢复默认档）。 */
+export interface RpcModelSetContextBudgetResponse {
+  provider: string
+  model: string
+  /** 当前存储的预算值；JSON 里缺省即「已恢复默认档」。 */
+  contextBudget?: number
 }
 
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */

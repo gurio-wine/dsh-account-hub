@@ -271,6 +271,9 @@ export interface TraeCnFallbackModel {
    * max 档（多数为 1048576）**刻意不取** —— 目录里它是理论上限，
    * 而 `resolveModel` 声明的窗口会被 DSH 用来决定何时压缩上下文，
    * 按上限声明会让压缩迟迟不触发。
+   *
+   * ⚠️ **本表一律不带 `maxContextWindow`**（理由见 {@link fallbackTraeCnCatalog}）：
+   * 静态路径下这些模型**没有档位可选**，是预期行为而非缺陷。
    */
   contextWindow: number
   /**
@@ -410,6 +413,18 @@ export interface TraeCnModelEntry {
   supportsImages?: boolean
   /** 上下文窗口（目录给的 dev 档 / `prompt_max_tokens`）。缺省 = 未提供。 */
   contextWindow?: number
+  /**
+   * 上下文窗口的 **Max 档**（目录 `context_window_tokens.max`）。
+   *
+   * ⚠️ **只在严格大于 {@link contextWindow} 时才写入**（见 {@link parseTraeCnDirectory}）：
+   * `max <= dev`（含 `max` 为 0 / 缺失 / 与 dev 相等）一律视为**没有 Max 档** ——
+   * Work 侧实测就是 `{dev: 184000, max: 184000}` 这种「两档同值」的形态，
+   * 收下它会渲染出一个切过去毫无效果的档位。
+   *
+   * 缺省 = 无 Max 档或目录未下发。用户可选的档位因此**永远精确等于目录公布的档位之一**，
+   * 声明值只有 dev / max 两种可能（见 `TraeCnAdapter.resolveModel` 的预算覆盖）。
+   */
+  maxContextWindow?: number
   /** 最大输出 token（**只记录，不 materialize**，见 TraeCnFallbackModel.maxTokens）。 */
   maxTokens?: number
   /** 可选思考档位；缺省 = 不声明（选择器不渲染该行）。 */
@@ -437,7 +452,20 @@ export interface TraeCnModelEntry {
   invisible?: boolean
 }
 
-/** 静态回退表 → 目录条目（全部映射到 {@link TRAE_CN_SOLO_REMOTE_FUNCTION}）。 */
+/**
+ * 静态回退表 → 目录条目（全部映射到 {@link TRAE_CN_SOLO_REMOTE_FUNCTION}）。
+ *
+ * ## ⚠️ 静态路径**一律不产出 `maxContextWindow`**（这是设计，不是遗漏）
+ *
+ * 手上有 Max 档的旁证只有一条：`4022` 的钳制实验（998 161 token 成功 /
+ * 1 002 248 token 失败 ⇒ 上游硬限约 1M）。那是**网关级**的容量证据，不是
+ * **逐模型**的档位表 —— 它说不出「哪几个模型公布了两档、各自 Max 是多少」。
+ * 静态表本身也没有任何一行带 `ctx(max)` 的原始记录。
+ *
+ * 把「1M」按网关结论摊派到 11 项上，就是**编造**：用户会看到一个切过去
+ * 未必被上游接受的档位，而本项目对未取证的东西一律不猜。故静态路径下
+ * **11 项都没有档位 UI**（目录拉取成功时才有），宁缺毋编。
+ */
 export function fallbackTraeCnCatalog(): TraeCnModelEntry[] {
   return TRAE_CN_FALLBACK_MODELS.map((model) => ({
     id: model.id,
@@ -540,6 +568,9 @@ export function applyTraeCnStaticMetadata(entries: readonly TraeCnModelEntry[]):
  * - id：`config_name`（空串跳过）；
  * - 展示名：`display_config.display_name`，缺省回退 id；
  * - 上下文窗口：`model_detail_list[0].prompt_max_tokens`，回退 `context_window_tokens.dev`；
+ *   **Max 档**另读 `context_window_tokens.max`，且只在**严格大于**上面那个 dev 档时才收
+ *   （`max <= dev`（含 0 与两档同值）、max 缺失、dev 档本身缺失，都视为无 Max 档，
+ *   理由见 `TraeCnModelEntry.maxContextWindow`）；
  * - 输出上限：`model_detail_list[0].max_tokens`；
  * - 思考档位：`reasoning_effort_config`（`support_thinking === true` 且 `options`
  *   是非空字符串数组才声明，`default_level` 不在 options 内时只丢默认档）；
@@ -568,6 +599,11 @@ export function parseTraeCnDirectory(body: unknown, functionName: string): TraeC
     const detail = firstRecord(record.model_detail_list)
     const contextTokens = asRecord(record.context_window_tokens)
     const contextWindow = readPositive(detail?.prompt_max_tokens) ?? readPositive(contextTokens?.dev)
+    // Max 档：**只记录，不参与默认声明**（默认仍是 dev 档，见 TraeCnModelEntry.contextWindow）。
+    // 它与 dev 的严格大小关系在下面 push 时判定 —— 判据必须对着**实际生效的 dev 档**
+    // （`prompt_max_tokens` 可能覆盖 `context_window_tokens.dev`），拿 `contextTokens.dev`
+    // 去比会在两者不一致时误收一个「其实不大于默认档」的 Max。
+    const maxContextWindow = readPositive(contextTokens?.max)
     const maxTokens = readPositive(detail?.max_tokens)
     const reasoning = readReasoningConfig(record)
     const usage = readString(record.usage)
@@ -575,6 +611,10 @@ export function parseTraeCnDirectory(body: unknown, functionName: string): TraeC
       id,
       name: readString(display?.display_name) ?? id,
       ...contextWindow === undefined ? {} : { contextWindow },
+      // `max <= dev`、`max` 为 0、缺失、以及 dev 档本身缺失，四种情况**都不收**。
+      ...maxContextWindow !== undefined && contextWindow !== undefined && maxContextWindow > contextWindow
+        ? { maxContextWindow }
+        : {},
       ...maxTokens === undefined ? {} : { maxTokens },
       ...reasoning,
       // 过滤线索：`usage` 用于识别账号私有 BYOK 项；`is_invisible_to_user`

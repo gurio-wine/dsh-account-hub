@@ -448,7 +448,10 @@ export function apply(ctx: Context): void {
   // 否则「刷新的是解析凭据时所用的那个账号」这条不变量会被打破
   // （详因见 makeAccountPicker 的说明，回归测试在 lobsterai-wiring.spec.ts）。
   const pickTraeCnAccount = makeAccountPicker(pool, TRAE_CN.id)
-  registerTraeCnLlm(ctx, {
+  // 适配器实例要交给 RPC 层：Account Hub 的「显示列表」需要逐模型的窗口档位
+  // （dev / Max），而那是**目录持有者**独有的数据 —— `ctx.llm.listModels()` 会把
+  // 适配器返回的额外字段丢掉，ctx 上也没有「按 provider 取适配器」的入口。
+  const traeCnAdapter = registerTraeCnLlm(ctx, {
     credentialRef: credentialRef(TRAE_CN.defaultCredentialRef),
     // 只从 Trae CN 自己的账号池取账号，回退到自己的单凭据 ref，
     // 保证不会串用其它四条线的凭据。
@@ -732,7 +735,9 @@ export function apply(ctx: Context): void {
 
   // ===== Account Hub RPC 注册 =====
   // 参数次序照既有惯例：provider 服务的排列顺序与上面注册顺序一致，
-  // 新增的 `qoderCn` 排在尾（`qoder` 之后）。
-  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn)
+  // 新增的 `qoderCn` 排在尾（`qoder` 之后）；末位是**可选的**窗口档位来源
+  // （目前由 Trae CN 适配器实现，见 `ContextTierSource`），省略时
+  // `model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝。
+  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, traeCnAdapter)
   ctx.provide('accountPool', pool)
 }

@@ -682,29 +682,104 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, cre
 }
 
 /**
+ * 上下文窗口的展示文案（token 数 → `1M` / `200K` / 原样数字）。
+ *
+ * ## 为什么只在**整除**时才缩写
+ *
+ * 档位标签必须让用户能对得上目录公布的值，而 1024 进制缩写不是无损的：
+ * `119040` 是 `116.25K`，四舍五入成 `116K` 会显示一个**目录里不存在的数**，
+ * 用户拿它去和别处（Trae 客户端、文档）核对就会对不上。故规则是：
+ * 能被 1024（或 1024²）整除才缩写，否则**原样输出数字**。
+ *
+ * - `1048576` → `1M`（目录的 Max 档正是这个值）
+ * - `262144` → `256K`、`204800` → `200K`
+ * - `119040` → `119040`（不是 1024 的整数倍，缩写会失真）
+ */
+function formatCapacity(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '';
+  const mega = 1024 * 1024;
+  if (value % mega === 0) return `${value / mega}M`;
+  if (value % 1024 === 0) return `${value / 1024}K`;
+  return String(value);
+}
+
+/**
+ * 单个模型的上下文窗口档位选择（「默认 xxx」/「Max xxx」两个 radio）。
+ *
+ * ## 只在真正有 Max 档时渲染
+ *
+ * 判据是 `maxContextWindow > contextWindow`（Host 侧已按此过滤过一遍，这里再判一次
+ * 是为了防御脏数据）。没有 Max 档的模型**不渲染这一列** —— 那正是
+ * 「用户能选的档位永远精确等于目录公布的档位之一」这条原则在 UI 上的样子：
+ * 宁可少一个控件，也不给一个切过去毫无效果的选项。
+ *
+ * ## 为什么不是 label 包住整行
+ *
+ * 这个组件挂在模型行的右侧、与「显示开关」同级。若把 radio 放进**包住开关的那个
+ * `<label>`** 里，点 radio 会连带激活 label 的隐式控件（那个 checkbox），
+ * 一次点击同时改两件事。故 ModelToggle 的根节点是 `div`，label 只包住
+ * 「名字 + 开关」那一半。
+ */
+function ModelTierPicker({ model, busy, onSelect }) {
+  const dev = model.contextWindow;
+  const max = model.maxContextWindow;
+  if (typeof dev !== 'number' || typeof max !== 'number' || max <= dev) return null;
+  // 选中态由 Host 回传的预算值决定：等于 max 才是 Max 档，其余（含 undefined）都是默认档。
+  const selected = model.contextBudget === max ? 'max' : 'default';
+  const name = model.name || model.id;
+  const option = (tier, window, text) => React.createElement('label', {
+    className: 'dim-jh-tierOption',
+    // 精确值放 title：缩写是给一眼扫过的，tooltip 是给要核对数字的人的。
+    title: `${text}档 · ${window} token`,
+  },
+    React.createElement('input', {
+      type: 'radio',
+      name: `dim-jh-tier-${model.id}`,
+      checked: selected === tier,
+      disabled: busy,
+      onChange: () => onSelect(model.id, window),
+    }),
+    React.createElement('span', null, `${text} ${formatCapacity(window)}`));
+  return React.createElement('div', {
+    className: 'dim-jh-modelTier',
+    role: 'radiogroup',
+    'aria-label': `${name} 上下文窗口档位`,
+  },
+    option('default', dev, '默认'),
+    option('max', max, 'Max'));
+}
+
+/**
  * 单个模型的开关。
  *
  * 刻意不做本地乐观更新：模型列表与黑名单都以 Host 为准（可能是远端拉取的
  * 结果），本地猜测状态容易与真实持久化结果分叉。这里等 RPC 返回后再翻状态，
  * 期间禁用开关，保证界面上看到的就是服务端已接受的。
  */
-function ModelToggle({ model, busy, onToggle }) {
-  return React.createElement('label', {
+function ModelToggle({ model, busy, onToggle, tierBusy, onSelectTier }) {
+  return React.createElement('div', {
     className: 'dim-jh-modelRow',
     'data-disabled': model.disabled ? 'true' : 'false',
-    title: model.id,
   },
-    React.createElement('span', { className: 'dim-jh-modelInfo' },
-      React.createElement('strong', { className: 'dim-jh-modelName' }, model.name || model.id),
-      React.createElement('code', { className: 'dim-jh-modelId' }, model.id)),
-    React.createElement('input', {
-      type: 'checkbox',
-      className: 'dim-jh-switch',
-      role: 'switch',
-      checked: !model.disabled,
-      disabled: busy,
-      'aria-label': `${model.name || model.id} 是否在模型选择中显示`,
-      onChange: () => onToggle(model.id, !model.disabled),
+    // label 只包住「名字 + 显示开关」：两者的点击语义都属于「开关模型可见性」。
+    // 档位 radio 在它之外，避免点档位时连带翻转显示开关。
+    React.createElement('label', { className: 'dim-jh-modelMain', title: model.id },
+      React.createElement('span', { className: 'dim-jh-modelInfo' },
+        React.createElement('strong', { className: 'dim-jh-modelName' }, model.name || model.id),
+        React.createElement('code', { className: 'dim-jh-modelId' }, model.id)),
+      React.createElement('input', {
+        type: 'checkbox',
+        className: 'dim-jh-switch',
+        role: 'switch',
+        checked: !model.disabled,
+        disabled: busy,
+        'aria-label': `${model.name || model.id} 是否在模型选择中显示`,
+        onChange: () => onToggle(model.id, !model.disabled),
+      })),
+    React.createElement(ModelTierPicker, {
+      model,
+      busy: tierBusy,
+      onSelect: onSelectTier,
     }));
 }
 
@@ -727,6 +802,9 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const [toggleError, setToggleError] = React.useState(null);
   // 正在提交的模型 id 集合：只禁用被点的那一行，避免整表锁死。
   const [busyIds, setBusyIds] = React.useState(() => new Set());
+  // 正在提交档位的模型 id 集合。与 `busyIds` 分开：两者是同两行上的**两件独立的事**
+  // （改可见性不该禁用档位选择，反之亦然）。
+  const [tierBusyIds, setTierBusyIds] = React.useState(() => new Set());
   const mounted = React.useRef(true);
 
   const load = React.useCallback(async () => {
@@ -786,6 +864,47 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   const hiddenCount = all.filter(m => m.disabled).length;
   const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
 
+  /**
+   * 切换某个模型的上下文窗口档位。
+   *
+   * 成功后**本地刷新**选中态：`contextBudget` 与 `contextWindow` 的关系就是
+   * 单选列的选中判据（见 ModelTierPicker）。刻意不做乐观更新 —— 与显示开关同理，
+   * 档位是否被接受由 Host 校验决定（它手上有目录），本地先翻会让「编造值被拒绝」
+   * 看起来像成功了。失败时把 RPC 返回的原文显示出来：那句话里带着该模型
+   * **实际可用的档位值**，是用户唯一能据以改正的信息。
+   */
+  const selectTier = async (modelId, window) => {
+    setTierBusyIds(prev => new Set(prev).add(modelId));
+    setToggleError(null);
+    try {
+      const res = await rpcCall('model.setContextBudget', { provider, model: modelId, window });
+      if (!mounted.current) return;
+      setModels(prev => (prev || []).map(m => (m.id === modelId
+        ? { ...m, contextBudget: res?.contextBudget }
+        : m)));
+    } catch (caught) {
+      console.error('[jet-hub] set context budget failed:', caught);
+      if (!mounted.current) return;
+      setToggleError(caught?.message || '设置上下文窗口档位失败');
+    } finally {
+      if (mounted.current) {
+        setTierBusyIds((prev) => {
+          const next = new Set(prev);
+          next.delete(modelId);
+          return next;
+        });
+      }
+    }
+  };
+
+  // 档位列只在 Trae CN 出现：只有它的 `model.list` 会带 `contextWindow` /
+  // `maxContextWindow`（Work 侧目录实测 dev==max 故判成无 Max 档，其余 provider
+  // 的适配器不产出窗口元数据）。故这里不需要按 provider 名再判一次 ——
+  // 数据在，列就在；数据不在，ModelTierPicker 自己返回 null。
+  const tierHint = all.some(m => typeof m.maxContextWindow === 'number' && m.maxContextWindow > m.contextWindow)
+    ? '「Max」档只切换向对话宿主声明的上下文窗口（影响自动压缩时机），不改变发给上游的请求内容。'
+    : null;
+
   const dialog = React.createElement('div', {
     className: 'dim-jh-modalOverlay',
     // 点击遮罩关闭；点击弹窗内部不关闭（stopPropagation 由内层容器负责）。
@@ -818,6 +937,9 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
+      tierHint
+        ? React.createElement('p', { className: 'dim-jh-modalHint' }, tierHint)
+        : null,
       toggleError
         ? React.createElement('div', {
             className: 'dim-jh-probeNotice',
@@ -844,6 +966,8 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                     model,
                     busy: busyIds.has(model.id),
                     onToggle: (id, disabled) => void toggleModel(id, disabled),
+                    tierBusy: tierBusyIds.has(model.id),
+                    onSelectTier: (id, window) => void selectTier(id, window),
                   }))))));
 
   // 与登录弹窗（.dim-jh-loginOverlay）同款做法：直接渲染在组件树内，靠

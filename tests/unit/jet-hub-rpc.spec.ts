@@ -591,12 +591,22 @@ describe('model.list / model.setDisabled 端点', () => {
     accounts?: Array<Record<string, unknown>>
     /** 预置数据版本号（断言它将随 replace 一起被携带）。 */
     schemaVersion?: number
+    /** 预置上下文窗口预算（Trae CN 的 dev / Max 档位）。 */
+    contextBudgets?: Record<string, Record<string, number>>
+    /**
+     * 窗口档位来源（`registerJetHubRpc` 的第 10 个参数）。
+     *
+     * 省略即「未接线」：`model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝
+     * （headless / 未传适配器时的既定降级）。
+     */
+    contextTiers?: { contextTiers(): Promise<Map<string, { contextWindow?: number; maxContextWindow?: number }>> }
   }) {
     // settings 替身：内存里保存 namespace 的值，语义与真实服务一致的
     // 「整体 replace」。
     let stored: Record<string, unknown> = {
       accounts: options.accounts ?? [],
       ...options.disabledModels !== undefined ? { disabledModels: options.disabledModels } : {},
+      ...options.contextBudgets !== undefined ? { contextBudgets: options.contextBudgets } : {},
       ...options.schemaVersion !== undefined ? { schemaVersion: options.schemaVersion } : {},
     }
     let handler: Handler | undefined
@@ -663,6 +673,7 @@ describe('model.list / model.setDisabled 端点', () => {
     registerJetHubRpc(
       ctx as never, pool, {} as never, {} as never, {} as never,
       {} as never, {} as never, {} as never, {} as never,
+      options.contextTiers as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -1065,6 +1076,165 @@ describe('model.list / model.setDisabled 端点', () => {
     await call('model.list', { provider: 'trae-cn' })
     expect(writeCount()).toBe(afterFirst)
   })
+  })
+
+  /**
+   * 上下文窗口档位（Trae CN 的 dev / Max）。
+   *
+   * 三条必须一起成立的事：
+   * 1. `model.list` 把目录公布的 dev / Max 与**当前存储的预算**一起播报，
+   *    UI 才能渲染单选列并显示选中项；
+   * 2. `model.setContextBudget` 只接受**精确等于目录档位**的值 ——
+   *    编造值被拒，且错误信息里带着可用档位（用户唯一能据以改正的信息）；
+   * 3. 只对 Trae CN 开放（其余 provider 直接拒绝，而不是静默写一个永不生效的值）。
+   */
+  describe('model.list 窗口档位 / model.setContextBudget', () => {
+    /** 目录档位替身：一个两档模型 + 一个单档模型（id 取自下面共用的 MODELS）。 */
+    const TIERS = new Map([
+      ['glm-5.2', { contextWindow: 119_040, maxContextWindow: 1_048_576 }],
+      ['deepseek-v4-flash', { contextWindow: 119_040 }],
+    ])
+    const tierSource = { contextTiers: async () => TIERS }
+
+    it('model.list 播报 dev / Max / 当前预算（有则带，无则缺省）', async () => {
+      const { call } = registerEndpoints({
+        models: MODELS,
+        contextTiers: tierSource,
+        contextBudgets: { 'trae-cn': { 'glm-5.2': 1_048_576 } },
+      })
+
+      const result = await call('model.list', { provider: 'trae-cn' })
+      expect(result.ok).toBe(true)
+      const byId = new Map((result.value as { models: Array<Record<string, unknown>> }).models.map(m => [m.id, m]))
+      // 选过 Max 档的模型：三个字段齐全。
+      expect(byId.get('glm-5.2')).toMatchObject({
+        contextWindow: 119_040, maxContextWindow: 1_048_576, contextBudget: 1_048_576,
+      })
+      // 目录里没声明窗口的模型（`hy3` 不在 TIERS 里）：一个字都不带 ——
+      // UI 据此不渲染档位列。
+      expect(byId.get('hy3')).not.toHaveProperty('contextWindow')
+      expect(byId.get('hy3')).not.toHaveProperty('contextBudget')
+    })
+
+    it('单档模型只带 dev，且**没有预算时 contextBudget 缺省**（而非 0）', async () => {
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const result = await call('model.list', { provider: 'trae-cn' })
+      const byId = new Map((result.value as { models: Array<Record<string, unknown>> }).models.map(m => [m.id, m]))
+      expect(byId.get('deepseek-v4-flash')).toMatchObject({ contextWindow: 119_040 })
+      expect(byId.get('deepseek-v4-flash')).not.toHaveProperty('maxContextWindow')
+      expect(byId.get('deepseek-v4-flash')).not.toHaveProperty('contextBudget')
+    })
+
+    it('其它 provider **一个窗口字段都不带**（档位只在 Trae CN 存在）', async () => {
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const result = await call('model.list', { provider: 'trae-cn-work' })
+      for (const model of (result.value as { models: Array<Record<string, unknown>> }).models) {
+        expect(model).not.toHaveProperty('contextWindow')
+        expect(model).not.toHaveProperty('maxContextWindow')
+      }
+    })
+
+    it('未接线（没有档位来源）时 model.list 不带窗口字段，也不报错', async () => {
+      const { call } = registerEndpoints({ models: MODELS })
+      const result = await call('model.list', { provider: 'trae-cn' })
+      expect(result.ok).toBe(true)
+      for (const model of (result.value as { models: Array<Record<string, unknown>> }).models) {
+        expect(model).not.toHaveProperty('contextWindow')
+      }
+    })
+
+    it('设置 Max 档：写入预算，且后续 model.list 立刻反映', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+
+      const set = await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window: 1_048_576 })
+      expect(set.ok).toBe(true)
+      expect((set.value as Record<string, unknown>).contextBudget).toBe(1_048_576)
+      expect(storedValue().contextBudgets).toEqual({ 'trae-cn': { 'glm-5.2': 1_048_576 } })
+
+      const result = await call('model.list', { provider: 'trae-cn' })
+      const glm = (result.value as { models: Array<Record<string, unknown>> }).models.find(m => m.id === 'glm-5.2')!
+      expect(glm.contextBudget).toBe(1_048_576)
+    })
+
+    it('**编造值被拒**，且错误信息里带着该模型实际可用的档位', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+
+      for (const window of [999_999_999, 119_041, 0, -1]) {
+        const result = await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window })
+        expect(result.ok, String(window)).toBe(false)
+        const message = (result.error as { message: string }).message
+        // 两个可用档位值都要出现在提示里（用户据此改正）。
+        expect(message, String(window)).toContain('119040')
+        expect(message, String(window)).toContain('1048576')
+      }
+      // 一次都没写进去。
+      expect(storedValue().contextBudgets ?? {}).toEqual({})
+    })
+
+    it('**单档模型**只接受 dev（= 恢复默认），任何 Max 值都被拒', async () => {
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const rejected = await call('model.setContextBudget', {
+        provider: 'trae-cn', model: 'deepseek-v4-flash', window: 1_048_576,
+      })
+      expect(rejected.ok).toBe(false)
+      const message = (rejected.error as { message: string }).message
+      // 可用档位只有那一个，且**不编造 Max**（提示里的 1048576 是用户提交的原值，
+      // 出现在「不支持 1048576」那一段，不是被列出的档位）。
+      expect(message).toContain('可用档位为 119040（默认）')
+      expect(message).not.toContain('（Max）')
+    })
+
+    it('省略 window 或恰好等于 dev = **恢复默认档**（清除预算，而不是写入 dev）', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        contextTiers: tierSource,
+        contextBudgets: { 'trae-cn': { 'glm-5.2': 1_048_576 } },
+      })
+
+      const restored = await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2' })
+      expect(restored.ok).toBe(true)
+      expect((restored.value as Record<string, unknown>).contextBudget).toBeUndefined()
+      expect(storedValue().contextBudgets).toEqual({})
+
+      // 再按 Max 设一次，然后用 dev 值恢复（两条恢复路径都要成立）。
+      await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window: 1_048_576 })
+      expect(storedValue().contextBudgets).toEqual({ 'trae-cn': { 'glm-5.2': 1_048_576 } })
+      await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window: 119_040 })
+      expect(storedValue().contextBudgets).toEqual({})
+    })
+
+    it('目录里没有该模型 / 模型未声明窗口 → 拒绝（不写任何东西）', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const unknown = await call('model.setContextBudget', { provider: 'trae-cn', model: 'brand-new', window: 1_048_576 })
+      expect(unknown.ok).toBe(false)
+      expect((unknown.error as { message: string }).message).toContain('未声明上下文窗口')
+      expect(storedValue().contextBudgets ?? {}).toEqual({})
+    })
+
+    it('**非 Trae CN 一律拒绝**（先只对它开放）', async () => {
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      for (const provider of ['trae-cn-work', 'buddy-cn', 'codearts']) {
+        const result = await call('model.setContextBudget', { provider, model: 'glm-5.2', window: 1_048_576 })
+        expect(result.ok, provider).toBe(false)
+        expect((result.error as { message: string }).message, provider).toContain('不支持上下文窗口档位')
+      }
+    })
+
+    it('未接线时同样拒绝（没有目录就无法校验，宁可拒绝也不盲写）', async () => {
+      const { call, storedValue } = registerEndpoints({ models: MODELS })
+      const result = await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window: 1_048_576 })
+      expect(result.ok).toBe(false)
+      expect(storedValue().contextBudgets ?? {}).toEqual({})
+    })
+
+    it('参数缺失时拒绝（provider / model 必填）', async () => {
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      for (const payload of [{}, { provider: 'trae-cn' }, { provider: 'trae-cn', model: '' }, { model: 'glm-5.2' }]) {
+        const result = await call('model.setContextBudget', payload)
+        expect(result.ok, JSON.stringify(payload)).toBe(false)
+        expect((result.error as { message: string }).message).toContain('必填')
+      }
+    })
   })
 })
 
