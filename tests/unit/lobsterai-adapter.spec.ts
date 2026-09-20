@@ -619,6 +619,70 @@ describe('LobsteraiAdapter SSE 消费', () => {
     const chunks = await collect(generateOptions(), adapter)
     expect(chunks).toContainEqual({ type: 'text-delta', index: 0, text: 'ok' })
   })
+
+  /**
+   * 上游会下发 **显式的 `null`** 而不是省略字段 —— 工具调用轮的首帧
+   * (`content:null`) 与只带思考的帧 (`reasoning_content:null`) 都是实测形态。
+   *
+   * 历史缺陷：守卫写成 `delta?.content !== undefined && delta.content.length > 0`，
+   * `null` 能穿过 `!== undefined` 直达 `.length`，抛出
+   * `TypeError: Cannot read properties of null (reading 'length')`。
+   * 它不是被适配器接住的可读错误，而是从 `stream()` 直接逃逸的原始 TypeError，
+   * 表现为整轮子代理运行失败。故这里钉死「null 必须与缺字段同义」。
+   */
+  it('delta.content 为显式 null 时按「无正文」处理（不抛 TypeError）', async () => {
+    const { adapter } = makeAdapter(() => sseResponse([
+      JSON.stringify({ choices: [{ delta: { content: null } }] }),
+      JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    ]))
+    const chunks = await collect(generateOptions(), adapter)
+    // 没有任何正文增量，但流正常走完（这是与「抛错」的关键分别）。
+    expect(chunks.filter((c) => c.type === 'text-delta')).toEqual([])
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+  })
+
+  it('delta.reasoning_content 为显式 null 时按「无思考」处理（不抛 TypeError）', async () => {
+    const { adapter } = makeAdapter(() => sseResponse([
+      JSON.stringify({ choices: [{ delta: { reasoning_content: null } }] }),
+      JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    ]))
+    const chunks = await collect(generateOptions(), adapter)
+    expect(chunks.filter((c) => c.type === 'reasoning-delta')).toEqual([])
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+  })
+
+  it('工具调用首帧同时带 content:null / reasoning_content:null 时正常解析工具', async () => {
+    // 这是**真实**触发场景：工具调用轮的首帧通常把两个文本通道都写成 null，
+    // 只带 tool_calls。修复前它在 `.length` 上炸掉，工具根本到不了 harness。
+    const { adapter } = makeAdapter(() => sseResponse([
+      JSON.stringify({
+        choices: [{
+          delta: {
+            content: null,
+            reasoning_content: null,
+            tool_calls: [{ index: 0, id: 'call_1', function: { name: 'read', arguments: '{"a":1}' } }],
+          },
+        }],
+      }),
+      JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+    ]))
+    const chunks = await collect(generateOptions(), adapter)
+    const end = chunks.find((c) => c.type === 'block-end' && c.block.type === 'tool-call')
+    expect(end).toMatchObject({ block: { type: 'tool-call', id: 'call_1', name: 'read', arguments: '{"a":1}' } })
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'tool-calls' } })
+  })
+
+  it('message.content 为显式 null 时不被当成完整消息采纳', async () => {
+    // 兼容回退分支同样只认字符串：`message:{content:null}` 若被采纳，
+    // `textDelta` 会变成 null 并在下面的 `.length` 上炸。
+    const { adapter } = makeAdapter(() => sseResponse([
+      JSON.stringify({ choices: [{ message: { content: null } }] }),
+      JSON.stringify({ choices: [{ delta: { content: 'ok' } }] }),
+      JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+    ]))
+    const chunks = await collect(generateOptions(), adapter)
+    expect(chunks).toContainEqual({ type: 'text-delta', index: 0, text: 'ok' })
+  })
 })
 
 describe('LobsteraiAdapter 孤儿工具调用清理', () => {

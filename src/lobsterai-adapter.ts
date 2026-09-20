@@ -906,8 +906,12 @@ export class LobsteraiAdapter extends LlmAdapter {
             error?: { message?: string }
             choices?: Array<{
               delta?: {
-                content?: string
-                reasoning_content?: string
+                // ⚠️ `| null` 不是防御性收窄：上游**真的**会下发 `"content": null`
+                // 与 `"reasoning_content": null`（工具调用轮的首帧 / 只带思考的帧）。
+                // 只写 `?: string` 会让下面基于 `.length` 的守卫在运行时炸成
+                // `TypeError: Cannot read properties of null (reading 'length')`。
+                content?: string | null
+                reasoning_content?: string | null
                 tool_calls?: Array<{
                   index?: number
                   id?: string
@@ -915,7 +919,7 @@ export class LobsteraiAdapter extends LlmAdapter {
                 }>
               }
               /** 有的上游把完整消息放在 message 而非 delta（对齐 sse.go:97-102）。 */
-              message?: { content?: string }
+              message?: { content?: string | null }
               finish_reason?: string
             }>
             usage?: {
@@ -947,12 +951,16 @@ export class LobsteraiAdapter extends LlmAdapter {
           // Go 用 `&& !gotAnyContent`（`sse.go:98`，标志位在 `sse.go:72`
           // 每次写入 delta.content 时置 true）表达「只要已经收到过正文，
           // 就再也不采纳 message 形态」。这里照搬该语义。
+          // ⚠️ 守卫必须是 `typeof === 'string'` 而不是 `!== undefined`：
+          // 上游会下发 `"content": null`，`null.length` 直接抛 TypeError 并炸掉
+          // 整轮（null 与 undefined 的分别正是本处历史缺陷的根因）。
           const deltaContent = delta?.content
-          const textDelta = deltaContent !== undefined && deltaContent.length > 0
+          const hasDeltaContent = typeof deltaContent === 'string' && deltaContent.length > 0
+          const textDelta = hasDeltaContent
             ? deltaContent
             : (!gotAnyContent && typeof choice?.message?.content === 'string' ? choice.message.content : undefined)
           if (textDelta !== undefined && textDelta.length > 0) {
-            if (deltaContent !== undefined && deltaContent.length > 0) gotAnyContent = true
+            if (hasDeltaContent) gotAnyContent = true
             let block = blocks.find(candidate => candidate.kind === 'text')
             if (block === undefined) {
               block = { index: nextIndex++, kind: 'text', text: '' }
@@ -962,15 +970,17 @@ export class LobsteraiAdapter extends LlmAdapter {
             block.text += textDelta
             yield { type: 'text-delta', index: block.index, text: textDelta }
           }
-          if (delta?.reasoning_content !== undefined && delta.reasoning_content.length > 0) {
+          // 同上：`reasoning_content: null` 会让 `!== undefined` 守卫放行到 `.length`。
+          const reasoningDelta = delta?.reasoning_content
+          if (typeof reasoningDelta === 'string' && reasoningDelta.length > 0) {
             let block = blocks.find(candidate => candidate.kind === 'reasoning')
             if (block === undefined) {
               block = { index: nextIndex++, kind: 'reasoning', text: '' }
               blocks.push(block)
               yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
             }
-            block.text += delta.reasoning_content
-            yield { type: 'reasoning-delta', index: block.index, text: delta.reasoning_content }
+            block.text += reasoningDelta
+            yield { type: 'reasoning-delta', index: block.index, text: reasoningDelta }
           }
           for (const call of delta?.tool_calls ?? []) {
             const wireIndex = call.index ?? 0
