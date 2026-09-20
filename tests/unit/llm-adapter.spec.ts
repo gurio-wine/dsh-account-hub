@@ -2,6 +2,7 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { CHAT_API_BASE, CodeArtsAdapter, QUEUE_STATUS_BASE } from '../../src/llm-adapter.js'
+import type { RemoteModel } from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
 const CREDENTIAL_REF = credentialRef('CODEARTS_ACCESS_TOKEN')
@@ -22,7 +23,7 @@ function makeAdapter(overrides: {
   credential?: CodeArtsCredential | undefined
   refresh?: () => Promise<void>
   fetchImpl?: typeof fetch
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  fetchRemoteModels?: () => Promise<RemoteModel[]>
   /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
   accountPool?: unknown
 } = {}) {
@@ -84,7 +85,7 @@ describe('CodeArtsAdapter', () => {
   it('resolveModel discloses contextWindow for GLM-5.2 and deepseek-v4 models', async () => {
     // GLM-5.2：202752；glm-5.3-flash：1048576（1M，对齐 deveco-code-rust 90aeb17d）；
     // deepseek-v4-flash/pro：1048576（1M）。
-    // 其余模型（GLM-5.1/GLM-5/openpangu-*）未公开容量，context 应为 undefined。
+    // 其余模型（GLM-5/openpangu-*）未公开容量，context 应为 undefined。
     const adapter = makeAdapter()
     const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
     expect(glm52.context).toEqual({ contextWindow: 202752 })
@@ -94,10 +95,96 @@ describe('CodeArtsAdapter', () => {
     expect(dsFlash.context).toEqual({ contextWindow: 1048576 })
     const dsPro = await adapter.resolveModel('codearts', 'deepseek-v4-pro')
     expect(dsPro.context).toEqual({ contextWindow: 1048576 })
-    const glm51 = await adapter.resolveModel('codearts', 'GLM-5.1')
-    expect(glm51.context).toBeUndefined()
     const pangu = await adapter.resolveModel('codearts', 'openpangu-2.0-pro')
     expect(pangu.context).toBeUndefined()
+  })
+
+  /**
+   * 静态兜底表的两项追加（远端不可用时才生效）。
+   *
+   * - `GLM-5.1`：IDE 内置 KERNEL_MODELS 硬证据 202752；
+   * - `glm-5.2-sft-harmony`：GLM-5.2 系的变体，按同一口径推断。
+   *
+   * ⚠️ `openpangu-2.0-flash` / `openpangu-2.0-pro` / `GLM-5` **刻意不补** ——
+   * 三方（IDE 模型卡、内置 KERNEL_MODELS、远端目录）都没有窗口旁证，编造一个
+   * 数字会直接改写宿主的压缩时机。
+   */
+  it('static fallback covers GLM-5.1 and glm-5.2-sft-harmony, and deliberately omits the unsubstantiated trio', async () => {
+    const adapter = makeAdapter()
+    expect((await adapter.resolveModel('codearts', 'GLM-5.1')).context).toEqual({ contextWindow: 202752 })
+    expect((await adapter.resolveModel('codearts', 'glm-5.2-sft-harmony')).context).toEqual({ contextWindow: 202752 })
+    expect((await adapter.resolveModel('codearts', 'GLM-5')).context).toBeUndefined()
+    expect((await adapter.resolveModel('codearts', 'openpangu-2.0-flash')).context).toBeUndefined()
+    expect((await adapter.resolveModel('codearts', 'openpangu-2.0-pro')).context).toBeUndefined()
+  })
+
+  /**
+   * 远端窗口接线：远端目录下发的 `context_window` **优先于**静态表。
+   * 用与静态值不同的数字，确保断言命中的是远端而不是兜底。
+   */
+  it('prefers the remote context_window over the static fallback', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 999_999 },
+        { id: 'GLM-5.1', name: 'GLM-5.1', contextWindow: 123_456 },
+      ],
+    })
+    expect((await adapter.resolveModel('codearts', 'GLM-5.2')).context).toEqual({ contextWindow: 999_999 })
+    expect((await adapter.resolveModel('codearts', 'GLM-5.1')).context).toEqual({ contextWindow: 123_456 })
+  })
+
+  /**
+   * 回退语义（本修复的硬约束）：**远端字段缺失 / 目录整体失败时，声明值的来源
+   * 必须原样回到静态表** —— 网络抖动不该改变声明的窗口。
+   */
+  it('falls back to the static table when the remote entry omits context_window', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        { id: 'GLM-5.2', name: 'GLM-5.2' },
+        { id: 'GLM-5.1', name: 'GLM-5.1' },
+      ],
+    })
+    expect((await adapter.resolveModel('codearts', 'GLM-5.2')).context).toEqual({ contextWindow: 202752 })
+    expect((await adapter.resolveModel('codearts', 'GLM-5.1')).context).toEqual({ contextWindow: 202752 })
+  })
+
+  it('falls back to the static table when the remote catalog fails outright', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => { throw new Error('network down') },
+    })
+    expect((await adapter.resolveModel('codearts', 'GLM-5.2')).context).toEqual({ contextWindow: 202752 })
+    expect((await adapter.resolveModel('codearts', 'deepseek-v4-pro')).context).toEqual({ contextWindow: 1048576 })
+    // 静态表也没有的模型：仍然不声明，不因远端失败而编造。
+    expect((await adapter.resolveModel('codearts', 'openpangu-2.0-pro')).context).toBeUndefined()
+  })
+
+  it('falls back to the static table when the remote catalog comes back empty', async () => {
+    const adapter = makeAdapter({ fetchRemoteModels: async () => [] })
+    expect((await adapter.resolveModel('codearts', 'GLM-5.2')).context).toEqual({ contextWindow: 202752 })
+  })
+
+  /**
+   * id 归一回归：远端下发的是带日期后缀的 `deepseek-v4-flash-0731`，解析层已
+   * 归一为 `deepseek-v4-flash`（选择器播报的也正是归一后的 id），故窗口能按
+   * 归一后的 id 命中 —— 此处**不引入新的模糊匹配**，靠的是既有归一语义。
+   */
+  it('matches the remote context_window through the existing date-suffix normalization', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash', contextWindow: 1_048_576 },
+      ],
+    })
+    const resolved = await adapter.resolveModel('codearts', 'deepseek-v4-flash')
+    expect(resolved.context).toEqual({ contextWindow: 1_048_576 })
+    // 带后缀的原始 id 不作为路由 id（既有语义：后端未注册该 id）。
+    expect((await adapter.resolveModel('codearts', 'deepseek-v4-flash-0731')).context).toBeUndefined()
+  })
+
+  it('does not invent a context window for a remote-only model that discloses none', async () => {
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [{ id: 'brand-new-model', name: 'Brand New' }],
+    })
+    expect((await adapter.resolveModel('codearts', 'brand-new-model')).context).toBeUndefined()
   })
 
   // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用

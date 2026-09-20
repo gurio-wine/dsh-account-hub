@@ -7,6 +7,7 @@ import {
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
+import type { RemoteModel } from './models.js'
 import { signRequestHuawei } from './sign.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
@@ -29,14 +30,29 @@ const DEFAULT_MODELS: readonly string[] = [
 ]
 
 /**
- * 模型上下文窗口（最大合并请求+响应 token 数）。
+ * 模型上下文窗口**静态兜底表**（最大合并请求+响应 token 数）。
+ *
+ * ⚠️ **远端优先，此表为兜底快照**：`resolveModel()` 先读远端目录下发的
+ * `context_window`（`src/models.ts` 的 `RemoteModel.contextWindow`），只有远端
+ * 整体拉取失败、或该模型未下发该字段时才落到这里。故本表**不追求与远端逐项
+ * 追平**，它的职责只有一条：远端不可用时声明值不发生漂移。
+ *
  * - GLM-5.2：202752（对齐 CodeArts Agent IDE 模型卡标注）。
+ * - GLM-5.1：202752（**推断**自 IDE 内置 KERNEL_MODELS 的硬证据取值为 202752；
+ *   与 GLM-5.2 同口径）。
+ * - glm-5.2-sft-harmony：202752（**推断**：GLM-5.2 系的 SFT/harmony 变体，按
+ *   GLM-5.2 同一口径处理；无独立旁证）。
  * - glm-5.3-flash：1048576（1M，逆向自 IDE gateway/config，对齐 deveco-code-rust 90aeb17d）。
  * - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
- * - 其余模型未公开上下文容量，留 undefined 让后端默认裁剪。
+ * - ⚠️ **openpangu-2.0-flash / openpangu-2.0-pro 与 GLM-5 刻意留空**：三者
+ *   在 IDE 模型卡、内置 KERNEL_MODELS、远端目录**三方都没有窗口旁证**。宁可让
+ *   宿主按「未声明」处理，也不编造一个数字 —— 声明错值会直接改写它的压缩时机
+ *   （与「不猜」原则一致）。
  */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['GLM-5.2', 202752],
+  ['GLM-5.1', 202752],
+  ['glm-5.2-sft-harmony', 202752],
   ['glm-5.3-flash', 1_048_576],
   ['deepseek-v4-flash', 1048576],
   ['deepseek-v4-pro', 1048576],
@@ -68,8 +84,13 @@ export interface CodeArtsAdapterOptions {
    * 「按账号池选号再续期」的实现保持与选号一致的口径；默认单凭据路径忽略它。
    */
   refresh: (model?: string) => Promise<void>
-  /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
-  fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+  /**
+   * 动态拉取远端模型列表；失败时调用方回退到静态列表。
+   *
+   * ⚠️ 目录项带 `contextWindow`（远端 `context_window`）时，`resolveModel`
+   * **优先采用远端值**；字段缺失才回退静态兜底表。
+   */
+  fetchRemoteModels?: () => Promise<RemoteModel[]>
   fetchImpl?: typeof fetch
   chatId?: string
   sessionId?: string
@@ -762,7 +783,7 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 
   /** 动态模型缓存（首次 listModels 成功后填充）。 */
-  private remoteModels: Array<{ id: string; name: string }> | undefined
+  private remoteModels: RemoteModel[] | undefined
 
   /**
    * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
@@ -802,7 +823,27 @@ export class CodeArtsAdapter extends LlmAdapter {
     await this.ensureRemoteModels()
     const remoteModel = this.remoteModels?.find((m) => m.id === model)
     const name = remoteModel?.name ?? model
-    const contextWindow = CONTEXT_WINDOWS.get(model)
+    // 上下文窗口：**远端优先 → 静态兜底**（None 表示两边都没有 → 不声明）。
+    //
+    // ⚠️ 远端目录失败、或该模型未下发 `context_window` 时必须**原样回退静态表**
+    // —— 网络抖动不该改变声明值的来源。`remoteModels` 在拉取失败时保持
+    // undefined、列表项在字段缺失时整个属性缺省，两种情形都由这里的 `?.`
+    // 与 `??` 落到 `CONTEXT_WINDOWS.get(model)`，不需要额外分支。
+    //
+    // 为什么要接远端：宿主压缩管线在 `context === undefined` 时逐 step 抛
+    // `TargetPressureConfigError`（被 catch 成 warning 后继续）—— 自动压缩
+    // **永久失效**，且每个 step 都白跑一次。远端目录是权威声明（如
+    // deepseek-v4-flash-0731: context_window=1048576），静态表只是快照。
+    //
+    // ⚠️ 远端 `max_tokens`（最大输出）**刻意不接线**：它在网关配置里与
+    // `context_window` 成对下发，但出站 body 的 `max_tokens` 现由
+    // `options.maxTokens ?? 65536` 决定（见下方请求体构造处），接远端值属于
+    // 行为变更 —— 本次只接 contextWindow。
+    //
+    // ⚠️ id 匹配沿用既有语义：远端 id 在 `parseModelInfo` 里已去掉日期后缀
+    // （`deepseek-v4-flash-0731` → `deepseek-v4-flash`），与选择器播报的 id
+    // 同源，故此处按归一后的 id 直接比对，**不要**另发明一套模糊匹配。
+    const contextWindow = remoteModel?.contextWindow ?? CONTEXT_WINDOWS.get(model)
     const resolved: LlmResolvedModelInfo = { provider, id: model, name }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
     return resolved

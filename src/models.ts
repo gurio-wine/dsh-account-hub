@@ -27,6 +27,30 @@ export const MODEL_REFRESH_INTERVAL_MS = 2 * 3_600_000
 export interface RemoteModel {
   id: string
   name: string
+  /**
+   * 上下文窗口（最大合并请求+响应 token 数），取自远端下发的 `context_window`。
+   *
+   * ⚠️ **只在拿到正数时才存在**（见 {@link readContextWindow}）：字段缺失、
+   * 为 0 / 负数 / 非 number 时整个属性缺省，由适配器回退静态兜底表
+   * （`src/llm-adapter.ts` 的 `CONTEXT_WINDOWS`）。**远端优先、静态兜底**这条
+   * 语义靠这个「缺省」表达 —— 不要在这里给一个猜测的默认值。
+   *
+   * 注：`max_tokens`（最大输出）远端也下发，但**刻意不接线**，理由见
+   * `src/llm-adapter.ts` 的请求体构造处注释。
+   */
+  contextWindow?: number
+}
+
+/**
+ * 读取远端下发的上下文窗口（`context_window`）。
+ *
+ * 只接受**正的有限 number**：0 / 负数 / NaN / 字符串形态一律视为未声明。
+ * 刻意不做字符串数字解析 —— 抓包与实测响应里该字段始终是 JSON number，
+ * 为未见过的形态发明一套解析规则属于猜测。
+ */
+function readContextWindow(m: Record<string, unknown>): number | undefined {
+  const raw = m['context_window']
+  return typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : undefined
 }
 
 /** 模块级内存缓存：远端拉取或磁盘加载后填充；availableCodeArtsModels 优先读取。 */
@@ -60,7 +84,8 @@ function parseModelInfo(m: Record<string, unknown>, seen: Set<string>): RemoteMo
   const name = typeof rawName === 'string' && rawName.length > 0 ? normalizeModelId(rawName) : id
   if (seen.has(id)) return undefined
   seen.add(id)
-  return { id, name }
+  const contextWindow = readContextWindow(m)
+  return contextWindow === undefined ? { id, name } : { id, name, contextWindow }
 }
 
 /** 从 JSON 响应中沿路径指针取数组。 */

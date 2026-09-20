@@ -140,3 +140,99 @@ describe('fetchCodeArtsRemoteModels', () => {
     expect(calls).toHaveLength(0)
   })
 })
+
+/**
+ * 远端 `context_window` 解析（本修复的接线点）。
+ *
+ * 该字段两个端点都下发（gateway/config 的 benefit 模型与 snap-access 的常规
+ * 模型），此前被整条丢弃 —— 这是「未声明模型 → 宿主压缩永久失效」的根因。
+ */
+describe('fetchCodeArtsRemoteModels — context_window', () => {
+  it('reads context_window from the opengw gateway benefit models', async () => {
+    const { fetcher } = makeFetcher({
+      [OPENGW_GATEWAY_CONFIG_URL]: {
+        body: JSON.stringify({
+          result: {
+            models: [
+              { model_id: 'deepseek-v4-flash-0731', model_name: 'deepseek-v4-flash', context_window: 1048576, max_tokens: 393216 },
+              { model_id: 'glm-5.3-flash', model_name: 'glm-5.3-flash', context_window: 1048576, max_tokens: 131072 },
+            ],
+          },
+        }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    // 日期后缀在解析层归一，窗口跟着归一后的 id 落库。
+    expect(models).toContainEqual({ id: 'deepseek-v4-flash', name: 'deepseek-v4-flash', contextWindow: 1048576 })
+    expect(models).toContainEqual({ id: 'glm-5.3-flash', name: 'glm-5.3-flash', contextWindow: 1048576 })
+  })
+
+  it('reads context_window from the snap-access builtin models', async () => {
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({
+          builtinModels: [
+            { model_id: 'GLM-5.2', model_name: 'GLM-5.2', context_window: 202752 },
+            { model_id: 'glm-5.2-sft-harmony', model_name: 'glm-5.2-sft-harmony', context_window: 202752 },
+          ],
+        }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    expect(models).toContainEqual({ id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 202752 })
+    expect(models).toContainEqual({ id: 'glm-5.2-sft-harmony', name: 'glm-5.2-sft-harmony', contextWindow: 202752 })
+  })
+
+  it('omits contextWindow entirely when the endpoint does not disclose it', async () => {
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({ builtinModels: [{ model_id: 'openpangu-2.0-pro', model_name: 'openpangu-2.0-pro' }] }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    // ⚠️ 属性**缺省**（而不是 undefined 值）：适配器靠这一点回退静态兜底表，
+    // 也让旧磁盘缓存（无该字段）天然兼容。用 toEqual 锁定整个对象形状。
+    expect(models).toEqual([{ id: 'openpangu-2.0-pro', name: 'openpangu-2.0-pro' }])
+    expect(models[0]).not.toHaveProperty('contextWindow')
+  })
+
+  it('drops non-positive, non-finite and non-numeric context_window values', async () => {
+    // 只接受**正的有限 number**：其余形态一律视为未声明（回退静态表），
+    // 不发明字符串解析规则 —— 未见过的形态就是没证据。
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({
+          builtinModels: [
+            { model_id: 'zero', model_name: 'zero', context_window: 0 },
+            { model_id: 'negative', model_name: 'negative', context_window: -1 },
+            { model_id: 'null-value', model_name: 'null-value', context_window: null },
+            { model_id: 'string-value', model_name: 'string-value', context_window: '202752' },
+            { model_id: 'nan-value', model_name: 'nan-value', context_window: Number.NaN },
+            { model_id: 'infinite-value', model_name: 'infinite-value', context_window: Number.POSITIVE_INFINITY },
+            { model_id: 'good', model_name: 'good', context_window: 202752 },
+          ],
+        }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    for (const id of ['zero', 'negative', 'null-value', 'string-value', 'nan-value', 'infinite-value']) {
+      expect(models.find((m) => m.id === id)).not.toHaveProperty('contextWindow')
+    }
+    expect(models.find((m) => m.id === 'good')).toMatchObject({ contextWindow: 202752 })
+  })
+
+  it('does not let max_tokens leak into the model entry (deliberately not wired)', async () => {
+    // 远端同时下发 `max_tokens`（最大输出），但本次**刻意不接线**（会改变
+    // 出站 body 的 max_tokens 来源）。这里钉死它不会被顺手带进目录项。
+    const { fetcher } = makeFetcher({
+      [OPENGW_GATEWAY_CONFIG_URL]: {
+        body: JSON.stringify({
+          result: { models: [{ model_id: 'deepseek-v4-flash-0731', model_name: 'deepseek-v4-flash', context_window: 1048576, max_tokens: 393216 }] },
+        }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    expect(models[0]).not.toHaveProperty('maxTokens')
+    expect(models[0]).toEqual({ id: 'deepseek-v4-flash', name: 'deepseek-v4-flash', contextWindow: 1048576 })
+  })
+})
