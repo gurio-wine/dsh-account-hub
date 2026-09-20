@@ -38,7 +38,7 @@
 
 Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Trae CN Work **与 Trae CN 是同一批账号**故签到只在后者提供；Qoder 与 Qoder CN **都不提供**（国际版无此活动、CN **疑似有但端点未知**，见能力矩阵表）。Trae CN 的签到与余额**前后端及宿主接线均已就绪**（`src/trae-cn-credits.ts` + 客户端能力矩阵 + `jet-hub-rpc.ts` 三处分支与 `traeCn` 实例传参）。T5 / T7 已真机校准；**T9 已于 2026-09-20 第三次修正**（原「不校验设备号形态」的推论被单变量 A/B 推翻，真根因是设备身份）。见「积分能力必须在请求前判定」与 README 的「Trae CN provider」章节。**八个 provider 都有 Account Hub 面板**（Trae CN Work 那条见下节，Qoder 与 Qoder CN 那两条见 README 的「Qoder provider」）。
 
-### Qoder 国际版（`qoder`）—— chat 250 的两条硬事实
+### Qoder 国际版（`qoder`）—— chat 250 的三条硬事实
 
 ⚠️ **`tools` 必须包裹成 OpenAI 标准形态（2026-09-21 真机报障根因）**：`buildQoderChatBody` 必须把 harness 的
 `ToolSchema`（`{name,description,parameters}`）翻译成 `{type:'function',function:{…}}` 再发（`serializeQoderTools`）。
@@ -47,6 +47,23 @@ Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理�
 `'function' is a required property, expected an object - 'tools.0'`。⚠️ **`lite` 是唯一两种形态都不报错的模型**
 （走上游宽松兼容路径）—— 这正是它逃过 T2 的原因（T2 发的是手写 OpenAI 形态，不是 `GenerateOptions.tools` 的形态）。
 包裹后 `qmodel`/`gmodel`/`dmodel`/`lite` 实测仍回标准结构化 `tool_calls`，其余六个 provider 也都是这么包的（Qoder 曾是唯一例外）。
+
+⚠️ **256 KiB 字节墙 + 240 KiB 本地闸门（2026-09-21 字节级矩阵取证）**：Qoder 国际版 chat 网关对请求体有**确定性**
+字节墙 —— body ≥ **262 144 B（256 KiB）** 恒回 HTTP 500 `{"error":"internal server error"}`，**无任何可判别的 code**；
+262 144 B → 200（4 次复测）、262 145 B → 500（3 次复测），**零抖动**。故 `QODER_MAX_REQUEST_BYTES = 245_760`（240 KiB，
+留 ~8.5% 余量覆盖 fetch 传输编码与 istio-envoy 的差异；贴着墙设阈值会让「本地放行」的请求正好撞墙），
+`QoderAdapter.stream()` 在 `buildQoderChatBody` 之后、fetch 之前量 `Buffer.byteLength(body,'utf8')`，**达阈值即不发请求**、
+直接抛错。⚠️ **映射成 `CONTEXT_WINDOW_EXCEEDED` 是刻意的，且与「未知码不得瞎猜 CWE」原则不冲突**：那条原则管的是
+**上游语义未知**（猜就是编造），而本地字节数是**我们自己算出来的确定性事实** —— 「这个请求过不了那道墙」是算术不是猜测；
+DSH 的自动压缩补救**只认这一个码**（`compaction-basic` 的 `agent/request-error` 首行即 `failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE`
+就放行），压缩后请求回落到墙内、重试必成功。⚠️ 判据走**显式标志位** `classification.localByteGate`，
+**绝不靠 `isContextWindowExceededError` 的文案关键词** —— 闸门文案是中文、正则是英文，靠关键词这条映射会**静默失效**。
+⚠️ **绝不能把它交给既有的 HTTP 兜底**：`500 → backoff` 会把确定性失败变成无限退避重试，真因被「网关瞬时故障」掩盖
+（这正是本次修复的缺陷）。**声明窗口 200_000 一律不改**：它决定宿主压缩后的**保留预算**（16% × 200K = 32K token ≈ 134 KiB，
+在墙内），调小只会多丢历史；而它决定不了压缩**触发时机**（阈值 0.8 × 200K ≈ 160K token ≈ 655 KiB，**永远在墙之后**），
+所以「靠调小声明值把压缩提前到墙前」这条路本来就走不通 —— **闸门负责挡墙，声明值负责保留量**。
+每次发送把 `bodyBytes` 经 `onDebug` 以 **debug 级**报出（⚠️ Cordis 默认导出阈值是 INFO，即默认不显示；撞墙趋势要可见时
+把 exporter 的 level 提到 3）；闸门作用于 `qoder` / `qoder-cn` 共享的发送代码，对 CN 无副作用（其 chat 本就结构性不可用）。
 
 ⚠️ **`provider_error` 的真因在 `details`，且有多种形态**：`details.error.code`（T3 原形态）、**整段带 `data: ` 前缀的
 SSE 帧原文**、只有 `details.error.message`/根层 `message`（无 code）、`details.error.code` 是业务文本（如 `"1210"`）。

@@ -53,6 +53,33 @@
  * {@link applyQoderQuotaVerdict} 依据额度端点的查询结果做出。这样「未确证前
  * 绝不换号」成为**类型上的默认值**，而不是一句口头约定。
  *
+ * ## 本地字节闸：≥ 240 KiB 的请求在**发出之前**就判 `CONTEXT_WINDOW_EXCEEDED`
+ *
+ * Qoder 国际版的 chat 网关对请求体有一条**确定性字节墙**（2026-09-21 字节级
+ * 矩阵取证）：body ≥ **262 144 B（256 KiB）** 恒回 HTTP 500
+ * `{"error":"internal server error"}`，**没有任何可判别的 code**；单变量钉死、
+ * 零抖动（262 144 B → 200 四次复测，262 145 B → 500 三次复测）。
+ *
+ * 这条墙的处置**不能**交给既有的 HTTP 兜底：`500 → 'backoff'` 会把一个
+ * **确定性失败**变成无限退避重试（永远救不回来），真因（请求太大）被
+ * 「网关瞬时故障」完全掩盖。故在适配器侧设一道**本地闸**
+ * （{@link QODER_MAX_REQUEST_BYTES}）：序列化完成后先量字节，达阈值即
+ * **不发请求**、直接以 {@link buildQoderByteGateFailure} 的结果抛错。
+ *
+ * 映射成 `CONTEXT_WINDOW_EXCEEDED` 的理由与 trae-cn 的 `4006`（请求超长）
+ * 完全同构（`traeCnErrorCodeForAction`）：DSH 的自动压缩补救**只认这一个码**
+ * （`packages/compaction/compaction-basic` 的 `agent/request-error` 处理器
+ * 首行就判 `failure.code !== CONTEXT_WINDOW_EXCEEDED_CODE` 即放行），压缩后
+ * 请求体回落到墙内，重试必成功。
+ *
+ * ⚠️ **这与「未知码不得瞎猜 CONTEXT_WINDOW_EXCEEDED」的原则不冲突**，两者
+ * 判据的性质根本不同：未知**业务码**是上游语义未知、猜了就是编造；而本地
+ * 字节数是**我们自己算出来的确定性事实**（`Buffer.byteLength` 的结果），
+ * 「这个请求一定过不了那道墙」是算术，不是猜测。故这里用**显式标志位**
+ * （{@link QoderErrorClassification.localByteGate}）承载判据，
+ * **不靠文案关键词**去命中 `isContextWindowExceededError` —— 文案是中文，
+ * 正则本就命不中，靠关键词等于把确定性判据降级成字符串巧合。
+ *
  * 本模块**只有纯函数**，无副作用、不发请求（不 import fetch），故可整表穷举单测。
  */
 
@@ -141,6 +168,14 @@ export interface QoderErrorClassification {
   jobTokenExpired: boolean
   /** 凭据（PAT）失效：需用户重新粘贴。 */
   credentialInvalid: boolean
+  /**
+   * 本结果来自**本地字节闸**（请求体 ≥ {@link QODER_MAX_REQUEST_BYTES}），
+   * 而不是上游的任何响应。
+   *
+   * 它与 `jobTokenExpired` 等同属「标志位」：下游据此把错误码映射到
+   * `CONTEXT_WINDOW_EXCEEDED`，**不靠文案关键词**（判据性质的说明见模块头）。
+   */
+  localByteGate: boolean
   /** `provider_error` 包装码二次解析出的真码（有则带）。 */
   wrappedCode?: string
   /** 面向用户的中文文案（含上游原文）。 */
@@ -189,6 +224,29 @@ const QODER_QUOTA_CODE = 116
 
 /** 包装码：真实业务码藏在字符串化的 `details` 里（形态 C）。 */
 const QODER_PROVIDER_ERROR_CODE = 'provider_error'
+
+/**
+ * chat 请求体的**本地字节闸**阈值（字节，240 KiB）。
+ *
+ * ## 为什么是这个数
+ *
+ * 实测墙是 **262 144 B（256 KiB）**：字节级矩阵取证（2026-09-21）里
+ * 262 144 B 恒回 200（4 次复测）、262 145 B 恒回 500（3 次复测），**零抖动**。
+ * 阈值取 240 KiB 是对该墙留 **~8.5%** 的余量（262 144 − 245 760 = 16 384 B）：
+ *
+ * - **余量是必需的**，不是保守：这次量的是我们**序列化出来的 body**，
+ *   而网关量的是**它收到的那份**。两者之间还隔着 `fetch` 的传输编码与
+ *   中间层（istio-envoy）可能引入的差异 —— 贴着 262 144 设阈值，任何一点
+ *   协议开销都会让「本地放行」的请求正好撞墙，闸门就成了摆设。
+ * - **余量不能更大**：闸门每收紧一字节，用户就少一截可用上下文（撞闸会触发
+ *   一次压缩 + 重试，白丢历史）。8.5% 足以覆盖上述差异，又不会平白砍掉
+ *   可用窗口。
+ *
+ * 该墙**只在国际版 chat 上实测**；`qoder-cn` 的 chat 本就结构性不可用
+ * （路径不存在，见 {@link classifyQoderError} 的 7a 条），闸门对其无副作用，
+ * 故两个 region 共用同一个阈值，不按 product 分叉。
+ */
+export const QODER_MAX_REQUEST_BYTES = 245_760
 
 /** 额度端点 401 的两条可区分文案（真机实测，大小写不敏感）。 */
 const QODER_TOKEN_EXPIRE_MARKERS: readonly string[] = ['TOKEN_EXPIRE', 'TOKEN IS NOT ACTIVE']
@@ -466,6 +524,7 @@ interface QoderClassificationSeed {
   quotaConfirmed?: boolean
   jobTokenExpired?: boolean
   credentialInvalid?: boolean
+  localByteGate?: boolean
   wrappedCode?: string
 }
 
@@ -485,6 +544,7 @@ function buildClassification(input: QoderErrorInput, seed: QoderClassificationSe
     quotaConfirmed: seed.quotaConfirmed ?? false,
     jobTokenExpired: seed.jobTokenExpired ?? false,
     credentialInvalid: seed.credentialInvalid ?? false,
+    localByteGate: seed.localByteGate ?? false,
     ...(seed.wrappedCode === undefined ? {} : { wrappedCode: seed.wrappedCode }),
     message: seed.message,
   }
@@ -684,6 +744,29 @@ export function classifyQoderError(input: QoderErrorInput): QoderErrorClassifica
 }
 
 /**
+ * 本地字节闸的判定结果：请求体已达/超过 {@link QODER_MAX_REQUEST_BYTES} 时，
+ * 构造一个**不发请求**就能得到的分类结果。
+ *
+ * @param bodyBytes - 已序列化的请求体的 UTF-8 字节数（`Buffer.byteLength(body, 'utf8')`）。
+ * @param product - 产品配置（只用于文案里的 provider 名与声明窗口）。
+ * @returns 动作恒为 `'fail'`（确定性失败：同一个 body 再发多少次都撞同一道墙）、
+ *          `localByteGate: true` 的分类结果。
+ */
+export function buildQoderByteGateFailure(
+  bodyBytes: number,
+  product: QoderProduct = QODER,
+): QoderErrorClassification {
+  return buildClassification({}, {
+    action: 'fail',
+    localByteGate: true,
+    message: `${product.id} 的请求体为 ${bodyBytes} 字节，超出 Qoder 上游网关的 256 KiB `
+      + `（262 144 字节）限制 —— 该限制是确定性的，超过后网关恒回 HTTP 500，重发无用，`
+      + `故本次请求在本地就被拦下（未发出）。DSH 将自动压缩上下文后重试；`
+      + `若压缩不可用（或压缩后仍然超限），请新建对话再继续。`,
+  })
+}
+
+/**
  * 用 quota 二次判别结果确证/否定额度耗尽（步骤 4 接入，本步只留接口）。
  *
  * 这是「402 语义污染」的**唯一解药**：402 + 116 只说明网关拦下了这次请求，
@@ -809,6 +892,10 @@ export function recordsQoderCooldown(classification: QoderErrorClassification): 
  * - 文案命中上下文超限 → `'CONTEXT_WINDOW_EXCEEDED'`（触发 DSH 的上下文自动
  *   压缩恢复）。判据用 harness 自己的权威函数 `isContextWindowExceededError`，
  *   **不自建关键词表** —— 自建的那份必然与 DSH 的判断漂移。
+ * - **本地字节闸**（`localByteGate`）→ `'CONTEXT_WINDOW_EXCEEDED'`，同上触发
+ *   自动压缩。⚠️ 它**排在上一条之前**，且**不经过** `isContextWindowExceededError`：
+ *   闸门文案是中文，正则是英文关键词，走那条路必然命不中（判据性质的说明见
+ *   模块头「本地字节闸」一节）。
  * - 其余 → `'INVALID_REQUEST'`。
  */
 export function qoderHarnessErrorCode(classification: QoderErrorClassification): string {
@@ -816,6 +903,7 @@ export function qoderHarnessErrorCode(classification: QoderErrorClassification):
     return 'RATE_LIMIT'
   }
   if (classification.credentialInvalid) return 'AUTH'
+  if (classification.localByteGate) return CONTEXT_WINDOW_EXCEEDED_CODE
   if (isContextWindowExceededError(classification.message)) return CONTEXT_WINDOW_EXCEEDED_CODE
   return 'INVALID_REQUEST'
 }

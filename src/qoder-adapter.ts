@@ -72,7 +72,9 @@ import {
 } from './qoder-models.js'
 import type { QoderModelEntry } from './qoder-models.js'
 import {
+  QODER_MAX_REQUEST_BYTES,
   applyQoderQuotaVerdict,
+  buildQoderByteGateFailure,
   classifyQoderError,
   parseQoderStreamErrorPayload,
   qoderHarnessErrorCode,
@@ -1035,6 +1037,19 @@ export interface QoderAdapterOptions {
   fetchImpl?: typeof fetch
   /** 多账号池（用于确证额度耗尽后切换账号）。 */
   accountPool?: AccountPool
+  /**
+   * 调试观测回调（可选）。
+   *
+   * 目前只有一个用途：**每次 chat 发送都把请求体字节数报出来**
+   * （`bodyBytes`），供撞墙趋势可见 —— 这条墙是字节级硬阈值，等到用户报障
+   * 才知道「已经贴着墙了」是不可接受的。
+   *
+   * 与 `trae-cn-credits` / `qoder-credits` 的 `onDebug` 同一形态与同一接线
+   * （宿主接 `ctx.logger`）。⚠️ **它不是日志设施本身**：本插件没有注入
+   * `ctx.logger` 的通道（适配器是纯构造注入的），故这里只留回调，由宿主决定
+   * 落到哪一级；省略时**静默不报**（不影响请求）。
+   */
+  onDebug?: (message: string) => void
   /** 产品配置；默认 `QODER`。 */
   product?: QoderProduct
 }
@@ -1297,6 +1312,28 @@ export class QoderAdapter extends LlmAdapter {
     }
 
     const body = buildQoderChatBody(options, this.product)
+
+    // ⚠️ **本地字节闸**：序列化完成后、发请求之前先量字节（见
+    // `qoder-errors.ts` 的模块头「本地字节闸」一节）。
+    //
+    // 撞墙的形态是 HTTP 500 + `{"error":"internal server error"}`，**没有任何
+    // 可判别的 code** —— 交给下游分类器只会落进「5xx → backoff」，把一个
+    // **确定性失败**变成无限退避重试，真因（请求太大）被完全掩盖。故在这里
+    // 就拦下：不发请求，直接抛 `CONTEXT_WINDOW_EXCEEDED`，让 DSH 走它的
+    // 上下文自动压缩补救路径（压缩保留 = 16% × 声明窗口，在墙内，重试必成功）。
+    //
+    // ⚠️ **声明窗口（目录的 200_000）刻意不改**：它决定的是宿主压缩后的
+    // **保留预算**（16% × 200K = 32K token ≈ 134 KiB），调小它只会让压缩
+    // 多丢历史；而它决定不了压缩的**触发时机** —— 自动压缩阈值是
+    // 0.8 × 声明窗口 ≈ 160K token ≈ 655 KiB，**永远在 256 KiB 的墙之后**，
+    // 所以「靠声明窗口把压缩提前到墙前」这条路本来就走不通。
+    // 分工是：**闸门负责挡墙，声明值负责保留量**，两者互不替代。
+    const bodyBytes = Buffer.byteLength(body, 'utf8')
+    this.options.onDebug?.(`[qoder] chat 请求体 ${bodyBytes} 字节（本地闸阈值 ${QODER_MAX_REQUEST_BYTES}）`)
+    if (bodyBytes >= QODER_MAX_REQUEST_BYTES) {
+      const gated = buildQoderByteGateFailure(bodyBytes, this.product)
+      throw new LlmError(gated.message, qoderHarnessErrorCode(gated))
+    }
 
     // ⚠️ **刻意不在这里拉目录**（只读已就绪的缓存）。
     //

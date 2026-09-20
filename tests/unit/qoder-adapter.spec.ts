@@ -14,6 +14,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { AccountPool } from '../../src/account-pool.js'
+import { QODER_MAX_REQUEST_BYTES } from '../../src/qoder-errors.js'
 import type { QoderCredential } from '../../src/qoder-product.js'
 import {
   QoderAdapter,
@@ -788,5 +789,134 @@ describe('模型目录已接线（步骤 3 起不再是占位）', () => {
     const adapter = new QoderAdapter(adapterOptions())
     expect(adapter.providerInfo(undefined as unknown as string).id).toBe('qoder')
     expect(adapter.providerInfo('qoder').name).toBe('Qoder')
+  })
+})
+
+// ── 10. 本地字节闸（256 KiB 墙；真机取证的确定性阈值） ──────────────────────
+
+/**
+ * 网关对请求体有一条**确定性**字节墙：≥ 262 144 B 恒回 HTTP 500
+ * `{"error":"internal server error"}`，**无任何可判别的 code**（2026-09-21
+ * 字节级矩阵：262 144 B → 200 四次复测、262 145 B → 500 三次复测）。
+ *
+ * 交给下游分类器只会落进 `5xx → backoff`（无限退避重试一个不可能成功的请求），
+ * 故闸门必须发生在**序列化之后、fetch 之前**：本地量字节、本地判、本地抛
+ * `CONTEXT_WINDOW_EXCEEDED`（DSH 的自动压缩补救只认这个码）。
+ *
+ * 这一组用例的两条主线：
+ * 1. **阈值处真的不发请求**（断言 fetch 零调用 —— 这是本功能的全部意义）；
+ * 2. **阈值下照常放行**（闸门不能误伤正常请求）。
+ */
+describe('本地字节闸', () => {
+  /**
+   * 造一个「请求体恰好 N 字节」的 options。
+   *
+   * 用 {@link buildQoderChatBody} 自己量出**空正文时**的固定开销（模型名 /
+   * 元数据 / JSON 结构），再补足正文 —— 这样「阈值处」「阈值下一字节」是
+   * **精确**构造的，而不是靠估一个大数碰运气。
+   *
+   * ⚠️ 基准必须量**空正文**那版：量 `generateOptions()` 默认的 `'hi'` 会多算
+   * 两个字符，夹具就整体偏移 2 字节，「恰好等于阈值」那条断言会变成
+   * 「阈值 − 2」（用例仍然绿，但测的已经不是边界）。
+   * ASCII 正文保证 1 字符 = 1 字节。
+   */
+  function optionsWithBodyBytes(target: number): GenerateOptions {
+    const empty: GenerateOptions = generateOptions({
+      messages: [{ role: 'user', content: [{ type: 'text', text: '' }] }],
+    })
+    const base = Buffer.byteLength(buildQoderChatBody(empty), 'utf8')
+    const filler = 'x'.repeat(target - base)
+    return generateOptions({
+      messages: [{ role: 'user', content: [{ type: 'text', text: filler }] }],
+    })
+  }
+
+  it('阈值处（245 760 B）：不发请求，直接抛 CONTEXT_WINDOW_EXCEEDED', async () => {
+    const fetcher = vi.fn(async () => sseResponse(NORMAL_STREAM))
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: fetcher as unknown as typeof fetch,
+    }))
+    const options = optionsWithBodyBytes(QODER_MAX_REQUEST_BYTES)
+    // 先确证这个夹具真的是「恰好在阈值上」（否则下面测的是别的东西）。
+    expect(Buffer.byteLength(buildQoderChatBody(options), 'utf8')).toBe(QODER_MAX_REQUEST_BYTES)
+
+    await expect(collect(adapter.stream(options)))
+      .rejects.toMatchObject({ code: 'CONTEXT_WINDOW_EXCEEDED' })
+    // ⚠️ 本功能的**全部意义**就在这一条：请求根本没发出去。
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('阈值下一字节：放行（闸门不误伤正常请求）', async () => {
+    const fetcher = vi.fn(async () => sseResponse(NORMAL_STREAM))
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: fetcher as unknown as typeof fetch,
+    }))
+    const options = optionsWithBodyBytes(QODER_MAX_REQUEST_BYTES - 1)
+
+    const chunks = await collect(adapter.stream(options))
+    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(textOf(chunks)).toBe('Hello world')
+  })
+
+  it('远超阈值（320 KiB）：同样本地拦下，且不换号、不记冷却徽章', async () => {
+    const fetcher = vi.fn(async () => sseResponse(NORMAL_STREAM))
+    const getAvailableAccount = vi.fn()
+    const updateModelRateLimit = vi.fn()
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: fetcher as unknown as typeof fetch,
+      accountPool: {
+        getAvailableAccount,
+        findAccountIdByCredential: async () => 'acct-1',
+        updateModelRateLimit,
+      } as unknown as AccountPool,
+    }))
+
+    await expect(collect(adapter.stream(optionsWithBodyBytes(320 * 1024))))
+      .rejects.toMatchObject({ code: 'CONTEXT_WINDOW_EXCEEDED' })
+    expect(fetcher).not.toHaveBeenCalled()
+    // 请求太大与账号无关：换号只会拿同一个超长 body 再撞一次同一道墙。
+    expect(getAvailableAccount).not.toHaveBeenCalled()
+    expect(updateModelRateLimit).not.toHaveBeenCalled()
+  })
+
+  it('错误文案不丢关键信息（字节数 / 256 KiB / 压缩重试 / 新建对话）', async () => {
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: (async () => sseResponse(NORMAL_STREAM)) as unknown as typeof fetch,
+    }))
+
+    const error = await collect(adapter.stream(optionsWithBodyBytes(QODER_MAX_REQUEST_BYTES)))
+      .then(() => undefined, (caught: unknown) => caught as Error)
+    expect(error).toBeInstanceOf(Error)
+    const message = String(error?.message)
+    expect(message).toContain('256 KiB')
+    expect(message).toContain('压缩')
+    expect(message).toContain('新建对话')
+    // 真的报出**实测的那个字节数**（不是阈值），用户据此能知道超了多少。
+    expect(message).toContain(String(QODER_MAX_REQUEST_BYTES))
+  })
+
+  it('每次发送都报出 bodyBytes（debug 观测；撞墙趋势要可见）', async () => {
+    const seen: string[] = []
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: (async () => sseResponse(NORMAL_STREAM)) as unknown as typeof fetch,
+      onDebug: (message) => seen.push(message),
+    }))
+    const options = optionsWithBodyBytes(1000)
+
+    await collect(adapter.stream(options))
+    const expected = Buffer.byteLength(buildQoderChatBody(options), 'utf8')
+    expect(seen.join('\n')).toContain(String(expected))
+    expect(seen.join('\n')).toContain('阈值')
+  })
+
+  it('被拦下时**也**报 bodyBytes（否则「刚好撞闸」在日志里是空白）', async () => {
+    const seen: string[] = []
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: (async () => sseResponse(NORMAL_STREAM)) as unknown as typeof fetch,
+      onDebug: (message) => seen.push(message),
+    }))
+
+    await expect(collect(adapter.stream(optionsWithBodyBytes(QODER_MAX_REQUEST_BYTES)))).rejects.toThrow()
+    expect(seen.join('\n')).toContain(String(QODER_MAX_REQUEST_BYTES))
   })
 })

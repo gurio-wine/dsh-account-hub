@@ -586,6 +586,16 @@ export function apply(ctx: Context): void {
     },
     accountPool: pool,
     product: QODER,
+    // 每次发送报出请求体字节数（**debug 级**）：Qoder 国际版有一条 256 KiB 的
+    // 字节墙，闸门在 240 KiB（见 `src/qoder-errors.ts` 的
+    // `QODER_MAX_REQUEST_BYTES`）。报字节数是让「贴着墙」这件事在**用户报障
+    // 之前**就可观测。
+    //
+    // ⚠️ 走 `debug` 而不是 `info`：这是一条每次请求都发的常规观测，不该在默认
+    // 级别刷屏。⚠️ 但要知道 Cordis 的默认导出阈值是 **INFO**，故 debug 行默认
+    // **不显示** —— 需要它时把 exporter 的 level 提到 3（本仓库其它 provider 的
+    // `onDebug` 接的是 `info`，那是「偶发的一次性诊断」，与本条的高频性质不同）。
+    onDebug: (message) => ctx.logger?.debug?.(message),
   })
 
   // ===== Qoder CN (国内版) 服务 =====
@@ -654,6 +664,10 @@ export function apply(ctx: Context): void {
     },
     accountPool: pool,
     product: QODER_CN,
+    // 与上面 QODER 段**同源同口径**（同一个回调、同一级 debug）：两个 region 共用
+    // 同一份发送代码，观测也必须共用同一处语义 —— 只给国际版接会让 CN 的
+    // bodyBytes 静默消失（而 CN 的 chat 本就打不通，缺口更难被发现）。
+    onDebug: (message) => ctx.logger?.debug?.(message),
   })
 
   // ===== 多账号静默续期调度 =====

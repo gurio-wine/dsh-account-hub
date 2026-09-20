@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
+  QODER_MAX_REQUEST_BYTES,
   applyQoderQuotaVerdict,
+  buildQoderByteGateFailure,
   classifyQoderError,
   createQoderErrorDeduper,
   isQoderBackoff,
@@ -11,6 +13,7 @@ import {
   recordsQoderCooldown,
   shouldSwitchQoderAccount,
 } from '../../src/qoder-errors.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
 
 /**
  * Qoder 错误分类的单测。
@@ -886,5 +889,85 @@ describe('shouldSwitchQoderAccount / isQoderBackoff 真值表', () => {
         JSON.stringify(input),
       ).toBe(false)
     }
+  })
+})
+
+// ── 16. 本地字节闸（256 KiB 墙） ────────────────────────────────────────────
+
+/**
+ * 字节墙是**确定性**的（2026-09-21 字节级矩阵取证：262 144 B → 200 四次复测、
+ * 262 145 B → 500 三次复测，零抖动），故闸门的判据必须来自**本地算术**
+ * 而不是上游文案 —— 这一组用例正是钉死「不确定的东西不许猜、确定的东西不靠猜」。
+ */
+describe('本地字节闸（QODER_MAX_REQUEST_BYTES）', () => {
+  it('阈值就是 240 KiB（245 760 B），对实测墙 262 144 B 留 ~8.5% 余量', () => {
+    expect(QODER_MAX_REQUEST_BYTES).toBe(240 * 1024)
+    expect(QODER_MAX_REQUEST_BYTES).toBeLessThan(262_144)
+    // 余量是「传输开销 + 中间层差异」的容错空间，不是随手取的整数：
+    // 贴着墙设阈值会让任何一点协议开销把「本地放行」的请求正好送进墙里。
+    expect(262_144 - QODER_MAX_REQUEST_BYTES).toBe(16_384)
+  })
+
+  it('闸门结果：动作恒为 fail（确定性失败，重发无用，也不换号）', () => {
+    const gated = buildQoderByteGateFailure(300_000)
+
+    expect(gated.action).toBe('fail')
+    expect(shouldSwitchQoderAccount(gated.action)).toBe(false)
+    expect(isQoderBackoff(gated.action)).toBe(false)
+    // 不是额度问题：不该记冷却徽章，也不该被当成额度候选。
+    expect(recordsQoderCooldown(gated)).toBe(false)
+    expect(gated.quotaCandidate).toBe(false)
+    expect(gated.credentialInvalid).toBe(false)
+  })
+
+  it('闸门结果映射为 CONTEXT_WINDOW_EXCEEDED（DSH 唯一的自动压缩补救入口）', () => {
+    const gated = buildQoderByteGateFailure(300_000)
+
+    expect(gated.localByteGate).toBe(true)
+    expect(qoderHarnessErrorCode(gated)).toBe('CONTEXT_WINDOW_EXCEEDED')
+  })
+
+  it('映射走显式标志位，**不靠文案关键词**（文案是中文，正则命不中）', () => {
+    // 反证：闸门文案里没有任何 harness 英文关键词，若靠 isContextWindowExceededError
+    // 判，这条映射会**静默失效**（压缩补救整条路走不通）。
+    const gated = buildQoderByteGateFailure(300_000)
+    expect(gated.message).not.toMatch(/context (length|window)/i)
+    // 标志位为真时映射无需文案配合 —— 这就是它与「未知码不猜」的区别。
+    expect(qoderHarnessErrorCode({ ...gated, message: '完全无关的一句话' }))
+      .toBe('CONTEXT_WINDOW_EXCEEDED')
+  })
+
+  it('文案含关键信息：字节数、256 KiB 墙、宿主将压缩重试、压缩不可用则新建对话', () => {
+    const gated = buildQoderByteGateFailure(262_400)
+
+    expect(gated.message).toContain('262400')
+    expect(gated.message).toContain('256 KiB')
+    expect(gated.message).toContain('262 144')
+    expect(gated.message).toContain('压缩')
+    expect(gated.message).toContain('新建对话')
+  })
+
+  it('文案带 provider 名，两个 region 各自可分辨（共用同一道闸）', () => {
+    expect(buildQoderByteGateFailure(300_000, QODER).message).toContain('qoder 的请求体')
+    expect(buildQoderByteGateFailure(300_000, QODER_CN).message).toContain('qoder-cn 的请求体')
+  })
+
+  it('其余标志位恒为 false（与既有布尔位同约定：调用方无需 ?? false）', () => {
+    const gated = buildQoderByteGateFailure(245_760)
+
+    expect(gated.jobTokenExpired).toBe(false)
+    expect(gated.quotaConfirmed).toBe(false)
+    expect(gated.wrappedCode).toBeUndefined()
+  })
+
+  it('上游 500 仍然按 backoff 处理 —— 闸门不改变既有的 5xx 语义', () => {
+    // 闸门是「本地提前拦」，不是「把 500 重新定义」。国际版的 500 语义
+    // （瞬时故障，退避重试）一个字节都没动：真正撞墙的请求根本发不出去，
+    // 能收到 500 的请求说明它没到墙。
+    const upstream = classifyQoderError({ httpStatus: 500, message: 'internal server error' })
+
+    expect(upstream.action).toBe('backoff')
+    expect(upstream.localByteGate).toBe(false)
+    expect(qoderHarnessErrorCode(upstream)).toBe('RATE_LIMIT')
   })
 })
