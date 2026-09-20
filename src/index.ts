@@ -20,12 +20,45 @@ import { BUDDY_CN, BUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE_CN } from './trae-cn-product.js'
 import { TRAE_CN_WORK } from './trae-cn-work-product.js'
-import { QODER } from './qoder-product.js'
+import { QODER, QODER_CN } from './qoder-product.js'
 import { checkQoderQuotaExhausted } from './qoder-credits.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { TraeCnCredential } from './trae-cn-oauth.js'
 import type { QoderCredential } from './qoder-product.js'
+
+/**
+ * 第二个 Qoder region（CN）在 cordis 上的服务名声明。
+ *
+ * ## 为什么这条 `declare module` 落在这里，而不是 `src/qoder-auth.ts`
+ *
+ * `QoderAuth` 自己的 `declare module`（在 `src/qoder-auth.ts`）只声明**默认
+ * 产品**（国际版）的服务名 `qoderAuth` —— 那是该类的固有属性。而
+ * `qoderCnAuth` 是**宿主接线**引入的第二个实例：同一个 `QoderAuth` 类在这里被
+ * 实例化两次，服务名由传入的 `QODER_CN.serviceName` 决定。把它声明在
+ * `qoder-auth.ts` 里会让那个文件同时描述「类」与「本插件注册了几个实例」两件事，
+ * 而后者是 `index.ts` 的职责（与 `buddyAuth` 的声明落在 `buddy-auth.ts` 不同：
+ * 那里两个实例都是该类自身的产品配置所描述的形态，且 `BuddyProduct.serviceName`
+ * 是**必填**字段，两个服务名都属类的固有属性）。
+ *
+ * ## 声明的是**显式 serviceName 的产物**，不是机械派生
+ *
+ * `qoder-cn` 带连字符，`${id}Auth` 机械派生得到 `qoder-cnAuth`（非标识符风格）。
+ * 产品配置显式给出 `qoderCnAuth` —— 这正是 `QoderProduct.serviceName` 那条
+ * 判据的**正面用例**（无连字符的 `qoder` 不声明该字段，是反面用例）。
+ *
+ * cordis 的 `Service` 按名称注册，同名第二次注册会抛
+ * `service "..." has been registered`，故两个 region 各占一个服务名；
+ * 且两个实例**必须分开**：jt 运行时缓存、在途 exchange 去重与失效标记都是
+ * 实例字段，合用一个会让 CN 账号拿到国际版换来的 jt（失败形态是假的
+ * 「PAT 已失效」）。
+ */
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** Qoder **CN（国内版）** 的认证服务实例（第二 region）。 */
+    qoderCnAuth: QoderAuth
+  }
+}
 
 export const name = 'codearts-auth'
 // `connection` 刻意不列入静态 inject：它只由 Web bundle（dsh-client-connection）
@@ -217,9 +250,14 @@ export function apply(ctx: Context): void {
   // 是**两个 provider**（协议不同源、模型池不重合、扣不同积分池），
   // 但**共用同一批账号与凭据**（Work 无独立登录）。
   // 第七个是 Qoder（`qoder`）—— 第六条协议线，登录形态是 PAT 粘贴。
+  // 第八个是 Qoder **CN**（`qoder-cn`）—— 与国际版**同协议双 region**，
+  // 但两区的账号、用量、PAT **互不相通**，故是**两个独立 provider**
+  // （详见 `src/qoder-product.ts` 的模块头）。namespace 用连字符是**正确**的：
+  // 它是字符串键而非标识符，与 cordis 服务名 `qoderCnAuth` 走两套命名规则。
   registerProviderSettings(
     ctx,
-    'llm-buddy-cn', 'llm-buddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae-cn', 'llm-trae-cn-work', 'llm-qoder',
+    'llm-buddy-cn', 'llm-buddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae-cn', 'llm-trae-cn-work',
+    'llm-qoder', 'llm-qoder-cn',
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -550,6 +588,74 @@ export function apply(ctx: Context): void {
     product: QODER,
   })
 
+  // ===== Qoder CN (国内版) 服务 =====
+  //
+  // **与国际版同协议、双 region**：exchange / quota / models 三个端点的错误信封
+  // 逐字节同构，故**不新写任何实现** —— 适配器与 auth 都是同一份代码按传入的
+  // `product` 现算（见 `src/qoder-product.ts` 的模块头）。本段只是把**第二个
+  // region** 接上宿主：另一个服务名、另一条路由、另一个池键。
+  //
+  // ## 为什么是**两个 provider** 而不是一个 provider 的两个 region 开关
+  //
+  // 两个 region 的**账号、用量、PAT 互不相通**（实测 CN 的 `jt-` 打国际版端点
+  // 回 401，Credits 完全不互通）。若合成一个 provider，账号池里两区的凭据会
+  // 混在同一组候选里，适配器换号时会把 CN 的 PAT 拿去打国际版端点 ——
+  // 得到的是「凭据失效」的假象，且**不报任何配置错误**。
+  //
+  // ⚠️ **这与 `trae-cn-work` 的「复用池」方向正好相反，不要照抄那边**：
+  // Work 与 Trae CN 是**同一批账号**的两种用法，故那边把面板 id 映射到
+  // `trae-cn`；而 Qoder CN 与国际版是**两批账号**，池查询一律传
+  // `QODER_CN.id`（`'qoder-cn'`），**不做任何 poolProviderId 映射**。
+  // 账号条目的 `provider` 字段 = `'qoder-cn'`，凭据 ref 前缀
+  // `QODER_CN_ACCOUNT_*`（连字符转下划线的机制已有，见
+  // `src/jet-hub-rpc.ts` 的 `accountCredentialRefName`）。
+  //
+  // 服务名由产品配置显式给出 `qoderCnAuth`：id 带连字符，机械派生的
+  // `qoder-cnAuth` 不是合法标识符风格 —— 这正是 `QoderProduct.serviceName`
+  // 那条判据的**正面用例**（国际版 `qoder` 不声明该字段，是反面用例）。
+  // 构造时 `QoderAuth` 自动读取 `product.serviceName`，本段**不另写派生**。
+  const qoderCn = new QoderAuth(ctx, { product: QODER_CN })
+  // 与 resolveCredential 共用同一个选号器：两者必须挑到**同一个**账号，
+  // 否则「刷新的是解析凭据时所用的那个账号」这条不变量会被打破
+  // （详因见 makeAccountPicker 的说明，回归测试在 lobsterai-wiring.spec.ts）。
+  const pickQoderCnAccount = makeAccountPicker(pool, QODER_CN.id)
+  // 适配器与 quotaVerdict **共用同一个凭据解析器**：两处各写一份必然分叉
+  // （理由同上）。
+  const resolveQoderCnCredential = makeCredentialResolver<QoderCredential>(
+    ctx, pool, QODER_CN.id, QODER_CN.defaultCredentialRef,
+  )
+  registerQoderLlm(ctx, {
+    credentialRef: credentialRef(QODER_CN.defaultCredentialRef),
+    // 只从 Qoder CN 自己的账号池取账号，回退到自己的单凭据 ref
+    // （`QODER_CN_PERSONAL_TOKEN`）—— 保证不会串用国际版的凭据。
+    // provider 实参用 QODER_CN.id 而非字面量：写死字面量在改名场景下会静默
+    // 查不到账号（本插件在 workbuddy 上踩过同类坑）。
+    resolveCredential: resolveQoderCnCredential,
+    // 续期同样是**重打 exchange**，打的却是 CN 自己的 openapi 基址
+    // （`product.openapiBase`，A 段已让 exchange 走产品配置）。
+    refresh: async (model?: string) => {
+      const available = await pickQoderCnAccount(model)
+      if (available) await qoderCn.refreshAccountCredential(available.entry.credentialRef)
+      else await qoderCn.refresh()
+    },
+    // job token 提供者：**必须是 CN 的 auth 实例** —— jt 缓存按实例持有，
+    // 用国际版实例换来的 jt 打 CN 端点只会得到一次 401。
+    getJobToken: (pat: string) => qoderCn.getJobToken(pat),
+    invalidateJobToken: (pat: string) => { qoderCn.invalidateJobToken(pat) },
+    // **402 的额度二次判别**：与国际版同因（402 在本 provider 上有语义污染 ——
+    // quota=0 的账号上无效模型名也回同一个 402 `code:116`），故「换号可救」
+    // 必须由**CN 的**额度端点确证。查不到一律返回 undefined ⇒ 保守判「不换号」。
+    quotaVerdict: async () => {
+      const credential = await resolveQoderCnCredential()
+      if (credential === undefined || credential.access_token.length === 0) return undefined
+      return checkQoderQuotaExhausted(credential, qoderCn, {
+        onDebug: (message) => ctx.logger?.info?.(message),
+      })
+    },
+    accountPool: pool,
+    product: QODER_CN,
+  })
+
   // ===== 多账号静默续期调度 =====
   // 替代原有的单账号 scheduleRefresh()，使用 refreshAll() 遍历所有账号续期
   const REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 每 30 分钟检查一次
@@ -573,6 +679,11 @@ export function apply(ctx: Context): void {
     try {
       await qoder.refreshAll(pool)
     } catch { /* 静默 */ }
+    try {
+      // CN 与 国际版是**两个独立的 provider**（两区账号不互通），故各刷各的：
+      // 漏掉这一行不会报错，只是 CN 账号永远等不到主动续期。
+      await qoderCn.refreshAll(pool)
+    } catch { /* 静默 */ }
   }
 
   // 启动时如果有任何可续期账号，安排定期续期
@@ -589,6 +700,7 @@ export function apply(ctx: Context): void {
         lobsterai.stop()
         traeCn.stop()
         qoder.stop()
+        qoderCn.stop()
       }, 'jet-hub: multi-account refresh scheduler')
     }
   })
@@ -601,9 +713,12 @@ export function apply(ctx: Context): void {
     lobsterai.stop()
     traeCn.stop()
     qoder.stop()
+    qoderCn.stop()
   }, 'codearts-auth.scheduler (legacy)')
 
   // ===== Account Hub RPC 注册 =====
-  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder)
+  // 参数次序照既有惯例：provider 服务的排列顺序与上面注册顺序一致，
+  // 新增的 `qoderCn` 排在尾（`qoder` 之后）。
+  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn)
   ctx.provide('accountPool', pool)
 }

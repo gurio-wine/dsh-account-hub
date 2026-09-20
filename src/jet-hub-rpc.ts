@@ -40,7 +40,7 @@ import {
 } from './lobsterai-credits.js'
 import { TRAE_CN } from './trae-cn-product.js'
 import { TRAE_CN_WORK } from './trae-cn-work-product.js'
-import { QODER } from './qoder-product.js'
+import { QODER, QODER_CN, qoderProductById } from './qoder-product.js'
 import { fetchQoderCreditBalance } from './qoder-credits.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { isTraeCnJunkModelId } from './trae-cn-models.js'
@@ -200,6 +200,51 @@ export function poolProviderFor(provider: string): string {
  */
 export function traeCnPoolFor(provider: string): TraeCnPoolId {
   return provider === TRAE_CN_WORK.id ? TRAE_CN_POOL_WORK : TRAE_CN_POOL_UNIVERSAL
+}
+
+/**
+ * Qoder 的 **region 解引用**：provider id → （产品配置, 该 region 的 auth 实例）。
+ *
+ * ## 为什么必须是**成对**返回，而不是让调用方各取各的
+ *
+ * Qoder 的两个 region 是**同协议、两套 host、两批互不相通的账号**
+ * （见 `src/qoder-product.ts` 的模块头）。三条依赖都必须与 region 对齐：
+ *
+ * | 依赖 | 落在哪 | 配错的失败形态 |
+ * |---|---|---|
+ * | exchange / quota / models 的 host | `product.*` | 拿 CN 的 PAT 打国际版端点 → 假的「凭据失效」 |
+ * | jt 运行时缓存、在途去重、失效标记 | **auth 实例的字段** | 用国际版实例换的 jt 打 CN → 401 → 又指向「PAT 失效」 |
+ * | 账号池键 / 凭据 ref 前缀 | `product.id` / `product.*Ref` | 串到另一区的账号 |
+ *
+ * 三者的取值来源**不同**（配置 vs 实例），所以「调用方自己按 id 取配置、
+ * 再自己按 id 挑实例」这种写法在将来新增 region 时极易只改一半。本函数把它们
+ * 绑成一个返回值，调用点拿到的是**已经对齐的**一对。
+ *
+ * ## 与 `poolProviderFor` / `traeCnPoolFor` 的区别
+ *
+ * 那两者答的是「面板 id 该查哪个池 / 显示哪个池」，本函数答的是「这个 region
+ * 该用哪份配置与哪个实例」。Qoder **没有**池映射（两区是两批账号），故
+ * `qoder-cn` 既不被映射到 `qoder`，也不反向映射 —— 这正是与国际版账号隔离的
+ * 实现方式，与 `trae-cn-work` 的「复用池」方向刻意相反。
+ *
+ * @returns 该 provider 的 region；**不是 Qoder 系 provider 时 `undefined`**
+ *          （由调用方决定是拒绝还是走别的分支 —— 本函数不抛错，因为
+ *          调用点还需要区分「未知 provider」与「已知但配置不全」）。
+ */
+export function qoderRegionFor(
+  provider: string,
+  qoder: QoderAuth,
+  qoderCn: QoderAuth,
+): { product: QoderProduct; auth: QoderAuth } | undefined {
+  const product = qoderProductById(provider)
+  if (product === undefined) return undefined
+  // 显式列举两个 region，**不用** `product === QODER ? qoder : qoderCn` 这种
+  // 二选一：后者会让将来新增的第三个 region 静默复用 CN 的实例（也就是用 CN
+  // 的 jt 缓存去打第三区的端点），而那种错误在响应上表现为「凭据失效」，与
+  // 真实原因毫无关系。
+  if (product === QODER) return { product, auth: qoder }
+  if (product === QODER_CN) return { product, auth: qoderCn }
+  return undefined
 }
 
 /** 解析 Buddy 凭据 JSON；解析失败返回 undefined。 */
@@ -541,9 +586,10 @@ export function registerJetHubRpc(
   lobsterai: LobsteraiAuth,
   traeCn: TraeCnAuth,
   qoder: QoderAuth,
+  qoderCn: QoderAuth,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder)
+    registerJetHubEndpoints(connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn)
   })
 }
 
@@ -557,6 +603,7 @@ function registerJetHubEndpoints(
   lobsterai: LobsteraiAuth,
   traeCn: TraeCnAuth,
   qoder: QoderAuth,
+  qoderCn: QoderAuth,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -841,12 +888,20 @@ function registerJetHubEndpoints(
             pendingTraeCnLogins.delete(id)
           })
           return { ok: true, value: { accountId: id, loginUrl: loginSession.loginUrl } }
-        } else if (provider === QODER.id) {
+        } else if (provider === QODER.id || provider === QODER_CN.id) {
           // Qoder 是**唯一的非浏览器登录形态**：用户粘贴一个 PAT，宿主当场打一次
           // exchange 验证并落凭据。故这里**没有两段式**——不存在「等用户操作
           // 10 分钟」的手势窗口，验证本身是一次即时请求（计划 §2 决策 1）。
           //
-          // 三条契约：
+          // ## 两个 region 共用这一条分支（**同协议**，不要拆成两份）
+          //
+          // CN 与国际版的 exchange 请求逐字节同构（错误信封一致、PAT 前缀同为
+          // `pt-`），差异**只有 host** —— 而 host 由传入 `loginWithPat` 的那个
+          // auth 实例的产品配置承载（A 段已让 exchange 走 `product.openapiBase`）。
+          // 拆成两份会把下面四条契约各抄一遍，任何一条改动漏了另一半就是静默分叉。
+          //
+          // ## 四条契约（region 无关，两区一致）
+          //
           //   1. **同步完成**：`loginWithPat` 内部是「前缀校验 → exchange → 落凭据
           //      + 落账号」，返回时凭据已在盘上，客户端那套按「凭据可解析」判定的
           //      `login.poll` 天然兼容（不需要为它改轮询逻辑）；
@@ -854,10 +909,30 @@ function registerJetHubEndpoints(
           //   3. **失败即拒绝**：`loginWithPat` 抛出的原因（前缀不对 / exchange
           //      401 判 PAT 失效 / 网络失败）原样透传。**不预先建占位账号** ——
           //      与两段式那三个分支不同，这里失败时根本没有「后台第二段」会去
-          //      清理，先建占位就会留下一个永远没有凭据的幽灵账号。
+          //      清理，先建占位就会留下一个永远没有凭据的幽灵账号；
+          //   4. **`loginUrl` 恒为空串**（没有浏览器登录流程）。客户端按
+          //      `loginUrl` 决定是否开窗，空串正好表达「无事可开」。
+          //
+          // ## ⚠️ 产品配置与 auth 实例必须**成对**取（两个 region 各一份）
+          //
+          // jt 缓存、在途 exchange 去重、失效标记都是**实例字段**（见
+          // `QoderAuth`）。用国际版实例换来的 `jt-` 打 CN 端点只会得到一次 401
+          // —— 而错误文案会指向「PAT 失效」，把用户引去重签一张本来好用的凭据。
+          // 同理 exchange 的 host 取自传入实例的 `product.openapiBase`，配错
+          // 就是「拿 CN 的 PAT 打国际版端点」，失败形态同样是假的「凭据失效」。
+          //
+          // 故两处一律走 {@link qoderRegionFor}（唯一一处「哪个 region 用哪份
+          // 配置与实例」的映射），不在这里就地拼 —— 那会让同一件事在本函数与
+          // `credits.balances` 里各写一遍，必然分叉。
+          const region = qoderRegionFor(provider, qoder, qoderCn)
+          if (region === undefined) {
+            // 不可达：上面的分支条件已限定为两个 region 之一。保留这道闸是
+            // 为了让将来新增 region 时**显式接线**，而不是静默落到国际版。
+            return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
+          }
           const pat = typeof req.pat === 'string' ? req.pat : ''
           try {
-            const result = await qoder.loginWithPat(pat, {
+            const result = await region.auth.loginWithPat(pat, {
               refName,
               accountId: id,
               pool,
@@ -866,16 +941,17 @@ function registerJetHubEndpoints(
             // 有则用）。它**刻意不写 `expiresAt`**：PAT 的过期时间本地无从得知，
             // 而 jt 的 24h 只是运行时缓存的有效期 —— 写进账号卡片会让它在闲置
             // 24h 后显示「已过期」，而实际上一次 getJobToken 就能自愈。
-            //
-            // `loginUrl` 对 Qoder 恒为空串（没有浏览器登录流程）。客户端按
-            // `loginUrl` 决定是否开窗，空串正好表达「无事可开」。
             return { ok: true, value: { accountId: id, loginUrl: result.loginUrl } }
           } catch (error) {
             // 已经是**终态**：凭据没落盘、账号也没建，无残留可清。
             // 抛出去由 RPC 层包成 `jet-hub/handler-failed`，客户端会把 message
             // 原样展示给用户（`submitPat` 的 catch 分支就是这么写的）。
+            //
+            // 前缀带上产品展示名：两区共用一条分支后，只说「Qoder 登录失败」
+            // 会让拿着 CN PAT 的用户分不清该去哪张签发页重签（两区的 PAT 与
+            // 签发页都不通用）。
             throw new Error(
-              `Qoder 登录失败：${error instanceof Error ? error.message : String(error)}`,
+              `${region.product.displayName} 登录失败：${error instanceof Error ? error.message : String(error)}`,
             )
           }
         } else {
@@ -958,6 +1034,13 @@ function registerJetHubEndpoints(
             case QODER.id:
               // 对 Qoder「刷新」= 重打一次 exchange 换新 jt（PAT 不变，随时可重打）。
               await qoder.refreshAccountCredential(entry.credentialRef)
+              break
+            case QODER_CN.id:
+              // CN 与 国际版**各刷各的 auth 实例**：两者是两批账号（`entry.provider`
+              // 就是 `qoder-cn`），而 jt 缓存与 exchange host 都按实例/产品取值。
+              // 用国际版实例刷 CN 账号 = 拿 CN 的 PAT 打国际版 exchange 端点，
+              // 结果是「PAT 已失效，请重新粘贴」—— 而那张 PAT 本来完全好用。
+              await qoderCn.refreshAccountCredential(entry.credentialRef)
               break
             default:
               throw new Error(`Unknown provider: ${entry.provider}`)
@@ -1085,6 +1168,15 @@ function registerJetHubEndpoints(
         }
         const product = productById(provider)
         if (product === undefined) {
+          // ⚠️ **Qoder 系两个 region 都刻意落到这里**（`qoder` 与 `qoder-cn`）：
+          // 它们**没有公开的签到接口**（官方每日 100 Credits 只能在 Qoder 桌面
+          // App 手动领），故 `unsupported provider: qoder-cn` 是**正确契约**，
+          // 不是漏加分支。客户端靠 `credits-capabilities.js` 的
+          // `dailyCheckin: false` 在**发请求之前**就不发（`loadCredits` /
+          // `claimCredits` 各有一道守卫）。
+          // 判据是 `productById()`（Buddy 系）—— Qoder 的产品配置是
+          // `QoderProduct`，**任何 region 都不会命中它**，故这条拒绝是结构性的、
+          // 不需要为 CN 单独写一行。
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const accounts = await pool.listAccounts(provider)
@@ -1130,6 +1222,9 @@ function registerJetHubEndpoints(
         }
         const product = productById(provider)
         if (product === undefined) {
+          // ⚠️ **Qoder 系两个 region 都刻意落到这里** —— 理由与 `credits.status`
+          // 处那条同源（没有公开的签到接口，`dailyCheckin: false` 由能力矩阵在
+          // 发请求之前挡掉）。这里是**契约声明**，不是待补的分支。
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const value = await collectClaimResults(accounts, product, {
@@ -1174,17 +1269,29 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
-        if (provider === QODER.id) {
+        if (provider === QODER.id || provider === QODER_CN.id) {
           // Qoder **只有一个池**（三池结构里另外两个本账号缺席，且它们同属这一个
           // 端点的同一个数字口径），故没有任何选池映射 —— 与 Trae 系那条
           // `traeCnPoolFor()` 刻意不同，不要为「形态对称」凭空造一个。
+          // CN 同样如此：实测 CN 的 quota 响应只有 `userQuota` + `addOnQuota`，
+          // `orgResourcePackage` 键**整个不存在** —— 而三池解析本来就是容缺的
+          // （每个池独立解析，缺席 = 该池不存在），故**无需任何 CN 专属分支**。
           //
-          // 第二个实参传 `qoder`（QoderAuth 实例）：额度端点**只认 `jt-`**
-          // （PAT 打它回 401 `TOKEN_EXPIRE`），由 auth 负责换取与缓存。
-          const values = await collectCreditBalances<QoderCredential, QoderProduct>(accounts, QODER, {
+          // 第二个实参是本 region 的 auth 实例：额度端点**只认 `jt-`**
+          // （PAT 打它回 401 `TOKEN_EXPIRE`），由 auth 负责换取与缓存；
+          // 而 jt 缓存是**实例字段**，用错实例换来的是另一区的 jt。
+          //
+          // ⚠️ **第三个实参必须是本 region 的产品配置**（`region.product`）：
+          // 它决定 `openapiBase`（额度端点 host）。传错会让请求打到另一区，
+          // 表现为「凭据失效」而不是任何配置错误。
+          const region = qoderRegionFor(req.provider, qoder, qoderCn)
+          if (region === undefined) {
+            return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+          }
+          const values = await collectCreditBalances<QoderCredential, QoderProduct>(accounts, region.product, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalance: (credential, product) =>
-              fetchQoderCreditBalance(credential, qoder, {
+              fetchQoderCreditBalance(credential, region.auth, {
                 product,
                 onDebug: (msg) => ctx.logger?.info?.(msg),
               }),

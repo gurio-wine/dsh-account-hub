@@ -297,6 +297,10 @@ function makeHarness(accounts: ProviderAccountEntry[]) {
     {} as never,
     {} as never,
     {} as never,
+    // qoder / qoderCn：本文件只断 `account.list` / `model.*` / `poolProviderFor`
+    // 的分派（不建号、不查余额），两条 Qoder 分支都不会被进入。
+    {} as never,
+    {} as never,
   )
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 

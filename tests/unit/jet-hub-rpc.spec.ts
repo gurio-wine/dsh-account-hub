@@ -660,7 +660,10 @@ describe('model.list / model.setDisabled 端点', () => {
       logger: { warn: () => {}, info: () => {} },
     }
 
-    registerJetHubRpc(ctx as never, pool, {} as never, {} as never, {} as never)
+    registerJetHubRpc(
+      ctx as never, pool, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never,
+    )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     /** 调用一个端点方法，返回解包后的 result。 */
@@ -1103,7 +1106,10 @@ describe('积分端点的 provider 能力边界', () => {
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
     const pool = { listAccounts: async () => [] }
 
-    registerJetHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never)
+    registerJetHubRpc(
+      ctx as never, pool as never, {} as never, {} as never, {} as never,
+      {} as never, {} as never, {} as never, {} as never,
+    )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {

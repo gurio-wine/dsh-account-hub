@@ -252,7 +252,14 @@ function createHarness(): Harness {
     get: () => undefined,
   }
 
-  registerJetHubRpc(rpcCtx as never, pool, codearts, buddy, workbuddy, lobsterai)
+  // 后三个实参（traeCn / qoder / qoderCn）本文件都不涉及：本文件只驱动
+  // `account.create`，而它按 provider 精确分派，这些服务不会被碰到。传空对象是
+  // **刻意的**——若哪天有人让某个分支默认落到某一区，这里会立刻以
+  // `Cannot read properties of undefined` 暴露，而不是静默走错实现。
+  registerJetHubRpc(
+    rpcCtx as never, pool, codearts, buddy, workbuddy, lobsterai,
+    {} as never, {} as never, {} as never,
+  )
   if (handler === undefined) throw new Error('account.create 端点未注册')
 
   const call = async <T>(method: string, payload: unknown): Promise<RpcResult<T>> => {

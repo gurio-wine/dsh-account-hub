@@ -39,7 +39,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { QoderAuth } from '../../src/qoder-auth.js'
-import { QODER, QODER_PAT_URL, type QoderCredential } from '../../src/qoder-product.js'
+import { QODER, QODER_CN, QODER_PAT_URL, type QoderCredential } from '../../src/qoder-product.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 // ── 测试基建 ────────────────────────────────────────────────────────────────
@@ -170,9 +170,17 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
   // 凭据写入全走真实代码路径。每个 harness 一个独立 Context —— cordis 的
   // Service 按名称注册，同一个 Context 上第二次 `new QoderAuth` 会抛
   // `service "qoderAuth" has been registered`。
+  //
+  // **两个 region 各一个实例**（服务名 `qoderAuth` / `qoderCnAuth` 互不冲突）：
+  // 生产接线就是这样，而分派必须按 provider 选对实例 —— jt 缓存与 exchange
+  // host 都按实例/产品取值，用错实例的失败形态是假的「PAT 失效」。
   const serviceCtx = new Context()
   serviceCtx.provide('credentials', credentials as never)
   const qoder = new QoderAuth(serviceCtx, { fetcher: fetcher as unknown as typeof fetch })
+  const qoderCn = new QoderAuth(serviceCtx, {
+    product: QODER_CN,
+    fetcher: fetcher as unknown as typeof fetch,
+  })
 
   let handler: ((request: Request) => Promise<Response>) | undefined
   const rpcCtx: Record<string, unknown> = {
@@ -201,6 +209,7 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
     {} as never,
     {} as never,
     qoder,
+    qoderCn,
   )
   if (handler === undefined) throw new Error('Account Hub 端点未注册')
 
@@ -227,6 +236,7 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
     calls,
     async teardown() {
       qoder.stop()
+      qoderCn.stop()
     },
   }
   harnesses.push(harness)

@@ -12,7 +12,7 @@ import { TraeCnAuth } from '../../src/trae-cn-auth.js'
 import { QoderAuth } from '../../src/qoder-auth.js'
 import { BUDDY } from '../../src/product.js'
 import { LOBSTERAI } from '../../src/lobsterai-product.js'
-import { QODER } from '../../src/qoder-product.js'
+import { QODER, QODER_CN } from '../../src/qoder-product.js'
 
 vi.mock('../../src/login.js', () => ({
   runLoginFlow: vi.fn(),
@@ -566,5 +566,134 @@ describe('Qoder provider 注册（认证服务 + 模型路由）', () => {
     const stop = vi.spyOn(ctx.qoderAuth, 'stop')
     await ctx.fiber.dispose()
     expect(stop).toHaveBeenCalled()
+  })
+})
+
+/**
+ * Qoder **CN**（第二 region）的注册接线。
+ *
+ * 本组与上一组的判据**互为反例**，这是全组存在的理由：两个 region 同协议、
+ * 同一份实现，差异只在「服务名显式与否」与「池键是不是同一个字符串」——
+ * 这两条恰恰是最容易被「顺手统一」抹平的地方，而抹平之后**两个方向都不报错**。
+ */
+describe('Qoder CN provider 注册（第二 region）', () => {
+  it('apply 时注册 qoder-cn provider 路由与适配器（与国际版并列，不是替换）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // **两个**路由必须同时存在：CN 是新增的第二个 provider，不是把国际版改掉。
+    expect(ctx.llm.registeredProviders).toContain('qoder')
+    expect(ctx.llm.registeredProviders).toContain('qoder-cn')
+    expect(ctx.llm.adapters).toContain('qoder-cn')
+  })
+
+  it('注册 qoder-cn 的可配置 provider 目录项（含展示名与 settingsNs）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const entry = ctx.llm.configurableProviders.find((item: { provider: string }) => item.provider === 'qoder-cn')
+    expect(entry).toMatchObject({ provider: 'qoder-cn', displayName: QODER_CN.displayName })
+    expect(entry?.displayName).toBe('Qoder CN')
+    expect(entry?.settingsNs).toBe('llm-qoder-cn')
+  })
+
+  it('`llm-qoder-cn` settings namespace 已注册（漏注册会让模型设置页崩溃）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // namespace 未注册时，模型设置页会在 `refFor → deriveKeyRef(provider)` 处以
+    // `provider.toUpperCase is not a function` 崩溃 —— 与其余 provider 同因。
+    // 注意这里的连字符是**正确**的：namespace 是字符串键，不是标识符。
+    expect(ctx.settings.registeredNamespaces).toContain('llm-qoder-cn')
+    // 国际版的 namespace 不受影响（两个 region 各有自己的配置页）。
+    expect(ctx.settings.registeredNamespaces).toContain('llm-qoder')
+  })
+
+  /**
+   * ⚠️ **本组最重要的一条**：`qoderCnAuth` 是**显式声明**的结果，不是机械派生。
+   *
+   * `qoder-cn` 带连字符，`${id}Auth` 派生出来的是 `qoder-cnAuth` —— 非标识符
+   * 风格，`ctx['qoder-cnAuth']` 才能访问。产品配置因此显式给出
+   * `serviceName: 'qoderCnAuth'`。
+   *
+   * 这与上一组 `qoder`（无连字符，**刻意不声明** serviceName）**互为反例**：
+   * 那条判据是「派生结果合不合法」，不是「所有 provider 都得声明」。
+   * 若哪天有人为了「形态统一」给国际版也补一个 `serviceName`，或把 CN 的删掉
+   * 改成机械派生，两条断言会一起变红。
+   */
+  it('服务名 `qoderCnAuth` 是**产品配置显式声明**的，而非机械派生', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.qoderCnAuth).toBeInstanceOf(QoderAuth)
+    expect(ctx.qoderCnAuth.name).toBe('qoderCnAuth')
+    // 判据链：产品配置里有这个字段，且它**不等于**机械派生的结果。
+    expect(QODER_CN.serviceName).toBe('qoderCnAuth')
+    expect(`${QODER_CN.id}Auth`).toBe('qoder-cnAuth')
+    expect(QODER_CN.serviceName).not.toBe(`${QODER_CN.id}Auth`)
+    // 机械派生的那个名字**不应**存在于 ctx 上（注册走的是 serviceName）。
+    expect((ctx as unknown as Record<string, unknown>)['qoder-cnAuth']).toBeUndefined()
+    // 反面判据（同一断言里锁死，防「顺手统一」）：国际版无该字段。
+    expect(QODER.serviceName).toBeUndefined()
+  })
+
+  it('与既有七个 provider 的服务实例两两不同（同名二次注册会抛错）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // 两个 Qoder region 也是**两个不同实例** —— 它们各自持有 jt 缓存与失效标记，
+    // 共用实例会让 CN 的 jt 被拿去打国际版端点（失败形态是假的「PAT 失效」）。
+    for (const other of [
+      ctx.qoderAuth, ctx.codeartsAuth, ctx.buddyCnAuth, ctx.buddyAuth, ctx.lobsteraiAuth, ctx.traeCnAuth,
+    ]) {
+      expect(ctx.qoderCnAuth, ctx.qoderCnAuth.name).not.toBe(other)
+    }
+  })
+
+  it('qoderCnAuth 只读 CN 自己的凭据 ref（**不与国际版串**）', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    // 只写国际版的 ref：CN 必须报告未配置 —— 两个 region 的 PAT 互不通用，
+    // 串用会让一台机器上的国际版凭据被当成 CN 凭据发出去（必然 401）。
+    await ctx.credentials.set('QODER_PERSONAL_TOKEN', JSON.stringify({
+      access_token: 'pt-intl', refresh_token: 'jrt-1',
+    }))
+    expect((await ctx.qoderAuth.status()).configured).toBe(true)
+    expect((await ctx.qoderCnAuth.status()).configured).toBe(false)
+
+    // 反过来：只写 CN 的 ref ⇒ 只有 CN 报告已配置。
+    await ctx.credentials.unset('QODER_PERSONAL_TOKEN')
+    await ctx.credentials.set('QODER_CN_PERSONAL_TOKEN', JSON.stringify({
+      access_token: 'pt-cn', refresh_token: 'jrt-2',
+    }))
+    expect((await ctx.qoderCnAuth.status()).configured).toBe(true)
+    expect((await ctx.qoderAuth.status()).configured).toBe(false)
+  })
+
+  it('两个 region 的产品配置与凭据 ref 都不同（否则就是同一个 provider）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    expect(ctx.qoderCnAuth.product).toBe(QODER_CN)
+    expect(ctx.qoderCnAuth.product.id).toBe(QODER_CN.id)
+    expect(ctx.qoderCnAuth.credentialRefName).toBe('QODER_CN_PERSONAL_TOKEN')
+    expect(ctx.qoderCnAuth.credentialRefName).not.toBe(ctx.qoderAuth.credentialRefName)
+    // 两个 region 打的是两套 host：产品配置配错会让请求静默打到错 region。
+    expect(ctx.qoderCnAuth.product.openapiBase).toBe('https://openapi.qoder.com.cn')
+    expect(ctx.qoderCnAuth.product.openapiBase).not.toBe(ctx.qoderAuth.product.openapiBase)
+  })
+
+  it('不注册任何 qoder-cn 斜杠命令（入口在 Account Hub 的 PAT 表单）', () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const names = ctx.commands.definitions.map((d) => d.name)
+    for (const removed of ['qoder-cn-login', 'qoder-cn-status', 'qoder-cn-refresh', 'qoderCn-login']) {
+      expect(names, removed).not.toContain(removed)
+    }
+  })
+
+  it('dispose 时**两个 region 的**续期调度都被停掉', async () => {
+    const ctx = createMockContext()
+    apply(ctx as never)
+    const intlStop = vi.spyOn(ctx.qoderAuth, 'stop')
+    const cnStop = vi.spyOn(ctx.qoderCnAuth, 'stop')
+    await ctx.fiber.dispose()
+    // 漏掉 CN 这一处不会报错，只是 CN 的调度器在插件卸载后仍然存活。
+    expect(intlStop).toHaveBeenCalled()
+    expect(cnStop).toHaveBeenCalled()
   })
 })

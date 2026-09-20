@@ -85,6 +85,11 @@ async function callRefresh(
     makeServiceStub('buddy-cn', calls) as never,
     makeServiceStub('buddy', calls) as never,
     makeServiceStub('lobsterai', calls) as never,
+    // traeCn / qoder / qoderCn：本文件只驱动 `account.refresh`，而它按账号条目
+    // 自己的 `provider` 分派；这三种 provider 都不在 fixture 里，故不会被碰到。
+    makeServiceStub('trae-cn', calls) as never,
+    makeServiceStub('qoder', calls) as never,
+    makeServiceStub('qoder-cn', calls) as never,
   )
   const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
     method: 'POST',

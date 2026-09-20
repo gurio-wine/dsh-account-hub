@@ -113,6 +113,11 @@ function harness(options: {
     {} as never,
     {} as never,
     {} as never,
+    {} as never,
+    // qoder / qoderCn：本文件只驱动 trae 系的积分分支（两个 Qoder region 都
+    // 走不到），传空对象以暴露任何误落到 Qoder 分支的改动。
+    {} as never,
+    {} as never,
   )
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 

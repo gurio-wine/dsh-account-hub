@@ -170,6 +170,10 @@ function makeHarness(accounts: ProviderAccountEntry[]) {
     {} as never,
     {} as never,
     traeCn as never,
+    // qoder / qoderCn：本文件只用到 `account.list` / `model.*` / `credits.*` 的
+    // trae 分支，Qoder 两个 region 都走不到。
+    {} as never,
+    {} as never,
   )
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 
