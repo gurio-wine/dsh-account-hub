@@ -95,3 +95,50 @@
   `src/qoder-adapter.ts` 的注入口签名），留待真机验收时按实际表现决定。
 - ⚠️ **真机验收未做**：本步只保证类型、单测、构建与产物冒烟全绿；PAT 实测聊天
   与额度查询由用户自行在 DSH 里加 PAT 验证（`reasoning_effort` 是否生效亦在其中）。
+
+## 4. 双 region 扩展（2026-09-20）
+
+国际版六步落地后，追加了**国内版第二 region**。它不是第三个 provider 协议 ——
+真机探测确证 Qoder CN 与国际版**同协议**（exchange / quota / models 三个端点的
+错误信封**逐字节同构**、PAT 前缀同为 `pt-`、目录字段同构），故**代码只有一份**，
+差异全部收敛在 `src/qoder-product.ts` 的两份 `QoderProduct` 配置里。
+
+### 探测定案要点
+
+| 项 | 定案 |
+|---|---|
+| provider id / 显示名 | `qoder-cn` / **Qoder CN**（带连字符 ⇒ **必须**显式声明 `serviceName: 'qoderCnAuth'`，机械派生会得到非法的 `qoder-cnAuth`） |
+| CN OpenAPI | `openapi.qoder.com.cn` —— ✅ 真机实测 200 |
+| CN 模型目录 | `api.qoder.com.cn` —— ✅ 真机实测 200（**14 项快照，全部 `is_enabled:true`**；短别名 id 体系；**无 `lite`**） |
+| CN chat | `gateway.qoder.com.cn` —— 🔴 **源码定案、真机未验证**：取自官方 CN CLI（`@qodercn-ai/qoderclicn@1.1.58`）的选区常量 `CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`；**探测时该主机整机 503**（阿里云 ALB 无健康后端，官方 CN CLI 同样打不通）。⚠️ 与国际版**不带 `-v2` 段**，不要按同形替换去猜 |
+| `client_type` | CN 取 **`"5"`**（官方 CN CLI 的 `kg()` 默认值 `process.env.CLIENT_TYPE ?? "5"`）⚠️ 源码值，未实测 |
+| Cosy 头 | CN 发 `Cosy-ClientType`（= `clientType`）与 `Cosy-Version`（`1.1.58`）⚠️ 未实测；`Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**（官方条件性发送，本插件不猜机器身份） |
+| 签到 | 矩阵仍是 `dailyCheckin: false`，但理由是**「端点未知、未验证」**（CLI2API 的 `RegionDescriptor` 只在 cn 挂 Checkin），**不是**「没有权益」—— 拿到端点后翻 `true`，届时需补 `credits.status` / `credits.claimAll` 的 `qoder-cn` 分支 |
+
+### 两区隔离（与 `trae-cn` / `trae-cn-work` 那对方向相反）
+
+| 维度 | `qoder` / `qoder-cn` | `trae-cn` / `trae-cn-work` |
+|---|---|---|
+| 账号池 | **各自独立**（`QODER_ACCOUNT_*` vs `QODER_CN_ACCOUNT_*`） | 同一批（`TRAE_CN_ACCOUNT_*`） |
+| 令牌 | **互不承认**（拿错 host 打 = 「凭据失效」的假象） | 同一份凭据 |
+| `poolProviderFor()` | **恒等** | **必须映射**到 `trae-cn` |
+| 积分 | 各查各的额度端点，**没有**选池映射 | 同一端点 + `traeCnPoolFor()` 选池 |
+
+**逃生阀** `QODER_MODEL_SERVER_HOST` 可覆盖 chat 的 host（与官方 CN CLI 同语义）：
+⚠️ **只影响 chat**（`openapiBase` / `modelsBase` 两条控制面不受影响）、路径与查询串
+一律丢弃（路径恒为 `/model/v1/chat/completions`）、**显式 scheme 优先**（裸主机名沿用
+原基址的 `https`，写 `http://` 就按 http 发）、**请求时读取**（不是启动时定型）、
+作用于两个 region。用于阿里云侧就绪后或临时指向别的网关；不设时一律走 `product.chatBase`。
+⚠️ **绝不因为「测不通」就把它改成国际版 host** —— 那会把「上游暂时不可用」伪装成
+「凭据失效」。
+
+### 三段提交
+
+| 段 | 范围 | 提交 |
+|---|---|---|
+| A | 产品配置 + 协议字段参数化（`QODER_CN`、`clientType` / `cosyVersion`） | `221d309` |
+| B | 宿主接线（`src/index.ts` 注册第二个 `QoderAuth` 实例与适配器；`jet-hub-rpc.ts` 的 `account.create` / `credits.balances` / `account.refresh` 三分支 + `qoderRegionFor()`；`credits.status` / `claimAll` 结构性拒绝） | `88ad3d2` |
+| C | 客户端面板 + 文档收尾（`PROVIDERS` 第八条、`PAT_LOGIN_PROVIDERS` 第二个 region、能力矩阵行、测试与 README/AGENTS 同步） | **本次提交** |
+
+⚠️ **两端仍未真机验收**（CN 与国际版一样）：chat 主机 503 期间无法端到端验证，
+`client_type` / Cosy 头 / `QODER_CN_USER_AGENT` 三个出站身份值是源码推断值。

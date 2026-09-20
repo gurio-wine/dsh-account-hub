@@ -13,7 +13,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-account-hub`），提供华为云 Codearts 浏览器登录与凭据管理功能。插件还附带 `buddy-cn`（**Buddy CN**，腾讯 CodeBuddy 中国版）、`buddy`（**Buddy**，腾讯 WorkBuddy **国际版** / WorkBuddy AI）与 `lobsterai`（**LobsterAI**，有道）三个 LLM provider 路由，以及 `trae-cn` / `trae-cn-work`（字节跳动 **Trae 国内版**及其 TraeWork 路径）与 `qoder`（**Qoder**，PAT 粘贴式登录 —— 本插件唯一的非浏览器登录形态）。
+本项目是 DeepSeek Harness 的一个插件（`dsh-account-hub`），提供华为云 Codearts 浏览器登录与凭据管理功能。插件还附带 `buddy-cn`（**Buddy CN**，腾讯 CodeBuddy 中国版）、`buddy`（**Buddy**，腾讯 WorkBuddy **国际版** / WorkBuddy AI）与 `lobsterai`（**LobsterAI**，有道）三个 LLM provider 路由，以及 `trae-cn` / `trae-cn-work`（字节跳动 **Trae 国内版**及其 TraeWork 路径）与 `qoder` / `qoder-cn`（**Qoder** 的**国际版与国内版两个 region**，PAT 粘贴式登录 —— 本插件唯一的非浏览器登录形态）。
 
 > **命名（2026-09-18 改名后）**：显示名与 provider id 一律按**产品品牌**，不再用历史代号。
 > `buddy-cn` / `buddy` 是**新**命名；旧命名 `buddy`（中国版）/ `workbuddy`（国际版）
@@ -36,7 +36,26 @@
 
 ⚠️ **「客户端模型池（IDE 代际）」≠「SOLO 网关配置表」**（理解「少模型」报障的关键区分）：客户端能显示的模型受**本地 vscdb 缓存**影响（旧 `chat_v3` 16 项，独有 `Doubao-Seed-Code` / `glm-5.3-flash` / `deepseek-v4.1-flash` / `kimi-k2.8-preview` / `qwen3.8-flash`），而**请求只认 SOLO 表**（网关按 `config_name` 在它自己那张表里找配置，找不到即 `4001`，与客户端 UI 显示什么无关）。**SOLO 表才是本 provider 的权威可用集**，故 5 项剔除已二次确认**非误伤**；反向也成立 —— `kimi-k2.7-code` / `kimi-k2.6` 只在 SOLO 表、不在旧客户端池，是**正常可调项必须保留**。
 
-Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Trae CN Work **与 Trae CN 是同一批账号**故签到只在后者提供。Trae CN 的签到与余额**前后端及宿主接线均已就绪**（`src/trae-cn-credits.ts` + 客户端能力矩阵 + `jet-hub-rpc.ts` 三处分支与 `traeCn` 实例传参）。T5 / T7 已真机校准；**T9 已于 2026-09-20 第三次修正**（原「不校验设备号形态」的推论被单变量 A/B 推翻，真根因是设备身份）。见「积分能力必须在请求前判定」与 README 的「Trae CN provider」章节。**七个 provider 都有 Account Hub 面板**（Trae CN Work 那条见下节，Qoder 那条见 README 的「Qoder provider」）。
+Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」按钮（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Trae CN Work **与 Trae CN 是同一批账号**故签到只在后者提供；Qoder 与 Qoder CN **都不提供**（国际版无此活动、CN **疑似有但端点未知**，见能力矩阵表）。Trae CN 的签到与余额**前后端及宿主接线均已就绪**（`src/trae-cn-credits.ts` + 客户端能力矩阵 + `jet-hub-rpc.ts` 三处分支与 `traeCn` 实例传参）。T5 / T7 已真机校准；**T9 已于 2026-09-20 第三次修正**（原「不校验设备号形态」的推论被单变量 A/B 推翻，真根因是设备身份）。见「积分能力必须在请求前判定」与 README 的「Trae CN provider」章节。**八个 provider 都有 Account Hub 面板**（Trae CN Work 那条见下节，Qoder 与 Qoder CN 那两条见 README 的「Qoder provider」）。
+
+### Qoder CN（`qoder-cn`）—— 第二 region 的两条要点
+
+`qoder-cn`（显示名 **Qoder CN**）与 `qoder`（国际版）**同协议双 region**：exchange / quota / models 三个端点的错误信封逐字节同构、PAT 前缀同为 `pt-`、目录字段同构，故**代码只有一份**（`src/qoder*.ts` 按传入的 `product` 现算），差异全部收敛在 `src/qoder-product.ts` 的两份 `QoderProduct` 配置里。
+
+⚠️ **两区是两套账号、两套 Credits、两套令牌 —— 与 `trae-cn` / `trae-cn-work` 那对方向相反**：
+
+| 维度 | `qoder` / `qoder-cn`（两个 region） | `trae-cn` / `trae-cn-work`（两条路径） |
+|---|---|---|
+| 账号 | **各自独立**（凭据 ref 前缀 `QODER_ACCOUNT_*` vs `QODER_CN_ACCOUNT_*`） | **同一批**（都是 `TRAE_CN_ACCOUNT_*`） |
+| 令牌 | **互不承认**（拿错 host 打 = 「凭据失效」的假象） | 同一份凭据 |
+| `poolProviderFor()` | **恒等**（`qoder-cn` → `qoder-cn`） | **必须映射**（`trae-cn-work` → `trae-cn`） |
+| 积分 | 各查各的额度端点（**没有**选池映射） | 同一端点、按面板选池（`traeCnPoolFor()`） |
+
+⚠️ **照抄 Work 的写法把 `qoder-cn` 映射到 `qoder` 是静默故障**：CN 面板会列出国际版账号、用 CN 凭据打国际版 host —— 端点仍回 `ok: true`，只是账号对不上 / 报「凭据失效」。`tests/unit/qoder-hub-panel.spec.ts` 与 `qoder-cn-rpc-dispatch.spec.ts` 从两个方向钉死。
+
+**CN 三个基址**：`openapi.qoder.com.cn`（✅ 实测 200）、`api.qoder.com.cn`（✅ 实测 200）、**`gateway.qoder.com.cn`（chat，🔴 源码定案、探测时整机 503）**。第三条取自官方 CN CLI 的选区常量，**阿里云侧未就绪**；实现照常按此值构造、错误直报，恢复后无需改代码。**逃生阀** `QODER_MODEL_SERVER_HOST` 可覆盖 chat 的 host（⚠️ **只影响 chat**，exchange / 目录两条控制面不受影响；路径与查询串一律丢弃；显式 scheme 优先；**请求时读取**，进程起来后再设也生效），作用于两个 region。⚠️ **绝不因为「测不通」就把它改成国际版 host** —— 那会把「上游暂时不可用」伪装成「凭据失效」。
+
+**CN 的两项出站身份标识**（⚠️ **均源码值、未实测**）：`client_type: "5"`（国际版是 `qodercli`，取自 CN CLI 的 `kg()` 默认值）与 **Cosy 头**（`Cosy-ClientType` / `Cosy-Version`，**仅 CN 发**）。⚠️ `Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**（官方条件性发送，本插件**不猜机器身份** —— 缺头比错头安全）。
 
 ### Trae CN Work（`trae-cn-work`）—— 第二条 Trae CN 路径
 
@@ -139,9 +158,9 @@ Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流�
 
 ## 工作方式
 
-本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyCnAuth`、`buddyAuth`、`lobsteraiAuth`、`traeCnAuth`、`qoderAuth`）均遵循统一接口：
+本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyCnAuth`、`buddyAuth`、`lobsteraiAuth`、`traeCnAuth`、`qoderAuth`、`qoderCnAuth`）均遵循统一接口：
 
-- `login(options?)` — 执行浏览器登录流程（**`qoderAuth` 例外**：Qoder 没有浏览器登录，`login({ pat })` 只是 `loginWithPat` 的别名，缺 `pat` 时如实抛「请粘贴 PAT」而不是开一个不存在的流程）
+- `login(options?)` — 执行浏览器登录流程（**`qoderAuth` / `qoderCnAuth` 例外**：Qoder 两个 region 都没有浏览器登录，`login({ pat })` 只是 `loginWithPat` 的别名，缺 `pat` 时如实抛「请粘贴 PAT」而不是开一个不存在的流程）
 - `status()` — 查询凭据状态（configured、source、expiresAt、refreshable）
 - `refresh()` — 手动静默续期凭据
 - `logout()` — 清除凭据并停止续期定时器
@@ -214,7 +233,7 @@ Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流�
 
 ## LLM Provider 约定
 
-- **provider 名称**：`codearts` / `buddy-cn` / `buddy` / `lobsterai` / `trae-cn` / `trae-cn-work` / `qoder`
+- **provider 名称**：`codearts` / `buddy-cn` / `buddy` / `lobsterai` / `trae-cn` / `trae-cn-work` / `qoder` / `qoder-cn`
 - **provider id 与 cordis 服务名是两件事**，不要机械派生。默认规则是
   `${product.id}Auth`，但**带连字符的 id 都要显式声明 `serviceName`**：
   `trae-cn` → `traeCnAuth`，`buddy-cn` → `buddyCnAuth`（`BuddyProduct` 已有
@@ -224,6 +243,11 @@ Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流�
   ⚠️ **`qoder` 是反面判据**：它**无连字符**，机械派生的 `qoderAuth` 本身就是合法
   的标识符风格，故 `QoderProduct` **刻意不声明 `serviceName`** —— 那条「都要显式
   声明」只适用于**机械派生结果不合法**的 id，不是「所有 provider 都得声明」。
+  ⚠️ **`qoder-cn` 又是正面判据**：同一个 `QoderProduct` 类型、同一份实现，只因
+  id **带连字符**（机械派生得到非标识符风格的 `qoder-cnAuth`）就**必须**显式声明
+  `serviceName: 'qoderCnAuth'` —— 两个 region 恰好落在判据的两侧，**不要**
+  为了「形态统一」把两行写成一样。`src/plugin.spec.ts` 已钉死
+  `ctx['qoder-cnAuth']` 为 `undefined`、`ctx.qoderCnAuth` 才是那个实例。
 - 端点格式为 OpenAI 兼容
 - 请求签名/鉴权方式因 provider 而异：
   - `codearts`：华为云 `SDK-HMAC-SHA256` 签名方案
@@ -279,7 +303,7 @@ Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流�
 - 返回同一个 `ClaimOutcome` 判别联合，使 `computeClaimSummary` 与前端摘要 UI 三套协议共用
 - **领取流程自带多步预检的 provider 传 `precheckStatus: false`**（LobsterAI 与 Trae CN）：它们的 `claim` 内部已经查过状态，外部再查一次纯属重复请求
 
-**积分余额（Credits Balance）** 覆盖五个产品、四套端点，语义一致（「查不到」与「余额为 0」严格区分），与签到是彼此独立的能力 —— 不要因为「国际版没有签到」就推断也查不到余额（Buddy 系两个产品通用同一端点）：
+**积分余额（Credits Balance）** 覆盖六个 provider、四套端点，语义一致（「查不到」与「余额为 0」严格区分），与签到是彼此独立的能力 —— 不要因为「国际版没有签到」就推断也查不到余额（Buddy 系两个产品通用同一端点）：
 
 - **Buddy 系（buddy-cn / buddy 通用，仅 baseURL 随 `product.endpoint` 切换）**：端点 `POST /v2/billing/meter/get-user-resource`，body `{}`
   - 响应**双层嵌套**：`data.Response.Data.Accounts[]`（签到是单层 `data`，此处最易解析错）
@@ -316,6 +340,12 @@ Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流�
 | `trae-cn` | ✓ 通用池（IDE 路径能花的，见下） | ✓（`checkin_credits` 两步 + 设备头） |
 | `trae-cn-work` | ✓ Work 池（TraeWork 能花的；同一批账号、同一个查询实现，只是**显示另一个池**） | ✗（签到留在 Trae CN 面板，避免同账号重复领取） |
 | `qoder` | ✓ 三池之和（`userQuota` / `addOnQuota` / `orgResourcePackage`，后两池容缺） | ✗（**有这项权益但没有公开接口**：官方每日 100 Credits 只能在 Qoder 桌面 App 手动领 —— 与 `buddy` 的「后端压根没有该接口」不是同一种情况） |
+| `qoder-cn` | ✓ 同一份实现、CN 的端点（CN 实测**两池**：`userQuota` + `addOnQuota`；解析器三池容缺，天然兼容） | ✗ ⚠️ **疑似有签到，但端点未知**（CLI2API 的 `RegionDescriptor` 只在 cn 挂 Checkin；未验收）——`false` 的理由是「**端点未知、未验证**」，**不是**「没有权益」，将来拿到端点后翻 `true` |
+
+> ⚠️ **Qoder 两个 region 的 `dailyCheckin` 都是 `false`，但理由互不相同、不可合并叙述**：
+> `qoder` 是**活动不存在**（国际版实测不显示签到），`qoder-cn` 是**端点未知**（待办）。
+> 合并成一句「Qoder 没有签到」会把后者的待办性质抹掉，而两者将来会分叉（CN 可能翻 true）。
+> `tests/unit/credits-capabilities.spec.ts` 有断言同时钉死取值与这两段注释的存在。
 
 > ⚠️ **改名的语义翻转点就在这里**：矩阵里 `buddy` 这个键**换了主人** ——
 > 旧 `buddy`（中国版，✓✓）让位给 `buddy-cn`，旧 `workbuddy`（国际版，✓✗）

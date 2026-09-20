@@ -41,6 +41,13 @@ const STYLES = `
 /* Qoder 的官方图标是 412x412 的彩色 PNG（自带不透明底色），与 buddy 系那几条
    base64 PNG 同类，故容器配色一致。类名同样必须存在：见上面那条集合相等断言。 */
 .dim-jh-providerIcon.qoder { background: white; }
+/* Qoder CN 与 Qoder **共用同一个图标本体**（同一品牌的两个 region，官方
+   qoder.cn 的 rel="icon" 指向的就是同一张 alicdn PNG）—— 与 trae-cn-work
+   别名 trae-cn 同一处理。容器配色与 .qoder 一致，只多一道极淡的品牌色内描边
+   作为**两区区分**：两个面板的图标完全一样时会让人以为点错了标签页。
+   类名必须单独存在（logoClass 与条目的集合相等断言守着），缺了它只是少了
+   白底与描边，肉眼几乎看不出来。 */
+.dim-jh-providerIcon.qoder-cn { background: white; box-shadow: 0 1px 3px rgb(31 35 41 / 7%), 0 0 0 1px color-mix(in srgb, #1677ff 26%, transparent) inset; }
 
 /* provider 文案：align dsh-im .dim-channelCopy */
 .dim-jh-providerLabel { min-width: 0; display: grid; }

@@ -111,6 +111,45 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('qoder')).toBe(false)
   })
 
+  it('Qoder CN 支持余额，签到为 false —— 但那是「**端点未知**」而不是「没有权益」', () => {
+    // `balance`：CN 与国际版**同协议双 region**，走的是**同一个**
+    // `fetchQoderCreditBalance`（按传入的 product 现算 host）。CN 侧实测只有
+    // 两个池（userQuota + addOnQuota），而解析器本就是**三池容缺**（缺席按 0），
+    // 故 CN 天然兼容、客户端零分支。
+    expect(CREDITS_CAPABILITIES['qoder-cn']).toEqual({ balance: true, dailyCheckin: false })
+    expect(supportsCreditBalance('qoder-cn')).toBe(true)
+    expect(supportsDailyCheckin('qoder-cn')).toBe(false)
+  })
+
+  it('⚠️ Qoder 两个 region 的 dailyCheckin 都是 false，但**理由互不相同**，不得合并叙述', () => {
+    // 这条断言守的是**代码注释里那两句理由**，而不是布尔值本身（上面的用例
+    // 已经钉过取值）。原因：这两个 false 极易被后来者「统一」成一句
+    // 「Qoder 没有签到」—— 而其中一句是**待办**，合并之后待办就消失了。
+    //
+    //   - `qoder`（国际版）：CLI2API 实测**国际版不显示签到**，活动不存在；
+    //   - `qoder-cn`（国内版）：CLI2API 的 RegionDescriptor **只在 cn 挂
+    //     Checkin** —— 疑似有签到，但**端点未知、未验收**，拿到端点后要翻 true。
+    //
+    // 故这里以**注释正文**为判据（与 trae-cn-work / qoder 那几条同类手法）：
+    // 若谁把 CN 那段的「端点未知」改写成「没有这项权益」，这条立刻红。
+    const source = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/credits-capabilities.js'),
+      'utf8',
+    )
+    // 两段理由必须各自成句、且都在文件里。
+    expect(source).toContain('疑似有签到，但端点未知')
+    expect(source).toContain('将来拿到端点后把它翻成 `true`')
+    // 国际版那句也必须还在（不然「分开写」就退化成「只写 CN 一句」）。
+    expect(source).toContain('CLI2API 实测**国际版不显示签到**')
+    // 反面锚点：CN 那一段**不得**出现「没有这项权益」的定性。
+    const cnCommentStart = source.indexOf('// Qoder **CN（国内版）**')
+    const cnEntryStart = source.indexOf("'qoder-cn': Object.freeze(")
+    expect(cnCommentStart, '找不到 Qoder CN 的注释段').toBeGreaterThan(-1)
+    expect(cnEntryStart).toBeGreaterThan(cnCommentStart)
+    const cnSection = source.slice(cnCommentStart, cnEntryStart)
+    expect(cnSection).not.toContain('没有这项权益')
+  })
+
   it('能力矩阵的键与 PROVIDERS 的 id 逐字对齐（含连字符 provider）', () => {
     // 集合相等那条断言用 PROVIDER_ENTRY_PATTERN 抓 id，而它的字符类必须是
     // `[a-z-]+`：只认小写字母的话，带连字符的 id 抓不到，于是**漏登记时那条
@@ -129,8 +168,12 @@ describe('积分能力矩阵', () => {
     // Qoder 是**第七条**，也是唯一登录形态不是浏览器登录的那条（PAT 粘贴）。
     // id 无连字符、与后端 `QODER.id` 逐字一致。
     expect(ids).toContain('qoder')
+    // Qoder CN 是**第八条**：同一形态的第二个 region，id **带连字符**
+    // （`qoder-cn`），写成 `qoderCn` / `qoder_cn` 都会让能力矩阵查不到它 ——
+    // 面板静默不显示积分，且不报任何错。
+    expect(ids).toContain('qoder-cn')
     expect(ids).not.toContain('workbuddy')
-    expect(ids).toHaveLength(7)
+    expect(ids).toHaveLength(8)
   })
 
   it('未登记的 provider 默认不支持任何积分能力（默认关闭）', () => {
@@ -162,7 +205,7 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
   const source = readClientSource()
 
   /**
-   * `PROVIDERS` 的**七条**最终形态。
+   * `PROVIDERS` 的**八条**最终形态。
    *
    * 顺序即面板标签页顺序，也是后端注册顺序；`label` 是面板标题与按钮文案里的
    * 显示名，`logoClass` 必须与 `jet-hub-styles.js` 的
@@ -175,13 +218,17 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     { id: 'lobsterai', label: 'LobsterAI', logoClass: 'lobsterai' },
     { id: 'trae-cn', label: 'Trae CN', logoClass: 'trae-cn' },
     { id: 'trae-cn-work', label: 'Trae CN Work', logoClass: 'trae-cn-work' },
-    // Qoder 排在最后（= PROVIDERS 的书写顺序）。它比上面六条多一个**全新的
+    // Qoder 排在 Trae CN Work 之后。它比上面六条多一个**全新的
     // 登录形态**：PAT 粘贴（其余六条全是浏览器登录），见 jet-hub.js 的
     // PAT_LOGIN_PROVIDERS。
     { id: 'qoder', label: 'Qoder', logoClass: 'qoder' },
+    // Qoder CN 紧跟在 Qoder 之后（= PROVIDERS 的书写顺序）：同一个形态的
+    // 第二个 region。`label` 是 `Qoder CN` —— 显示名只留产品名、不带公司注记
+    // （下面「显示名不带公司注记」那条断言同样管着它）。
+    { id: 'qoder-cn', label: 'Qoder CN', logoClass: 'qoder-cn' },
   ] as const
 
-  it('七条 provider 的 id / label / logoClass 与定稿一致', () => {
+  it('八条 provider 的 id / label / logoClass 与定稿一致', () => {
     const entries = [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)].map((m) => ({
       id: m[1]!, label: m[2]!, logoClass: m[4]!,
     }))
@@ -196,7 +243,7 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     // 判据是「有没有 loginHint」而不是某个显式的布尔标志：新增 provider 忘记
     // 声明时，最坏结果是多一个本来就能用的按钮，而不是把面板变成没有入口的死面板。
     const entries = [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)]
-    // 先钉死匹配器本身抓全了七条：漏抓的条目 `entry[5]` 恒为 undefined，
+    // 先钉死匹配器本身抓全了八条：漏抓的条目 `entry[5]` 恒为 undefined，
     // 会让下面那条「只有 Work 有」的断言在条目整个消失时反而是绿的。
     expect(entries).toHaveLength(EXPECTED.length)
     for (const entry of entries) {
@@ -240,6 +287,11 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     // Qoder 的图标是**官方原图**（qoder.com 首页 rel=icon 指向的 412x412 PNG，
     // 原样 base64 内联），不是 SVG，也不与任何既有常量共用。
     expect(entries.get('qoder')).toBe('QODER_ICON')
+    // ⚠️ Qoder CN **刻意复用** `QODER_ICON`（不是新常量）：两个 region 是同一个
+    // 品牌，官方 `qoder.cn` 首页的 rel=icon 指向的正是**同一张** alicdn PNG。
+    // 故两处都只能是 `QODER_ICON` —— 若谁给 CN 引入第二个图标常量，第二句会红，
+    // 提醒他确认「是不是拿到了真正不同的官方标识」。
+    expect(entries.get('qoder-cn')).toBe('QODER_ICON')
     // 旧常量名不得残留（它们现在指向不存在的符号，客户端会直接崩）。
     expect(source).not.toContain('CODEBUDDY_ICON')
     expect(source).not.toContain('WORKBUDDY_ICON')

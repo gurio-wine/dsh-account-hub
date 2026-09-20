@@ -50,7 +50,7 @@ import {
   poolProviderFor,
   registerJetHubRpc,
 } from '../../src/jet-hub-rpc.js'
-import { QODER, QODER_PAT_URL as HOST_QODER_PAT_URL } from '../../src/qoder-product.js'
+import { QODER, QODER_CN, QODER_CN_PAT_URL as HOST_QODER_CN_PAT_URL, QODER_PAT_URL as HOST_QODER_PAT_URL } from '../../src/qoder-product.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -103,7 +103,8 @@ function toCjs(source: string): string {
     + ' normalizePatInput: normalizePatInput,'
     + ' createAccountWithPat: createAccountWithPat,'
     + ' PatLoginForm: PatLoginForm,'
-    + ' QODER_PAT_URL: QODER_PAT_URL };\n',
+    + ' QODER_PAT_URL: QODER_PAT_URL,'
+    + ' QODER_CN_PAT_URL: QODER_CN_PAT_URL };\n',
   )
 }
 
@@ -135,6 +136,7 @@ const {
   createAccountWithPat,
   PatLoginForm,
   QODER_PAT_URL,
+  QODER_CN_PAT_URL,
 } = loadClientModule() as {
   providerPatLogin: (provider: string) => { patUrl: string } | null
   normalizePatInput: (raw: unknown) => string
@@ -148,6 +150,7 @@ const {
   }) => Promise<Record<string, unknown>>
   PatLoginForm: (props: Record<string, unknown>) => TreeNode
   QODER_PAT_URL: string
+  QODER_CN_PAT_URL: string
 }
 
 /** `createElement` 占位的产物形态。 */
@@ -326,14 +329,20 @@ function makeHarness(accounts: ProviderAccountEntry[]) {
   }
 }
 
-/** 一个 provider 为 `qoder` 的账号条目。 */
-function qoderEntry(id: string, enabled = true): ProviderAccountEntry {
+/**
+ * 一个 Qoder 账号条目。
+ *
+ * `provider` 参数化而不是写死 `'qoder'`：Qoder 与国际版是**两套互相隔离的
+ * 账号池**（CN 凭据 ref 前缀是 `QODER_CN_ACCOUNT`），本文件要用同一构造器造出
+ * 两边的条目，才能断言「一个面板看不到另一个面板的账号」。
+ */
+function qoderEntry(id: string, enabled = true, provider: 'qoder' | 'qoder-cn' = 'qoder'): ProviderAccountEntry {
   return {
     id,
-    provider: 'qoder',
+    provider,
     nickname: id,
     enabled,
-    credentialRef: `QODER_ACCOUNT_${id.toUpperCase()}`,
+    credentialRef: `${provider === 'qoder' ? 'QODER' : 'QODER_CN'}_ACCOUNT_${id.toUpperCase()}`,
     createdAt: 1,
     refreshable: true,
   }
@@ -347,6 +356,19 @@ describe('poolProviderFor：qoder 是恒等映射（与 trae-cn-work 互为反�
     // 像 trae-cn-work 那样登记 poolProviderId」。
     expect(poolProviderFor('qoder')).toBe('qoder')
     expect(poolProviderFor(QODER.id)).toBe('qoder')
+  })
+
+  it('qoder-cn 同样原样返回（两个 region 是**各自的**账号池，不做任何映射）', () => {
+    // ⚠️ 与 `trae-cn` / `trae-cn-work` 那对**方向相反**：Trae CN Work 要映射到
+    // `trae-cn`（同批账号），而 Qoder CN 有**自己的凭据体系**（`QODER_CN_ACCOUNT_*`）
+    // 与**自己的额度**（两区互不承认令牌）。
+    // 若有人照抄 Work 的写法把 `qoder-cn` 映射到 `qoder`：CN 面板会列出国际版
+    // 账号、打国际版的 host 用 CN 凭据 —— 得到的是「凭据失效」的假象，
+    // 而且**不报任何错**。这条断言就是那个陷阱的哨兵。
+    expect(poolProviderFor('qoder-cn')).toBe('qoder-cn')
+    expect(poolProviderFor(QODER_CN.id)).toBe('qoder-cn')
+    // 反向映射也不存在：`qoder` 不得被送去 CN。
+    expect(poolProviderFor('qoder')).not.toBe('qoder-cn')
   })
 
   it('反例锚点：trae-cn-work **必须**映射到别处（本插件唯一的非恒等映射）', () => {
@@ -399,6 +421,61 @@ describe('Qoder 面板的 RPC 分派（qoder 一路原样透传）', () => {
   })
 })
 
+describe('Qoder CN 面板的 RPC 分派（qoder-cn 一路原样透传，**不**落到国际版）', () => {
+  it('account.list 按 `qoder-cn` 查池：**只**列出 CN 账号，国际版的一个都不出现', async () => {
+    // 两区是两套账号池。若有人把 `qoder-cn` 映射到 `qoder`（照抄 Work 的写法），
+    // 这条会在「列出的账号」与「查池实参」两处同时失败 —— 且端点仍回 ok:true。
+    const h = makeHarness([
+      qoderEntry('qoder-1'),
+      qoderEntry('intl-only', true, 'qoder'),
+      qoderEntry('cn-1', true, 'qoder-cn'),
+      qoderEntry('cn-2', false, 'qoder-cn'),
+    ])
+    const result = await h.call('account.list', { provider: 'qoder-cn' })
+    expect(result.ok, result.error?.message).toBe(true)
+    const value = result.value as { accounts: ProviderAccountEntry[] }
+    expect(value.accounts.map((a) => a.id)).toEqual(['cn-1', 'cn-2'])
+    expect(h.listAccountsCalls).toEqual(['qoder-cn'])
+  })
+
+  it('反过来：`qoder` 面板列不到 CN 账号（两个方向都隔离）', async () => {
+    // 只钉一个方向不够 —— 「两池独立」是**双向**断言，单向的绿可能是过滤写反
+    // 却恰好也对（例如两边都返回全表时）。
+    const h = makeHarness([
+      qoderEntry('intl-1'),
+      qoderEntry('cn-1', true, 'qoder-cn'),
+    ])
+    const result = await h.call('account.list', { provider: 'qoder' })
+    expect(result.ok, result.error?.message).toBe(true)
+    expect((result.value as { accounts: ProviderAccountEntry[] }).accounts.map((a) => a.id))
+      .toEqual(['intl-1'])
+    expect(h.listAccountsCalls).toEqual(['qoder'])
+  })
+
+  it('model.list 把 `qoder-cn` 原样透传给 ctx.llm，黑名单也读同一个键', async () => {
+    // 两个 region 的模型目录**不同源**（CN 是 14 项、全 is_enabled），
+    // 透传成 `qoder` 会列出国际版的目录，与实际可调的模型完全对不上。
+    const h = makeHarness([qoderEntry('cn-1', true, 'qoder-cn')])
+    const result = await h.call('model.list', { provider: 'qoder-cn' })
+    expect(result.ok, result.error?.message).toBe(true)
+    expect(h.listModelsCalls).toEqual(['qoder-cn'])
+    expect(h.listDisabledCalls).toEqual(['qoder-cn'])
+  })
+
+  it('model.setDisabled 写入 `qoder-cn` 键（不写进国际版的黑名单）', async () => {
+    // 黑名单按 provider id 存：映射过去会把 CN 的开关写进国际版，两个面板的
+    // 显示列表互相串味，而**两边都不报错**。
+    const h = makeHarness([qoderEntry('cn-1', true, 'qoder-cn')])
+    const result = await h.call('model.setDisabled', {
+      provider: 'qoder-cn', modelId: 'qmodel_38max', disabled: true,
+    })
+    expect(result.ok, result.error?.message).toBe(true)
+    expect(h.setModelDisabledCalls).toEqual([
+      { provider: 'qoder-cn', modelId: 'qmodel_38max', disabled: true },
+    ])
+  })
+})
+
 describe('Qoder 的账号凭据 ref 前缀', () => {
   it('accountCredentialRefName 产出 QODER_ACCOUNT_xxx，且被真实的 credentialRef() 接受', () => {
     const name = accountCredentialRefName('qoder', 'A1B2C3D4')
@@ -407,6 +484,23 @@ describe('Qoder 的账号凭据 ref 前缀', () => {
     // 一个永远没有凭据的幽灵条目（见 src/jet-hub-rpc.ts 的后果链说明）。
     // Qoder 无连字符，归一化前后逐字符相同，故既有形态无需迁移。
     expect(() => credentialRef(name)).not.toThrow()
+  })
+
+  it('qoder-cn 的 ref 前缀是 QODER_CN_ACCOUNT —— 连字符被归一化成下划线', () => {
+    // ⚠️ 这里是**带连字符**的 id：`accountCredentialRefName` 会做
+    // `toUpperCase().replace(/-/g, '_')`，得到 `QODER_CN_ACCOUNT_xxx`。
+    // 若归一化规则变了（比如保留连字符），ref 会变成 `QODER-CN_ACCOUNT_xxx` ——
+    // **非法 ref ⇒ 凭据落不了盘**，而账号池里照样多出条目（幽灵账号）。
+    // 更要紧的是它必须与 `QODER_CN.accountCredentialRefPrefix` 逐字符一致：
+    // 两处漂移的后果是「凭据写到一个名字、读的时候找另一个名字」。
+    const name = accountCredentialRefName('qoder-cn', 'A1B2C3D4')
+    expect(name).toBe('QODER_CN_ACCOUNT_A1B2C3D4')
+    expect(() => credentialRef(name)).not.toThrow()
+    expect(name).toBe(`${QODER_CN.accountCredentialRefPrefix}_A1B2C3D4`)
+    expect(QODER_CN.accountCredentialRefPrefix).toBe('QODER_CN_ACCOUNT')
+    // 两区前缀**不得**互为前缀关系（`QODER_ACCOUNT` 不是 `QODER_CN_ACCOUNT` 的
+    // 前缀，但拼错一个字符就会撞上，故直接钉死两者不相等）。
+    expect(QODER_CN.accountCredentialRefPrefix).not.toBe(QODER.accountCredentialRefPrefix)
   })
 
   it('与宿主 src/qoder-product.ts 的 accountCredentialRefPrefix 逐字符一致', () => {
@@ -440,6 +534,19 @@ describe('providerPatLogin：PAT 形态的查表入口', () => {
     for (const provider of ['codearts', 'buddy-cn', 'buddy', 'lobsterai', 'trae-cn', 'trae-cn-work']) {
       expect(providerPatLogin(provider), provider).toBeNull()
     }
+  })
+
+  it('qoder-cn 也返回 PAT 元数据，且 patUrl 指向 **CN** 的签发页', () => {
+    // 两个 region 都是 PAT 粘贴形态（同一套表单、零改动），但 `patUrl` 必须
+    // 各是各的：把 CN 用户送到国际版签发页，他拿回来的 PAT 在 CN 上会被判
+    // 「凭据失效」—— 面板上看不出是链接指错了。
+    expect(providerPatLogin('qoder-cn')).toEqual({ patUrl: QODER_CN_PAT_URL })
+    expect(providerPatLogin('qoder-cn')?.patUrl).toContain('qoder.cn')
+    // 反向：两区的 patUrl **不得**相同（写死同一个常量是最可能的复制粘贴事故）。
+    expect(QODER_CN_PAT_URL).not.toBe(QODER_PAT_URL)
+    // Work 那条仍必须是 null：它是**共用账号**的 provider（去 Trae CN 登录），
+    // 若被顺手登记成 PAT 形态，面板会渲染一个没有签发页的表单。
+    expect(providerPatLogin('trae-cn-work')).toBeNull()
   })
 
   it('用 hasOwnProperty 查表：原型链上的键一律回 null，不误判成 PAT 形态', () => {
@@ -550,6 +657,39 @@ describe('createAccountWithPat 的载荷形状（核心契约）', () => {
       provider: 'qoder', pat: '', rpcCall: stub.rpcCall, sleep: noopSleep,
     })
     expect(stub.calls[0]![1]).toEqual({ provider: 'qoder', pat: '' })
+  })
+
+  it('qoder-cn 的载荷逐字等于 { provider: \'qoder-cn\', pat }（同一个函数、只换 provider）', async () => {
+    // ⚠️ 这条是**本段接入的核心契约**：PAT 表单是 provider 无关的，两个 region
+    // 共用同一个 `createAccountWithPat`。若有人为了 CN 复制一份函数（或在这里
+    // 加一句 provider 特判），载荷形状就会成为第二个真相源 —— 而写错键名
+    // 宿主只会回一个 bad-request，按钮看上去是「点了没反应」。
+    const stub = makeRpcStub({ create: { accountId: 'qoder-cn-1' }, polls: [{ done: true }, { done: true }] })
+    const outcome = await createAccountWithPat({
+      provider: 'qoder-cn', pat: 'pt-cn-abc', rpcCall: stub.rpcCall, sleep: noopSleep,
+    })
+    expect(outcome).toEqual({ kind: 'created', accountId: 'qoder-cn-1' })
+    const first = stub.calls[0]!
+    expect(first[0]).toBe('account.create')
+    // 整对象深比较 + 键集合，与 qoder 那条同口径：多一个字段也会立刻红。
+    expect(first[1]).toEqual({ provider: 'qoder-cn', pat: 'pt-cn-abc' })
+    expect(Object.keys(first[1]!)).toEqual(['provider', 'pat'])
+    // 轮询也带 CN 的 provider —— 写成 `qoder` 会让宿主去国际版池里找这个
+    // 刚建的 CN 账号，**永远找不到**，表现为「PAT 提交了但账号一直不出现」。
+    expect(stub.calls[1]).toEqual(['login.poll', { accountId: 'qoder-cn-1', provider: 'qoder-cn' }])
+  })
+
+  it('两个 region 的载荷只在 provider 取值上不同（CN 不引入任何额外字段）', async () => {
+    // 把两次调用放在一起比：差异集合必须**恰好**是 provider 一项。这样
+    // 「给 CN 顺手加个字段」这类改动会以「多出的键」的形式现形。
+    const intl = makeRpcStub({ create: { accountId: 'qoder-1' }, polls: [{ done: true }] })
+    const cn = makeRpcStub({ create: { accountId: 'qoder-cn-1' }, polls: [{ done: true }] })
+    await createAccountWithPat({ provider: 'qoder', pat: 'pt-x', rpcCall: intl.rpcCall, sleep: noopSleep })
+    await createAccountWithPat({ provider: 'qoder-cn', pat: 'pt-x', rpcCall: cn.rpcCall, sleep: noopSleep })
+    const intlPayload = intl.calls[0]![1]!
+    const cnPayload = cn.calls[0]![1]!
+    expect(Object.keys(intlPayload).sort()).toEqual(Object.keys(cnPayload).sort())
+    expect({ ...cnPayload, provider: 'qoder' }).toEqual(intlPayload)
   })
 })
 
@@ -991,6 +1131,51 @@ describe('客户端 QODER_PAT_URL 与宿主同值（跨侧副本）', () => {
     // 查表入口拿到的就是这个常量，而不是另一份手抄的地址。
     expect(providerPatLogin('qoder')?.patUrl).toBe(HOST_QODER_PAT_URL)
   })
+
+  it('Qoder **CN** 的两处字面量逐字相等，且两区地址互不相同', () => {
+    // 同一个跨侧副本风险，但后果更隐蔽：CN 面板指向国际版签发页时，用户**照样
+    // 能签出一个 PAT**（那一页是活的），只是粘回来判「凭据失效」—— 看起来像
+    // 「我的令牌不对」，而不是「链接指错了」。
+    const matched = /const QODER_CN_PAT_URL = '([^']*)';/.exec(normalized)
+    expect(matched, '客户端源码里找不到 QODER_CN_PAT_URL 常量声明').not.toBeNull()
+    expect(matched![1]).toBe(HOST_QODER_CN_PAT_URL)
+    expect(QODER_CN_PAT_URL).toBe(HOST_QODER_CN_PAT_URL)
+    expect(providerPatLogin('qoder-cn')?.patUrl).toBe(HOST_QODER_CN_PAT_URL)
+    // 两个常量不得指向同一个地址（复制粘贴时最容易忘改的那一处）。
+    expect(QODER_CN_PAT_URL).not.toBe(QODER_PAT_URL)
+    expect(HOST_QODER_CN_PAT_URL).toBe(QODER_CN.patUrl)
+    expect(HOST_QODER_PAT_URL).toBe(QODER.patUrl)
+    // 两区 host 必须真的不同（`.cn` 与 `.com`），而不只是路径不同。
+    expect(new URL(HOST_QODER_CN_PAT_URL).hostname).not.toBe(new URL(HOST_QODER_PAT_URL).hostname)
+  })
+})
+
+describe('Qoder 两区共用同一个 PAT 表单（源码级回归：不为 CN 复制一份逻辑）', () => {
+  const normalized = readClientSourceNormalized()
+
+  it('PAT 表单注册表有两条，且**只有** `patUrl` 一个字段', () => {
+    // 条目形态被「形态被锁死」这条守着：多一个字段就意味着**某个 region 有
+    // 别人没有的登录步骤**，那时该讨论的是要不要给表单加 prop，而不是偷偷塞进表里。
+    const entries = [...normalized.matchAll(/^\s*'?([a-z-]+)'?:\s*Object\.freeze\(\{\s*patUrl:\s*([A-Z0-9_]+)\s*\}\)/gm)]
+      .map((m) => [m[1]!, m[2]!] as const)
+    expect(entries).toEqual([
+      ['qoder', 'QODER_PAT_URL'],
+      ['qoder-cn', 'QODER_CN_PAT_URL'],
+    ])
+  })
+
+  it('两个 region 共用同一个 createAccountWithPat / PatLoginForm（没有第二份实现）', () => {
+    // CN 面板走的就是 qoder 那套：表单是 provider 无关的，唯一的差异是
+    // `provider` 实参与 `patUrl`。若有人复制出 `createAccountWithCnPat` 之类，
+    // 条数会变，这条立刻红。
+    for (const symbol of ['function createAccountWithPat(', 'function PatLoginForm(']) {
+      const occurrences = normalized.split(symbol).length - 1
+      expect(occurrences, symbol).toBe(1)
+    }
+    expect(normalized).not.toMatch(/qoderCnPat|createAccountWithCnPat|QoderCnPatLogin/);
+    // 表单的打开/提交路径里不得出现 provider 分叉（`patLogin` 查表已经把它收干净）。
+    expect(normalized).toContain('const patLogin = providerPatLogin(provider);')
+  })
 })
 
 describe('能力矩阵驱动的积分行为在客户端不被 qoder 特判', () => {
@@ -1004,6 +1189,21 @@ describe('能力矩阵驱动的积分行为在客户端不被 qoder 特判', () 
     expect(normalized).toContain('const supportsCredits = supportsDailyCheckin(provider);')
     // 签到按钮按矩阵渲染。
     expect(normalized).toMatch(/supportsCredits\n\s*\? React\.createElement\('button'/)
+  })
+
+  it('两个 Qoder region 走**同一条**能力矩阵路径（CN 不新增任何客户端分支）', () => {
+    // Qoder CN 的面板与 Qoder 面板在客户端唯一的差别就是 `provider` 的取值 ——
+    // 积分行、积分按钮、PAT 表单全部由矩阵与查表驱动。
+    // 故这里断言：文件里 provider 取值的来源只有面板 prop，没有 CN 专属逻辑。
+    expect(normalized).not.toMatch(/qoder-cn['"]\s*\)/);  // 不存在 isCn(provider) 之类的调用
+    // 两区的**显示池**也不同源（各查各的额度端点），但那是宿主的事：
+    // 客户端不选池、不传 pool 参数（`traeCnPoolFor` 是 Trae CN 那对专属的映射，
+    // 客户端从不实现映射 —— 见 client 侧 `account.list` 那条断言）。
+    // 先剥整行注释：文件里叙述 Trae CN 那对映射的**注释**是合理的，
+    // 判据是**调用**而不是子串。
+    const code = codeLinesOf(normalized)
+    expect(code).not.toMatch(/traeCnPoolFor\s*\(/);
+    expect(code).not.toMatch(/qoderRegionFor\s*\(/);
   })
 
   it('credits.claimAll 与 credits.balances 的调用点邻域里没有 qoder 字面量', () => {
@@ -1044,5 +1244,26 @@ describe('qoder 不作为比较表达式出现（判据是表达式，不是子�
     expect(code).toContain('qoder: Object.freeze({ patUrl: QODER_PAT_URL })')
     expect(code).toContain("const QODER_PAT_URL = 'https://qoder.com/account/integrations';")
     expect(code).toMatch(/qoder/)
+  })
+
+  it('`qoder-cn` 也不作为比较表达式出现（它是**另一个** id，不是 `qoder` 的别名）', () => {
+    // ⚠️ 判据同样是**表达式**而不是子串：`id: 'qoder-cn'`、表键
+    // `'qoder-cn': Object.freeze(…)`、以及 URL 常量里都**本该**出现它。
+    // 面板里一旦出现 `provider === 'qoder-cn'` 这类散落比较，将来漏改一处就是
+    // 「按钮还在，点了报 unknown provider」。
+    const COMPARISONS: ReadonlyArray<RegExp> = [
+      /===\s*'qoder-cn'/, /!==\s*'qoder-cn'/, /===\s*"qoder-cn"/, /!==\s*"qoder-cn"/,
+      /'qoder-cn'\s*===/, /'qoder-cn'\s*!==/, /"qoder-cn"\s*===/, /"qoder-cn"\s*!==/,
+    ]
+    for (const pattern of COMPARISONS) {
+      expect(code, String(pattern)).not.toMatch(pattern)
+    }
+    // 反面锚点：子串确实在（否则上面那组在条目被删掉时也是绿的）。
+    expect(code).toContain("id: 'qoder-cn'")
+    expect(code).toContain("'qoder-cn': Object.freeze({ patUrl: QODER_CN_PAT_URL })")
+    expect(code).toContain("const QODER_CN_PAT_URL = 'https://qoder.cn/account/integrations';")
+    // ⚠️ 最容易写错的一处：CN 的 patUrl **不是**把 qoder.com 换成 qoder.cn 那么简单
+    // —— 两处常量必须各自独立存在，不能只留一个。
+    expect(code).not.toMatch(/QODER_PAT_URL\s*=\s*'https:\/\/qoder\.cn/)
   })
 })

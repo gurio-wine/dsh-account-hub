@@ -106,6 +106,20 @@ const PROVIDERS = Object.freeze([
   // credits-capabilities.spec.ts 的 FULL 匹配器逐字锁死（可选第五项 loginHint），
   // 这就是「PAT 形态的元数据另立一张表」而不是塞进本条目第三个字段的原因。
   { id: 'qoder', label: 'Qoder', icon: QODER_ICON, logoClass: 'qoder' },
+  // Qoder **CN（国内版）**：与国际版**同协议双 region**（另一组 host、另一套
+  // 出站身份值），登录形态同样是 PAT 粘贴。
+  //
+  // ⚠️ **图标刻意复用 `QODER_ICON`**（不是新造一份）：两个 region 是**同一个
+  //   品牌**，官方 `qoder.cn` 首页的 `rel="icon"` 指向的正是**同一张** alicdn
+  //   PNG（与 qoder.com 逐字节同源），靠 `label` 与 `logoClass` 区分面板即可 ——
+  //   与 `TRAE_CN_WORK_ICON` 别名 `TRAE_CN_ICON` 是同一处理。
+  //   （`qoder.cn` 另有一张内联 `favIcon.svg`，但 73 KB，远超内联预算，故不取。）
+  //
+  // ⚠️ **与 `qoder` 一样不声明 `loginHint`**：本面板**有自己的登录入口**
+  //   （PAT 粘贴表单，见 PAT_LOGIN_PROVIDERS）。`loginHint` 的语义是
+  //   「本面板没有入口，去隔壁面板登录」，加上去会让 `canCreateAccount`
+  //   变成 false、PAT 表单的唯一入口整块消失，而且**不报任何错**。
+  { id: 'qoder-cn', label: 'Qoder CN', icon: QODER_ICON, logoClass: 'qoder-cn' },
 ]);
 
 /**
@@ -136,6 +150,16 @@ function providerLoginHint(provider) {
 const QODER_PAT_URL = 'https://qoder.com/account/integrations';
 
 /**
+ * Qoder **CN（国内版）** 的 PAT 签发页。
+ *
+ * 与宿主 `src/qoder-product.ts` 的 `QODER_CN_PAT_URL` **同值**（同样的跨侧副本
+ * 理由见上）。⚠️ **两个 region 的 PAT 互不通用**：把 CN 面板的链接指向国际版
+ * 签发页，用户拿到的 PAT 在 CN 上会被判「凭据失效」，而**不报任何错** ——
+ * 只是「我明明签发了却用不了」。单测钉死两处字面量相等。
+ */
+const QODER_CN_PAT_URL = 'https://qoder.cn/account/integrations';
+
+/**
  * PAT 粘贴式登录的面板：provider → 该形态需要的元数据。
  *
  * 只有 Qoder 一条 —— 其余六个 provider 全是浏览器登录（两段式 RPC + 轮询）。
@@ -150,6 +174,12 @@ const QODER_PAT_URL = 'https://qoder.com/account/integrations';
  */
 const PAT_LOGIN_PROVIDERS = Object.freeze({
   qoder: Object.freeze({ patUrl: QODER_PAT_URL }),
+  // Qoder CN 与 Qoder 是**同一个形态的第二个 region** —— 但 `patUrl` **必须是
+  // CN 自己的**：两个 region 的 PAT 互不通用，让 CN 面板把用户送到国际版签发页，
+  // 他拿回来的 PAT 会被 CN 判「凭据失效」，而面板上看不出是链接指错了。
+  // 表单本身（`normalizePatInput` / `createAccountWithPat` / `PatLoginForm`）
+  // 是**provider 无关**的，故这里只登记这一条元数据，别处零改动。
+  'qoder-cn': Object.freeze({ patUrl: QODER_CN_PAT_URL }),
 });
 
 /**

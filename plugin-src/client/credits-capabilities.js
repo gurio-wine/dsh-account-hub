@@ -28,6 +28,7 @@
  * | `trae-cn`       | ✓ 通用池（IDE 路径能花的） | ✓ `checkin_credits` 两步 + 设备头 |
  * | `trae-cn-work`  | ✓ Work 池（TraeWork 能花的） | ✗ 签到留在 Trae CN 面板       |
  * | `qoder`         | ✓ 与 CreditBalance 同构 | ✗ 每日 100 Credits 只能桌面 App 手动领 |
+ * | `qoder-cn`      | ✓ 与 CreditBalance 同构（CN 两池容缺） | ✗ **疑似有签到但端点未知**（未验收） |
  *
  * - `balance`：Buddy 系走 `POST /v2/billing/meter/get-user-resource`，该端点
  *   在 Buddy CN 与 Buddy（国际版）**通用**（仅 baseURL 随 `product.endpoint`
@@ -46,15 +47,27 @@
  *   签到是**账号级、当日一次**的操作，与走哪条路径无关。两个面板都放签到按钮
  *   必然是同一个账号两处重复领取 —— 第二次点击只会得到「今天已签到」，
  *   这在用户看来就是按钮坏了。故签到**只留在 Trae CN 面板**。
- * - ⚠️ `qoder` 的 `dailyCheckin` 是 **false**，且**与 Buddy（国际版）同形但
- *   原因完全不同**，不要因为「看着像」就顺手改对称：
- *   - `buddy` 是**后端根本没有接口**（内核里只有 `get-dosage-notify`）；
- *   - `qoder` 是**有这项权益但没有公开接口** —— 官方的每日 100 Credits 只能在
- *     **Qoder 桌面 App 里手动领取**，服务端未暴露可编程的签到端点。本插件也不
- *     打算用任何「模拟桌面客户端」的手段去领（那既不可靠也超出本插件的边界）。
- *   尤其**不能**因为它的 `balance` 是 true 就推断签到也能做 —— 正如不能用
- *   Buddy（国际版）没有签到反推它查不到余额一样，两个能力彼此独立。
- *   在面板上的表现是：Qoder 面板**渲染**积分行与「刷新积分」、**不渲染**
+ * - ⚠️ Qoder 系**两个 region 的 `dailyCheckin` 都是 `false`，但理由互不相同**。
+ *   下面两条必须**分开读**，不要合并成一句「Qoder 没有签到」：
+ *
+ *   1. `qoder`（**国际版**）—— **没有签到**：CLI2API 实测**国际版不显示签到**，
+ *      该活动在国际版不存在（与 `buddy` 的「后端无接口」同形但不是同一种，
+ *      国际版的每日 100 Credits 只能在 **Qoder 桌面 App 里手动领取**，
+ *      服务端未暴露可编程的签到端点）。本插件也不打算用任何「模拟桌面客户端」
+ *      的手段去领（那既不可靠也超出本插件的边界）。
+ *
+ *   2. `qoder-cn`（**国内版**）—— **疑似有签到，但端点未知**：CLI2API 的
+ *      `RegionDescriptor` **只在 cn 一侧挂了 Checkin**，即国内版很可能有这项
+ *      权益；但**端点至今未知、未验收**。故这里的 `false` 表达的是
+ *      「**端点未知、未验证**」，**不是**「没有这项权益」、
+ *      **更不是**「与国际版一样不存在该活动」。
+ *      **将来拿到端点后把它翻成 `true`**（届时宿主侧还要补
+ *      `credits.status` / `credits.claimAll` 的 `qoder-cn` 分支 —— 这两条
+ *      现在对两个 region 一律结构性拒绝，见 `src/jet-hub-rpc.ts`）。
+ *
+ *   两个 region 的 `balance` 都是 true，都**不能**从它推断签到也能做 ——
+ *   正如不能用 Buddy（国际版）没有签到反推它查不到余额一样，两个能力彼此独立。
+ *   在面板上的表现是：Qoder CN 面板**渲染**积分行与「刷新积分」、**不渲染**
  *   「一键领取积分」。
  *
  * `trae-cn` 的 `balance` 走 `POST /trae/api/v2/pay/web_user_ent_usage`，响应里的
@@ -113,6 +126,25 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   就顺手把 `dailyCheckin` 也写成 true，Qoder 面板就会多出一个**每次点击
   //   都必然失败**的按钮（没有任何端点可打）。单测有断言钉死这两项。
   qoder: Object.freeze({ balance: true, dailyCheckin: false }),
+  // Qoder **CN（国内版）**：与国际版**同协议双 region**（另一组 host + 另一组
+  // 出站身份值），登录形态同样是 PAT 粘贴。
+  //
+  // `balance: true` —— `src/qoder-credits.ts` 是**同一份实现**（按传入的
+  //   `product` 现算 host），返回结构与 `CreditBalance` 逐字段同构；
+  //   CN 侧实测只有**两个池**（`userQuota` + `addOnQuota`，无 `orgResourcePackage`），
+  //   而解析器本就是**三池容缺**（缺席按 0），故 CN 两池天然兼容、客户端零分支。
+  //   ⚠️ 与 trae-cn / trae-cn-work 那对**不同**：Qoder 两 region 是**各自的池**，
+  //   不存在「选哪个池显示」的问题，宿主侧也没有 `traeCnPoolFor()` 那类映射。
+  //
+  // `dailyCheckin: false` —— ⚠️ **理由是「端点未知、未验证」，不是「没有权益」**，
+  //   也**不是**「与 `qoder` 一样不存在该活动」：
+  //   - `qoder`（国际版）：CLI2API 实测**国际版不显示签到**，活动不存在；
+  //   - `qoder-cn`：CLI2API 的 `RegionDescriptor` **只在 cn 挂 Checkin** ——
+  //     疑似有签到，但**端点至今未知、未验收**。
+  //   故这一行是**待办**而不是结论：**拿到端点后翻 true**
+  //   （届时宿主侧还要补 credits.status / claimAll 的 qoder-cn 分支）。
+  //   单测有断言钉死当前取值与「两个 region 理由不同」这件事。
+  'qoder-cn': Object.freeze({ balance: true, dailyCheckin: false }),
 });
 
 /**

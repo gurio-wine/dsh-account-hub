@@ -6,7 +6,7 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
 凭证可直接用于 CodeArts 后端模型调用。
 
-此外插件内置另外六个 provider 路由：
+此外插件内置另外**七**个 provider 路由：
 
 - **buddy-cn（Buddy CN）** — 见 [Buddy CN provider](#buddy-cn-provider)；
   另支持「一键领取积分」（每日签到）。
@@ -23,8 +23,12 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 - **qoder（Qoder）** — 见 [Qoder provider](#qoder-providerqoder)；
   **唯一的非浏览器登录形态**（粘贴 PAT）；不支持「一键领取积分」（该权益只能在
   Qoder 桌面 App 里手动领取，服务端没有公开的签到端点）。
+- **qoder-cn（Qoder CN）** — Qoder 的**国内版 region**（同协议、另一组 host，
+  见 [Qoder provider](#qoder-providerqoder) 的「Qoder CN：第二个 region」）；
+  同样是 PAT 粘贴登录，**账号池与 Credits 与国际版完全独立、令牌互不承认**；
+  亦不支持「一键领取积分」（疑似有该权益，但**端点未知**，见能力矩阵说明）。
 
-七个 provider 的 Account Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
+八个 provider 的 Account Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
@@ -243,18 +247,23 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册六个独立路由：`buddy-cn`（见
+除 `codearts` 外，插件另注册**七**个独立路由：`buddy-cn`（见
 [Buddy CN provider](#buddy-cn-provider)）与 `buddy`（见
 [Buddy provider](#buddy-provider)）两个 buddy 系路由、`lobsterai`
 （见 [LobsterAI provider](#lobsterai-provider)）、`trae-cn`
 （见 [Trae CN provider](#trae-cn-provider字节跳动-trae-国内版)）与
 `trae-cn-work`（见 [Trae CN Work provider](#trae-cn-work-providertraework-网页协议)）、
-`qoder`（见 [Qoder provider](#qoder-providerqoder)）。
-七者互不覆盖，可同时使用。
+`qoder` 与 `qoder-cn`（Qoder 的**两个 region**，见
+[Qoder provider](#qoder-providerqoder)）。
+八者互不覆盖，可同时使用。
 
 > `trae-cn-work` 与 `trae-cn` 是**同一批账号**（Work 无独立登录，见
 > [Account Hub 里的 Trae CN Work 面板](#account-hub-里的-trae-cn-work-面板)），
 > 但它们注册成**两个路由**：协议不同源、模型池不重合、扣的是两个互不通用的积分池。
+>
+> ⚠️ `qoder-cn` 与 `qoder` 与上面那对不同：它们是**两个 region 的两套账号**，
+> 不是同一批账号的两条路径 —— 令牌互不承认、账号池与 Credits 各自独立
+> （见 [Qoder CN：第二个 region](#qoder-cn第二个-region)）。
 
 ## 凭证
 
@@ -520,7 +529,8 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
 账号卡片上的「积分」一行显示该账号的**可用积分**，与 IDE 顶部显示的
 `Credits Balance` 是同一个数值。鼠标悬停可看到各资源包的明细与到期时间。
 
-**支持范围**覆盖五个 provider、四套端点，语义一致：
+**支持范围**覆盖六个 provider、四套端点，语义一致（⚠️ **Qoder 系的国际版与国内版
+是两个 provider、两条 host，但用的是同一套查询实现**，故端点数不变）：
 
 - **Buddy 系（`buddy-cn` / `buddy` 通用，仅 baseURL 随 `product.endpoint`
   切换）**：
@@ -571,6 +581,13 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
   两位小数规整）。**主池耗尽 ≠ 额度耗尽**：只要加量包或资源包里还有余额，
   这个账号就还能用。`expiredTotal` 恒为 0（quota 端点只在账号级给一个
   `expiresAt`，池本身没有失效字段）。
+
+  ⚠️ **两个 region 各查各的端点**：`qoder` 打 `openapi.qoder.sh`、`qoder-cn` 打
+  **`openapi.qoder.com.cn`**，走的是同一条解析路径（`fetchQoderCreditBalance`
+  按传入的 `product` 现算 host）。**CN 侧实测只有两池**（`userQuota` +
+  `addOnQuota`，`orgResourcePackage` 键整个不存在）—— 三池解析器**天然兼容**
+  （缺席按 0），故 CN 面板零分支、零特判。两区的余额**互不相通**（各自账号、
+  各自额度），不存在「合并显示」这回事。
 
 「余额为 0」与「查不到」严格区分：失败时 `balance` 为 `null` 并带 `error`，
 卡片显示原因而非 0。**这一条在 Qoder 上尤其要紧**：额度端点 401 靠
@@ -1073,7 +1090,7 @@ URL、只把 `redirect` 换成 `1`**（官方 `getLoginUrl(…, 1, …)` →
 provider id 是 `trae-cn`（带连字符，对齐用户与生态叫法），但 cordis 服务名
 **不是**机械派生的 `trae-cnAuth`，而是显式指定的 `ctx.traeCnAuth`
 （见 `src/trae-cn-product.ts` 的 `serviceName`）。理由是带连字符的属性名
-无法用点号语法访问，且与另外六个 provider 的命名风格不一致。
+无法用点号语法访问，且与另外七个 provider 的命名风格不一致。
 
 > ✅ **T5（回调 URL 形态）已用真机日志校准**（2026-09-17 main.log:136/139），
 > 不再是候选表：参数名、编码形态、回调载荷结构（`authCodeInfo` / `userInfo`）
@@ -1397,7 +1414,7 @@ id 形态极不规则（`qwen-3.7-plus` 带连字符、`minimax-m3` 全小写）
   `listModels` 与 `resolveModel` 读的是同一个 `supportsImages` 字段，两处口径强制
   同源（不一致会让选择器与请求路径自相矛盾）；
 - `maxTokens` **只记录不 materialize**：DSH 的 `defaultMaxTokens` 会在调用方未给
-  上限时自动填进请求体，而本仓库另外六个 provider 一个都没设该字段 ——
+  上限时自动填进请求体，而本仓库另外七个 provider 一个都没设该字段 ——
   由适配器替用户决定输出上限是行为变更，不在本次范围内。
 - **消耗倍率不再解析**：旧实现会从 `display_contact_config.consumption_rate.data.rate`
   读出倍率但不展示（DSH 的 `LlmModelInfo` 没有放自定义元数据的位置，塞进
@@ -2040,26 +2057,37 @@ id**、不做任何映射 —— 若在客户端映射，宿主那几个按池�
 
 ## Qoder provider（Qoder）
 
-独立路由 `qoder`（**Qoder**），实现是独立一套 `src/qoder*.ts`
+> ⚠️ **本章覆盖两个 provider**：`qoder`（国际版）与 `qoder-cn`（国内版，见下面的
+> 「Qoder CN：第二个 region」小节）。标题保留 `Qoder` 是为了不改变本页既有锚点
+> （正文里多处 `#qoder-providerqoder` 链接指向它）。
+
+**两个独立路由**：`qoder`（**Qoder**，国际版）与 `qoder-cn`（**Qoder CN**，国内版）。
+两者是**同一份协议的两个 region**，实现是独立一套 `src/qoder*.ts`
 （`qoder-product.ts` / `qoder-auth.ts` / `qoder-adapter.ts` / `qoder-errors.ts` /
 `qoder-models.ts` / `qoder-credits.ts`），只共用架构模式（产品配置驱动、账号池、
-限流切换、模型黑名单）。**四个端点散在三个不同的 host** 上（`openapi.qoder.sh`
-承载其中两个），这是它最容易被写错的地方。
+限流切换、模型黑名单）。**代码只有一份**，region 差异全部收敛在
+`src/qoder-product.ts` 的两份 `QoderProduct` 配置里（见下节），故下文除专门标注
+CN 的地方外，两个 region 行为一致。
+
+⚠️ **四个端点散在三个不同的 host** 上（`openapi.qoder.sh` 承载其中两个），
+这是它最容易被写错的地方。**CN 是另一组三个 host**，一套都不能混用 ——
+拿国际版 host 打 CN 凭据得到的是「凭据失效」的**假象**。
 
 该 provider 与既有各条线**均不同源**，其中两项是本插件里的头一份：
 
 - **登录形态是 PAT 粘贴**，不是浏览器 OAuth —— 其余六条线全是浏览器登录
-  （两段式 RPC + 轮询）或本地回调；
+  （两段式 RPC + 轮询）或本地回调；CN 沿用同一形态（**同一套表单、零改动**，
+  只有 `patUrl` 与 `provider` 取值不同）；
 - **凭据只有一件长效物**（PAT），换来的 job token 是**进程内运行时缓存**、
   **不落盘**。
 
-| 项 | 腾讯系（Buddy CN / Buddy） | LobsterAI | Trae CN | **Qoder** |
+| 项 | 腾讯系（Buddy CN / Buddy） | LobsterAI | Trae CN | **Qoder / Qoder CN** |
 |---|---|---|---|---|
 | 登录 | 轮询后端 API | 本地回调收 `authCode` | 本地回调 + PKCE(S256) | **粘贴 PAT（无浏览器、无回调）** |
 | 长期凭据 | access + refresh | access + refresh + 身份字段 | 五件套 | **PAT 一件**（`pt-`） |
 | 鉴权 | `Bearer` + 归属头 | `Bearer` | `Cloud-IDE-JWT` | **`Bearer`（但分红：目录用 PAT、chat/额度用 `jt-`）** |
 | 续期 | `X-Refresh-Token` 头 | `POST /api/auth/refresh` | exchange（body 四字段） | **重打 exchange**（PAT 不变，随时可重打） |
-| 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **不做**（无公开端点） |
+| 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **不做**（国际版无此活动；CN **疑似有但端点未知**） |
 
 ### 登录与凭据：PAT 粘贴（本插件唯一的非浏览器登录形态）
 
@@ -2203,31 +2231,114 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
 
 ⚠️ **签到刻意不做，且理由与 Buddy（国际版）不是同一种**：
 
-- Buddy（国际版）是**后端压根没有签到接口**；
-- Qoder 是**有这项权益但没有公开接口** —— 官方每日 **100 Credits** 只能在
-  **Qoder 桌面 App 里手动领取**，服务端没有暴露可编程的签到端点。本插件也不打算
-  用任何「模拟桌面客户端」的手段去领（既不可靠，也超出本插件的边界）。
+⚠️ **签到刻意不做，且两个 region 的理由不是同一种**（这一条与 `credits-capabilities.js`
+的矩阵注释同源，改一处必须改另一处）：
 
-故 Qoder 面板**渲染**积分行与「刷新积分」、**不渲染**「一键领取积分」。
+- **Qoder（国际版）**：**活动不存在** —— CLI2API 实测国际版不显示签到；官方的
+  每日 **100 Credits** 只能在 **Qoder 桌面 App 里手动领取**，服务端没有暴露可编程
+  的签到端点。本插件也不打算用任何「模拟桌面客户端」的手段去领
+  （既不可靠，也超出本插件的边界）；
+- **Qoder CN（国内版）**：**疑似有这项权益，但端点未知** —— CLI2API 的
+  `RegionDescriptor` **只在 cn 一侧挂了 Checkin**。故矩阵里的 `false` 是
+  「**端点未知、未验证**」，**不是**「没有权益」、更不是「与国际版一样不存在该活动」。
+  **拿到端点后要把它翻成 `true`**（届时宿主侧还要补 `credits.status` /
+  `credits.claimAll` 的 `qoder-cn` 分支）。
+
+故 Qoder CN 面板**渲染**积分行与「刷新积分」、**不渲染**「一键领取积分」。
+
+### Qoder CN：第二个 region
+
+`qoder-cn`（显示名 **Qoder CN**）是 Qoder 的**国内版**，与 `qoder`（国际版）
+**同协议、双 region**：真机探测确证 exchange / quota / models 三个端点的**错误信封
+逐字节同构**、PAT 前缀同为 `pt-`、目录字段同构。故**代码只有一份**，差异全部收敛在
+`src/qoder-product.ts` 的两份配置里。
+
+⚠️ **两区是两套账号、两套 Credits、两套令牌**：
+
+- **令牌互不承认**：拿国际版 host 打 CN 凭据（或反之）得到的是「凭据失效」的
+  **假象** —— 看起来像「我的 PAT 不对」，实际是打错了 region；
+- **账号池独立**：凭据 ref 前缀 `QODER_CN_ACCOUNT_*`（国际版是 `QODER_ACCOUNT_*`），
+  账号条目 `provider` 为 `qoder-cn`。两个面板**互相看不到对方的账号**，
+  且 `poolProviderFor('qoder-cn')` 是**恒等映射**（与 `trae-cn-work` 那条
+  映射到 `trae-cn` 的规则**方向相反**，不要照抄）；
+- **PAT 不通用**：CN 面板的签发链接指向 `qoder.cn`，不是国际版那一页。
+
+**CN 的三个基址**（与国际版逐个不同，且**不带 `-v2` 段**，不要按同形替换去猜）：
+
+| 用途 | CN 端点 | 状态 |
+|---|---|---|
+| 换 job token / 额度 | `openapi.qoder.com.cn` | ✅ 真机实测 200 |
+| 模型目录 | `api.qoder.com.cn` | ✅ 真机实测 200 |
+| chat | `gateway.qoder.com.cn` | 🔴 **源码定案、真机未验证** |
+
+⚠️ **chat 基址当前是 503**：`gateway.qoder.com.cn` 取值为官方 CN CLI
+（`@qodercn-ai/qoderclicn@1.1.58`）里的选区常量
+`CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`，但**探测时该主机整机 503**
+（阿里云 ALB 无健康后端，官方 CN CLI 同样打不通）。实现**照常按此值构造**，
+错误自然直报上游 —— 阿里云侧恢复后**无需改代码即可用**。
+
+> **绝不要因为「测不通」就把它改成国际版 host**：那会把「上游暂时不可用」
+> 伪装成「凭据失效」，方向完全错。CN 目录与额度两条线**都实测 200**，
+> 只有 chat 这一条卡在上游。
+
+**逃生阀**：`QODER_MODEL_SERVER_HOST` 环境变量可覆盖 chat 的 host（含显式 scheme），
+用于阿里云侧就绪后，或者你想临时指向另一个网关时：
+
+```powershell
+# 只覆盖 host（scheme 缺省时按 https 处理）
+$env:QODER_MODEL_SERVER_HOST = 'gateway.qoder.com.cn'
+# 也可以写全 scheme（自建反代 / 本地抓包调试）
+$env:QODER_MODEL_SERVER_HOST = 'http://127.0.0.1:8080'
+```
+
+三条语义（与官方 CN CLI 一致，本插件不发明新开关）：
+
+- ⚠️ **只影响 chat**：`openapiBase`（exchange / 额度）与 `modelsBase`（目录）
+  **不受影响** —— 把另外两条控制面一并改掉会让「只换 chat 出口」的用法直接失效，
+  且失败形态是「凭据失效」，极难诊断；
+- **路径与查询串一律丢弃**（路径恒为 `/model/v1/chat/completions`），只有主机生效；
+- **显式 scheme 优先**：裸主机名沿用原基址的 `https`，但写了 `http://` 就按 http 发
+  （指向本地代理时不会被悄悄升级成 https 而得到一个 TLS 失败）；
+- **请求时读取**（不是启动时定型），进程起来后再设也生效；
+- 该变量作用于**两个 region**（它是「本机怎么连上游」的运行期开关，不是 region 配置）；
+  不设它时一律走 `product.chatBase`。
+
+**CN 的两项出站身份标识**（⚠️ **均为源码值、未实测**，真机可用后若被证伪只改配置）：
+
+- `client_type: "5"` —— chat 请求体 `metadata.context.client_type`，取自官方 CN CLI
+  的 `kg()` 默认值 `process.env.CLIENT_TYPE ?? "5"`（国际版是 `qodercli`）；
+- **Cosy 头**（`Cosy-ClientType` = `clientType`、`Cosy-Version` = `1.1.58`）——
+  仅 CN 发（国际版不发，现有实现实测可用）。⚠️ `Cosy-MachineOS` /
+  `Cosy-MachineHostname` **刻意不实现**：官方对这两个头是**条件性**发送，
+  本插件**不猜机器身份** —— 缺头比错头安全（错头会被后台当真记进设备维度）。
+
+**CN 目录是 14 项快照**（国际版是 17 项、且只有 2 项 `is_enabled`）：
+
+- **全部 `is_enabled:true`** —— 故 CN 的「只播报 `is_enabled` 项」规则实际不过滤掉
+  任何一项，但**规则本身不动**（两个 region 共用同一个解析器）；
+- **全为短别名 id**（`qmodel_38max` / `qfmodel` / …），与国际版同一套 id 体系；
+- **无 `lite`** —— `lite` 是国际版的免费遗留路径，CN 目录里没有它。
 
 ### Account Hub 里的 Qoder 面板
 
-`PROVIDERS` 含 **Qoder** 一栏（排在 Trae CN Work 之后），能力矩阵登记为
-`balance ✓ / dailyCheckin ✗`：
+`PROVIDERS` 含 **Qoder** 与 **Qoder CN** 两栏（Qoder CN 紧随 Qoder 之后），
+能力矩阵两行都是 `balance ✓ / dailyCheckin ✗`：
 
-| 项 | Qoder 面板 |
-|---|---|
-| 账号列表 | ✓ 本 provider 自己的账号（`QODER_*`） |
-| 「+ 新建账号」 | ✓ **内联 PAT 表单**（输入框 `type=password`），不是登录弹窗 |
-| 积分行 / 「刷新积分」 | ✓ 三池之和的**单数字**与资源包明细 |
-| 「一键领取积分」 | ✗ **刻意不渲染** —— 官方只能在桌面 App 手动领，没有公开 API |
-| 卡片操作（刷新 / 删除 / 启停 / 重测 / 重置） | ✓ 「刷新」= **重打一次 exchange**（PAT 不变，随时可重打） |
-| 「显示列表」（模型开关） | ✓ 作用于 **`qoder` 这个键** |
+| 项 | Qoder 面板 | Qoder CN 面板 |
+|---|---|---|
+| 账号列表 | ✓ 自己的账号（`QODER_*`） | ✓ 自己的账号（`QODER_CN_*`），**与国际版互不可见** |
+| 「+ 新建账号」 | ✓ **内联 PAT 表单**（`type=password`），不是登录弹窗 | ✓ 同一个表单，签发链接指向 `qoder.cn` |
+| 积分行 / 「刷新积分」 | ✓ 三池之和的**单数字**与资源包明细 | ✓ 同口径（CN 实测两池，容缺解析天然兼容） |
+| 「一键领取积分」 | ✗ 无公开 API | ✗ **端点未知**（见上，拿到端点后翻 true） |
+| 卡片操作（刷新 / 删除 / 启停 / 重测 / 重置） | ✓ 「刷新」= **重打一次 exchange** | ✓ 同上，打的是 **CN 的** exchange |
+| 「显示列表」（模型开关） | ✓ 作用于 **`qoder` 这个键** | ✓ 作用于 **`qoder-cn` 这个键**（两区模型池不同，黑名单必须分开） |
 
-**三处积分端点里只有 `credits.balances` 有 qoder 分支**：`credits.status` 与
-`credits.claimAll` 对 qoder **如实回 `unsupported provider: qoder`** —— 这是
-**正确的契约**（该 provider 确实没有签到流程），不是缺陷。客户端靠能力矩阵在
+**三处积分端点里只有 `credits.balances` 有 qoder 系分支**：`credits.status` 与
+`credits.claimAll` 对 **`qoder` 与 `qoder-cn` 两个 region 都**如实回
+`unsupported provider: qoder` / `unsupported provider: qoder-cn` —— 这是
+**正确的契约**（两个 region 确实都没有签到流程），不是缺陷。客户端靠能力矩阵在
 **发请求之前**就不发这两个请求，与 CodeArts 的既有约定同源。
+（⚠️ CN 将来拿到签到端点时，这两条**结构性拒绝**就是要动的地方。）
 
 > **账号昵称不是「真实用户名回填」。** 账号条目的 `nickname` 取凭据里的
 > `user_id`，取不到就回退到 accountId —— 本步**没有**做任何「把昵称换成真实
@@ -2245,4 +2356,10 @@ JS 标识符风格属性名 —— 故 `QoderProduct` **刻意不声明 `service
 那两处是因为**带连字符的机械派生结果不是合法标识符风格**才必须显式声明，
 Qoder 恰恰相反 —— 它**没有**需要绕开的东西。给 Qoder 补一个 `serviceName`
 不会有任何好处，只会让人以为「所有 provider 都得声明」。
+
+⚠️ **同一份配置类型里，两个 region 落在判据的两侧**：`qoder-cn` **带连字符**，
+`${id}Auth` 派生出的 `qoder-cnAuth` 不是合法标识符风格 ⇒ 它**必须**显式声明
+`serviceName: 'qoderCnAuth'`（`QODER_CN` 已声明）。所以「`QoderProduct` 不声明
+`serviceName`」这句话**只对国际版成立**，不要顺手给两个 region 写成一样 ——
+漏声明会让宿主试图挂载 `ctx['qoder-cnAuth']`，而服务名根本对不上。
 
