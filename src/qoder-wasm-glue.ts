@@ -68,9 +68,6 @@ declare namespace WebAssembly {
   ): Promise<InstantiateResult>
 }
 
-/** 带可选 `detached` 的 ArrayBuffer（`detached` 在旧版 Node 上不存在）。 */
-type DetachableBuffer = ArrayBuffer & { detached?: boolean }
-
 /** 本文件对上层暴露的 wasm 实例类型（只声明用到的导出）。 */
 export interface QoderWasmExports {
   memory: WebAssembly.Memory
@@ -156,12 +153,24 @@ export function createGlueInternals(getWasm: () => QoderWasmExports): {
     return idx
   }
 
+  /**
+   * wasm 内存的 4 字节对齐视图（缓存，但**陈旧判据按引用比较**）。
+   *
+   * ⚠️ **不要改用 `buf.detached` 去判陈旧**（真机缺陷，2026-09-21）：
+   * 内存增长后 `memory.buffer` 是**新**对象，而新对象的
+   * `ArrayBuffer.prototype.detached` 为 **`false`**（Node ≥21 起该属性存在，
+   * 本机 Node 24.19.0 实测 `typeof === 'boolean'`）⇒ 「靠 `detached` 猜陈旧」
+   * 的判据两个分支都不成立，于是返回持**旧（已 detached）** buffer 的视图，
+   * 随后的 `getInt32` 抛
+   * `TypeError: Cannot perform DataView.prototype.getInt32 on a detached ArrayBuffer`。
+   * 大 body（明文签名）必然经 `passString` 内部的 wasm `malloc`/`realloc`
+   * 触发内存增长，故那条路径**必炸**、且炸点在发送之前（与网络无关）。
+   *
+   * 唯一可靠的判据是**与当前内存 buffer 按引用比较**：换绑了新对象即重建。
+   */
   const getDataView = (): DataView => {
-    const buf = getWasm().memory.buffer as DetachableBuffer
-    if (dataView === null || buf.detached === true
-      || (buf.detached === undefined && dataView.buffer !== buf)) {
-      dataView = new DataView(buf)
-    }
+    const buf = getWasm().memory.buffer
+    if (dataView === null || dataView.buffer !== buf) dataView = new DataView(buf)
     return dataView
   }
 
