@@ -766,16 +766,23 @@ export class QoderAuth extends Service {
   }
 
   /**
-   * 静默续期：用存储的 PAT **重打 exchange**，更新 jt 缓存与凭据元数据。
+   * 静默续期：**按令牌族分派**（设备令牌 → `deviceToken/refresh`；PAT → 重打 exchange），
+   * 更新 jt 缓存与凭据元数据。
    *
-   * 与另外四个 provider 的语义差异：这里没有「refresh_token 换新」这回事。
-   * PAT 不变 ⇒ 只要 PAT 本身没被吊销，`refresh()` **永远可以成功**。
-   * 唯一会失败的情形是 PAT 已失效 —— 那时 exchange 回 401 / `TOKEN_EXPIRE`，
-   * 本方法抛 {@link RefreshTokenExpiredError}，调度器停止重试并向 UI 暴露
-   * 「请重新粘贴」。
+   * ## PAT 族
+   * 没有「refresh_token 换新」这回事。PAT 不变 ⇒ 只要它没被吊销，
+   * `refresh()` **永远可以成功**。失败即 PAT 已失效 —— exchange 回 401 /
+   * `TOKEN_EXPIRE`，本方法抛 {@link RefreshTokenExpiredError}，调度器停止重试
+   * 并向 UI 暴露「请重新登录」。
+   *
+   * ## 设备令牌族
+   * 用凭据里的 `drt-…` 打 `deviceToken/refresh` 换一份新的 `dt-…`。
+   * 缺少 `refresh_token` 时**不出网**直接判终态（重试也变不出来）。
+   *
+   * ⚠️ **文案一律中性**（「请重新登录」而非「请重新粘贴 PAT」）：面板已无 PAT 入口。
    *
    * 终态判定边界：
-   * - 网络失败、5xx、429 → 普通 Error，走调度器可重试路径（断网不等于 PAT 失效）；
+   * - 网络失败、5xx、429 → 普通 Error，走调度器可重试路径（断网不等于凭据失效）；
    * - HTTP 401/403、响应命中失效标记、200 却缺 token → 终态。
    */
   async refresh(): Promise<void> {
