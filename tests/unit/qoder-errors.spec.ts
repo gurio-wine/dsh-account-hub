@@ -971,3 +971,71 @@ describe('本地字节闸（QODER_MAX_REQUEST_BYTES）', () => {
     expect(qoderHarnessErrorCode(upstream)).toBe('RATE_LIMIT')
   })
 })
+
+// ── 13. 签名路径的新形态（2026-09-21 接线） ─────────────────────────────────
+
+/**
+ * CN 的 chat 接入 wasm 签名路径后，失败多出两种**只在签名路径上出现**的形态：
+ *
+ * 1. **流内 `{"code":"101","message":"Signature invalid"}`**（HTTP 200）——
+ *    真机 A/B 定案的成因是「签名身份与登录态/机器身份不一致」，最可能的用户
+ *    动作是**重新登录**；而它长得像「未知业务码」，不特殊化就会退化成
+ *    「上游原文：Signature invalid」而**不给任何下一步**。
+ * 2. **wasm 组件不可用**（`QoderWasmUnavailableError`）—— 环境问题，
+ *    换号/退避都不可能救，且必须把三级尝试原因带给用户。
+ *
+ * ⚠️ **既有分支一条都不动**：CN 的 503 直报（7a 条）保持原样，这两条是**新增**，
+ * 判据互不重叠（101 带业务码、wasm 不可用发生在发请求之前）。
+ */
+describe('签名路径的新错误形态', () => {
+  /** 只传 101 帧的**逐字节真机原文**形态（`code` 是字符串、平铺在根层）。 */
+  it('101 Signature invalid ⇒ 直报 + 中文提示重新登录', () => {
+    const result = classifyQoderError({
+      httpStatus: 200,
+      code: '101',
+      message: 'Signature invalid',
+      source: 'chat',
+      product: QODER_CN,
+    })
+
+    expect(result.action).toBe('fail')
+    expect(isQoderBackoff(result.action)).toBe(false)
+    expect(shouldSwitchQoderAccount(result.action)).toBe(false)
+    expect(recordsQoderCooldown(result)).toBe(false)
+    expect(qoderHarnessErrorCode(result)).toBe('INVALID_REQUEST')
+    // 中文提示要点名「签名失效」与「重新登录」这两个可执行动作。
+    expect(result.message).toContain('签名失效')
+    expect(result.message).toContain('重新登录')
+    // 上游原文一字不改地保留（排障要与官方对得上号）。
+    expect(result.message).toContain('Signature invalid')
+    expect(result.message).toContain('101')
+  })
+
+  it('101 **数字码**与字符串码同判（上游两种都发过）', () => {
+    const asNumber = classifyQoderError({ httpStatus: 200, code: 101, message: 'Signature invalid' })
+    const asString = classifyQoderError({ httpStatus: 200, code: '101', message: 'Signature invalid' })
+    expect(asNumber.message).toContain('签名失效')
+    expect(asString.message).toContain('签名失效')
+  })
+
+  it('101 但文案不是签名问题 ⇒ **不套用**签名提示（只认码+文案两件都对）', () => {
+    // 反向保护：把「101」当成「永远是签名问题」是猜测。码相同而文案不同时
+    // 说明上游复用了该码，此时套签名提示会把用户引向无用的重新登录。
+    const result = classifyQoderError({ httpStatus: 200, code: '101', message: 'something else entirely' })
+    expect(result.message).not.toContain('签名失效')
+    expect(result.message).toContain('something else entirely')
+  })
+
+  it('**未知码不受影响**：既不套签名提示，也不套重新登录', () => {
+    const result = classifyQoderError({ httpStatus: 200, code: '102', message: 'Signature invalid' })
+    expect(result.action).toBe('fail')
+    expect(result.message).not.toContain('签名失效')
+    expect(result.message).not.toContain('重新登录')
+    expect(result.message).toContain('102')
+  })
+
+  it('国际版的 101 同样直报（同协议，两区共用签名路径的判据）', () => {
+    const result = classifyQoderError({ httpStatus: 200, code: '101', message: 'Signature invalid', product: QODER })
+    expect(result.message).toContain('签名失效')
+  })
+})

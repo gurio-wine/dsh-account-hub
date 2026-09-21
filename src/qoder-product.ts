@@ -99,39 +99,37 @@ export const QODER_USER_AGENT = 'qoder/1.1.16'
 export const QODER_CN_OPENAPI_BASE = 'https://openapi.qoder.com.cn'
 
 /**
- * **CN** chat 基址：OpenAI 兼容的 `/model/v1/chat/completions`。
+ * **CN** chat 基址 —— ⚠️ **对 CN 的 chat 这已不是端点，只是签名路径的 host**
+ * （2026-09-21 接线后）。
  *
- * 🔴 **该路径在 CN 上不存在 —— 不是「未就绪」，而是结构性不可用。**
- *
- * host 本身取自官方 CN CLI（`@qodercn-ai/qoderclicn@1.1.58`）的选区常量
+ * host 取自官方 CN CLI（`@qodercn-ai/qoderclicn@1.1.58`）的选区常量
  * `CR = _o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`（`_o` 为真走 CN）——
- * 那一半是**官方源码值**，没有问题。问题在**路径**：
+ * 这是**官方源码值**，也是官方 chat 真正打的主机。
  *
- * ## 二次取证定案（2026-09-21，真机矩阵 + 官方客户端佐证）
+ * ## 曾经的「结构性不可用」结论已被真机推翻（保留为历史）
  *
- * 1. **503 是路径级的**：`/model/v1/chat/completions` 在该 host 上**不存在**。
- *    ALB 对「该路径 × 任意方法 × 任意头」恒 503（无 `Authorization`、垃圾 `jt-`、
- *    空 Bearer 四种组合返回的 alb 错误页**逐字节相同**）；同 host 的
- *    `/api/v2/config/getDataPolicy` 返回**应用层** 401/400（证明路径活着）。
- *    故与凭据、出口、host 全部无关，**也不会「恢复」**。
- * 2. **官方客户端的真实 chat 通道是另一条路径**：
- *    `/algo/api/v2/service/pro/sse/agent_chat_generation`（用户机器上 Qoder CN
- *    IDE 0.3.4 的 `qodercli.log` 实录 POST 该路径 200）。
- * 3. **该通道有 WASM 签名门槛**：官方请求由 `qoder_auth_wasm` 的
- *    `prepareInferRequest` 生成（构造需 `machineId` + `cosyVersion` +
- *    **`userInfoJson` 里的登录用户密钥**）。用有效 `jt-` 直打会得到 200 + SSE，
- *    但帧内是 `{"code":"101","message":"Signature invalid"}`。
- *    **PAT 型凭据给不出用户密钥 ⇒ PAT 形态永远过不去。**
+ * 旧记载：`/model/v1/chat/completions` 在该 host 上**不存在**（ALB 按路径级
+ * 恒 503，四种头组合的 alb 错误页逐字节相同；同 host 的
+ * `/api/v2/config/getDataPolicy` 却回**应用层** 401/400，证明路径活着）⇒
+ * 当时判定「CN 的 chat 对 PAT 结构性不可用」。**那半段取证至今成立**（REST
+ * 路径的确不存在，也不必再试）。
  *
- * 结论：CN 的 chat 对**本插件的登录形态（PAT）结构性不可用**，不是待恢复的
- * 瞬时故障。国际版（{@link QODER_CHAT_BASE}）**完全正常**（同一套实现实测 200
- * 标准 OpenAI JSON），是本次取证的控制组。
+ * ⚠️ **但结论错了**：当时认定「WASM 签名门槛需登录用户密钥，PAT 给不出」——
+ * 真机 A/B 已推翻（2026-09-21）：签名身份的四要素（`uid` /
+ * `security_oauth_token` / `organization_id` / `organization_tags` /
+ * `data_policy_agreed`）**PAT 路径全部拿得到** —— `security_oauth_token` 就是
+ * PAT 换来的 `jt-`，`uid` 从 `GET {openapiBase}/api/v1/userinfo` 取。
+ * **同一请求只改 `uid` 这一处**：空串 → `{"code":"101","message":"Signature invalid"}`；
+ * 真实 uid → **HTTP 200 + SSE 真内容**。⇒ **CN 的 chat 已复活**，走的是
+ * `/algo/api/v2/service/pro/sse/agent_chat_generation`（见
+ * `QODER_SIGNED_CHAT_PATH`），**不是**本常量拼出来的 REST 路径。
  *
- * ## 为什么仍保留本常量与其路径
+ * ## 于是本常量现在的角色
  *
- * 字段本身**不做改动**，理由有二：**逃生阀** {@link resolveQoderChatBase}
- * （`QODER_MODEL_SERVER_HOST`）需要一个可被覆盖的默认 host；且上游协议将来
- * 若变化（或 CN 补上 OpenAI 兼容端点），改这一处即可生效。
+ * 它是**签名路径的 host 基址** —— `prepareInferRequest(hostBase, …)` 的第一参
+ * 由它（经逃生阀）给出，路径与查询串由 wasm 自己拼。⚠️ **不要给它拼
+ * `QODER_CHAT_PATH`**：那条路径对 CN 不存在（见上），而签名路径的正确拼法
+ * 在 wasm 里（含 `?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`）。
  *
  * ⚠️ **绝不因为「打不通」就把它改成国际版 host** —— 禁令仍然成立，且理由更硬：
  * 实测**CN 的 `jt-` 打国际版 chat 会回 401**（两区令牌互不承认），于是
@@ -758,11 +756,11 @@ export const QODER: QoderProduct = {
  * |---|---|---|
  * | `openapiBase` | `openapi.qoder.com.cn` | ✅ 实测 200 |
  * | `modelsBase` | `api.qoder.com.cn` | ✅ 实测 200 |
- * | `chatBase` | `gateway.qoder.com.cn` | 🔴 host 是官方源码值，但 **`/model/v1/chat/completions` 在该 host 上不存在**（ALB 恒 503）⇒ chat 对 PAT 结构性不可用，见该常量注释 |
+ * | `chatBase` | `gateway.qoder.com.cn` | ✅ host 是官方源码值，且是**签名路径**的 host（`prepareInferRequest` 的第一参）。⚠️ 它拼出来的 `/model/v1/chat/completions` 在 CN **不存在**（ALB 恒 503）—— 适配器对 CN **不再打那条路径**，改走 `QODER_SIGNED_CHAT_PATH` |
  * | `patUrl` | `qoder.cn/account/integrations` | 官方 CN 文档明写 |
  * | `userAgent` | `qoder/1.1.58` | ⚠️ 官方源码模板 `` `qoder/${版本}` ``（与 region 无关）；版本号取自 CN CLI，未实测 |
  * | `clientType` | `"5"` | ⚠️ 源码值（CN CLI `kg()` 默认），未实测 |
- * | `cosyVersion` | `1.1.58` | 同 `userAgent` 的版本来源（CN CLI 版本） |
+ * | `cosyVersion` | `1.1.58` | 同 `userAgent` 的版本来源（CN CLI 版本）｜**签名器真的用它**（进 wasm 上下文与复用判据） |
  *
  * ## `serviceName` 必须显式声明
  *

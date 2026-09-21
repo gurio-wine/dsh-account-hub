@@ -62,6 +62,9 @@ import {
   shouldSwitchQoderAccount,
 } from '../../src/qoder-errors.js'
 import { accountCredentialRefName } from '../../src/jet-hub-rpc.js'
+import { QODER_SIGNED_CHAT_PATH } from '../../src/qoder-wasm-context.js'
+import type { QoderInferRequest } from '../../src/qoder-wasm-context.js'
+import type { QoderSigningSource } from '../../src/qoder-signing.js'
 
 // ── 夹具 ──
 
@@ -72,7 +75,69 @@ const CREDENTIAL: QoderCredential = {
   token_expires_at: '0',
 }
 
-/** 组装适配器选项（默认目录拉取返回空 = 回退静态表，保证零网络）。 */
+/**
+ * 一次签名的入参记录（四参数里的三个 + 凭据两件）。
+ *
+ * 本文件**不**测签名本身的正确性（那在 `qoder-cn-signed-chat.spec.ts`），
+ * 只测 IN/CN 的 region 分流与其余既有语义，故签名来源给一个**最小可用**的桩：
+ * 它必须返回与 REST 形态**不同**的 URL（好让「CN 到底打了哪个端点」这类断言
+ * 能区分两条路径），并且能被测试替换掉。
+ */
+interface StubSignCall {
+  pat: string
+  jobToken: string
+  hostBase?: string
+  modelKey?: string
+  modelSource?: string
+}
+
+/**
+ * 假的签名来源（记录调用；`prepareInferRequest` 的返回值可被覆写）。
+ *
+ * ⚠️ 默认返回的 URL host 是 `signed.example.test`，与 CN 的 `gateway.qoder.com.cn`
+ * **不同** —— 早前用真 host 写过一版，结果「URL 来自签名结果」这条断言在
+ * 「实现根本没调签名、直接拼了 REST URL」时**照样会通过**（假阳性）。
+ */
+function makeSigningSource(overrides: {
+  prepareInferRequest?: QoderSigningSource['prepareInferRequest']
+  contextFor?: QoderSigningSource['contextFor']
+} = {}): { source: QoderSigningSource; calls: StubSignCall[] } {
+  const calls: StubSignCall[] = []
+  const source: QoderSigningSource = {
+    contextFor: async (pat: string, jobToken: string) => {
+      if (overrides.contextFor) return overrides.contextFor(pat, jobToken)
+      const record: StubSignCall = { pat, jobToken }
+      calls.push(record)
+      return {
+        prepareInferRequest: overrides.prepareInferRequest ?? ((hostBase, _body, modelKey, modelSource) => {
+          record.hostBase = hostBase
+          record.modelKey = modelKey
+          record.modelSource = modelSource
+          return {
+            url: `https://signed.example.test${QODER_SIGNED_CHAT_PATH}`,
+            headers: new Map<string, string>([
+              ['Authorization', 'Bearer COSY.stub'],
+              ['Cosy-ClientType', '5'],
+              ['Cosy-Version', '1.1.58'],
+            ]),
+            body: 'CIPHERTEXT',
+            free: () => {},
+          } satisfies QoderInferRequest
+        }),
+      }
+    },
+    dispose: () => {},
+  }
+  return { source, calls }
+}
+
+/**
+ * 组装适配器选项（默认目录拉取返回空 = 回退静态表，保证零网络）。
+ *
+ * ⚠️ **默认注入一个签名源**：CN 的 chat 自 2026-09-21 起只有签名路径可用，
+ * 不注入的话**每个** `stream()` 用例都会先撞上「接线缺失」的直报错误。
+ * 需要测「未注入」这一形态的用例显式传 `signing: undefined`。
+ */
 function adapterOptions(overrides: Partial<QoderAdapterOptions> = {}): QoderAdapterOptions {
   return {
     credentialRef: 'QODER_CN_PERSONAL_TOKEN' as QoderAdapterOptions['credentialRef'],
@@ -82,6 +147,7 @@ function adapterOptions(overrides: Partial<QoderAdapterOptions> = {}): QoderAdap
     invalidateJobToken: () => {},
     fetchRemoteModels: async () => [],
     product: QODER_CN,
+    signing: makeSigningSource().source,
     ...overrides,
   }
 }
@@ -392,8 +458,13 @@ describe('chat 请求体：metadata.context.client_type', () => {
   })
 })
 
-describe('Cosy 头：存在 cosyVersion 才发', () => {
-  /** 记录最后一次请求头的假 fetch（返回 JSON 错误体，让 stream 快速结束）。 */
+describe('Cosy 头：CN 的签名路径由 wasm 给，REST 分支保留但不可达', () => {
+  /**
+   * 记录最后一次请求的假 fetch（返回 401 让 stream 快速结束）。
+   *
+   * ⚠️ 现在**只有国际版**的 `stream()` 会走到这个 fetch —— CN 的请求由签名源
+   * 产出（URL/头/body 全来自 wasm），`fetchImpl` 拿到的就是签名结果。
+   */
   function headerSpy(): { fetcher: typeof fetch; headers: () => Record<string, string> } {
     let captured: Record<string, string> = {}
     const fetcher = (async (_url: unknown, init?: RequestInit) => {
@@ -405,16 +476,28 @@ describe('Cosy 头：存在 cosyVersion 才发', () => {
     return { fetcher, headers: () => captured }
   }
 
-  it('CN：发 Cosy-ClientType = clientType 与 Cosy-Version = cosyVersion', async () => {
+  it('CN 的 chat 出站头**全部来自签名结果**（REST 头一个都不发）', async () => {
+    // ⚠️ 这条**推翻**了本用例的旧形态（旧断言要求 `Cosy-ClientType: 5` 出现在
+    // 适配器自己拼的头里）。2026-09-21 接线后 CN 走 wasm 签名路径，出站头由
+    // wasm 给 —— 适配器的 `send()`（拼 `qoderJobTokenHeaders` + Cosy 头那条）
+    // 对 CN **已无可达路径**，拿它当断言对象就测不到真实出站形态了。
     const spy = headerSpy()
     const adapter = new QoderAdapter(adapterOptions({ fetchImpl: spy.fetcher }))
     try {
       for await (const _chunk of adapter.stream(generateOptions())) { /* 消费到结束 */ }
     } catch { /* 401 是预期的收尾方式 */ }
-    expect(spy.headers()['Cosy-ClientType']).toBe('5')
-    expect(spy.headers()['Cosy-Version']).toBe('1.1.58')
-    // 与请求体的 client_type 同源（两处必须是同一个值）。
-    expect(spy.headers()['Cosy-ClientType']).toBe(qoderClientType(QODER_CN))
+
+    const headers = spy.headers()
+    // 签名源给的那三个头在（证明用的是签名结果）。
+    expect(headers['Authorization']).toBe('Bearer COSY.stub')
+    expect(headers['Cosy-ClientType']).toBe('5')
+    expect(headers['Cosy-Version']).toBe('1.1.58')
+    // REST 那套头**一个都不许出现**（混用 = 101）。尤其 `Authorization` 必须是
+    // COSY 而不是 jt —— 那正是「只补签名头不换 body」的失败形态。
+    expect('jt-test' in headers).toBe(false)
+    expect(JSON.stringify(headers)).not.toContain('jt-test')
+    expect(headers['User-Agent']).toBeUndefined()
+    expect(headers['Accept']).toBeUndefined()
   })
 
   it('国际版：**一个 Cosy 头都不发**（零头变化）', async () => {
@@ -429,9 +512,9 @@ describe('Cosy 头：存在 cosyVersion 才发', () => {
     expect('Cosy-Version' in headers).toBe(false)
   })
 
-  it('刻意不发 Cosy-MachineOS / Cosy-MachineHostname（不猜机器身份）', async () => {
+  it('国际版仍不发 Cosy-MachineOS / Cosy-MachineHostname（不猜机器身份）', async () => {
     const spy = headerSpy()
-    const adapter = new QoderAdapter(adapterOptions({ fetchImpl: spy.fetcher }))
+    const adapter = new QoderAdapter(adapterOptions({ fetchImpl: spy.fetcher, product: QODER }))
     try {
       for await (const _chunk of adapter.stream(generateOptions())) { /* 同上 */ }
     } catch { /* 同上 */ }
@@ -439,25 +522,14 @@ describe('Cosy 头：存在 cosyVersion 才发', () => {
     expect('Cosy-MachineHostname' in spy.headers()).toBe(false)
   })
 
-  it('除 Cosy 外，CN 与国际化版请求头逐键相同（同协议）', async () => {
-    const cnSpy = headerSpy()
-    const cnAdapter = new QoderAdapter(adapterOptions({ fetchImpl: cnSpy.fetcher }))
-    try { for await (const _c of cnAdapter.stream(generateOptions())) { /* noop */ } } catch { /* noop */ }
-
-    const intlSpy = headerSpy()
-    const intlAdapter = new QoderAdapter(adapterOptions({ fetchImpl: intlSpy.fetcher, product: QODER }))
-    try { for await (const _c of intlAdapter.stream(generateOptions())) { /* noop */ } } catch { /* noop */ }
-
-    const cnExtra = Object.keys(cnSpy.headers()).filter((key) => !(key in intlSpy.headers()))
-    expect(cnExtra.sort()).toEqual(['Cosy-ClientType', 'Cosy-Version'])
-    // 国际版的头集合是 CN 的**子集**（没有 CN 独有头之外的差异）。
-    for (const [key, value] of Object.entries(intlSpy.headers())) {
-      // User-Agent 是唯一按产品取值的头，其余（鉴权 / Accept / Content-Type）同值。
-      if (key === 'User-Agent') continue
-      expect(cnSpy.headers()[key], key).toBe(value)
-    }
-    expect(intlSpy.headers()['User-Agent']).toBe(QODER.userAgent)
-    expect(cnSpy.headers()['User-Agent']).toBe(QODER_CN.userAgent)
+  it('REST 分支的 Cosy 头**仍是 CN 产品配置的产物**（残留代码的自查）', async () => {
+    // 这条不经过适配器（CN 的 `stream()` 已到不了 `send()`），而是直接钉
+    // `qoderJobTokenHeaders` + 产品字段：万一将来有人把 CN 接回 REST，出站身份
+    // 仍应是 `client_type 5` + `qoder/1.1.58` 而不是国际版那套。
+    const headers = qoderJobTokenHeaders('jt-x', QODER_CN, 'text/event-stream')
+    expect(headers['User-Agent']).toBe(QODER_CN.userAgent)
+    expect(qoderClientType(QODER_CN)).toBe('5')
+    expect(QODER_CN.cosyVersion).toBe('1.1.58')
   })
 
   it('qoderJobTokenHeaders 本身不带 Cosy 头（头集在适配器 send() 里追加）', () => {
@@ -505,27 +577,73 @@ describe('QODER_MODEL_SERVER_HOST 逃生阀（仅 chat）', () => {
   })
 
   it('**请求时读取**（不是构造时缓存）：构造后再改环境变量也生效', async () => {
-    const urls: string[] = []
-    // 回一条**成功**的流：每次 stream() 只发一个请求（401 会触发重换重试，
-    // 用 401 的话一次 stream 有两次请求，断言下标就会指错那一次）。
+    // 这条对 CN 走的是**签名路径** —— 逃生阀覆盖的是「chat 的 host 基址」，
+    // 而 CN 的 chat **就是**签名路径。故这里断言的是 `hostBase`（传给
+    // `prepareInferRequest` 的第一参），不是 fetch 的 URL：签名后的 URL 由
+    // wasm 拼（含 `?FetchKeys=…` 查询串），逃生阀管不到它，也不该管。
+    const hostBases: Array<string | undefined> = []
+    const signing = makeSigningSource()
+    const recording: QoderSigningSource = {
+      contextFor: async (pat: string, jobToken: string) => {
+        const ctx = await signing.source.contextFor(pat, jobToken)
+        return {
+          prepareInferRequest: (hostBase, body, modelKey, modelSource) => {
+            hostBases.push(hostBase)
+            return ctx.prepareInferRequest(hostBase, body, modelKey, modelSource)
+          },
+        }
+      },
+      dispose: () => {},
+    }
     const successStream = 'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n\n'
       + 'data: [DONE]\n\n\n'
+    const fetcher = (async () => new Response(successStream, {
+      status: 200, headers: { 'content-type': 'text/event-stream' },
+    })) as unknown as typeof fetch
+    const options = () => generateOptions()
+
+    // 基线：构造时**没有**该环境变量。
+    const adapter = new QoderAdapter(adapterOptions({ fetchImpl: fetcher, signing: recording }))
+    for await (const _c of adapter.stream(options())) { /* noop */ }
+    expect(hostBases).toEqual([QODER_CN.chatBase])
+
+    // 构造之后才设 —— 若实现把它缓存在构造时，这里仍会用原 host。
+    process.env.QODER_MODEL_SERVER_HOST = 'late-bound.example'
+    for await (const _c of adapter.stream(options())) { /* noop */ }
+    expect(hostBases[1]).toBe('https://late-bound.example')
+  })
+
+  it('逃生阀**不越界**：签名后的 URL 由 wasm 拼，不走 `resolveQoderChatBase`', async () => {
+    // 签名路径的 URL 含查询串（`?FetchKeys=…&AgentId=…&Encode=1`）且路径是
+    // `/algo/...`；若实现错误地把**完整 URL** 当 hostBase 传进去，或者事后又
+    // 用 `resolveQoderChatBase` 去「修正」签名结果，都会把它改坏。
+    process.env.QODER_MODEL_SERVER_HOST = 'model-gw.internal'
+    const urls: string[] = []
+    const signing = makeSigningSource()
+    const recording: QoderSigningSource = {
+      contextFor: async (pat: string, jobToken: string) => {
+        const ctx = await signing.source.contextFor(pat, jobToken)
+        return {
+          prepareInferRequest: (hostBase, body, modelKey, modelSource) =>
+            ctx.prepareInferRequest(hostBase, body, modelKey, modelSource),
+        }
+      },
+      dispose: () => {},
+    }
     const fetcher = (async (url: unknown) => {
       urls.push(String(url))
-      return new Response(successStream, {
+      return new Response('data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n\ndata: [DONE]\n\n\n', {
         status: 200, headers: { 'content-type': 'text/event-stream' },
       })
     }) as unknown as typeof fetch
 
-    // 基线：构造时**没有**该环境变量。
-    const adapter = new QoderAdapter(adapterOptions({ fetchImpl: fetcher }))
+    const adapter = new QoderAdapter(adapterOptions({ fetchImpl: fetcher, signing: recording }))
     for await (const _c of adapter.stream(generateOptions())) { /* noop */ }
-    expect(urls).toEqual([`${QODER_CN.chatBase}/model/v1/chat/completions`])
 
-    // 构造之后才设 —— 若实现把它缓存在构造时，这里仍会打到原 host。
-    process.env.QODER_MODEL_SERVER_HOST = 'late-bound.example'
-    for await (const _c of adapter.stream(generateOptions())) { /* noop */ }
-    expect(urls[1]).toBe('https://late-bound.example/model/v1/chat/completions')
+    // 打到的是**签名结果给的 URL 原样**（host 是签名源的 `signed.example.test`，
+    // 不是逃生阀的 `model-gw.internal`，也不是 CN 的 `gateway.qoder.com.cn`）。
+    expect(urls[0]).toBe(`https://signed.example.test${QODER_SIGNED_CHAT_PATH}`)
+    expect(urls[0]).not.toContain('model-gw.internal')
   })
 
   it('只影响 chat：目录与额度端点仍走 product 的 base', async () => {
@@ -810,7 +928,7 @@ describe('chat 503 按 region 分流的定性（路径不存在 vs 瞬时故障�
     expect(qoderHarnessErrorCode(result)).toBe('INVALID_REQUEST')
   })
 
-  it('CN 的 503 文案点名真因：路径不存在 + WASM 签名门槛 + PAT 过不去', () => {
+  it('CN 的 503 文案点名真因：路径不存在 + WASM 签名通道 + 已改走该通道', () => {
     const result = classifyQoderError({ httpStatus: 503, message: 'upstream unavailable', product: QODER_CN })
 
     // 三个事实都要在文案里，否则用户只会看到一句「503」而无从判断该不该重试。
@@ -819,7 +937,13 @@ describe('chat 503 按 region 分流的定性（路径不存在 vs 瞬时故障�
     expect(result.message).toContain('不存在')
     expect(result.message).toContain('agent_chat_generation')
     expect(result.message).toContain('签名')
-    expect(result.message).toContain('PAT')
+    // ⚠️ **本条曾经断言 `toContain('PAT')`，2026-09-21 接线后改为断言「已改走该通道」**：
+    //    旧文案说「PAT 形态无法通过该签名门槛」，而真机 A/B 已推翻那个推论
+    //    （PAT 路径拿得到签名四要素，真根因是空 uid）。分支的**判据与动作一字未改**，
+    //    只有那句已被证伪的定性换成了「本插件已改走该通道，本错误说明接线被改回或
+    //    逃生阀指到了别处」—— 对走到这个分支的用户，这才是真信息。
+    expect(result.message).toContain('已改走该通道')
+    expect(result.message).not.toContain('PAT')
     // 并明确告知**不会重试**，以及控制面不受影响（避免用户以为整个 provider 挂了）。
     expect(result.message).toContain('不会重试')
     // 上游原文原样保留（诊断线索不该被处置文案冲掉）。

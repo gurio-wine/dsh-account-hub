@@ -1,0 +1,29 @@
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"\",\"role\":\"assistant\"},\"index\":0}],\"created\":1789965531,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"We\"},\"index\":0}],\"created\":1789965531,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\" need respond\"},\"index\":0}],\"created\":1789965531,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\" to user: \\\"\"},\"index\":0}],\"created\":1789965531,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"只回复 pong\\\"\"},\"index\":0}],\"created\":1789965532,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\" meaning only reply pong\"},\"index\":0}],\"created\":1789965532,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\". Need final only\"},\"index\":0}],\"created\":1789965532,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\" pong. Ensure no\"},\"index\":0}],\"created\":1789965532,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\" extra.\"},\"index\":0}],\"created\":1789965532,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"pong\",\"reasoning_content\":\"\"},\"index\":0}],\"created\":1789965532,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"\"},\"finish_reason\":\"stop\",\"index\":0}],\"created\":1789965532,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\"}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"{\"choices\":[],\"created\":1789965532,\"id\":\"chatcmpl-e3232f0b-3b64-9292-8b92-282b2bef1d5a\",\"model\":\"auto\",\"object\":\"chat.completion.chunk\",\"usage\":{\"billable\":true,\"completion_tokens\":28,\"completion_tokens_details\":{\"reasoning_tokens\":25},\"credits\":0.03946272,\"original_credits\":0.03946272,\"prompt_tokens\":64,\"prompt_tokens_details\":{\"cached_tokens\":0},\"total_tokens\":92}}","statusCodeValue":200,"statusCode":"OK"}
+
+data:{"headers":{"Content-Type":["application/json"]},"body":"[DONE]","statusCodeValue":200,"statusCode":"OK"}
+
+event:finish
+data:{"firstTokenDuration":1015,"totalDuration":1536,"serverDuration":228}
+

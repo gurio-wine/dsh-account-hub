@@ -22,6 +22,9 @@ import { TRAE_CN } from './trae-cn-product.js'
 import { TRAE_CN_WORK } from './trae-cn-work-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { checkQoderQuotaExhausted } from './qoder-credits.js'
+import { QoderSigningProvider } from './qoder-signing.js'
+import { extractQoderWasm } from './qoder-wasm.js'
+import { instantiateQoderWasm } from './qoder-wasm-glue.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { TraeCnCredential } from './trae-cn-oauth.js'
@@ -637,6 +640,25 @@ export function apply(ctx: Context): void {
   const resolveQoderCnCredential = makeCredentialResolver<QoderCredential>(
     ctx, pool, QODER_CN.id, QODER_CN.defaultCredentialRef,
   )
+  // **签名来源**：CN 的 chat 只有 wasm 签名路径可用（REST 路径在 CN 网关不存在，
+  // 实测 ALB 按路径级恒 503），故必须注入。
+  //
+  // ⚠️ **只在 CN 段建实例**：签名器把 `product` 绑在构造时，两区共用一个实例会
+  // 拿 CN 的机器码去签国际版的请求（上游回 `101 Signature invalid`，与「凭据
+  // 失效」同形，极难排查）。国际版根本不走签名路径，也就不需要这个实例。
+  //
+  // **wasm 是懒加载**（`loadGlue` 在第一次真正要签名时才调）：提取要扫 35 MB 的
+  // worker 文本或下载 30 MB 的 tarball，放在插件启动期会让启动平白变慢。
+  // 提取失败原样抛出 `QoderWasmUnavailableError`，由适配器转成可读的直报错误
+  // （带三级尝试原因）—— 这里**不吞**，否则用户只会看到一句「请求失败」。
+  const qoderCnSigning = new QoderSigningProvider({
+    product: QODER_CN,
+    loadGlue: async () => {
+      const artifact = await extractQoderWasm({ product: QODER_CN })
+      ctx.logger?.debug?.(`[qoder-cn] wasm 来源 ${artifact.source}：${artifact.detail}`)
+      return instantiateQoderWasm(artifact.bytes)
+    },
+  })
   registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER_CN.defaultCredentialRef),
     // 只从 Qoder CN 自己的账号池取账号，回退到自己的单凭据 ref
@@ -667,9 +689,11 @@ export function apply(ctx: Context): void {
     },
     accountPool: pool,
     product: QODER_CN,
+    // 签名来源（本 region 专用实例，见上方的构造点）。
+    signing: qoderCnSigning,
     // 与上面 QODER 段**同源同口径**（同一个回调、同一级 debug）：两个 region 共用
     // 同一份发送代码，观测也必须共用同一处语义 —— 只给国际版接会让 CN 的
-    // bodyBytes 静默消失（而 CN 的 chat 本就打不通，缺口更难被发现）。
+    // bodyBytes 静默消失。
     onDebug: (message) => ctx.logger?.debug?.(message),
   })
 

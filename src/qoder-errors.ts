@@ -242,9 +242,11 @@ const QODER_PROVIDER_ERROR_CODE = 'provider_error'
  *   一次压缩 + 重试，白丢历史）。8.5% 足以覆盖上述差异，又不会平白砍掉
  *   可用窗口。
  *
- * 该墙**只在国际版 chat 上实测**；`qoder-cn` 的 chat 本就结构性不可用
- * （路径不存在，见 {@link classifyQoderError} 的 7a 条），闸门对其无副作用，
- * 故两个 region 共用同一个阈值，不按 product 分叉。
+ * 该墙**只在国际版 chat 上实测**（CN 的 REST 路径根本不存在，实测无从谈起）。
+ * ⚠️ **CN 的 chat 自 2026-09-21 起走 wasm 签名路径，闸门对它同样生效** ——
+ * 量的是**签名之前的明文**（见 `qoder-adapter.ts` 的 `stream()`）：密文长度由
+ * wasm 决定、我们既预测不了也控制不了，拿它当判据只会引入假阳性。
+ * 故两个 region 共用同一个阈值与同一段判定，不按 product 分叉。
  */
 export const QODER_MAX_REQUEST_BYTES = 245_760
 
@@ -262,6 +264,28 @@ const QODER_STREAM_CODE_HINTS: Readonly<Record<string, string>> = {
   invalid_parameter_error: '请求参数不合法（上游拒绝了消息角色/结构，例如 role 不在允许集合内）。',
   invalid_model_error: '模型名不受支持（「model」为空或不在该账号的可用目录里）。',
 }
+
+/**
+ * 签名失效的业务码（真机实测，2026-09-21）。
+ *
+ * CN 的 chat 走 wasm 签名路径后，签名不合规的回复是
+ * `{"code":"101","message":"Signature invalid"}`（HTTP **200** 的流内帧）。
+ * 真机 A/B 已定位到成因之一：**uid 为空串**必回 101。
+ */
+const QODER_SIGNATURE_INVALID_CODE = '101'
+
+/**
+ * 101 的**配套文案**判据（大小写不敏感）。
+ *
+ * ⚠️ **必须码与文案两件都对**才套签名提示：`101` 这个数字码本身没有跨产品
+ * 的语义保证（官方三个 region 的码表并不互斥），只认码会在上游将来复用该码时
+ * 把用户引向一次**没用的重新登录**。反过来，只认文案也不够 ——
+ * 文案是上游的自由文本，可能被改写。
+ *
+ * 两件都对时给出可执行的中文提示：签名失效的成因在**登录态或机器身份**，
+ * 用户唯一能自己做的一步就是重新登录。
+ */
+const QODER_SIGNATURE_INVALID_MARKER = 'signature invalid'
 
 /** 判定值是否为「普通对象」（排除 null 与数组）。 */
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -672,6 +696,23 @@ export function classifyQoderError(input: QoderErrorInput): QoderErrorClassifica
   // 5. 流内业务码（HTTP 200 或未知状态）：只报错，绝不转成优雅结束。
   if (hasCode && (status === undefined || status === HTTP_OK)) {
     const codeText = String(code)
+    // 5a. **签名失效**（wasm 签名路径特有）：`101` + `Signature invalid` 两件都对。
+    //     普通「未知码直报」只说「上游原文：Signature invalid」，用户看不出下一步
+    //     该做什么；而这一条有**明确的用户动作**（重新登录）—— 真机 A/B 已定位到
+    //     成因是签名身份与登录态/机器身份不一致（空 uid 必回 101）。
+    //
+    //     ⚠️ **判据是「码 + 文案」两件**，缺一不套：只认码会在上游复用该码时
+    //     给出误导性的重新登录建议；只认文案则依赖上游自由文本。
+    if (codeText.trim() === QODER_SIGNATURE_INVALID_CODE
+      && upstream.toLowerCase().includes(QODER_SIGNATURE_INVALID_MARKER)) {
+      return buildClassification(input, {
+        action: 'fail',
+        message: `Qoder 签名失效（业务码 ${codeText}）：签名身份与当前登录态或机器身份不一致，`
+          + `服务端拒绝了这次签名请求。请尝试重新登录该账号（登录态或机器身份可能已变化）；`
+          + `若重新登录后仍失败，请反馈此消息以便继续排查。`
+          + `上游原文：${upstream}`,
+      })
+    }
     const hint = QODER_STREAM_CODE_HINTS[codeText.trim()]
     return buildClassification(input, {
       action: 'fail',
@@ -696,8 +737,12 @@ export function classifyQoderError(input: QoderErrorInput): QoderErrorClassifica
     // `gateway.qoder.com.cn` 上 `/model/v1/chat/completions` **不存在**：ALB 对该
     // 路径「任意方法 × 任意头」**恒 503**（alb 错误页逐字节相同）；同 host 的
     // `/api/v2/config/getDataPolicy` 却回应用层 401/400（证明路径活着）。
-    // 官方的 chat 走 `/algo/api/v2/service/pro/sse/agent_chat_generation`，
-    // 且带 WASM 签名（`prepareInferRequest` 需要登录用户密钥）—— PAT 给不出。
+    //
+    // ⚠️ **2026-09-21 起适配器已不再打这个路径**（CN 的 chat 改走 wasm 签名路径
+    // `/algo/api/v2/service/pro/sse/agent_chat_generation`，见 `qoder-adapter.ts`）。
+    // 本分支**保留不动**：它是逃生阀（`QODER_MODEL_SERVER_HOST`）把 CN 指到
+    // 别的主机、或将来有人误接回 REST 时的兜底 —— 那时这个 503 仍会被正确地判成
+    // 「路径级拒绝」而不是「网关抖动」，用户不必白等一轮轮退避。
     //
     // ⇒ 退避重试**永远不可能成功**，只会让用户白等一轮又一轮；必须直报，
     //    并说清「这不是你的凭据或网络的问题」。
@@ -713,7 +758,8 @@ export function classifyQoderError(input: QoderErrorInput): QoderErrorClassifica
           + `该路径（/model/v1/chat/completions）在 CN 网关不存在，ALB 按路径级拒绝并恒回 `
           + `HTTP ${status}（与凭据、请求头、网络出口均无关，也不会自行恢复）。`
           + `官方客户端走带 WASM 签名的 agent 通道（/algo/api/v2/service/pro/sse/agent_chat_generation），`
-          + `PAT 形态无法通过该签名门槛。故本 provider 的 chat 对 CN 结构性不可用，`
+          + `本插件的 CN chat 已改走该通道、不再打这条 REST 路径 —— 出现本错误说明`
+          + `要么是逃生阀把 CN 指到了别的主机，要么是接线被改回了 REST。`
           + `不会重试也不会切换账号；余额 / 模型目录 / 换令牌等控制面功能不受影响。`
           + `上游原文：${upstream}`,
       })

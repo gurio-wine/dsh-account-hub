@@ -596,14 +596,17 @@ describe('QoderWasmSigner：实例复用与凭据变更重建', () => {
     const signer = new QoderWasmSigner({ glue, product: QODER, machineIdOptions: offRealHome })
     const ctx = await signer.contextFor({ machineId: 'm', userInfo })
     const result = ctx.prepareInferRequest(
-      'https://gateway.qoder.com.cn', '{"a":1}', 'lite', 'solo_work_remote',
+      'https://gateway.qoder.com.cn', '{"a":1}', 'lite', 'system',
     )
     expect(calls.infer).toHaveLength(1)
     const [, endpoint, body, modelKey, modelSource] = calls.infer[0]!
     expect(endpoint).toBe('https://gateway.qoder.com.cn')
     expect(body).toBe('{"a":1}')
     expect(modelKey).toBe('lite')
-    expect(modelSource).toBe('solo_work_remote')
+    // ⚠️ `'system'` 是官方 `model_config?.source ?? "system"` 的**兜底值**
+    // （三值域 system / user / custom）。本夹具曾写作 `'solo_work_remote'` ——
+    // 那是 **Trae** 的 function 名，与 Qoder 毫无关系，已更正。
+    expect(modelSource).toBe('system')
     // 三件套来自 wasm，**不是**原样回传调用方的输入。
     expect(result.url).toBe('https://signed.example.test/path?q=1')
     expect(result.body).toBe('CIPHERTEXT')

@@ -651,3 +651,15 @@ function describeError(error: unknown): string {
   }
   return String(error)
 }
+
+/**
+ * 判定异常是否为「wasm 组件不可用」。
+ *
+ * 用 `instanceof` **加** `name` 双重判据：跨模块实例（打包/多副本场景）会让
+ * `instanceof` 失效，而 `name` 是构造时显式设的（见 {@link QoderWasmUnavailableError}）。
+ * 只认 `name` 字符串又太松（任何同名异常都会被当成组件缺失），故两者取或。
+ */
+export function isQoderWasmUnavailableError(value: unknown): value is QoderWasmUnavailableError {
+  return value instanceof QoderWasmUnavailableError
+    || (value instanceof Error && value.name === 'QoderWasmUnavailableError')
+}

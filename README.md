@@ -2525,17 +2525,24 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
    （`qodercli.log` 实录 POST 该路径 200）。
 3. **那条通道有 WASM 签名门槛**：官方请求由 `qoder_auth_wasm` 的
    `prepareInferRequest` 生成，构造需要 `machineId` + `cosyVersion` +
-   **`userInfoJson` 里的登录用户密钥**。用有效 `jt-` 直接打会得到 200 + SSE，
+   `userInfoJson` 里的用户密钥。用有效 `jt-` 直接打会得到 200 + SSE，
    但**帧内**是 `{"code":"101","message":"Signature invalid"}`。
-   **两种登录形态都给不出用户密钥 ⇒ 永远过不去。**
-   ⚠️ 这与「怎么登录」无关，而与**凭据形态**有关：设备流拿到的令牌与粘贴的 PAT
-   在这一点上完全一样（都不是官方 IDE 里那份带用户密钥的登录态），故设备流落地
-   **不改变** CN chat 的这条结论。
 
-⇒ **CN 的 chat 对本插件的凭据形态结构性不可用**，不是待恢复的瞬时故障。
-故 host 常量**保留**（逃生阀与未来协议变化仍用它），但错误分类**按 region 分流**：
-CN 的 chat 503 **直报、不退避、不换号**（退避重试一个不可能成功的请求纯属误导），
-国际版的 503 维持「网关瞬时故障 → 退避重试同一账号」不变。
+> ⚠️ **2026-09-21 接线后推翻：上面第 3 条的结论「两种登录形态都给不出用户密钥
+> ⇒ 永远过不去」是错的**，本插件的 PAT 与设备流凭据**都拿得到**签名四要素：
+> `machineId` 走登录链落盘的同一份文件、`security_oauth_token` 就是 PAT 换来的
+> `jt-`、`uid` 取自 `GET {openapiBase}/api/v1/userinfo`。真机 A/B（只改 `uid`
+> 一处）：**空 uid → `101`；真实 uid → HTTP 200 + SSE 真内容**。
+> 故 CN 的 chat **不是**结构性不可用，而是缺一次接线 —— 现已接上
+> （见「Qoder wasm 签名链」；三档真机请求 105 B / 4 KB / 40 KB 全部走通）。
+> **第 1、2 条仍然成立**：`/model/v1/chat/completions` 在 CN 网关确实不存在
+> （路径级 503，不会恢复），CN 也**不会再**打那条路径。
+
+⇒ host 常量**保留**（逃生阀与未来协议变化仍用它），错误分类**按 region 分流**：
+CN 的 chat 503 **直报、不退避、不换号**（退避重试一个不可能成功的请求纯属误导）
+—— ⚠️ **该分支现在是兜底**：CN 的正路是签名路径，只有逃生阀把 CN 指到别处、
+或将来有人把它误接回 REST 才会走到这里；国际版的 503 维持「网关瞬时故障 →
+退避重试同一账号」不变。
 
 > **绝不要因为「打不通」就把它改成国际版 host**：实测 **CN 的 `jt-` 打国际版
 > chat 会回 401**（两区令牌互不承认），于是「路径不存在」会被**伪装成
@@ -2579,11 +2586,25 @@ CN 的 chat 503 **直报、不退避、不换号**（退避重试一个不可能
 - **`machineId` 走登录链落盘的那一份**（设备流写的同一个文件），调用方不必传。
 - **glue 是手写复刻的**：官方那份内联在 35 MB worker runtime 里，本插件不整体加载它。
 
-⚠️ **本次只落地签名链，未改错误分类、未改适配器**（接入是后续任务）。
-国际版同路径的签名**有效**（无 `101`），但其 host **不是 `api2-v2.qoder.sh`**（该 host 404）
+⚠️ **签名路径的帧是双层信封，不是裸 OpenAI chunk（实测推翻）**：真机每帧是
+`data:{"headers":{…},"body":"<内层 JSON 字符串>","statusCodeValue":200,"statusCode":"OK"}`
+—— 内层**再 `JSON.parse` 一次**才是标准 chunk；收尾是 `"body":"[DONE]"`
+（⚠️ **`[DONE]` 也被包着**，不是裸哨兵）。剥离判据见 `unwrapQoderFrame`：
+**`statusCodeValue` 是数字 + `body` 是字符串，两个都在**才当信封 —— 只认 `body`
+会误伤国际版的裸帧（有反向断言钉死）。真机夹具
+`tests/unit/fixtures/qoder-cn-signed-sse.sse.txt` 是逐字节副本（内容只有 `pong`，无凭据）。
+
+⚠️ **接线范围**：只有 `qoder-cn` 的 chat 走签名路径；**国际版一行未动**（REST + `jt-`，
+有逐字节回归用例）。`QoderAdapterOptions.signing` 由 `src/index.ts` 注入
+`QoderSigningProvider`（**per-region 实例** —— 签名器把 `product` 绑在构造时，
+共用一个实例会让 CN 的机器码去签国际版的请求）。
+⚠️ **CN 未注入 `signing` 时直接抛错、绝不回退 REST**：回退只会得到上游 503，
+用户看到的是「网关故障」而不是「插件没接线」，后者才是可修的配置错误。
+
+**国际版同路径**：签名**有效**（无 `101`），但其 host **不是 `api2-v2.qoder.sh`**（该 host 404）
 而是 **`api1.qoder.sh`**（实测 200）；即便签名通过，body 形态仍回业务
 `400 flow nodes found for router agent_router` ⇒ **协议可达、参数待校准**，
-国际版大上下文的字节墙问题因此**尚未验证**。
+国际版大上下文的字节墙问题因此**尚未验证**。本次未把国际版接上签名路径。
 
 **逃生阀**：`QODER_MODEL_SERVER_HOST` 环境变量可覆盖 chat 的 host（含显式 scheme），
 用于指向自建网关或本地抓包调试：
@@ -2595,16 +2616,19 @@ $env:QODER_MODEL_SERVER_HOST = 'gateway.qoder.com.cn'
 $env:QODER_MODEL_SERVER_HOST = 'http://127.0.0.1:8080'
 ```
 
-⚠️ **对 CN 而言逃生阀与「chat 不可用」无关**：改 host **不会**让 CN 的 chat 活过来
-——路径不存在是 CN 网关侧的事实，换个出口打同一个路径仍是 503。它真正有用的场景是
-**官方将来补上 OpenAI 兼容端点**、或你自建了带签名的反代。
+⚠️ **对 CN 而言它改的是传给签名器的 host 基址**（`prepareInferRequest` 的第一参），
+而**不是**签名结果里那个完整 URL（后者含 `?FetchKeys=…` 查询串，事后「修正」会改坏它）。
+它**不会**让 CN 的 chat 变回走 REST —— CN 的正路就是签名路径。真正有用的场景是
+**自建带签名的反代 / 本地抓包调试**。
 
 三条语义（与官方 CN CLI 一致，本插件不发明新开关）：
 
 - ⚠️ **只影响 chat**：`openapiBase`（exchange / 额度）与 `modelsBase`（目录）
   **不受影响** —— 把另外两条控制面一并改掉会让「只换 chat 出口」的用法直接失效，
   且失败形态是「凭据失效」，极难诊断；
-- **路径与查询串一律丢弃**（路径恒为 `/model/v1/chat/completions`），只有主机生效；
+- **路径与查询串一律丢弃**，只有主机生效 —— ⚠️ 对**国际版**而言路径恒为
+  `/model/v1/chat/completions`；对 **CN** 而言它只改「传给签名器的 host 基址」，
+  路径与查询串由 wasm 在签名结果里给全（含 `?FetchKeys=…`），**不**再过这个函数；
 - **显式 scheme 优先**：裸主机名沿用原基址的 `https`，但写了 `http://` 就按 http 发
   （指向本地代理时不会被悄悄升级成 https 而得到一个 TLS 失败）；
 - **请求时读取**（不是启动时定型），进程起来后再设也生效；
@@ -2619,13 +2643,16 @@ $env:QODER_MODEL_SERVER_HOST = 'http://127.0.0.1:8080'
 - `client_type: "5"` —— chat 请求体 `metadata.context.client_type`，取自官方 CN CLI
   的 `kg()` 默认值 `process.env.CLIENT_TYPE ?? "5"`（国际版是 `qodercli`）；
 - **Cosy 头**（`Cosy-ClientType` = `clientType`、`Cosy-Version` = `1.1.58`）——
-  仅 CN 发（国际版不发，现有实现实测可用）。⚠️ `Cosy-MachineOS` /
-  `Cosy-MachineHostname` **刻意不实现**：官方对这两个头是**条件性**发送，
-  本插件**不猜机器身份** —— 缺头比错头安全（错头会被后台当真记进设备维度）。
+  ⚠️ `Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**：官方对这两个头是
+  **条件性**发送，本插件**不猜机器身份** —— 缺头比错头安全（错头会被后台当真记进设备维度）。
 
-⚠️ 三者的证据强度都**只是源码值**：CN 的 chat 路径不存在（见上），
-**没有任何一个能在真机上 A/B 验证**。它们与 `Cosy-Version` 一样属「按官方源码
-照抄、无法验收」的一类 —— 真机可用后若被证伪，只改 `src/qoder-product.ts` 一处。
+⚠️ **签名路径下这三者的实际出站者是 wasm，不是本插件**：`prepareInferRequest` 返回的
+20 个头里就含 `Cosy-ClientType` / `Cosy-Version` / `X-Model-Key` / `X-Model-Source`，
+适配器不再自己拼 CN 的头。⚠️ 这不等于「三者的值已被验收」—— 真机走通证明的是
+**wasm 那套值可用**；本插件 `send()` 里那段 Cosy 追加代码**对 CN 已无可达路径**，
+现属残留（留着防「将来接回 REST 时出站身份静默变化」，`client_type` 仍在请求体里、照发）。
+它们与 `Cosy-Version` 一样属「按官方源码照抄、无法单独 A/B」的一类 ——
+若被证伪，只改 `src/qoder-product.ts` 一处。
 
 **CN 目录是 14 项快照**（国际版是 17 项、且只有 2 项 `is_enabled`）：
 

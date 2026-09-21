@@ -102,7 +102,7 @@ DSH 的自动压缩补救**只认这一个码**（`compaction-basic` 的 `agent/
 在墙内），调小只会多丢历史；而它决定不了压缩**触发时机**（阈值 0.8 × 200K ≈ 160K token ≈ 655 KiB，**永远在墙之后**），
 所以「靠调小声明值把压缩提前到墙前」这条路本来就走不通 —— **闸门负责挡墙，声明值负责保留量**。
 每次发送把 `bodyBytes` 经 `onDebug` 以 **debug 级**报出（⚠️ Cordis 默认导出阈值是 INFO，即默认不显示；撞墙趋势要可见时
-把 exporter 的 level 提到 3）；闸门作用于 `qoder` / `qoder-cn` 共享的发送代码，对 CN 无副作用（其 chat 本就结构性不可用）。
+把 exporter 的 level 提到 3）；闸门作用于 `qoder` / `qoder-cn` 共享的发送代码，**对 CN 同样生效**（量的是签名**之前**的明文，密文长度不可控故不量）。
 
 ⚠️ **`provider_error` 的真因在 `details`，且有多种形态**：`details.error.code`（T3 原形态）、**整段带 `data: ` 前缀的
 SSE 帧原文**、只有 `details.error.message`/根层 `message`（无 code）、`details.error.code` 是业务文本（如 `"1210"`）。
@@ -158,15 +158,31 @@ SSE 帧原文**、只有 `details.error.message`/根层 `message`（无 code）�
 一个用宿主对象的 `getRandomValues`）、`__wbg_new_*` 两个变体（`new Uint8Array(len)` vs `new Map()`）。分派顺序「精确名 → 前缀兜住哈希后缀漂移」，
 **未知 import 显式抛错**（塞空函数会让 wasm 深处以「签名算错」失败，比立即报错难查得多）。
 
-**真机验证结果（2026-09-21，预算 6 次推理请求内）**：
+**真机验证结果（2026-09-21，两轮共 4 次推理请求）**：
 
 | 步骤 | 结果 | 证据 |
 |---|---|---|
-| ① CN 签名路径 | ✅ **通过（CN chat 复活实锤）** | `POST https://gateway.qoder.com.cn/algo/…/agent_chat_generation` → **HTTP 200 + SSE 真内容**，**不再有 `101 Signature invalid`**。真机 A/B：空 uid ⇒ `101`，真实 uid ⇒ 通过 |
-| ② 国际版同路径 | ⚠️ **签名通过、业务 400** | host **不是 `api2-v2.qoder.sh`**（该 host 404）而是 **`api1.qoder.sh`**（实测 200）。签名有效（无 `101`），但 body 形态未被接受：`{"code":"400","message":"[FAIL]node:agent_router msg:None flow nodes found for router agent_router"}` ⇒ **协议可达、参数待校准** |
-| ③ 大 body 字节墙 | ⏸ **未测**（②未通过，按「失败即停」跳过） | 国际版大上下文是否顺带解决**仍未知** |
+| ① CN 签名路径（签名链本身） | ✅ **通过** | `POST gateway.qoder.com.cn/algo/…/agent_chat_generation` → **200 + SSE 真内容**，无 `101`。A/B：空 uid ⇒ `101`，真实 uid ⇒ 通过 |
+| ② 国际版同路径 | ⚠️ **签名通过、业务 400** | host 是 **`api1.qoder.sh`**（`api2-v2.qoder.sh` 404）。签名有效但 body 未被接受：`{"code":"400","message":"[FAIL]node:agent_router msg:None flow nodes found for router agent_router"}` ⇒ 协议可达、**参数待校准** |
+| ③ 国际版大 body 字节墙 | ⏸ **未测**（②未通过，按「失败即停」跳过） | 国际版大上下文**仍未知** |
+| ④ **CN 接入适配器后**（下一轮 3 次） | ✅ **三档全通过** | 105 B / ≈4 KB / ≈40 KB 三档全部 200 + 正文 `pong` + reasoning + usage + `finish`。**CN 不存在国际版那种 business-layer 字节阈值**（国际版 960–2001 B 间有 `Cannot find model`） |
 
-⚠️ **本次不改错误分类、不改适配器**（接入是后续任务）；上述①②③只作为证据记录。
+⚠️ **④才是「CN chat 真正可用」的证据**：①②只证明**签名算子**能出有效签名，与④之间还差「帧能解析出来」（见下）。
+
+⚠️ **签名路径的帧是双层信封，不是裸 OpenAI chunk（2026-09-21 真机推翻）**：接线时假设「签名路径返回标准 OpenAI SSE，可复用
+`consumeQoderStream`」—— 后半句**错**。真机每帧是 `data:{"headers":{…},"body":"<内层 JSON 字符串>","statusCodeValue":200,"statusCode":"OK"}`
+—— 内层**再 `JSON.parse` 一次**才是标准 chunk；收尾是 `"body":"[DONE]"`（**`[DONE]` 也被包着**）。只认裸帧会让**每一帧**都落进
+「`choices` 不是数组 ⇒ 跳过」，表现为 `Stream ended without [DONE]（流未产出任何内容即结束）` —— 而 HTTP 与签名**全是好的**（真机第一轮就撞了）。
+剥离判据 `unwrapQoderFrame`：**`statusCodeValue` 是数字 + `body` 是字符串，两个都在**才当信封（只认 `body` 会误伤国际版裸帧，有反向断言）。
+夹具 `tests/unit/fixtures/qoder-cn-signed-sse.sse.txt` 是逐字节真机副本（只有 `pong`，无凭据）。
+
+⚠️ **接入方式**：`stream()` 在 `buildQoderChatBody` 后、字节闸后按 region 分流 —— **CN 走签名路径**（`signingSource()`），**国际版一行不动**（REST + jt，逐字节回归）。
+`QoderAdapterOptions.signing` 由 `src/index.ts` 注入 `QoderSigningProvider`（**per-region 实例**）。⚠️ **CN 未注入 `signing` 时直接抛错、绝不回退 REST**
+（回退得到上游 503，用户看到「网关故障」而非「插件没接线」，后者才是可修的配置错误）。⚠️ **签名分支不做 401 重换重试**（鉴权头是 `Bearer COSY.…`，401 不会发生）。
+⚠️ **字节闸仍量明文**（签名**之前**）：密文长度由 wasm 决定，量它只会引入假阳性。⚠️ **逃生阀对 CN 作用于 `hostBase`**（`prepareInferRequest` 第一参）；
+**签名结果给的完整 URL 不再过该函数**（含 `?FetchKeys=…`，事后「修正」会改坏它）。⚠️ **两个新错误形态进分类器**：`101` + `Signature invalid` → 直报 + 中文提示重新登录
+（⚠️ **「码 + 文案」两件都对**才算，只认 `101` 会在上游复用该码时误导用户）；`QoderWasmUnavailableError` → 直报 + 三级尝试原因。**未知码照旧直报不猜**。
+`uid` 取不到时 `contextFor` **抛错、一次都不签**。
 
 ### Qoder CN（`qoder-cn`）—— 第二 region 的两条要点
 
@@ -183,9 +199,9 @@ SSE 帧原文**、只有 `details.error.message`/根层 `message`（无 code）�
 
 ⚠️ **照抄 Work 的写法把 `qoder-cn` 映射到 `qoder` 是静默故障**：CN 面板会列出国际版账号、用 CN 凭据打国际版 host —— 端点仍回 `ok: true`，只是账号对不上 / 报「凭据失效」。`tests/unit/qoder-hub-panel.spec.ts` 与 `qoder-cn-rpc-dispatch.spec.ts` 从两个方向钉死。
 
-**CN 三个基址**：`openapi.qoder.com.cn`（✅ 实测 200）、`api.qoder.com.cn`（✅ 实测 200）、**`gateway.qoder.com.cn`（chat，🔴 host 确是官方源码值，但 `/model/v1/chat/completions` 在该 host 上不存在）**。⚠️ **2026-09-21 二次取证已推翻旧定性「阿里云侧未就绪」**：503 是**路径级**的 —— ALB 对「该路径 × 任意方法 × 任意头」恒 503（无 `Authorization` / 垃圾 `jt-` / 空 Bearer 三种打的 alb 错误页**逐字节相同**），而同 host 的 `/api/v2/config/getDataPolicy` 回**应用层** 401/400（证明路径活着）⇒ 与凭据、出口、host 全无关，**不是「未就绪」，不会恢复**。官方客户端的真实 chat 通道是 `/algo/api/v2/service/pro/sse/agent_chat_generation`（真机 `qodercli.log` 实录 200），但它有 **WASM 签名门槛**（`qoder_auth_wasm` 的 `prepareInferRequest` 需 `machineId` + `cosyVersion` + **`userInfoJson` 登录用户密钥**；用有效 `jt-` 直打回 200 + SSE 但帧内 `{"code":"101","message":"Signature invalid"}`）⇒ **PAT 型凭据给不出用户密钥，CN 的 chat 对 PAT 形态结构性不可用**，不是待恢复的瞬时故障。**错误分类按 region 分流**：CN 的 chat 503 直报 `'fail'`（不退避、不换号、不记徽章、harness 码 `INVALID_REQUEST`），region 判据**显式列举 `=== QODER_CN.id`**（对齐 `qoder-models.ts` 的 `qoderFallbackModels` 先例，防第三个 region 被静默归入该分支）；**国际版 503 维持 `backoff` → `RATE_LIMIT` 不变**（对它而言瞬时故障是真实可能，实测可用，是本次取证的**控制组**：同实现 + `/model/v1/chat/completions` 实测 200 标准 OpenAI JSON）。**逃生阀** `QODER_MODEL_SERVER_HOST` 可覆盖 chat 的 host（⚠️ **只影响 chat**，exchange / 目录两条控制面不受影响；路径与查询串一律丢弃；显式 scheme 优先；**请求时读取**，进程起来后再设也生效），作用于两个 region；⚠️ 但**对 CN 改 host 不会让 chat 活过来** —— 路径不存在是 CN 网关侧的事实，换出口打同一路径仍是 503。⚠️ **绝不因为「打不通」就把它改成国际版 host**（禁令不变，理由更硬）—— 那会把「路径不存在」伪装成「凭据失效」：实测 **CN 的 `jt-` 打国际版 chat 回 401**（两区令牌互不承认），用户会被引向反复重贴 PAT 的死路。
+**CN 三个基址**：`openapi.qoder.com.cn`（✅ 实测 200）、`api.qoder.com.cn`（✅ 实测 200）、**`gateway.qoder.com.cn`（chat，✅ 2026-09-21 起是签名路径的 host）**。⚠️ **旧定性「阿里云侧未就绪 / PAT 结构性不可用」已被真机推翻两半**：① 「503 是路径级的」**仍成立** —— `/model/v1/chat/completions` 在 CN 网关确实不存在（ALB 对「该路径 × 任意方法 × 任意头」恒 503，三种头组合的 alb 错误页逐字节相同；同 host 的 `/api/v2/config/getDataPolicy` 回**应用层** 401/400 证明路径活着）；② 但「PAT 给不出用户密钥」**错了** —— 签名四要素 PAT 路径全部拿得到（`security_oauth_token` 就是 PAT 换来的 `jt-`，`uid` 取自 `GET openapi/api/v1/userinfo`），空 uid 才回 `101`。**CN 的 chat 现在走 `/algo/api/v2/service/pro/sse/agent_chat_generation` + wasm 签名**（见上一节），**不再打**那条 REST 路径。**错误分类按 region 分流**：CN 的 chat 503 直报 `'fail'`（不退避、不换号、不记徽章、harness 码 `INVALID_REQUEST`）—— ⚠️ **该分支保留不动**：它现在是逃生阀把 CN 指到别处、或将来有人误接回 REST 时的兜底；region 判据**显式列举 `=== QODER_CN.id`**（对齐 `qoder-models.ts` 的 `qoderFallbackModels` 先例，防第三个 region 被静默归入该分支）；**国际版 503 维持 `backoff` → `RATE_LIMIT` 不变**（实测可用，是同实现的控制组）。**逃生阀** `QODER_MODEL_SERVER_HOST` 覆盖 chat 的 host（⚠️ **只影响 chat**；路径与查询串一律丢弃；显式 scheme 优先；**请求时读取**），作用于两个 region；对 CN 它改的是**传给签名器的 hostBase**（签名后的完整 URL **不再过**该函数）。⚠️ **绝不因为「打不通」就把它改成国际版 host** —— 那会把「路径不存在」伪装成「凭据失效」：实测 **CN 的 `jt-` 打国际版 chat 回 401**（两区令牌互不承认），用户会被引向反复重贴 PAT 的死路。
 
-**CN 的三个出站身份标识**（⚠️ **均源码值、未实测**，且**无从 A/B** —— chat 路径不存在）：UA 已按官方源码校正为 **`qoder/1.1.58`**（官方 `openApiJsonApiRequest` 用模板 `` `qoder/${版本}` ``，**与 region 无关**；此前的 `qodercn/1.1.58` 是把 npm 包名 `@qodercn-ai/qoderclicn` 当产品名的**推断错值**）、`client_type: "5"`（国际版是 `qodercli`，取自 CN CLI 的 `kg()` 默认值）与 **Cosy 头**（`Cosy-ClientType` / `Cosy-Version`，**仅 CN 发**）。⚠️ `Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**（官方条件性发送，本插件**不猜机器身份** —— 缺头比错头安全）。
+**CN 的三个出站身份标识**：UA **`qoder/1.1.58`**（官方 `openApiJsonApiRequest` 用模板 `` `qoder/${版本}` ``、**与 region 无关**；此前的 `qodercn/1.1.58` 是把 npm 包名当产品名的**推断错值**）、`client_type: "5"`（国际版是 `qodercli`，取自 CN CLI 的 `kg()` 默认值）、**Cosy 头**（`Cosy-ClientType` / `Cosy-Version`）。⚠️ **签名路径下这三个的实际出站者都是 wasm**（20 头里含 `Cosy-ClientType` / `Cosy-Version` / `X-Model-Key` / `X-Model-Source`）；适配器 `send()` 里那段 Cosy 追加代码**对 CN 已无可达路径**，属残留（留着防「将来接回 REST 时出站身份静默变化」）。⚠️ `Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**（官方条件性发送，本插件**不猜机器身份** —— 缺头比错头安全）。
 
 ### Trae CN Work（`trae-cn-work`）—— 第二条 Trae CN 路径
 

@@ -63,6 +63,9 @@ import type {
 import { AccountPool } from './account-pool.js'
 import { QODER, QODER_CHAT_PATH, qoderClientType, qoderJobTokenHeaders } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
+import { QODER_SIGNED_CHAT_PATH } from './qoder-wasm-context.js'
+import type { QoderSigningSource } from './qoder-signing.js'
+import { isQoderWasmUnavailableError } from './qoder-wasm.js'
 import {
   QODER_OFF_CATALOG_HINT,
   QoderCatalogStore,
@@ -116,6 +119,28 @@ const QODER_MAX_ROTATE = 3
 
 /** 确证额度耗尽后的冷却时长（毫秒，1 小时）。 */
 const QODER_COOLDOWN_MS = 3_600_000
+
+/**
+ * CN 的 provider id（**签名路径的唯一 region 判据**）。
+ *
+ * 显式写成常量而不是内联 `'qoder-cn'`：它同时被
+ * {@link QoderAdapter.signingSource}（决定走不走签名）与错误分类的 7a 条
+ * （`qoder-errors.ts`，决定 503 的定性）使用，两处必须**同源** —— 各写一份
+ * 字面量，将来加第三个 region 时必然分叉。
+ */
+const QODER_CN_ID = 'qoder-cn'
+
+/**
+ * `modelSource` 的取值（`X-Model-Source` 头的语义）。
+ *
+ * 官方是 `model_config?.source ?? "system"`，三值域 `system` / `user` / `custom`
+ * （`PIe` / `prA` / `U2`）。本插件的 chat body **不含 `model_config`**
+ * （Qoder 的 REST body 没有这个字段），故恒取兜底值 `'system'`。
+ *
+ * ⚠️ **不要写成 `'solo_work_remote'`** —— 那是 **Trae** 的 function 名，
+ * 与 Qoder 无关；混进来会让签名头带一个上游不认的来源。
+ */
+const QODER_MODEL_SOURCE_DEFAULT = 'system'
 
 /**
  * 官方逃生阀环境变量：覆盖 **chat** 主机的 host 部分。
@@ -678,6 +703,28 @@ export async function* consumeQoderStream(
             continue
           }
 
+          // ── 签名路径的**外层信封**（真机实录，见 unwrapQoderFrame） ──
+          //
+          // 顺序很关键：**先剥信封、再判 `[DONE]`／错误／chunk**。原来的代码只认
+          // 裸帧，于是 CN 的每一帧都走到「`record.choices` 不是数组 ⇒ continue」
+          // 那一支被丢掉（连 `[DONE]` 都被信封包着 ⇒ 成功流也报「未产出内容」）。
+          const unwrapped = unwrapQoderFrame(parsed)
+          if (unwrapped.kind === 'inner') {
+            const inner = unwrapped.inner.trim()
+            // 信封里的 `[DONE]`（真机最后一帧就是它）。
+            if (inner === '[DONE]') {
+              done = true
+              break
+            }
+            try {
+              parsed = JSON.parse(inner)
+            } catch {
+              // 内层不是合法 JSON：按坏帧跳过（既有纪律），不让一个畸形帧
+              // 升级成整条会话失败。
+              continue
+            }
+          }
+
           const record = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
             ? parsed as Record<string, unknown>
             : undefined
@@ -870,6 +917,49 @@ function isSseFieldLine(line: string): boolean {
 }
 
 /**
+ * 剥掉**签名路径**的外层信封，取出内层真正要解析的东西。
+ *
+ * ## 真机帧形态（2026-09-21，一次 200 响应逐字节实录）
+ *
+ * 签名路径（`/algo/api/v2/service/pro/sse/agent_chat_generation`）的每一帧都是
+ * **再包一层**的信封 —— 内层才是标准 OpenAI chunk：
+ *
+ * ```
+ * data:{"headers":{"Content-Type":["application/json"]},
+ *       "body":"{\"choices\":[{\"delta\":{\"content\":\"pong\"},\"index\":0}],…}",
+ *       "statusCodeValue":200,"statusCode":"OK"}
+ * ```
+ *
+ * 所以内层要**再 `JSON.parse` 一次**（它是被转义成字符串的 JSON）。收尾帧同理：
+ * `"body":"[DONE]"` —— `[DONE]` 也在信封里，**不是**裸哨兵。
+ *
+ * ## 为什么必须按「信封特征」判而不是「见到 `body` 就解」
+ *
+ * 国际版是**裸** OpenAI 帧（实测），且理论上可以有名为 `body` 的业务字段。
+ * 「见到 `body` 字符串就内层解析」会把国际版的正常帧解开一层 ——
+ * 轻则丢字段，重则整条流解析失败。故判据要求**两个字段同时在**：
+ * `statusCodeValue`（数字）+ `body`（字符串）—— 后者单独不足以定性。
+ *
+ * ## 返回值的语义
+ *
+ * - `{ kind: 'inner' }`：信封，`inner` 是**待再解析的原文**（可能是 `[DONE]`）；
+ * - `{ kind: 'raw' }`：不是信封（国际版裸帧 / 其它形态），按原样走既有逻辑。
+ *
+ * ⚠️ 内层解析**失败时不静默**：回退成按原帧处理（`kind: 'raw'`），让上面那条
+ * 「坏帧跳过」的既有纪律去兜 —— 在这里抛错会把一个畸形帧升级成整条会话失败。
+ */
+function unwrapQoderFrame(parsed: unknown): { kind: 'inner'; inner: string } | { kind: 'raw' } {
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return { kind: 'raw' }
+  const record = parsed as Record<string, unknown>
+  // 判据：`statusCodeValue` 是数字、`body` 是字符串 —— **两个都在**才当信封。
+  // 只认 `body` 会误伤国际版裸帧（见上）。
+  if (typeof record.statusCodeValue !== 'number' || typeof record.body !== 'string') {
+    return { kind: 'raw' }
+  }
+  return { kind: 'inner', inner: record.body }
+}
+
+/**
  * 非流式（`Content-Type: application/json`）响应路径。
  *
  * 形态与 OpenAI 的 `chat.completion` 一致：`choices[0].message` 携带
@@ -1052,6 +1142,20 @@ export interface QoderAdapterOptions {
   onDebug?: (message: string) => void
   /** 产品配置；默认 `QODER`。 */
   product?: QoderProduct
+  /**
+   * **签名来源**（CN 的 chat 必需；国际版忽略）。
+   *
+   * CN 的 chat 只有签名路径可用（`/model/v1/chat/completions` 在 CN 网关
+   * 不存在，ALB 按路径级恒 503），故 CN 分支用它换出整包签名三件套。
+   *
+   * ⚠️ **省略时 CN 抛错，而不是静默回退 REST**：回退会得到上游 503，用户看到
+   * 的是「网关故障」而非「插件没接线」—— 后者是可修的配置错误，前者会把人
+   * 引向等待恢复。国际版路径一个字节都不碰（不注入也不影响）。
+   *
+   * ⚠️ **一个 region 一个实例**：签名器把 `product` 绑在构造时，两区共用会拿
+   * CN 的机器码签国际版的请求（上游回 `101 Signature invalid`）。
+   */
+  signing?: QoderSigningSource
 }
 
 /** Qoder LLM 适配器。使用 `Bearer jt-…` 鉴权，仅支持流式（SSE）。 */
@@ -1617,6 +1721,9 @@ export class QoderAdapter extends LlmAdapter {
    *
    * `afterJobTokenRetry` 随结果返回，透传给流内错误分类器 —— 它是 401 分型的
    * **唯一**依据（时序标志），丢了它分类器就只能按「第一次」处理。
+   *
+   * ⚠️ **签名路径下 401 不会发生**（鉴权头是 `Bearer COSY.…`，不是 jt），故签名
+   * 分支只发一次请求。这与「jt 过期 ⇒ 重换」无关，不需要在该路径上保留重试。
    */
   private async attempt(
     credential: QoderCredential,
@@ -1624,7 +1731,16 @@ export class QoderAdapter extends LlmAdapter {
     options: GenerateOptions,
   ): Promise<{ response: Response; afterJobTokenRetry: boolean }> {
     const pat = credential.access_token
+    // CN：签名路径。先判「有没有接线」再取 jt —— 没接线就不该白换一次令牌。
+    const signing = this.signingSource()
     const first = await this.jobToken(pat)
+    // jt 仍要取（userinfo 与签名身份都用它），但**不放进请求头** ——
+    // 出站头由 wasm 给（含 `Authorization: Bearer COSY.…`）。
+    if (signing !== undefined) {
+      const response = await this.sign(signing, pat, first, body, options)
+      return { response, afterJobTokenRetry: false }
+    }
+
     let response = await this.send(first, body, options)
     if (response.status !== 401) return { response, afterJobTokenRetry: false }
     // 先丢弃缓存，再取一次 —— 不丢弃的话 `getJobToken` 会把同一个（被判失效的）
@@ -1633,6 +1749,108 @@ export class QoderAdapter extends LlmAdapter {
     const second = await this.jobToken(pat)
     response = await this.send(second, body, options)
     return { response, afterJobTokenRetry: true }
+  }
+
+  /**
+   * 本实例的签名来源：**只有 CN 走签名路径**。
+   *
+   * 判据是 region（`product.id`）而不是「有没有注入 signing」：国际版即使被
+   * 注入了签名来源也必须走 REST（它的 REST 路径实测可用，换路径等于把一条
+   * 已验证的通路改成未验证的）。反向也成立 —— CN 的 REST 路径不存在，
+   * 无论有没有注入都不能回退过去（见 {@link QoderAdapterOptions.signing}）。
+   */
+  private signingSource(): QoderSigningSource | undefined {
+    if (this.product.id !== QODER_CN_ID) return undefined
+    if (this.options.signing === undefined) {
+      // 「没接线」是明确的**配置**错误，绝不能伪装成上游问题：回退 REST 会得到
+      // 上游 503（该路径在 CN 网关不存在），用户看到的是「网关故障」而无从下手。
+      throw new LlmError(
+        `${this.product.id}: chat 需要 wasm 签名来源，但适配器未注入（接线缺失）——`
+        + `该 region 的 chat 只有签名路径（${QODER_SIGNED_CHAT_PATH}）可用，`
+        + '不会回退到 REST 端点。',
+        'INVALID_REQUEST',
+      )
+    }
+    return this.options.signing
+  }
+
+  /** 发起一次**签名**请求：换出签名三件套后整包发出。 */
+  private async sign(
+    signing: QoderSigningSource,
+    pat: string,
+    jobToken: string,
+    body: string,
+    options: GenerateOptions,
+  ): Promise<Response> {
+    let prepared
+    try {
+      const context = await signing.contextFor(pat, jobToken)
+      // ⚠️ 四个参数与官方 `ari()` 逐字同源：
+      //   `ari(host, body, model_config?.key ?? "unknown", model_config?.source ?? "system")`
+      // - 第一参是 **host 基址**（传完整 URL 会得到路径重复两遍的 URL，实测）；
+      // - `modelKey` 是模型 id（本插件的 body 不含 `model_config`，等价于官方兜底）；
+      // - `modelSource` 恒 `'system'`（官方三值域 system/user/custom 的默认值）。
+      //
+      // host 基址仍过 `resolveQoderChatBase`（逃生阀 `QODER_MODEL_SERVER_HOST`）：
+      // 该变量的契约是「只换 chat 的 host、两个 region 都生效、**请求时读取**」，
+      // 而 CN 的 chat **就是**这条签名路径 —— 不在这里读它，那个逃生阀对 CN
+      // 就会**静默失效**（用户设了值却毫无动静，比报错更难查）。未设置时
+      // 原样返回 `product.chatBase`，故默认行为与字面量传参完全一致。
+      const hostBase = resolveQoderChatBase(this.product.chatBase)
+      prepared = context.prepareInferRequest(
+        hostBase,
+        body,
+        options.model,
+        QODER_MODEL_SOURCE_DEFAULT,
+      )
+    } catch (error) {
+      throw this.signingFailure(error)
+    }
+
+    const headers: Record<string, string> = {}
+    for (const [key, value] of prepared.headers) headers[key] = value
+    try {
+      return await this.fetchImpl(prepared.url, {
+        method: 'POST',
+        headers,
+        // ⚠️ **密文**：明文 body 一个字节都不能发（只补签名头必然 101）。
+        body: prepared.body,
+        signal: options.signal,
+      })
+    } catch (error) {
+      if (options.signal?.aborted) throw error
+      if (isTransportError(error)) {
+        throw new LlmError(
+          `${this.product.id}: transport error: ${errorMessage(error)}`, 'TRANSPORT', { cause: error as Error },
+        )
+      }
+      throw error
+    } finally {
+      prepared.free()
+    }
+  }
+
+  /**
+   * 把签名环节的异常转成面向用户的 LlmError。
+   *
+   * 两类**直报**（换号与退避都救不了，判成可重试会让用户白等）：
+   * - **wasm 组件不可用** —— 环境问题，文案里带三级尝试的原因（`qoder-wasm.ts`
+   *   已经拼好）；
+   * - **uid 取不到** —— 签名身份的必需输入，重试同一个账号只会再失败一次。
+   *
+   * 其余异常**原样上抛**：那多半是代码缺陷（如签名器被释放后复用），
+   * 包装它会掩盖真因。
+   */
+  private signingFailure(error: unknown): unknown {
+    if (isQoderWasmUnavailableError(error)) {
+      return new LlmError(
+        `${this.product.id}: ${error.message}`,
+        // 组件缺失是确定性的环境问题：不可重试（INVALID_REQUEST 而非 RATE_LIMIT）。
+        'INVALID_REQUEST',
+        { cause: error as Error },
+      )
+    }
+    return error
   }
 
   /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
@@ -1644,8 +1862,14 @@ export class QoderAdapter extends LlmAdapter {
     // 注意：不用 `new Headers(...)` —— Headers 构造器会丢弃/规范化部分头，
     // 普通对象逐字传递（与 credits 模块一致），避免两处请求头形态不一致。
     const headers = qoderJobTokenHeaders(jobToken, this.product, 'text/event-stream')
-    // Cosy 头：**只在产品声明了 `cosyVersion` 时才发**（CN 特有）。国际版不声明
-    // ⇒ 零头变化。两处口径同源（`product.cosyVersion`），不要在这里再写一份判断。
+    // Cosy 头：**只在产品声明了 `cosyVersion` 时才发**（CN 特有）。
+    //
+    // ⚠️ **2026-09-21 起这一段对 CN 已无可达路径**：声明 `cosyVersion` 的只有
+    // `QODER_CN`，而 CN 的 chat 现在一律走 wasm 签名路径（见 {@link QoderAdapter.sign}
+    // 与 `signingSource()`），出站头由 wasm 给（它自带 `Cosy-ClientType` /
+    // `Cosy-Version`）。本段是**残留**：留着是为了「万一将来有人把 CN 接回
+    // REST」（那时缺 Cosy 头会静默改变出站身份），而不是因为现在用得上。
+    // 国际版不声明该字段 ⇒ 本段对它**一行都不执行**（零头变化）。
     //
     // ⚠️ `Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不发**：官方对它们是
     // 条件性发送，本插件不猜机器身份（见 `QoderProduct.cosyVersion` 的注释）。
