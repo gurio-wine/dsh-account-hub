@@ -85,10 +85,10 @@ export const DEFAULT_MODEL = 'deepseek-v4-flash'
 
 /**
  * 模型上下文窗口（对齐 Rust BuddyProvider::context_limit 的静态 fallback 表；
- * 权威来源是 /v3/config 的**默认档**上下文窗口 —— `data.models[].contextWindow.defaultLength`
- * （缺失时才回退 `maxInputTokens`，见 `src/buddy.ts` 的 parseModelMeta），
- * 由 fetchRemoteModels 动态拉取后经 remoteContextWindows 优先采用，
- * 此表仅作远端不可用时的兜底）。
+ * 权威来源是 /v3/config 的**最大档**上下文窗口 —— `data.models[].maxInputTokens`
+ * 与 `contextWindow.supportedLengths` 的最大档取 min（见 `src/buddy.ts` 的
+ * parseModelMeta），由 fetchRemoteModels 动态拉取后经 remoteContextWindows 优先
+ * 采用，此表仅作远端不可用时的兜底）。
  */
 const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['deepseek-v4-flash', 1_000_000],
@@ -350,6 +350,17 @@ function errorDetail(body: string): string {
  * 注意该报文的 `msg` 是「prompt is too long」措辞、`extError.code` 是
  * `context_length_exceeded`，两者都能被 `isContextWindowExceededError` 识别。
  *
+ * ⚠️ **2026-09-21 起这是「安全网」而非兜底主力**：声明窗口取最大档（≈1M）后，
+ * 正常路径不该撞窗口；万一某个模型真实窗口低于声明值，撞上的是今天实测的
+ * `{"code":11115,"msg":"prompt is too long: 100001 tokens > 100000 maximum",
+ *   "extError":{"code":"400001",...},"displayMsg":{"en":"The request exceeds the
+ *   model context limit. ..."}}` —— `extError.code` 从 `context_length_exceeded`
+ * 变成了**纯数字** `400001`，`msg` 也没有 `for this model` 后缀，故**命中的是
+ * `displayMsg.en` 那句英文措辞**。判据仍复用宿主的 `isContextWindowExceededError`
+ * （不在插件侧自建关键词表，见 lobsterai-errors.ts 的同一先例）；这条映射由
+ * `tests/unit/buddy-adapter.spec.ts` 的「安全网」用例钉死，含一条「摘掉
+ * displayMsg 就命中不了」的承重点记录。
+ *
  * 与 CodeArts 适配器（llm-adapter.ts 的 httpErrorCode）同一判定口径，但
  * **传入原始 body 而非 errorDetail(body)**：`errorDetail` 在能提取到
  * `error.*` / `message` 时会返回拼接后的短文本，从而丢掉 `extError`、
@@ -467,7 +478,7 @@ export class BuddyAdapter extends LlmAdapter {
   private remoteModels: BuddyRemoteModel[] | undefined
   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
-  /** 远端下发的模型上下文窗口（默认档 `contextWindow.defaultLength`，缺失回退 `maxInputTokens`）。 */
+  /** 远端下发的模型上下文窗口（**最大档**：min(maxInputTokens, 档位表最大档)）。 */
   private remoteContextWindows: ReadonlyMap<string, number> = new Map()
   /**
    * 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。
@@ -517,7 +528,7 @@ export class BuddyAdapter extends LlmAdapter {
   /**
    * 懒加载远端模型目录（仅拉取一次）。listModels 与 resolveModel 共用：
    * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样
-   * 触发一次远端拉取，保证远端的上下文窗口（默认档）能生效。
+   * 触发一次远端拉取，保证远端的上下文窗口（最大档）能生效。
    */
   private async ensureRemoteModels(): Promise<void> {
     if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
@@ -527,8 +538,9 @@ export class BuddyAdapter extends LlmAdapter {
         // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
         // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
         // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
-        // ⚠️ 窗口口径是**默认档**（defaultLength），不是 maxInputTokens —— 见
-        // `src/buddy.ts` 的 parseModelMeta：我方请求不带档位，上游按默认档服务。
+        // ⚠️ 窗口口径是**最大档**（min(maxInputTokens, supportedLengths 最大档)），
+        // 不是 defaultLength —— 见 `src/buddy.ts` 的 parseModelMeta：真机实测
+        // defaultLength 是 UI 默认值、不是硬限（320K–1.0M token 全部正常服务）。
         const reconciled = this.reconcileWithFallback(models)
         this.remoteModels = reconciled
         this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
@@ -655,7 +667,7 @@ export class BuddyAdapter extends LlmAdapter {
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     await this.ensureRemoteModels()
-    // 三级查找：远端默认档窗口 → 产品兜底表 → 通用静态表
+    // 三级查找：远端最大档窗口 → 产品兜底表 → 通用静态表
     // （对齐 Rust context_limit_for_model 的两级查找，多一层产品级）。
     const contextWindow = this.remoteContextWindows.get(model)
       ?? this.productFallbackContextWindows.get(model)

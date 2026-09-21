@@ -419,11 +419,11 @@ export interface BuddyRemoteModel {
   id: string
   name: string
   /**
-   * 上下文窗口：**上游实际按它服务的档位**，即 `contextWindow.defaultLength`
-   * （默认档）；远端未下发档位对时回退 `maxInputTokens`（单档模型的最大档
-   * 就是它真实提供的窗口）。两者都没有时缺省。
+   * 上下文窗口：**上游真实可服务的最大档**（≈1M）。
    *
-   * ⚠️ 不是 `maxInputTokens` 的照抄 —— 详见 {@link parseModelMeta} 的口径说明。
+   * 取值见 {@link parseModelMeta} 的口径说明：双信号取 `min(maxInputTokens,
+   * supportedLengths 最大档)`，只有其一取那个，都无才回退 `defaultLength`。
+   * ⚠️ **不是 `defaultLength`** —— 它是纯 UI 默认值、不是硬限（2026-09-21 实测）。
    */
   contextWindow?: number
   /** 是否接受图片输入（data.models[].supportsImages）。 */
@@ -575,24 +575,30 @@ function isChatModel(id: string, meta: Record<string, unknown> | undefined): boo
 /**
  * 提取单个 data.models[] 条目的上下文窗口与对话能力。
  *
- * ⚠️ **上下文窗口的取值口径是 `contextWindow.defaultLength`（默认档），不是
- * `maxInputTokens`（最大档）** —— 这是 2026-09-20 真机取证后修正的口径：
+ * ⚠️ **上下文窗口取「最大档」，不是 `contextWindow.defaultLength`（默认档）** ——
+ * 这是 2026-09-21 钳制二分实测后修正的口径，**推翻了 2026-09-20 的默认档定案**：
  *
- * - 远端对「1M 但默认档更小」的那批模型成对下发
- *   `contextWindow: {defaultLength, supportedLengths}`，`supportedLengths`
- *   的最大档恒为 1M、`defaultLength` 是 200K–400K 之间的档位；
- * - **我方的 chat 请求体不含任何档位字段**（全仓 grep 证实），因此**上游按
- *   `defaultLength` 服务** —— 声明值必须对着真实服务窗口算；
- * - 宿主用这个声明值算自动压缩阈值（0.8 × 窗口）：照抄最大档会让阈值
- *   （0.8 × 1M = 800K token）永远追不上真实窗口（200K–400K），长会话必然在
- *   压缩触发之前撞上游硬限。
+ * - 真机单变量实测（`buddy-cn` / `glm-5.3`）：prompt **320,307 / 500,507 /
+ *   900,910 / 1,000,970 token 全部 HTTP 200 正常服务**，1.2M token 才回 HTTP 400
+ *   `{"code":11115,"msg":"prompt is too long: …","extError":{"code":"400001"}}`；
+ * - ⇒ `defaultLength`（300K）**不是硬限，是纯 UI 默认值**；真实可服务窗口 ≈ 1M，
+ *   等于 `supportedLengths` 的最大档、也等于 `maxInputTokens`；
+ * - 官方客户端取证同样成立：档位选择器**不发任何出站字段**，只驱动它自己的压缩
+ *   触发点 —— 最大档在上游有真实对应窗口。
  *
- * 不带 `contextWindow` 字段的是**单档模型**，`maxInputTokens` 即真实服务窗口，
- * 故它是回退值而非被取代值。非正整数（0 / 负数 / 非数字）一律视为非法，同样
- * 回退 —— 与「只保留正数」的既有口径一致。
+ * 按默认档声明的代价是**怂恿过早压缩**（宿主阈值 0.8 × 300K = 240K 就丢历史），
+ * 与本仓批判过的 trae-cn `prompt_max_tokens=168K` 是同类错误。
  *
- * 另注：`supportedLengths` 只描述可选档位，本模块**刻意不解析**它 —— 我们不
- * 选档（选档属于出站协议变更，见 AGENTS.md 的 Buddy 章节）。
+ * 取值链（a = `maxInputTokens`，b = `supportedLengths` 的最大正整数）：
+ * 1. a、b 都存在 → **`min(a, b)`** —— 档位表是上游**刻意公布的上限**，它更小时
+ *    听它的（真机 `minimax-m3` 的档位表最大档是 512K，不能按 1M 虚报）；
+ * 2. 只有其一 → 取那个；
+ * 3. 都无 → 最后回退 `defaultLength`（正整数）；再无不声明。
+ *
+ * ⚠️ `supportedLengths` **只做这一处最小解析**（取最大正整数）：不存档位列表、
+ * 不做选档 UI、不做任何出站用途 —— 选档属于**出站协议变更**（见 AGENTS.md 的
+ * Buddy 章节）。非正整数（0 / 负数 / 非数字）逐项剔除，与「只保留正数」的既有
+ * 口径一致。
  *
  * 能力字段只在远端**显式**下发时保留：缺失即 undefined，交由适配器的静态
  * 兜底表决定，而不是猜成 false。
@@ -600,7 +606,7 @@ function isChatModel(id: string, meta: Record<string, unknown> | undefined): boo
 function parseModelMeta(record: Record<string, unknown> | undefined): Omit<BuddyRemoteModel, 'id' | 'name'> {
   if (record === undefined) return {}
   const meta: Omit<BuddyRemoteModel, 'id' | 'name'> = {}
-  const limit = readDefaultContextLength(record) ?? readPositiveLimit(record.maxInputTokens)
+  const limit = readMaxContextLength(record)
   if (limit !== undefined) meta.contextWindow = limit
   if (typeof record.supportsImages === 'boolean') meta.supportsImages = record.supportsImages
   const reasoning = record.reasoning
@@ -620,11 +626,52 @@ function parseModelMeta(record: Record<string, unknown> | undefined): Omit<Buddy
 }
 
 /**
+ * 按「最大档」口径读取上下文窗口（口径与理由见 {@link parseModelMeta}）。
+ *
+ * a = `maxInputTokens`，b = `contextWindow.supportedLengths` 的最大正整数：
+ * 都有取 `min(a, b)`（档位表更小时听档位表的），只有其一取那个，都无才回退
+ * `contextWindow.defaultLength`；全都不合法时返回 undefined（不声明窗口）。
+ */
+function readMaxContextLength(record: Record<string, unknown>): number | undefined {
+  const fromMaxInput = readPositiveLimit(record.maxInputTokens)
+  const fromLengths = readMaxSupportedLength(record)
+  if (fromMaxInput !== undefined && fromLengths !== undefined) return Math.min(fromMaxInput, fromLengths)
+  if (fromMaxInput !== undefined) return fromMaxInput
+  if (fromLengths !== undefined) return fromLengths
+  // 两个「最大档」信号都没有时才用默认档兜底 —— 它是最后手段，不是首选。
+  return readDefaultContextLength(record)
+}
+
+/**
+ * 读取 `contextWindow.supportedLengths` 的**最大正整数**。
+ *
+ * 形如 `[300000, 1000000]`，也可以混入非法项（0 / 负数 / 字符串 / NaN），
+ * 逐项剔除后取最大值；数组缺失 / 非数组 / 无合法项时返回 undefined。
+ *
+ * ⚠️ 只返回这一个数，**不返回整张档位表** —— 本模块不选档、不做出站用途。
+ */
+function readMaxSupportedLength(record: Record<string, unknown>): number | undefined {
+  const window = record.contextWindow
+  if (typeof window !== 'object' || window === null) return undefined
+  const lengths = (window as Record<string, unknown>).supportedLengths
+  if (!Array.isArray(lengths)) return undefined
+  let max: number | undefined
+  for (const value of lengths) {
+    const candidate = readPositiveLimit(value)
+    if (candidate === undefined) continue
+    if (max === undefined || candidate > max) max = candidate
+  }
+  return max
+}
+
+/**
  * 读取 `contextWindow.defaultLength`（模型的**默认档**上下文长度）。
  *
  * 形如 `{defaultLength: 300000, supportedLengths: [300000, 1000000]}`。
- * 只接受正整数：0 / 负数 / 非数字 / 字段缺失都返回 undefined，由调用方回退到
- * `maxInputTokens` —— 宁可声明最大档，也不要声明一个上游不会服务的非法档。
+ * 只接受正整数：0 / 负数 / 非数字 / 字段缺失都返回 undefined。
+ *
+ * ⚠️ 它是**最后手段**，不是首选：真机实测它**不是硬限**（320K–1.0M 全部正常
+ * 服务），拿它当首选会让宿主过早压缩、白丢历史。
  */
 function readDefaultContextLength(record: Record<string, unknown>): number | undefined {
   const window = record.contextWindow

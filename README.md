@@ -368,6 +368,14 @@ cordis 服务名是显式指定的 `ctx.buddyCnAuth` —— 带连字符的 id �
   `fetchModels()`。
 - 模型列表：以内置的产品目录为准（`src/product.ts` 的 `fallbackModels`），
   远端 `GET /v3/config` 可用时优先采用其元数据。
+- **上下文窗口声明值取「最大档」**：`min(maxInputTokens, contextWindow.supportedLengths`
+  最大档`)`，远端缺字段时才用 `fallbackModels` 的静态兜底（同为**最大档**口径）。
+  ⚠️ 上游成对下发的 `contextWindow: {defaultLength, supportedLengths}` 里，
+  **`defaultLength` 是官方客户端的 UI 默认档、不是服务端硬限** —— 2026-09-21 钳制二分
+  实测（`buddy-cn` / `glm-5.3`，同一请求只改 token 数）：320,307 / 500,507 / 900,910 /
+  1,000,970 token **全部 HTTP 200**，1.2M 才回 400 `code:11115`。故按最大档声明
+  （≈1M）；本插件**不发送任何档位字段**，也不提供档位选择 UI。
+  详见 [AGENTS.md](AGENTS.md) 的「Buddy 系 —— 上下文窗口取值口径」。
 - 请求头：除 `Authorization: Bearer` 外，还需 `X-Domain`、`X-Product`、
   `X-Product-Code` 以及伪装为 `CodeBuddyIDE/1.106.1` 的 `User-Agent`。
 - 凭据 ref：单账号 `BUDDY_CN_ACCESS_TOKEN`，多账号 `BUDDY_CN_ACCOUNT_<UUID_SHORT>`；
@@ -434,6 +442,12 @@ cordis 服务名是显式指定的 `ctx.buddyCnAuth` —— 带连字符的 id �
 - 续期：与 Buddy CN 共用同一套机制，插件启动后每 30 分钟对可续期账号静默刷新
   （`refresh_token` 经 `X-Refresh-Token` 头提交），无需重新打开浏览器。
 - 请求头、模型列表拉取与流式工具调用 id 处理均与 Buddy CN 一致，详见上一节。
+- **上下文窗口同为「最大档」口径**，但 ⚠️ **国际版没有实测证据**（账号余额不足，
+  无法做钳制二分），是按同协议形态推定的；CN 侧有 `glm-5.3` 的单变量实测。风险论证：
+  万一真实窗口低于声明值，撞 `11115` 会被映射成 `CONTEXT_WINDOW_EXCEEDED`，
+  由宿主自动压缩重试兜底；反之按默认档声明会**每次 240K 就丢历史**。国际版
+  **8 个「1M 且远端不下发 `contextWindow` 字段」**的模型是单档模型，
+  其 `maxInputTokens` 即服务窗口，静态兜底表按 **1M** 保留、不砍。
 
 ### 与 Account Hub 设置页的关系
 

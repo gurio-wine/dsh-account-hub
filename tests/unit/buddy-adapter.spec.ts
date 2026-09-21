@@ -144,25 +144,26 @@ describe('BuddyAdapter', () => {
     expect(resolved).toMatchObject({ provider: 'buddy-cn', id: 'deepseek-v4-flash', context: { contextWindow: 1_000_000 } })
   })
 
-  it('resolveModel matches the product fallback table (default-tier windows)', async () => {
-    // ⚠️ 兜底表的 `contextWindow` 语义是**默认档**（2026-09-20 真机快照）：
-    // 远端对「1M 但默认档更小」的模型下发 contextWindow.defaultLength，
-    // 而我方请求不带档位、上游按默认档服务。CN 的 1M 系 = 300K，
-    // minimax-m3 也是 300K（[300K, 512K]）；非 1M 条目（glm-5.1 200K /
-    // kimi-k2.6 256K）不动。
+  it('resolveModel matches the product fallback table (max-tier windows)', async () => {
+    // ⚠️ 兜底表的 `contextWindow` 语义是**最大档**（2026-09-21 钳制实测口径）：
+    // defaultLength 是 UI 默认值、不是硬限（320K–1.0M token 实测全部正常服务，
+    // 1.2M 才回 11115），真实窗口 = supportedLengths 最大档 = maxInputTokens。
+    // CN 的 1M 系 = 1M；⚠️ minimax-m3 = **512K**（官方档位表最大档是 512K）；
+    // 非 1M 条目（glm-5.1 200K / kimi-k2.6 256K）不动。
     const adapter = makeAdapter()
-    expect((await adapter.resolveModel('buddy-cn', 'glm-5.3-flash')).context).toEqual({ contextWindow: 300_000 })
-    expect((await adapter.resolveModel('buddy-cn', 'glm-5.3')).context).toEqual({ contextWindow: 300_000 })
-    expect((await adapter.resolveModel('buddy-cn', 'glm-5.2')).context).toEqual({ contextWindow: 300_000 })
+    expect((await adapter.resolveModel('buddy-cn', 'glm-5.3-flash')).context).toEqual({ contextWindow: 1_000_000 })
+    expect((await adapter.resolveModel('buddy-cn', 'glm-5.3')).context).toEqual({ contextWindow: 1_000_000 })
+    expect((await adapter.resolveModel('buddy-cn', 'glm-5.2')).context).toEqual({ contextWindow: 1_000_000 })
     expect((await adapter.resolveModel('buddy-cn', 'glm-5.1')).context).toEqual({ contextWindow: 200_000 })
-    expect((await adapter.resolveModel('buddy-cn', 'minimax-m3')).context).toEqual({ contextWindow: 300_000 })
+    expect((await adapter.resolveModel('buddy-cn', 'minimax-m3')).context).toEqual({ contextWindow: 512_000 })
     expect((await adapter.resolveModel('buddy-cn', 'kimi-k2.6')).context).toEqual({ contextWindow: 256_000 })
   })
 
   it('resolveModel prefers the remote window over the static table', async () => {
     // 远端是权威来源（对齐 Rust context_limit_for_model 两级查找）：远端下发值
-    // 覆盖静态 fallback。口径是**默认档**（src/buddy.ts 的 parseModelMeta 已把
-    // defaultLength 解析进 contextWindow），适配器只负责「远端优先」。
+    // 覆盖静态 fallback。口径是**最大档**（src/buddy.ts 的 parseModelMeta 已把
+    // min(maxInputTokens, supportedLengths 最大档) 解析进 contextWindow），
+    // 适配器只负责「远端优先」。
     const adapter = makeAdapter({
       fetchRemoteModels: async () => [{ id: 'glm-5.3-flash', name: 'GLM-5.3 Flash', contextWindow: 1_048_576 }],
     })
@@ -175,22 +176,22 @@ describe('BuddyAdapter', () => {
       fetchRemoteModels: async () => [{ id: 'glm-5.3-flash', name: 'GLM-5.3 Flash' }],
     })
     const resolved = await adapter.resolveModel('buddy-cn', 'glm-5.3-flash')
-    expect(resolved.context).toEqual({ contextWindow: 300_000 })
+    expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
   })
 
-  it('远端默认档窗口端到端生效（不取最大档）', async () => {
-    // 端到端口径防线：/v3/config 的 `contextWindow.defaultLength` 经
+  it('远端最大档窗口端到端生效（不取默认档）', async () => {
+    // 端到端口径防线：远端 `maxInputTokens` + `supportedLengths` 经
     // parseModelsFromConfig → reconcileWithFallback → resolveModel 一路到
-    // 宿主声明值。真机形态：最大档 1M、默认档 300K，请求不带档位字段。
+    // 宿主声明值。真机形态：defaultLength 300K（UI 默认）、最大档 1M（真实服务窗口）。
     const adapter = makeAdapter({
       fetchRemoteModels: async () => [{
         id: 'glm-5.3-flash',
         name: 'GLM-5.3 Flash',
-        contextWindow: 300_000,
+        contextWindow: 1_000_000,
       }],
     })
     const resolved = await adapter.resolveModel('buddy-cn', 'glm-5.3-flash')
-    expect(resolved.context).toEqual({ contextWindow: 300_000 })
+    expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
   })
 
   it('resolveModel omits context for unknown models', async () => {
@@ -287,8 +288,9 @@ describe('BuddyAdapter', () => {
     expect(call.model).toMatchObject({
       provider: 'buddy-cn',
       id: 'hy4-preview',
-      // 默认档口径：hy4-preview 远端 defaultLength = 300K（非最大档 1M）。
-      context: { contextWindow: 300_000 },
+      // 最大档口径：hy4-preview 的档位表最大档与 maxInputTokens 都是 1M
+      // （defaultLength 300K 是 UI 默认值、不是硬限）。
+      context: { contextWindow: 1_000_000 },
       inputModalities: ['text', 'image'],
     })
     expect(typeof call.stream).toBe('function')
@@ -455,6 +457,95 @@ describe('BuddyAdapter credential handling', () => {
     const adapter = makeAdapter({ fetchImpl: async () => new Response(variant, { status: 400 }) })
     const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
     expect((error as LlmError).failure.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+  })
+
+  /**
+   * 安全网：声明值取**最大档**（≈1M）后，万一某个模型真实窗口低于声明值，
+   * 撞上的就是 2026-09-21 实测的这条 11115 报文（buddy-cn / glm-5.3，1.2M 请求）：
+   *
+   * ```
+   * {"code":11115,"msg":"prompt is too long: 100001 tokens > 100000 maximum",
+   *  "extError":{"code":"400001","type":"invalid_request_error"},
+   *  "displayMsg":{"en":"The request exceeds the model context limit. ..."}}
+   * ```
+   *
+   * 报文里的 "100001 > 100000" 是**另一种计数尺度**的钳制显示（精确钳制点未定位），
+   * 但语义确凿：prompt 超限。
+   *
+   * ⚠️ **命中的是 `displayMsg.en` 那句话，不是 `msg`、也不是 `extError.code`** ——
+   * 这条必须在测试里写清楚，因为它决定了安全网的**承重点**：
+   * - `extError.code` 是**纯数字** `400001`，与旧的 `context_length_exceeded`
+   *   不同源，`STRUCTURED_CONTEXT_OVERFLOW` 认不出它；
+   * - `msg` 的「prompt is too long: N tokens > M maximum」也**不是**判据目标 ——
+   *   `TOO_LARGE_FOR_CONTEXT` 要求「too long **for this model**」，这句没有
+   *   `for … model`，故不命中（下面的「已知承重点」用例把这条钉死）。
+   *
+   * 结论不变：**无需改分类器**（判据的定义权在宿主，见 lobsterai-errors.ts 的
+   * 同一先例），只需把这条映射钉住，防它随口径变更静默失效 —— 一旦失效，长会话
+   * 就会退回 `INVALID_REQUEST`（致命、**不触发宿主压缩**）而彻底不可用。
+   */
+  it('安全网：11115 钳制报文（extError.code=400001）仍归为 CONTEXT_WINDOW_EXCEEDED', async () => {
+    const clampBody = JSON.stringify({
+      code: 11115,
+      msg: 'prompt is too long: 100001 tokens > 100000 maximum',
+      requestId: '1f0c2a94-6b31-4d4e-8f3a-2b0d6c7e9a51',
+      extError: { code: '400001', type: 'invalid_request_error' },
+      displayMsg: {
+        en: 'The request exceeds the model context limit. Please shorten the conversation or remove attachments.',
+        zh: '对话内容超出模型长度上限，请精简对话或减少附件后重试。',
+      },
+    })
+    const adapter = makeAdapter({ fetchImpl: async () => new Response(clampBody, { status: 400 }) })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).failure.code).toBe('CONTEXT_WINDOW_EXCEEDED')
+    // 上游原文保留在 message 里（真机排障要能对上号）
+    expect((error as LlmError).message).toContain('prompt is too long')
+  })
+
+  /**
+   * ⚠️ **已知承重点**：安全网挂在 `displayMsg.en` 的英文措辞上。
+   *
+   * 把 `displayMsg` 摘掉、只留 `msg` + `extError.code:"400001"`，宿主判定
+   * **不命中** ⇒ 落回 `INVALID_REQUEST`（不触发压缩）。这条不是在肯定该行为，
+   * 而是把「安全网靠什么承重」钉进测试：上游若改了 displayMsg 文案，这里会给出
+   * 最直接的线索，而不是让人对着「长会话忽然不可用」猜。
+   *
+   * 本次**刻意不改分类器**：判据的定义权在宿主（`isContextWindowExceededError`），
+   * 自建关键词表会与它漂移 —— 与 lobsterai / qoder 两条线同一原则。
+   */
+  it('⚠️ 已知承重点：摘掉 displayMsg 的裸 11115 报文命中不了（安全网依赖英文措辞）', async () => {
+    const bareBody = JSON.stringify({
+      code: 11115,
+      msg: 'prompt is too long: 100001 tokens > 100000 maximum',
+      extError: { code: '400001', type: 'invalid_request_error' },
+    })
+    const adapter = makeAdapter({ fetchImpl: async () => new Response(bareBody, { status: 400 }) })
+    const error = await collectChunks(adapter, streamOptions).catch((e: unknown) => e)
+    expect((error as LlmError).failure.code).toBe('INVALID_REQUEST')
+  })
+
+  it('安全网：钳制报文不带任何档位字段时也走同一条映射（出站零变更的对照）', async () => {
+    // 声明值只影响宿主的压缩阈值，**绝不进出站请求体**（红线）。这里确认
+    // 「最大档口径」没有顺手往请求里塞 supportedLengths / defaultLength 之类字段。
+    const clampBody = JSON.stringify({
+      code: 11115,
+      msg: 'prompt is too long: 100001 tokens > 100000 maximum',
+      extError: { code: '400001', type: 'invalid_request_error' },
+      displayMsg: { en: 'The request exceeds the model context limit.' },
+    })
+    let body: Record<string, unknown> = {}
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return new Response(clampBody, { status: 400 })
+      },
+    })
+    await collectChunks(adapter, streamOptions).catch(() => undefined)
+    for (const forbidden of ['contextWindow', 'defaultLength', 'supportedLengths', 'maxInputTokens', 'context_window']) {
+      expect(body, forbidden).not.toHaveProperty(forbidden)
+    }
   })
 
   it('stream sends the required CodeBuddy headers', async () => {
@@ -1750,7 +1841,7 @@ describe('BuddyAdapter 模型黑名单', () => {
     // ……但仍可解析元数据（DSH 契约要求目录缺省不构成请求拒绝）
     const resolved = await adapter.resolveModel('buddy-cn', 'glm-5.2')
     expect(resolved.id).toBe('glm-5.2')
-    // 兜底表口径是默认档（CN 的 1M 系 → 300K）。
-    expect(resolved.context?.contextWindow).toBe(300_000)
+    // 兜底表口径是最大档（CN 的 1M 系 → 1M）。
+    expect(resolved.context?.contextWindow).toBe(1_000_000)
   })
 })

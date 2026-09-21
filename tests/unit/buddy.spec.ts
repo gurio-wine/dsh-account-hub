@@ -282,47 +282,45 @@ describe('buddy model config parsing', () => {
     ])
   })
 
-  // ── 上下文窗口取值口径：默认档（defaultLength）优先 ──
+  // ── 上下文窗口取值口径：最大档 ──
   //
-  // 2026-09-20 真机取证：Buddy 系对「1M 但默认档更小」的模型成对下发
-  // `contextWindow: {defaultLength, supportedLengths}`（supportedLengths 最大档
-  // 恒为 1M，defaultLength 是 200K–400K 的档位）。**我方 chat 请求体不带任何档位
-  // 字段 → 上游按 defaultLength 服务**，故声明值必须取默认档：照抄最大档会让宿主
-  // 的压缩阈值（0.8 × 窗口）永远追不上真实窗口，长会话撞上游硬限即死。
-  describe('上下文窗口取默认档（contextWindow.defaultLength）', () => {
-    it('带档位对时取 defaultLength，而不是 maxInputTokens', () => {
+  // ⚠️ 2026-09-21 钳制二分实测**推翻**了 09-20 的「上游按默认档服务」推断：
+  // buddy-cn 的 glm-5.3 在 prompt 320,307 / 500,507 / 900,910 / 1,000,970 token
+  // **全部 HTTP 200 正常服务**，1.2M token 才回 HTTP 400 `code:11115`
+  //（`prompt is too long`）⇒ `contextWindow.defaultLength`(300K) 是**纯 UI 默认值、
+  // 不是硬限**；真实可服务窗口 ≈ 1M，等于 supportedLengths 最大档 = maxInputTokens。
+  // 官方客户端取证同样成立：档位选择器**不发任何出站字段**，只驱动它自己的压缩触发
+  // 点 —— 最大档在上游有真实对应窗口。
+  //
+  // 故声明值取**最大档**：按默认档声明会让宿主 0.8 × 300K = 240K 就压缩、白丢历史，
+  // 与本仓批判过的 trae-cn `prompt_max_tokens=168K` 完全同类。
+  //
+  // 口径（a = maxInputTokens，b = supportedLengths 的最大正整数）：
+  //   ① 两者都有 → min(a, b)（档位表是刻意上限，它更小时听它的）
+  //   ② 只有其一 → 取那个
+  //   ③ 都无 → 回退 defaultLength（正整数）；再无不声明
+  describe('上下文窗口取最大档（min(maxInputTokens, supportedLengths 最大档)）', () => {
+    it('双信号都存在时取 min —— 档位表更小时听档位表的', () => {
       const models = parseModelsFromConfig({
         data: {
-          agents: [{ name: 'craft', models: ['glm-5.3', 'deepseek-v4.1-flash', 'minimax-m3'] }],
+          agents: [{ name: 'craft', models: ['glm-5.3', 'minimax-m3', 'small-max'] }],
           models: [
-            // 真机形态：最大档 1M，默认档 300K。
+            // 真机形态：maxInputTokens 与档位表最大档都是 1M（glm-5.3 实测服务到 1M）。
             { id: 'glm-5.3', maxInputTokens: 1048576, contextWindow: { defaultLength: 300000, supportedLengths: [300000, 1048576] } },
-            { id: 'deepseek-v4.1-flash', maxInputTokens: 1048576, contextWindow: { defaultLength: 300000, supportedLengths: [300000, 1048576] } },
-            // 默认档与最大档不同源（minimax-m3 实测 [300K, 512K]）。
-            { id: 'minimax-m3', maxInputTokens: 524288, contextWindow: { defaultLength: 300000, supportedLengths: [300000, 524288] } },
+            // 档位表更小 ⇒ 听档位表的（真机 [300K, 512K]），不按 maxInputTokens 虚报。
+            { id: 'minimax-m3', maxInputTokens: 1048576, contextWindow: { defaultLength: 300000, supportedLengths: [300000, 524288] } },
+            // 反向：maxInputTokens 更小时取它（不因为档位表更大就跟着抬）。
+            { id: 'small-max', maxInputTokens: 200000, contextWindow: { defaultLength: 100000, supportedLengths: [100000, 524288] } },
           ],
         },
       })
-      expect(models.map((m) => m.contextWindow)).toEqual([300_000, 300_000, 300_000])
+      expect(models.map((m) => m.contextWindow)).toEqual([1_048_576, 524_288, 200_000])
     })
 
-    it('国际版的 200K / 400K 默认档同样生效', () => {
-      const models = parseModelsFromConfig({
-        data: {
-          agents: [{ name: 'craft', models: ['hy4-preview', 'gpt-6-astra'] }],
-          models: [
-            { id: 'hy4-preview', maxInputTokens: 1048576, contextWindow: { defaultLength: 200000, supportedLengths: [200000, 1048576] } },
-            { id: 'gpt-6-astra', maxInputTokens: 1048576, contextWindow: { defaultLength: 400000, supportedLengths: [400000, 1048576] } },
-          ],
-        },
-      })
-      expect(models.map((m) => m.contextWindow)).toEqual([200_000, 400_000])
-    })
-
-    it('不带 contextWindow 字段的条目保持 maxInputTokens（单档模型无档位可选）', () => {
-      // 真机：国际版 9 个 1M 模型（gpt-5.6-*、gpt-5.5、gemini-3.5-flash、
-      // glm-5.3、glm-5.2、kimi-k3）都不带该字段。无字段即无档位，maxInputTokens
-      // 就是服务窗口，**不能砍** —— 砍了等于谎报容量。
+    it('只有 maxInputTokens 时取它（单档模型的真实窗口）', () => {
+      // 真机：国际版 8 个 1M 模型（gpt-5.6-*、gpt-5.5、gemini-3.5-flash、
+      // glm-5.3、glm-5.2、kimi-k3）都不带 `contextWindow` 字段。无档位表即单档，
+      // maxInputTokens 就是服务窗口，**不能砍** —— 砍了等于谎报容量。
       const models = parseModelsFromConfig({
         data: {
           agents: [{ name: 'craft', models: ['gpt-5.6-sol', 'gemini-3.5-flash'] }],
@@ -335,43 +333,62 @@ describe('buddy model config parsing', () => {
       expect(models.map((m) => m.contextWindow)).toEqual([1_048_576, 1_048_576])
     })
 
-    it('defaultLength 非法时回退 maxInputTokens（不声明非法档）', () => {
-      // 0 / 负数 / 非数字 / 空对象 / 非对象 一律视为未下发档位。
+    it('只有 supportedLengths 时取它的最大正整数（逐项剔除非法值）', () => {
+      // 档位表在、maxInputTokens 缺失或非法时，档位表最大档是唯一信号；
+      // 表内非正整数项（0 / 负数 / 字符串 / NaN）逐个剔除，取剩下的最大值。
       const models = parseModelsFromConfig({
         data: {
-          agents: [{ name: 'craft', models: ['a', 'b', 'c', 'd', 'e', 'f'] }],
+          agents: [{ name: 'craft', models: ['only-lengths', 'dirty-lengths', 'zero-max'] }],
           models: [
-            { id: 'a', maxInputTokens: 1048576, contextWindow: { defaultLength: 0 } },
-            { id: 'b', maxInputTokens: 1048576, contextWindow: { defaultLength: -1 } },
-            { id: 'c', maxInputTokens: 1048576, contextWindow: { defaultLength: '300000' } },
-            { id: 'd', maxInputTokens: 1048576, contextWindow: {} },
-            { id: 'e', maxInputTokens: 1048576, contextWindow: null },
-            { id: 'f', maxInputTokens: 1048576, contextWindow: 300000 },
+            { id: 'only-lengths', contextWindow: { defaultLength: 300000, supportedLengths: [300000, 1000000] } },
+            { id: 'dirty-lengths', contextWindow: { supportedLengths: [200000, 0, -1, 'x', Number.NaN, 800000] } },
+            { id: 'zero-max', maxInputTokens: 0, contextWindow: { supportedLengths: [300000, 1000000] } },
           ],
         },
       })
-      expect(models.map((m) => m.contextWindow)).toEqual([1_048_576, 1_048_576, 1_048_576, 1_048_576, 1_048_576, 1_048_576])
+      expect(models.map((m) => m.contextWindow)).toEqual([1_000_000, 800_000, 1_000_000])
     })
 
-    it('defaultLength 非法且 maxInputTokens 也非法时不声明窗口', () => {
+    it('两者都无时回退 defaultLength（最后手段，不是首选）', () => {
+      // defaultLength 只在**没有任何「最大档」信号**时兜底：它已实测不是硬限
+      //（320K–1.0M 全部正常服务），拿它当首选就是怂恿过早压缩。
       const models = parseModelsFromConfig({
         data: {
-          agents: [{ name: 'craft', models: ['bad', 'worse'] }],
+          agents: [{ name: 'craft', models: ['only-default', 'bad-everything'] }],
           models: [
-            { id: 'bad', maxInputTokens: 0, contextWindow: { defaultLength: 0 } },
+            { id: 'only-default', contextWindow: { defaultLength: 300000 } },
+            { id: 'bad-everything', contextWindow: { defaultLength: -1, supportedLengths: [] } },
+          ],
+        },
+      })
+      expect(models).toEqual([
+        { id: 'only-default', name: 'only-default', contextWindow: 300_000 },
+        { id: 'bad-everything', name: 'bad-everything' },
+      ])
+    })
+
+    it('三个信号全非法时不声明窗口', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['bad', 'worse', 'worst'] }],
+          models: [
+            { id: 'bad', maxInputTokens: 0, contextWindow: { defaultLength: 0, supportedLengths: [0] } },
             { id: 'worse', maxInputTokens: Number.POSITIVE_INFINITY, contextWindow: { defaultLength: Number.NaN } },
+            { id: 'worst', contextWindow: { supportedLengths: null } },
           ],
         },
       })
       expect(models).toEqual([
         { id: 'bad', name: 'bad' },
         { id: 'worse', name: 'worse' },
+        { id: 'worst', name: 'worst' },
       ])
     })
 
-    it('解析 supportedLengths 之外不发明字段（不选档）', () => {
-      // supportedLengths 只描述可选档位；本模块刻意不解析它 —— 选档属于出站协议
-      // 变更（见 AGENTS.md 的 Buddy 章节）。这里钉死「解析结果里只有 contextWindow」。
+    it('supportedLengths 只用来取最大值，不发明字段（不存整档列表、不出站）', () => {
+      // supportedLengths 只参与这一个算术；本模块不存档位列表、不做 UI、不做任何
+      // 出站用途（选档属于出站协议变更，见 AGENTS.md 的 Buddy 章节）。这里钉死
+      //「解析结果里只有 contextWindow 一个字段」。
       const models = parseModelsFromConfig({
         data: {
           agents: [{ name: 'craft', models: ['glm-5.3'] }],
@@ -382,7 +399,7 @@ describe('buddy model config parsing', () => {
           }],
         },
       })
-      expect(models[0]).toEqual({ id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 300_000 })
+      expect(models[0]).toEqual({ id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_048_576 })
     })
   })
 

@@ -114,26 +114,30 @@ describe('产品配置', () => {
     expect(wb?.reasoningEfforts).toContain(wb?.defaultReasoningEffort)
   })
 
-  it('兜底目录的 contextWindow 是**默认档**（2026-09-20 真机快照），不是 maxInputTokens', () => {
-    // 远端对「1M 但默认档更小」的模型成对下发
-    // `contextWindow: {defaultLength, supportedLengths}`（supportedLengths 最大档
-    // 恒为 1M），而我方 chat 请求体**不带任何档位字段** → 上游按 defaultLength
-    // 服务。兜底表必须照默认档写：照抄最大档会让宿主的压缩阈值
-    // （0.8 × 窗口）永远追不上真实窗口（200K–400K），长会话撞上游硬限即死。
+  it('兜底目录的 contextWindow 是**最大档**（2026-09-21 钳制实测），不是 defaultLength', () => {
+    // 09-20 的「上游按默认档（defaultLength）服务」是**推断**，已被 09-21 单变量
+    // 钳制二分**推翻**：buddy-cn 的 glm-5.3 在 prompt 320,307 / 500,507 / 900,910 /
+    // 1,000,970 token 全部 HTTP 200 正常服务，1.2M 才回 `code:11115`
+    //（prompt is too long）⇒ defaultLength（300K）是**纯 UI 默认值、不是硬限**，
+    // 真实可服务窗口 ≈ 1M = supportedLengths 最大档 = maxInputTokens。
+    // 照默认档声明会让宿主 0.8 × 300K = 240K 就压缩、白丢历史。
     //
-    // ⚠️ 逐条钉死，任何一条被改错都等于谎报一个模型的容量。
+    // 口径：带档位对的条目 = min(maxInputTokens, 档位表最大档)；无档位对的条目 =
+    // maxInputTokens。⚠️ 逐条钉死，任何一条被改错都等于谎报一个模型的容量。
     const cnWindow = (id: string) => BUDDY_CN.fallbackModels!.find((m) => m.id === id)?.contextWindow
     const intlWindow = (id: string) => BUDDY.fallbackModels!.find((m) => m.id === id)?.contextWindow
 
-    // Buddy CN：1M 系全部为 300K（supportedLengths [300K, 1M]）；
-    // minimax-m3 同为 300K（[300K, 512K]，**不是**它的最大档 512K）。
-    for (const id of ['hy4-preview', 'deepseek-v4.1-flash', 'deepseek-v4-pro', 'glm-5.3', 'glm-5.3-flash', 'glm-5.2', 'kimi-k3-1', 'minimax-m3']) {
-      expect(cnWindow(id), `buddy-cn/${id}`).toBe(300_000)
+    // Buddy CN：带档位对（[300K, 1M]）的条目 → 1M；maxInputTokens 与档位表最大档一致。
+    for (const id of ['hy4-preview', 'deepseek-v4.1-flash', 'deepseek-v4-pro', 'glm-5.3', 'glm-5.3-flash', 'glm-5.2', 'kimi-k3-1']) {
+      expect(cnWindow(id), `buddy-cn/${id}`).toBe(1_000_000)
     }
-    // 国际版：hy4-preview-f / deepseek-v4.1-flash = 300K、gpt-6-astra = 400K。
-    expect(intlWindow('hy4-preview-f')).toBe(300_000)
-    expect(intlWindow('deepseek-v4.1-flash')).toBe(300_000)
-    expect(intlWindow('gpt-6-astra')).toBe(400_000)
+    // ⚠️ minimax-m3 是**唯一**例外：官方档位表最大档是 512K（[300K, 512K]），
+    // 档位表是刻意上限 ⇒ 取 512K，不是 1M、更不是默认档 300K。
+    expect(cnWindow('minimax-m3')).toBe(512_000)
+    // 国际版：三项远端下发过档位对（[300K/400K, 1M]）⇒ 取最大值 1M。
+    expect(intlWindow('hy4-preview-f')).toBe(1_000_000)
+    expect(intlWindow('deepseek-v4.1-flash')).toBe(1_000_000)
+    expect(intlWindow('gpt-6-astra')).toBe(1_000_000)
   })
 
   it('未定性条目的窗口一律不动（不许错位，也不许砍单档模型）', () => {
@@ -156,19 +160,38 @@ describe('产品配置', () => {
     }
   })
 
-  it('国际版未被定性的 1M 条目全部保持 1M（无 contextWindow 字段 ⇒ 单档模型）', () => {
-    // 真机取证：这些条目**不带 `contextWindow` 字段** ⇒ 单档模型，没有档位可选，
-    // `maxInputTokens` 就是服务窗口。砍它等于谎报容量，故一律保持 1M。
-    // （真机下发过档位对的三项是 hy4-preview-f / deepseek-v4.1-flash / gpt-6-astra，
-    //  已在上一条用例里按默认档钉死；其余 1M 条目一个都不许动。）
-    const untouchedOneMeg = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gemini-3.5-flash', 'glm-5.3', 'glm-5.2', 'kimi-k3']
-    for (const id of untouchedOneMeg) {
+  it('国际版 1M 条目集合 = 无档位对的 8 项 + 带档位对的 3 项（集合相等钉死）', () => {
+    // 三组互斥来源，合起来必须恰好等于国际版全部 1M 条目 —— 多一个（漏改的口径）
+    // 或少一个（误砍的单档模型）都会在这里炸：
+    //   ① **无 `contextWindow` 字段**（单档模型）8 项 → maxInputTokens 即服务窗口，
+    //      保持 1M；砍它等于谎报容量；
+    //   ② 远端**下发过档位对**的三项 → 最大档口径取 1M（09-20 曾按默认档写成
+    //      300K/400K，09-21 钳制实测已推翻该口径）；
+    //   ③ 其余非 1M 条目（gpt-5.4 272K、kimi-k2.6 256K 等）不在本条射程内。
+    const noTierField = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gemini-3.5-flash', 'glm-5.3', 'glm-5.2', 'kimi-k3']
+    for (const id of noTierField) {
       expect(BUDDY.fallbackModels!.find((m) => m.id === id)?.contextWindow, `buddy/${id}`).toBe(1_000_000)
     }
-    // 反向防线（比逐条断言更强）：国际版**所有** 1M 条目的集合必须恰好等于上表 ——
-    // 多一个（漏改的）或少一个（误砍的）都会在这里炸。
+    const withTierField = ['hy4-preview-f', 'deepseek-v4.1-flash', 'gpt-6-astra']
+    for (const id of withTierField) {
+      expect(BUDDY.fallbackModels!.find((m) => m.id === id)?.contextWindow, `buddy/${id}`).toBe(1_000_000)
+    }
+    // 反向防线（比逐条断言更强）：集合相等，两边都不许多也不许少。
     const oneMeg = BUDDY.fallbackModels!.filter((m) => m.contextWindow === 1_000_000).map((m) => m.id).sort()
-    expect(oneMeg).toEqual([...untouchedOneMeg].sort())
+    expect(oneMeg).toEqual([...noTierField, ...withTierField].sort())
+  })
+
+  it('Buddy CN 兜底表的 1M 条目集合恰好等于带档位对的 7 项（集合相等钉死）', () => {
+    // CN 侧同样用集合相等钉死，防止回退时漏改或误砍。
+    // ⚠️ minimax-m3 **不在**其中：它的官方档位表最大档是 512K（[300K, 512K]），
+    // 最大档口径取 512K 而非 1M —— 档位表是**刻意上限**，不是摆设。
+    const oneMeg = BUDDY_CN.fallbackModels!.filter((m) => m.contextWindow === 1_000_000).map((m) => m.id).sort()
+    expect(oneMeg).toEqual([
+      'deepseek-v4-pro', 'deepseek-v4.1-flash', 'glm-5.2',
+      'glm-5.3', 'glm-5.3-flash', 'hy4-preview', 'kimi-k3-1',
+    ].sort())
+    // 反向也钉一次：minimax-m3 的 512K 必须原样在表里（别被「统一成 1M」顺手改掉）。
+    expect(BUDDY_CN.fallbackModels!.find((m) => m.id === 'minimax-m3')?.contextWindow).toBe(512_000)
   })
 
   it('兜底目录不含非对话模型与实测不可用的内部别名', () => {
