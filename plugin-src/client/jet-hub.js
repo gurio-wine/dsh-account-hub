@@ -267,10 +267,14 @@ async function createAccountWithPat({ provider, pat, rpcCall, sleep, attempts = 
 /**
  * Qoder 的 PAT 粘贴表单。
  *
- * **内联展开**，不是弹窗、也**不新开浏览器标签**：Qoder 没有浏览器登录流程，
- * 用户要做的只有「去签发页复制一串字符、粘回来」，弹窗只会多一层关闭动作。
- * 与 `manualLogin`（弹窗被拦截时的兜底链接）的做法一致：都用原生 `<a>`
- * 由浏览器自己导航，不受脚本开窗策略影响。
+ * **内联展开**，不是弹窗、也**不新开浏览器标签**：用户要做的只有「去签发页
+ * 复制一串字符、粘回来」，弹窗只会多一层关闭动作。与 `manualLogin`（弹窗被
+ * 拦截时的兜底链接）的做法一致：都用原生 `<a>` 由浏览器自己导航，不受脚本
+ * 开窗策略影响。
+ *
+ * ⚠️ **文案不得声称「Qoder 不支持浏览器登录」**（2026-09-21 设备流落地后那
+ * 是事实错误）：浏览器登录是**默认形态**，PAT 只是并存的备选。说错会让用户
+ * 以为没有那条路 —— 而他就站在一个刚刚提供该选项的面板里。
  *
  * **刻意抽成模块级组件而不是在 ProviderPanel 里内联**：ProviderPanel 用了 hooks，
  * 单元测试加载不了它（react 不在依赖里，见 `tests/unit/jet-hub-credit-balance-row.spec.ts`
@@ -284,7 +288,7 @@ async function createAccountWithPat({ provider, pat, rpcCall, sleep, attempts = 
 function PatLoginForm({ patUrl, value, busy, error, onChange, onSubmit, onCancel }) {
   return React.createElement('div', { className: 'dim-jh-patForm' },
     React.createElement('p', null,
-      'Qoder 不支持浏览器登录：请先在官方的 Integrations 页面签发一个 PAT（Personal Access Token），再把它粘贴到这里。'),
+      '请先在官方的 Integrations 页面签发一个 PAT（Personal Access Token），再把它粘贴到这里。'),
     React.createElement('p', null,
       React.createElement('a', {
         href: patUrl,
@@ -324,6 +328,50 @@ function PatLoginForm({ patUrl, value, busy, error, onChange, onSubmit, onCancel
       }, '取消')),
     React.createElement('p', { className: 'dim-jh-patHint' },
       'PAT 只保存在本地，用于换取短期 job token；面板不会把它发给任何第三方。'));
+}
+
+/**
+ * 登录**形态选择器**：让用户在「浏览器登录」与「粘贴 PAT」之间二选一。
+ *
+ * ## 为什么需要它（而不是默认走某一条）
+ *
+ * 设备流落地后 Qoder 有**两种并存**的登录形态，两者都不是「高级选项」：
+ * 浏览器登录是官方 CLI / 桌面端的主路径，PAT 是不依赖浏览器的备用路径
+ * （无头环境、企业策略禁用弹窗、官方授权页打不开时）。替用户默认选一条，
+ * 都会让另一条**无法触达** —— 而用户根本不知道它存在。
+ *
+ * ## 为什么抽成模块级组件
+ *
+ * 与 {@link PatLoginForm} 同因：`ProviderPanel` 用了 hooks，单测加载不了它。
+ * 抽出来才能对这棵树做整树深比较（含两个按钮的文案与回调）。
+ *
+ * ## 两个动作都**只转发**，不自己实现
+ *
+ * `onBrowserLogin` 接到既有的 `createAccount()`（它负责手势内开空窗 + 导航 +
+ * 轮询），`onPatLogin` 只是把 PAT 表单展开。这里**不新增** `window.open` 调用点
+ * —— 多一处开窗就是多一张被拦截的白页。
+ */
+function LoginChoiceForm({ productLabel, onBrowserLogin, onPatLogin, onCancel }) {
+  return React.createElement('div', { className: 'dim-jh-patForm' },
+    React.createElement('p', null,
+      `${productLabel} 支持两种登录方式：`),
+    React.createElement('p', null,
+      '浏览器登录会在新标签页打开官方授权页，登录后自动回到本面板；'
+      + '粘贴 PAT 适合无法打开浏览器或授权页不可用的环境。'),
+    React.createElement('div', { className: 'dim-jh-patActions' },
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        'data-kind': 'primary',
+        onClick: () => onBrowserLogin(),
+      }, '浏览器登录'),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        onClick: () => onPatLogin(),
+      }, '粘贴 PAT'),
+      React.createElement('button', {
+        className: 'dim-jh-btn',
+        onClick: () => onCancel(),
+      }, '取消')));
 }
 
 /**
@@ -1017,6 +1065,14 @@ function ProviderPanel({ provider, rpcCall }) {
   const [patValue, setPatValue] = React.useState('');
   const [patBusy, setPatBusy] = React.useState(false);
   const [patError, setPatError] = React.useState(null);
+  /**
+   * 登录**形态选择器**的展开状态（只有「两种形态并存」的 provider 用）。
+   *
+   * 与 `patOpen` 是**两个独立状态**：选择器是「还没决定用哪条路」，PAT 表单是
+   * 「已经决定粘贴 PAT」。合成一个状态会让「点浏览器登录」与「点粘贴 PAT」
+   * 在渲染上无法区分（选择器该收起来，而 PAT 表单该展开）。
+   */
+  const [loginChoiceOpen, setLoginChoiceOpen] = React.useState(false);
   const mounted = React.useRef(true);
   /**
    * 最新账号列表的 ref 镜像。
@@ -1452,10 +1508,10 @@ function ProviderPanel({ provider, rpcCall }) {
               className: 'dim-jh-btn',
               'data-kind': 'primary',
               title: patLogin
-                ? '粘贴一个 Qoder PAT（Personal Access Token）并加入账号池。'
+                ? '浏览器登录 Qoder，或粘贴一个 PAT（Personal Access Token）加入账号池。'
                 : '通过浏览器登录一个新的账号并加入账号池。',
               onClick: patLogin
-                ? () => { setPatOpen(true); setPatError(null); }
+                ? () => { setLoginChoiceOpen(true); setPatError(null); }
                 : () => void createAccount(),
               disabled: patLogin ? patBusy : creating,
             }, patLogin
@@ -1467,6 +1523,19 @@ function ProviderPanel({ provider, rpcCall }) {
     // 按钮点了没反应只会让用户以为坏了，而这里要传达的是「去别处登录」。
     loginHint
       ? React.createElement('p', { className: 'dim-jh-loginHint' }, loginHint)
+      : null,
+    // 登录**形态选择器**（只有「两种形态并存」的 provider，即 Qoder 两区）：
+    // 与 PAT 表单同位置、同门控理由 —— 点开就在按钮旁边，是一次登录操作的 UI。
+    // ⚠️ 门控是 `loginChoiceOpen && patLogin`（**两个**都要）而不是只看标志位：
+    // 非 PAT 形态的 provider 若标志位为真会误渲染，那时 `patLogin` 是 null，
+    // 节点照样出来而不报错。
+    loginChoiceOpen && patLogin
+      ? React.createElement(LoginChoiceForm, {
+          productLabel: label,
+          onBrowserLogin: () => { setLoginChoiceOpen(false); void createAccount(); },
+          onPatLogin: () => { setLoginChoiceOpen(false); setPatOpen(true); },
+          onCancel: () => { setLoginChoiceOpen(false); setPatError(null); },
+        })
       : null,
     // PAT 粘贴表单（只有 Qoder）：渲染在标题区之后的第一个位置，紧邻驱动它的
     // 「+ 新建账号」按钮，点开就在原地 —— 它是一次登录操作的 UI，
@@ -1530,7 +1599,7 @@ function ProviderPanel({ provider, rpcCall }) {
               // 文案说错会让用户去找一个根本不存在的登录页。
               React.createElement('p', null, canCreateAccount
                 ? (patLogin
-                    ? '点击"+ 新建账号"粘贴 PAT。'
+                    ? '点击"+ 新建账号"，选择浏览器登录或粘贴 PAT。'
                     : '点击"+ 新建账号"进行浏览器登录。')
                 : '请先在上方提示的 Trae CN 面板登录账号。'))
           : React.createElement('div', null,

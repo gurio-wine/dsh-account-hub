@@ -236,15 +236,23 @@ describe('QODER_CN 配置逐字段', () => {
     expect(QODER_CN.accountCredentialRefPrefix).not.toBe(QODER.accountCredentialRefPrefix)
   })
 
-  it('国际版 QODER **逐字段不变**：键集合与取值都与接入 CN 前一致', () => {
+  it('国际版 QODER **逐字段不变**：键集合与取值都与接入 CN / 设备流前一致', () => {
     // 键集合锁死：新增 CN 专属字段（serviceName / clientType / cosyVersion）时
     // 若「顺手」也给国际版补上，这条会立刻失败。CN 落地前 QODER 恰有这 10 个键。
+    //
+    // ⚠️ 2026-09-21 设备流落地后为 **13 个**：`authBaseUrl` / `clientId` /
+    // `machineIdDir` 是**两区都必须有**的设备流字段（不是 CN 专属），故三个
+    // 键在两侧都出现。这条断言的**原意不变** —— 它守的是「CN 专属的可选字段
+    // 不许漏进国际版」，那三个键由下面的可选字段用例继续守。
     expect(Object.keys(QODER).sort()).toEqual([
       'accountCredentialRefPrefix',
+      'authBaseUrl',
       'chatBase',
+      'clientId',
       'defaultCredentialRef',
       'displayName',
       'id',
+      'machineIdDir',
       'modelsBase',
       'openapiBase',
       'patPrefix',
@@ -263,7 +271,27 @@ describe('QODER_CN 配置逐字段', () => {
       patUrl: 'https://qoder.com/account/integrations',
       defaultCredentialRef: 'QODER_PERSONAL_TOKEN',
       accountCredentialRefPrefix: 'QODER_ACCOUNT',
+      // 设备流：授权页在主站（**不是** openapi host），client_id 是 CLI 那一个。
+      authBaseUrl: 'https://qoder.com',
+      clientId: 'e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb',
+      machineIdDir: '.qoder',
     })
+  })
+
+  it('设备流三字段两区**同形不同值**：host 与机器码目录各归各的', () => {
+    // 三字段都是**必填**（不是可选）—— 少一个就会静默落到另一区的授权页，
+    // 而用户在那一页上看不到自己的账号，只觉得「登录不了」。
+    expect(QODER_CN.authBaseUrl).toBe('https://qoder.cn')
+    expect(QODER.authBaseUrl).toBe('https://qoder.com')
+    expect(new URL(QODER_CN.authBaseUrl).hostname).not.toBe(new URL(QODER.authBaseUrl).hostname)
+    // machine_id 目录与官方 CLI 同路径：`.qoder` / `.qoder-cn` 必须不同，
+    // 共用会让装了两版 CLI 的用户两边机器码互相覆盖。
+    expect(QODER.machineIdDir).toBe('.qoder')
+    expect(QODER_CN.machineIdDir).toBe('.qoder-cn')
+    expect(QODER_CN.machineIdDir).not.toBe(QODER.machineIdDir)
+    // client_id 是**唯一**两区相同的设备流字段：官方就是一个 CLI 应用覆盖两区。
+    expect(QODER_CN.clientId).toBe(QODER.clientId)
+    expect(QODER.clientId).toBe('e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb')
   })
 
   it('CN 独有的三个可选字段只出现在 CN 配置上', () => {

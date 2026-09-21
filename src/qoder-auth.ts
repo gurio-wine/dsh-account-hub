@@ -28,6 +28,14 @@ import { credentialRef, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { RefreshScheduler } from './refresh.js'
 import { AccountPool } from './account-pool.js'
 import {
+  cancelQoderDeviceLogin,
+  prepareQoderDeviceLogin,
+  type QoderDeviceLoginPrepareOutcome,
+  type QoderDevicePendingLogin,
+  type QoderDeviceTokenPayload,
+  type QoderMachineIdIo,
+} from './qoder-device-flow.js'
+import {
   QODER,
   QODER_JOB_TOKEN_EXCHANGE_PATH,
   QODER_JOB_TOKEN_REFRESH_LEAD_MS,
@@ -260,6 +268,31 @@ export interface QoderAuthOptions {
   product?: QoderProduct
   /** 服务名覆盖（默认取 `product.serviceName`，产品未声明时按 `${id}Auth` 派生）。 */
   serviceName?: string
+  /**
+   * 设备流注入面（测试用）。
+   *
+   * 三个字段都不是「配置」而是**替身入口**：出网、等待节奏、home 目录。
+   * ⚠️ `homeDir` 的存在是为了让测试**不污染**用户与官方 CLI 共用的
+   * `~/.qoder/.auth/machine_id` —— 那会让用户混用官方 CLI 时签名因机器码
+   * 漂移而失效。
+   */
+  deviceFlow?: QoderDeviceFlowOptions
+}
+
+/** 设备流的可注入面（生产一律走默认值）。 */
+export interface QoderDeviceFlowOptions {
+  /** 注入的 fetch（测试用）。 */
+  fetcher?: typeof fetch
+  /** 注入的等待函数（测试用）。 */
+  sleep?: (ms: number) => Promise<void>
+  /** home 目录覆盖（测试用）。 */
+  homeDir?: string
+  /** 文件系统注入面（测试用）。 */
+  io?: QoderMachineIdIo
+  /** 轮询间隔覆盖。 */
+  intervalMs?: number
+  /** 总超时覆盖。 */
+  timeoutMs?: number
 }
 
 /** {@link QoderAuth.login} / {@link QoderAuth.loginWithPat} 的公共选项。 */
@@ -382,24 +415,181 @@ export class QoderAuth extends Service {
   }
 
   /**
-   * 统一登录入口。
+   * 统一登录入口（**两种形态并存**）。
    *
-   * **Qoder 没有浏览器登录**：`login()` 只是 {@link loginWithPat} 的入口别名，
-   * 用来满足「所有 `ctx.xxxAuth` 都有 login(options?)」的统一接口约定
-   * （见 AGENTS.md「工作方式」）。
+   * | 调用 | 走哪条路 | 形态 |
+   * |---|---|---|
+   * | `login()` | **浏览器设备流** | 两段式：返回 `loginUrl`，等用户在浏览器授权 |
+   * | `login({ pat })` | PAT 粘贴 | 即时请求，当场完成 |
    *
-   * `options.pat` 缺失时**抛明确错误**而不是静默开一个不存在的浏览器流程：
-   * 调用方（RPC / 命令）拿到的是「该走 PAT 粘贴入口」的可读原因，
-   * 而不是一个更难归因的失败。
+   * `pat` 提供了就走 PAT（**一行未改**的 {@link loginWithPat}）；没提供就走设备流。
+   *
+   * ⚠️ **为什么无参不再抛错**：本 provider 落地时确实只有 PAT 一种形态，
+   * 那时「无参」等于「用户走错了入口」，抛一条指引是正确的。现在设备流是
+   * **默认的浏览器登录形态**，无参有了真实含义 —— 继续抛错会让统一接口
+   * （AGENTS.md「工作方式」要求每个 `ctx.xxxAuth` 都有 `login(options?)`）
+   * 名不副实。
+   *
+   * 设备流返回的 `loginUrl` 是**授权页地址**，调用方（RPC / 命令）负责把它
+   * 交给用户；本方法**不 await 用户操作**（那正是两段式要解决的问题）。
    */
   async login(options: QoderLoginOptions & { pat?: string } = {}): Promise<QoderLoginResult> {
-    const pat = options.pat?.trim() ?? ''
-    if (pat.length === 0) {
-      throw new Error(
-        `Qoder 不支持浏览器登录：请粘贴个人访问令牌（PAT），签发页 ${this.product.patUrl}`,
-      )
+    // 判据是「**`pat` 这个键在不在**」而不是「它的值非不非空」：`{ pat: '' }`
+    // 是「用户提交了一个空 PAT」，属于 PAT 路径的非法输入，必须回
+    // 「PAT 格式不正确」；把它当成「无 pat」会静默改走设备流、开出一个
+    // 授权页 —— 用户看到的是一个自己没要求的浏览器登录。
+    if (options.pat !== undefined) return this.loginWithPat(options.pat, options)
+
+    // 设备流：建会话 → 等授权 → 落凭据。`login()` 是**阻塞式**入口
+    // （与另外几个 provider 的 `login()` 同语义），Account Hub 走的是
+    // 两段式 `prepareLogin` + `persistLoginResult`，不经过这里。
+    const outcome = await this.prepareLogin(options)
+    if (!outcome.ok) throw new Error(outcome.message)
+    const session = outcome.session
+    let payload: QoderDeviceTokenPayload
+    try {
+      payload = await session.awaitToken()
+    } catch (error) {
+      session.cancel(error instanceof Error ? error.message : String(error))
+      throw error
     }
-    return this.loginWithPat(pat, options)
+    return this.persistDeviceToken(payload, { loginUrl: session.loginUrl, ...options })
+  }
+
+  /**
+   * **第一段**：建立设备流会话，返回 `loginUrl`（**不 await 用户操作**）。
+   *
+   * 这是 Account Hub 的入口（`account.create` 无 `pat` 时）：
+   *
+   * 1. 本方法**只建会话**（本地生成 PKCE、读写 machine_id），一次网都不出；
+   * 2. RPC 立刻把 `loginUrl` 返回给客户端，客户端在**同一用户手势内**开窗；
+   * 3. 后台由 {@link persistLoginResult} 消费 `awaitToken()` 完成第二段。
+   *
+   * 已有未结算会话时返回 `login-in-progress`（**provider 级互斥**：不新建、
+   * 不复用）；调用方应把该错误码**原样透传**给客户端做提示。
+   *
+   * ⚠️ **设备流会话与 PAT 无关**：PAT 路径不进这里（它是即时请求，没有
+   * 「会话」这个概念）。两条路只在 {@link login} 这一处分流。
+   */
+  async prepareLogin(
+    options: QoderLoginOptions = {},
+  ): Promise<QoderDeviceLoginPrepareOutcome> {
+    // 会话出现即视为「本次登录有效」：清掉上一次的失效标记，否则 status()
+    // 会一直显示旧的「PAT 已失效」提示，而用户明明正在重新登录。
+    this.active = true
+    return prepareQoderDeviceLogin({
+      product: this.product,
+      // 构造期注入的替身入口（测试用）；生产下 `deviceFlow` 缺省 ⇒ 全走默认值。
+      ...this.options.deviceFlow ?? {},
+      // ⚠️ `fetcher` 必须**单独**补在这里：`deviceFlow.fetcher` 与
+      // `QoderAuthOptions.fetcher` 是两个入口（前者给设备流、后者给 exchange），
+      // 而调用方通常只设后者。不补的话设备流会悄悄走**全局 fetch** ——
+      // 测试里表现为「注入的替身一次都没被调用」，生产里表现为代理 / 证书
+      // 配置不生效（exchange 走代理、设备流不走）。
+      ...this.options.fetcher === undefined ? {} : { fetcher: this.options.fetcher },
+    })
+  }
+
+  /**
+   * 取消当前进行中的设备流登录（幂等）。
+   *
+   * 供 `account.delete` 使用：删掉占位账号后必须终止轮询，否则它会一直打到
+   * 5 分钟超时（且互斥槽位不释放，用户重新登录会拿到 `login-in-progress`）。
+   */
+  cancelPendingLogin(reason?: string): void {
+    // 槽位是模块级单例、按 provider 分槽，故这里通过一次「空转 prepare」
+    // 之外的路径拿不到句柄 —— 由设备流模块暴露的取消入口统一处理。
+    cancelQoderDeviceLogin(this.product.id, reason)
+  }
+
+  /**
+   * **第二段**：把一个已完成的设备流结果落盘（凭据 + 账号池）。
+   *
+   * 时序约束（不可调换，与另外几个 provider 同因）：
+   * 1. 先写凭据，**再**补全账号 —— `login.poll` 以「该 ref 能否解析到凭据」
+   *    为完成判据，反过来会让轮询在凭据就绪前就报成功；
+   * 2. 占位条目的 `refreshable` / `expiresAt` / `nickname` 都依赖结果，
+   *    故第一段只能以 pending 形态存在。
+   *
+   * `accountId` + `pool` 提供时按账号路径补全；否则落到默认单凭据 ref
+   * （{@link login} 走的就是这条）。
+   */
+  async persistLoginResult(
+    session: QoderDevicePendingLogin,
+    options: QoderLoginOptions = {},
+  ): Promise<QoderLoginResult> {
+    const payload = await session.awaitToken()
+    return this.persistDeviceToken(payload, { loginUrl: session.loginUrl, ...options })
+  }
+
+  /**
+   * 把设备流拿到的令牌落成凭据（两条消费路径的**唯一**落盘点）。
+   *
+   * 抽出来是为了让「凭据长什么样」只有一处：`login()` 与
+   * `persistLoginResult()` 都走它，否则将来改字段会只改一半。
+   *
+   * ## 与 PAT 路径写**同一种**凭据形态
+   *
+   * 设备流的 `token` 与 PAT 在上游是**同一种东西**（都是可换 `jt-` 的长期
+   * 令牌），故同样进 `access_token`。这不是图省事：
+   * `AccountPool.findAccountIdByCredential` 对非 codearts 的 provider 统一取
+   * `access_token` 作身份标识，换字段会让限流记账**静默**失配。
+   *
+   * ## `refresh_token` 的优先级
+   *
+   * exchange 响应通常也带 `refresh_token`，但**设备流自己那份是权威**：
+   * 它是服务端在授权时签发给这次登录的，而 exchange 可能不带（见
+   * `applyQoderRefresh` 的注释）。故这里**显式覆盖**，避免 exchange 的空串
+   * 把设备流的令牌冲掉。
+   */
+  private async persistDeviceToken(
+    payload: QoderDeviceTokenPayload,
+    options: QoderLoginOptions & { loginUrl?: string } = {},
+  ): Promise<QoderLoginResult> {
+    this.active = true
+    const ref = options.refName ? credentialRef(options.refName) : credentialRef(this.credentialRefName)
+    // 用设备流令牌换一次 jt：既验证令牌可用（拿不到 jt 就不是有效登录），
+    // 也顺手把凭据的元数据（`user_id` 等）填上。
+    const exchangePayload = await this.exchange(payload.token)
+    const credential = buildQoderCredential(payload.token, {
+      ...exchangePayload,
+      // 设备流的 `refresh_token` 优先（见上方说明）。
+      refreshToken: payload.refreshToken.length > 0 ? payload.refreshToken : exchangePayload.refreshToken,
+    })
+    await this.ctx.credentials.set(ref, serializeQoderCredential(credential))
+    this.credentialInvalid = false
+    this.lastRefreshError = undefined
+    this.scheduleRefresh()
+
+    if (options.accountId !== undefined && options.pool !== undefined) {
+      const existing = (await options.pool.listAllAccounts()).find((a) => a.id === options.accountId)
+      // 两段式：占位条目已存在则**补全**，否则新建（`AccountPool.addAccount`
+      // 不按 id 去重，重复 add 会让池里出现同 id 的两条记录）。
+      if (existing) {
+        await options.pool.updateAccount(options.accountId, {
+          nickname: credential.user_id ?? options.accountId,
+          refreshable: isQoderRefreshable(credential),
+        })
+      } else {
+        await options.pool.addAccount({
+          id: options.accountId,
+          provider: this.product.id,
+          nickname: credential.user_id ?? options.accountId,
+          enabled: true,
+          credentialRef: options.refName ?? this.credentialRefName,
+          createdAt: Date.now(),
+          refreshable: isQoderRefreshable(credential),
+        })
+      }
+    }
+
+    return {
+      access: serializeQoderCredential(credential),
+      expires: 0,
+      ref,
+      loginUrl: options.loginUrl ?? '',
+      refreshable: isQoderRefreshable(credential),
+    }
   }
 
   /**

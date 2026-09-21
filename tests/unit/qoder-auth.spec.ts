@@ -1,10 +1,14 @@
 import { Context } from '@deepseek-ai/cordis'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   QoderAuth,
   RefreshTokenExpiredError,
   exchangeQoderJobToken,
   summarizeQoderErrorBody,
+  type QoderAuthOptions,
 } from '../../src/qoder-auth.js'
 import {
   QODER,
@@ -16,6 +20,14 @@ import {
 
 /** 所有已创建的 service；afterEach 统一 stop()，避免刷新定时器泄漏。 */
 const services: QoderAuth[] = []
+
+/**
+ * 设备流用例建的临时 home 目录；afterEach 统一删除。
+ *
+ * ⚠️ 设备流会读写 `~/.qoder/.auth/machine_id` —— 那是**用户与官方 CLI 共用**
+ * 的机器身份。不隔离就会污染用户真实环境。
+ */
+const tempHomes: string[] = []
 
 /** 最小化的内存凭据提供者，形状与 ctx.credentials 一致。 */
 class FakeCredentials {
@@ -42,7 +54,11 @@ function makeContext(): { ctx: Context; credentials: FakeCredentials } {
 
 function newService(
   ctx: Context,
-  options: { fetcher?: typeof fetch; serviceName?: string } = {},
+  options: {
+    fetcher?: typeof fetch
+    serviceName?: string
+    deviceFlow?: QoderAuthOptions['deviceFlow']
+  } = {},
 ): QoderAuth {
   const service = new QoderAuth(ctx, options)
   services.push(service)
@@ -91,9 +107,15 @@ function stubFetcher(
   return { fetcher, calls }
 }
 
-afterEach(() => {
-  for (const service of services) service.stop()
+afterEach(async () => {
+  for (const service of services) {
+    // 设备流用例可能留下未结算的会话（互斥槽位是模块级单例）：不取消会泄漏到
+    // 下一个用例，让它拿到一个莫名其妙的 login-in-progress。
+    service.cancelPendingLogin('测试清理')
+    service.stop()
+  }
   services.length = 0
+  for (const dir of tempHomes.splice(0)) await rm(dir, { recursive: true, force: true })
   vi.useRealTimers()
   vi.clearAllMocks()
 })
@@ -221,15 +243,51 @@ describe('QoderAuth 登录（PAT 粘贴）', () => {
     expect(headers['Content-Type']).toBe('application/json')
   })
 
-  it('login() 无 pat 时抛明确错误（提示走 PAT 粘贴入口，而非静默开浏览器流程）', async () => {
+  it('login() 无 pat 时走**浏览器设备流**（不再是「不支持浏览器登录」）', async () => {
+    // ⚠️ 语义已于 2026-09-21 反转：设备流落地前 `login()` 无参抛
+    // 「Qoder 不支持浏览器登录」是正确的（那时确实只有 PAT 一种形态）；
+    // 现在无参有了真实含义 —— 建一个设备流会话并返回授权页 URL。
+    //
+    // 本用例用**永不成功**的轮询（homeDir 指向临时目录，绝不碰用户真实
+    // `~/.qoder`）：要断言的是「它开始走设备流了」，而不是「登录成功」。
     const { ctx } = makeContext()
-    const { fetcher, calls } = stubFetcher(() => exchangeSuccess())
-    const service = newService(ctx, { fetcher })
+    const { fetcher, calls } = stubFetcher(() => new Response('', { status: 404 }))
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-auth-login-'))
+    tempHomes.push(homeDir)
+    const service = newService(ctx, {
+      fetcher,
+      deviceFlow: { homeDir, timeoutMs: 30, intervalMs: 5 },
+    })
 
     const error = await service.login().catch((e: unknown) => e)
-    expect((error as Error).message).toMatch(/不支持浏览器登录/)
-    expect((error as Error).message).toContain('https://qoder.com/account/integrations')
+    // 用户没在浏览器里授权 ⇒ 5 分钟（此处 30ms）超时是**正确终态**，
+    // 而不是「抛一条让你去粘贴 PAT」的指引。
+    expect((error as Error).message).toMatch(/超时/)
+    expect((error as Error).message).not.toMatch(/不支持浏览器登录/)
+    // 它**确实出网了**（轮询），这正是设备流与「直接抛错」的分界。
+    expect(calls.length).toBeGreaterThan(0)
+    expect(calls[0]!.url).toContain('/api/v1/deviceToken/poll')
+  })
+
+  it('设备流第一段返回授权页 URL（prepareLogin 不 await 用户）', async () => {
+    const { ctx } = makeContext()
+    const { fetcher, calls } = stubFetcher(() => new Response('', { status: 404 }))
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-auth-prepare-'))
+    tempHomes.push(homeDir)
+    const service = newService(ctx, {
+      fetcher,
+      deviceFlow: { homeDir, timeoutMs: 30, intervalMs: 5 },
+    })
+
+    const outcome = await service.prepareLogin()
+    expect(outcome.ok, JSON.stringify(outcome)).toBe(true)
+    if (!outcome.ok) return
+    const url = new URL(outcome.session.loginUrl)
+    expect(url.origin).toBe('https://qoder.com')
+    expect(url.pathname).toBe('/device/selectAccounts')
+    // **一次网都不出**：第一段只做本地生成（PKCE / machine_id）。
     expect(calls).toEqual([])
+    service.cancelPendingLogin('用例清理')
   })
 
   it('login({ pat }) 代理 loginWithPat（统一接口入口）', async () => {

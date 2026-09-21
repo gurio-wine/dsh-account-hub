@@ -898,9 +898,12 @@ function renderForm(overrides: Record<string, unknown> = {}): TreeNode {
 
 describe('PatLoginForm 的整树结构', () => {
   it('内联展开：根节点是 div.dim-jh-patForm，不是 modal 覆盖层', () => {
-    // Qoder 没有浏览器登录流程，用户要做的只有「复制一串字符、粘回来」，
-    // 弹窗只会多一层关闭动作。故这里钉死根节点的类名与整棵树的形状 ——
-    // 换成 `.dim-jh-modalOverlay` 那种结构会让这条立刻失败。
+    // PAT 表单是「复制一串字符、粘回来」的一步操作，弹窗只会多一层关闭动作。
+    // 故这里钉死根节点的类名与整棵树的形状 —— 换成 `.dim-jh-modalOverlay`
+    // 那种结构会让这条立刻失败。
+    //
+    // ⚠️ 首段文案已于 2026-09-21 改写：设备流落地后「Qoder 不支持浏览器登录」
+    // 是**事实错误**（浏览器登录正是默认形态），会误导用户以为没有那条路。
     expect(snapshot(renderForm())).toEqual({
       type: 'div',
       props: { className: 'dim-jh-patForm' },
@@ -908,7 +911,7 @@ describe('PatLoginForm 的整树结构', () => {
         {
           type: 'p',
           props: {},
-          children: ['Qoder 不支持浏览器登录：请先在官方的 Integrations 页面签发一个 PAT（Personal Access Token），再把它粘贴到这里。'],
+          children: ['请先在官方的 Integrations 页面签发一个 PAT（Personal Access Token），再把它粘贴到这里。'],
         },
         {
           type: 'p',
@@ -1049,23 +1052,37 @@ describe('PatLoginForm 的错误块', () => {
 describe('PAT 形态绝不走浏览器登录（源码级回归）', () => {
   const normalized = readClientSourceNormalized()
 
-  it('「+ 新建账号」的 onClick 是三元表达式：真分支展开 PAT 表单，假分支才走 createAccount', () => {
+  it('「+ 新建账号」的 onClick 是三元表达式：真分支展开登录形态选择器，假分支才走 createAccount', () => {
     // 走错分支的后果是「点一下弹出一个空白登录窗，而后端收不到 pat 直接拒绝」——
     // 用户看到的是多了一张白页 + 一条含糊的失败提示。
+    //
+    // ⚠️ 2026-09-21 设备流落地后，真分支从「直接展开 PAT 表单」改为
+    // 「展开形态选择器」—— 选择器才是「两种形态并存」的正确入口。
     const start = normalized.indexOf('onClick: patLogin')
     expect(start, '找不到「+ 新建账号」的 onClick').toBeGreaterThan(-1)
-    const slice = normalized.slice(start, start + 240)
+    const slice = normalized.slice(start, start + 260)
     // 用**精确的多行形态**而不是模糊正则：两个分支的先后、缩进与调用形态都要对上。
     expect(slice).toMatch(
-      /^onClick: patLogin\n\s*\? \(\) => \{ setPatOpen\(true\); setPatError\(null\); \}\n\s*: \(\) => void createAccount\(\),/,
+      /^onClick: patLogin\n\s*\? \(\) => \{ setLoginChoiceOpen\(true\); setPatError\(null\); \}\n\s*: \(\) => void createAccount\(\),/,
     )
-    // 再加一条**顺序**断言：即使将来改了措辞，PAT 分支也必须在浏览器登录分支之前
-    // 出现（反过来写会把两件事对调，而正则一旦被人放宽就会静默通过）。
-    const patBranch = slice.indexOf('setPatOpen(true)')
+    // 顺序断言：真分支必须在浏览器登录分支之前出现（反过来写会把两件事对调，
+    // 而正则一旦被人放宽就会静默通过）。
+    const choiceBranch = slice.indexOf('setLoginChoiceOpen(true)')
     const browserBranch = slice.indexOf('createAccount()')
-    expect(patBranch).toBeGreaterThan(-1)
+    expect(choiceBranch).toBeGreaterThan(-1)
     expect(browserBranch).toBeGreaterThan(-1)
-    expect(patBranch).toBeLessThan(browserBranch)
+    expect(choiceBranch).toBeLessThan(browserBranch)
+  })
+
+  it('整个源码里 window.open 只有一次调用，且落在 createAccount（浏览器登录）里', () => {
+    // 注释里提到 `window.open` 是合理的（文件里解释了为什么必须开空窗），
+    // 故先剥掉整行注释再查 —— 判据是**调用**，不是子串。
+    const code = codeLinesOf(normalized)
+    const opens = [...code.matchAll(/\bwindow\.open\s*\(/g)]
+    expect(opens).toHaveLength(1)
+    const createAccountStart = code.indexOf('const createAccount = async () => {')
+    expect(createAccountStart).toBeGreaterThan(-1)
+    expect(opens[0]!.index!).toBeGreaterThan(createAccountStart)
   })
 
   it('整个源码里 window.open 只有一次调用，且落在 createAccount（浏览器登录）里', () => {
@@ -1265,5 +1282,81 @@ describe('qoder 不作为比较表达式出现（判据是表达式，不是子�
     // ⚠️ 最容易写错的一处：CN 的 patUrl **不是**把 qoder.com 换成 qoder.cn 那么简单
     // —— 两处常量必须各自独立存在，不能只留一个。
     expect(code).not.toMatch(/QODER_PAT_URL\s*=\s*'https:\/\/qoder\.cn/)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// F. 浏览器设备流与 PAT **并存**（源码级回归）
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Qoder 面板：浏览器设备流与 PAT 粘贴并存', () => {
+  const normalized = readClientSourceNormalized()
+  const code = codeLinesOf(normalized)
+
+  it('「+ 新建账号」的 PAT 分支改为**先展开选择器**，而不是直接展开 PAT 表单', () => {
+    // 设备流落地前：点按钮 = 展开 PAT 表单（Qoder 唯一的登录形态）。
+    // 落地后：点按钮 = 先让用户在**两种形态**里选，选完才展开对应那一套。
+    // 若仍直接展开 PAT 表单，用户根本看不到浏览器登录这条路 —— 功能等于没做，
+    // 且**不报任何错**。
+    const start = normalized.indexOf('onClick: patLogin')
+    expect(start, '找不到「+ 新建账号」的 onClick').toBeGreaterThan(-1)
+    const slice = normalized.slice(start, start + 260)
+    expect(slice).toMatch(
+      /^onClick: patLogin\n\s*\? \(\) => \{ setLoginChoiceOpen\(true\); setPatError\(null\); \}\n\s*: \(\) => void createAccount\(\),/,
+    )
+    // ⚠️ 关键：这一步**不得**顺手把 PAT 表单也展开（`setPatOpen(true)`）——
+    // 那会让选择器形同虚设：两个界面同时出现，用户看到的是 PAT 表单。
+    expect(slice.slice(0, 120)).not.toContain('setPatOpen(true)')
+    // 顺序断言：PAT 分支仍必须在浏览器登录分支之前（两件事不许对调）。
+    expect(slice.indexOf('setLoginChoiceOpen(true)')).toBeLessThan(slice.indexOf('createAccount()'))
+  })
+
+  it('形态选择器是**面板内联**渲染，且受 `loginChoiceOpen && patLogin` 双重门控', () => {
+    // 双重门控的理由与 PAT 表单同源：只判 `loginChoiceOpen` 会让一个非 PAT
+    // 形态的 provider 在标志位为真时误渲染 —— 那时 `patLogin` 是 null，
+    // 节点照样出来，不报错。
+    expect(normalized).toMatch(
+      /loginChoiceOpen && patLogin\n\s*\? React\.createElement\(LoginChoiceForm, \{/,
+    )
+    // 反向：不得存在只判 loginChoiceOpen 的形态。
+    expect(normalized).not.toMatch(/loginChoiceOpen\n\s*\? React\.createElement\(LoginChoiceForm/)
+  })
+
+  it('选择器有两个动作：浏览器登录走 createAccount、粘贴 PAT 走 PAT 表单', () => {
+    // 两个动作必须**分别**接到既有的两条路径上，而不是新写一套：
+    // 新写一套 = 第三份建号逻辑，将来必分叉。
+    const start = normalized.indexOf('function LoginChoiceForm(')
+    expect(start, '找不到 LoginChoiceForm 组件').toBeGreaterThan(-1)
+    const body = normalized.slice(start, start + 2200)
+    expect(body).toContain('onBrowserLogin')
+    expect(body).toContain('onPatLogin')
+    // 文案要能区分两者（用户看不懂哪个是哪个就等于没有选择）。
+    expect(body).toMatch(/浏览器登录/)
+    expect(body).toMatch(/PAT/)
+  })
+
+  it('两个入口共用同一个 `patLogin` 查表结果（不为 CN 复制一份选择逻辑）', () => {
+    // 与 PAT 表单同一条纪律：CN 面板走的就是 qoder 那套，唯一差异是 provider。
+    const occurrences = normalized.split('function LoginChoiceForm(').length - 1
+    expect(occurrences).toBe(1)
+    expect(normalized).not.toMatch(/qoderCnLoginChoice|createAccountWithCnBrowser/)
+  })
+
+  it('浏览器登录入口**不新增** window.open 调用点（开窗仍在 createAccount 一处）', () => {
+    // `createAccount` 已经负责「手势内开空窗 + 导航」，选择器只是把用户送到它那里。
+    // 若选择器自己再开一次窗，就会多出一张白页（且第二张必然被拦截）。
+    const opens = [...code.matchAll(/\bwindow\.open\s*\(/g)]
+    expect(opens).toHaveLength(1)
+  })
+
+  it('PAT 表单的说明文案不再声称「Qoder 不支持浏览器登录」', () => {
+    // 那句话在设备流落地后是**事实错误**，会让用户以为没有浏览器登录这条路
+    // —— 而他就站在一个刚刚提供该选项的面板里。
+    //
+    // 判据取**正文**（剥掉整行注释）而不是整份源码：注释里为了说明「为什么
+    // 不能这么写」而**引用**这句话是合理的（本文件与客户端源码都这么做了），
+    // 查子串会把那段说明本身判成违规。真正承重的是上面那条整树快照 ——
+    // 它逐字钉死了渲染出来的文案。
+    expect(codeLinesOf(normalized)).not.toContain('Qoder 不支持浏览器登录')
   })
 })

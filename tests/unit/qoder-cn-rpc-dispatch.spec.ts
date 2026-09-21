@@ -29,6 +29,10 @@
  */
 
 import { Context } from '@deepseek-ai/cordis'
+import { mkdtempSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
@@ -129,6 +133,9 @@ interface Harness {
 
 const harnesses: Harness[] = []
 
+/** 设备流用例建的临时 home 目录；afterEach 统一删除。 */
+const tempHomes: string[] = []
+
 /**
  * 构造 ctx / pool / **两个真实的 `QoderAuth` 实例** + 全局 fetch 替身并注册端点。
  *
@@ -140,6 +147,10 @@ const harnesses: Harness[] = []
 function createHarness(responds: (call: CapturedCall) => Response | undefined): Harness {
   const credentials = new FakeCredentials()
   const calls: CapturedCall[] = []
+  // ⚠️ **临时 home**：设备流会读写 `~/.qoder-cn/.auth/machine_id`，那是用户与
+  // 官方 CN CLI **共用**的机器身份。不隔离就会污染用户真实环境。
+  const homeDir = mkdtempSync(join(tmpdir(), 'qoder-cn-rpc-'))
+  tempHomes.push(homeDir)
 
   const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
     const call: CapturedCall = {
@@ -172,10 +183,19 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
   // （同一 Context 上可以共存 —— 这正是 `serviceName` 字段存在的意义）。
   const serviceCtx = new Context()
   serviceCtx.provide('credentials', credentials as never)
-  const qoder = new QoderAuth(serviceCtx, { fetcher: fetcher as unknown as typeof fetch })
+  // 设备流注入：临时 home（**绝不碰用户真实的 `~/.qoder-cn`**）+ 快速超时
+  // （默认 5 分钟会让「等授权」的用例在真实时间里空转）。
+  const deviceFlow = {
+    homeDir,
+    sleep: (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, Math.min(ms, 1)) }),
+    intervalMs: 1,
+    timeoutMs: 60,
+  }
+  const qoder = new QoderAuth(serviceCtx, { fetcher: fetcher as unknown as typeof fetch, deviceFlow })
   const qoderCn = new QoderAuth(serviceCtx, {
     product: QODER_CN,
     fetcher: fetcher as unknown as typeof fetch,
+    deviceFlow,
   })
 
   let handler: ((request: Request) => Promise<Response>) | undefined
@@ -229,6 +249,9 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
     credentials,
     calls,
     async teardown() {
+      // 设备流的互斥槽位是模块级单例：不结算会泄漏到下一个用例。
+      qoder.cancelPendingLogin('测试清理')
+      qoderCn.cancelPendingLogin('测试清理')
       qoder.stop()
       qoderCn.stop()
     },
@@ -240,6 +263,7 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
 afterEach(async () => {
   for (const harness of harnesses) await harness.teardown()
   harnesses.length = 0
+  for (const dir of tempHomes.splice(0)) await rm(dir, { recursive: true, force: true })
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
@@ -301,7 +325,9 @@ describe('account.create —— qoder-cn 的 PAT 粘贴式登录', () => {
 
   it('载荷缺 pat 时按「PAT 格式不正确」拒绝，且一次网都不出', async () => {
     const h = createHarness(() => new Response(exchangeBody('x'), { status: 200 }))
-    for (const pat of [undefined, '', '   ', 'nope', 'dt-device-token']) {
+    // ⚠️ `undefined`（键缺失）已**不属于**这一组：那是「走浏览器设备流」。
+    // 这里只列**显式提交了非法 PAT 值**的形态，含空串与纯空白。
+    for (const pat of ['', '   ', 'nope', 'dt-device-token']) {
       const result = await h.call<unknown>('account.create', { provider: 'qoder-cn', pat })
       expect(result.ok, JSON.stringify(pat)).toBe(false)
       if (result.ok) continue

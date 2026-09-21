@@ -13,7 +13,7 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的一个插件（`dsh-account-hub`），提供华为云 Codearts 浏览器登录与凭据管理功能。插件还附带 `buddy-cn`（**Buddy CN**，腾讯 CodeBuddy 中国版）、`buddy`（**Buddy**，腾讯 WorkBuddy **国际版** / WorkBuddy AI）与 `lobsterai`（**LobsterAI**，有道）三个 LLM provider 路由，以及 `trae-cn` / `trae-cn-work`（字节跳动 **Trae 国内版**及其 TraeWork 路径）与 `qoder` / `qoder-cn`（**Qoder** 的**国际版与国内版两个 region**，PAT 粘贴式登录 —— 本插件唯一的非浏览器登录形态）。
+本项目是 DeepSeek Harness 的一个插件（`dsh-account-hub`），提供华为云 Codearts 浏览器登录与凭据管理功能。插件还附带 `buddy-cn`（**Buddy CN**，腾讯 CodeBuddy 中国版）、`buddy`（**Buddy**，腾讯 WorkBuddy **国际版** / WorkBuddy AI）与 `lobsterai`（**LobsterAI**，有道）三个 LLM provider 路由，以及 `trae-cn` / `trae-cn-work`（字节跳动 **Trae 国内版**及其 TraeWork 路径）与 `qoder` / `qoder-cn`（**Qoder** 的**国际版与国内版两个 region**，**浏览器设备流 + PAT 粘贴两种登录形态并存**）。
 
 > **命名（2026-09-18 改名后）**：显示名与 provider id 一律按**产品品牌**，不再用历史代号。
 > `buddy-cn` / `buddy` 是**新**命名；旧命名 `buddy`（中国版）/ `workbuddy`（国际版）
@@ -232,7 +232,7 @@ Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流�
 
 本插件定义的所有 `ctx.xxxAuth` 服务（`codeartsAuth`、`buddyCnAuth`、`buddyAuth`、`lobsteraiAuth`、`traeCnAuth`、`qoderAuth`、`qoderCnAuth`）均遵循统一接口：
 
-- `login(options?)` — 执行浏览器登录流程（**`qoderAuth` / `qoderCnAuth` 例外**：Qoder 两个 region 都没有浏览器登录，`login({ pat })` 只是 `loginWithPat` 的别名，缺 `pat` 时如实抛「请粘贴 PAT」而不是开一个不存在的流程）
+- `login(options?)` — 执行登录流程（**`qoderAuth` / `qoderCnAuth` 有两种形态**：`login()` 无参走**浏览器设备流**（两段式：返回授权页 URL、后台轮询换令牌），`login({ pat })` 走 PAT 粘贴（即时 exchange，同步完成）。两条路写**同一种凭据形态**，故下游 `refresh` / 额度 / 目录一行未改）
 - `status()` — 查询凭据状态（configured、source、expiresAt、refreshable）
 - `refresh()` — 手动静默续期凭据
 - `logout()` — 清除凭据并停止续期定时器
@@ -258,6 +258,27 @@ Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流�
 - `login.poll` **按 credentialRef 判断「凭据是否可解析」**，与 provider 无关 —— 占位条目 + 后台写凭据即可让客户端轮询生效，不需要为新 provider 改轮询逻辑；
 - **占位账号字段是 pending 形态**：`expiresAt` / `refreshable` / `nickname` 都依赖 exchange 结果，凭据落盘后由第二段补全；时序上必须**先写凭据、再补全账号**（反过来会让轮询在凭据就绪前报成功）；
 - **LobsterAI 登录是 provider 级互斥的**（`src/lobsterai-oauth.ts` 的 `prepareLobsteraiLogin`）：已有未结算会话时返回 `{ok:false, error:'login-in-progress'}`，不新建监听也不复用旧会话。理由：复用会让一份凭据被多个占位 accountId 共享，账号池出现重复候选；静默新建则每次点击堆积一个 loopback 端口直到 10 分钟超时。`account.delete` 会 cancel 对应会话以释放端口（`jet-hub-rpc.ts` 的待登录登记表）。
+
+### Qoder 设备流：两段式的第三种形态（2026-09-21）
+
+Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `account.create` 载荷里**有没有 `pat` 键**分流：
+
+| 载荷 | 形态 | 时序 |
+|---|---|---|
+| 无 `pat` 键 | **浏览器设备流** | 两段式（同 buddy 系 / lobsterai）：秒回 `loginUrl` + 后台轮询 |
+| `pat` 是 string（含 `''`） | PAT 粘贴 | 即时 exchange，同步完成 |
+
+⚠️ **判据是「键是否存在」而不是「值非空」**：`{ pat: '' }` 的语义是「用户提交了一个空 PAT」，必须回「PAT 格式不正确」，**不是**静默开一个授权页（用户会以为表单坏了）。故实现里是 `typeof req.pat === 'string'` / `options.pat !== undefined`。
+
+**与既有两段式的三处差异**：
+
+1. **互斥槽位按 provider 分键**（`activeLoginSlots`），两区**各自独立** —— 它们不是同一批账号（与 `trae-cn` / `trae-cn-work` 那对**方向相反**），一区的登录窗口不该挡住另一区。占位在**第一个 `await` 之前**同步写入 `'preparing'`；
+2. **轮询可取消**（`AbortSignal`）：`account.delete` 必须 cancel 对应会话。Qoder 的轮询是**每秒一次**的活跃循环，不取消会持续到 5 分钟超时；而槽位不释放会让用户此后**所有**登录都被 `login-in-progress` 挡住；
+3. **失败即移除占位**（`recordLoginFailure` + `pool.removeAccount`）—— 与另两条线一致，但这里额外要求**超时也是终态**（不是可重试的瞬时故障）。
+
+⚠️ **`machine_id` 读写用户真实 home**（`~/.qoder/.auth/machine_id` / `~/.qoder-cn/.auth/machine_id`），**与官方 CLI 同路径是刻意的**（混用时机器身份稳定，wasm 签名链才不失效）。**任何测试都必须注入 `homeDir`**，否则会污染用户环境；生产下 IO 失败退回内存态 UUID，**不抛错**（磁盘不可写是环境问题，不是「没资格登录」）。
+
+⚠️ **设备流与 PAT 写同一种凭据形态**（`access_token` = 令牌或 PAT），故 `refresh` / 额度 / 目录三条下游链路**一行未改**。改字段名会让 `AccountPool.findAccountIdByCredential` 的限流记账**静默**失配。
 
 ## 账号池与多账号
 

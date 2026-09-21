@@ -46,6 +46,7 @@ import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { isTraeCnJunkModelId } from './trae-cn-models.js'
 import type { TraeCnContextTier } from './trae-cn-adapter.js'
 import type { TraeCnCredential, TraeCnPendingLogin } from './trae-cn-oauth.js'
+import type { QoderDevicePendingLogin } from './qoder-device-flow.js'
 import type { TraeCnProduct } from './trae-cn-product.js'
 import {
   TRAE_CN_POOL_UNIVERSAL,
@@ -336,6 +337,26 @@ const pendingCodeartsLogins = new Map<string, { accountId: string; session: Code
  * 这里不重复实现判重 —— 否则两处状态会在异常路径上失去同步。
  */
 const pendingTraeCnLogins = new Map<string, { accountId: string; session: TraeCnPendingLogin }>()
+
+/**
+ * 进行中的 Qoder 设备流登录登记表（accountId → 会话句柄）。
+ *
+ * 与上面三张表同构、同样**只做生命周期管理**：`account.delete` 时按 accountId
+ * 找到会话并 cancel，立刻终止轮询并释放 provider 级互斥槽位。
+ *
+ * ## 与另外三张表的一个实质差异（为什么取消是必须的）
+ *
+ * 那三个 provider 的会话占用的是**本地回调端口**，不 cancel 的后果是端口挂到
+ * 超时；Qoder 设备流不占端口，但**每 1 秒打一次轮询**，不 cancel 的后果是：
+ *
+ * 1. 用户删掉占位账号后，后台仍在每秒钟问一次上游，直到 5 分钟超时；
+ * 2. **互斥槽位不释放** —— 用户想重新登录会一直拿到 `login-in-progress`，
+ *    而界面上看不出任何东西还在进行中。
+ *
+ * 真正的并发互斥在 `prepareQoderDeviceLogin` 内（provider 级、模块级单例），
+ * 这里不重复实现判重 —— 否则两处状态会在异常路径上失去同步。
+ */
+const pendingQoderDeviceLogins = new Map<string, { accountId: string; session: QoderDevicePendingLogin }>()
 
 /**
  * 登录**失败终态**登记表（accountId → 失败原因）。
@@ -920,71 +941,126 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: { accountId: id, loginUrl: loginSession.loginUrl } }
         } else if (provider === QODER.id || provider === QODER_CN.id) {
-          // Qoder 是**唯一的非浏览器登录形态**：用户粘贴一个 PAT，宿主当场打一次
-          // exchange 验证并落凭据。故这里**没有两段式**——不存在「等用户操作
-          // 10 分钟」的手势窗口，验证本身是一次即时请求（计划 §2 决策 1）。
+          // Qoder 有**两种登录形态并存**，本分支按「载荷里有没有 pat」分流：
           //
-          // ## 两个 region 共用这一条分支（**同协议**，不要拆成两份）
+          // | 载荷 | 形态 | 时序 |
+          // |---|---|---|
+          // | `{ provider, pat }` | PAT 粘贴 | **同步完成**（即时 exchange 验证） |
+          // | `{ provider }` | 浏览器设备流 | **两段式**（占位 → loginUrl → 后台补全） |
+          //
+          // ## 两个 region 共用这两条分支（**同协议**，不要拆成四份）
           //
           // CN 与国际版的 exchange 请求逐字节同构（错误信封一致、PAT 前缀同为
-          // `pt-`），差异**只有 host** —— 而 host 由传入 `loginWithPat` 的那个
-          // auth 实例的产品配置承载（A 段已让 exchange 走 `product.openapiBase`）。
-          // 拆成两份会把下面四条契约各抄一遍，任何一条改动漏了另一半就是静默分叉。
-          //
-          // ## 四条契约（region 无关，两区一致）
-          //
-          //   1. **同步完成**：`loginWithPat` 内部是「前缀校验 → exchange → 落凭据
-          //      + 落账号」，返回时凭据已在盘上，客户端那套按「凭据可解析」判定的
-          //      `login.poll` 天然兼容（不需要为它改轮询逻辑）；
-          //   2. **PAT 绝不回显**：错误信息里不含 PAT 本体、长度或任何片段；
-          //   3. **失败即拒绝**：`loginWithPat` 抛出的原因（前缀不对 / exchange
-          //      401 判 PAT 失效 / 网络失败）原样透传。**不预先建占位账号** ——
-          //      与两段式那三个分支不同，这里失败时根本没有「后台第二段」会去
-          //      清理，先建占位就会留下一个永远没有凭据的幽灵账号；
-          //   4. **`loginUrl` 恒为空串**（没有浏览器登录流程）。客户端按
-          //      `loginUrl` 决定是否开窗，空串正好表达「无事可开」。
+          // `pt-`）、设备流三步也同构（只有域名不同）—— 差异**全部由传入的
+          // auth 实例 / 产品配置承载**。拆开会把下面那些契约各抄一遍，任何一条
+          // 改动漏了另一半就是静默分叉。
           //
           // ## ⚠️ 产品配置与 auth 实例必须**成对**取（两个 region 各一份）
           //
-          // jt 缓存、在途 exchange 去重、失效标记都是**实例字段**（见
-          // `QoderAuth`）。用国际版实例换来的 `jt-` 打 CN 端点只会得到一次 401
-          // —— 而错误文案会指向「PAT 失效」，把用户引去重签一张本来好用的凭据。
-          // 同理 exchange 的 host 取自传入实例的 `product.openapiBase`，配错
-          // 就是「拿 CN 的 PAT 打国际版端点」，失败形态同样是假的「凭据失效」。
+          // jt 缓存、在途 exchange 去重、失效标记、设备流互斥槽位都是
+          // **实例 / 产品级**状态。用国际版实例换来的 `jt-` 打 CN 端点只会得到
+          // 一次 401 —— 而错误文案会指向「PAT 失效」，把用户引去重签一张本来
+          // 好用的凭据。同理设备流的 `loginUrl` 会指向错的授权页（用户在那
+          // 一页上根本看不到自己的 CN 账号）。
           //
           // 故两处一律走 {@link qoderRegionFor}（唯一一处「哪个 region 用哪份
-          // 配置与实例」的映射），不在这里就地拼 —— 那会让同一件事在本函数与
-          // `credits.balances` 里各写一遍，必然分叉。
+          // 配置与实例」的映射），不在这里就地拼。
           const region = qoderRegionFor(provider, qoder, qoderCn)
           if (region === undefined) {
             // 不可达：上面的分支条件已限定为两个 region 之一。保留这道闸是
             // 为了让将来新增 region 时**显式接线**，而不是静默落到国际版。
             return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
           }
-          const pat = typeof req.pat === 'string' ? req.pat : ''
-          try {
-            const result = await region.auth.loginWithPat(pat, {
-              refName,
-              accountId: id,
-              pool,
-            })
-            // 账号池条目由 `loginWithPat` 落（`nickname` 取 PAT 对应的用户 id，
-            // 有则用）。它**刻意不写 `expiresAt`**：PAT 的过期时间本地无从得知，
-            // 而 jt 的 24h 只是运行时缓存的有效期 —— 写进账号卡片会让它在闲置
-            // 24h 后显示「已过期」，而实际上一次 getJobToken 就能自愈。
-            return { ok: true, value: { accountId: id, loginUrl: result.loginUrl } }
-          } catch (error) {
-            // 已经是**终态**：凭据没落盘、账号也没建，无残留可清。
-            // 抛出去由 RPC 层包成 `jet-hub/handler-failed`，客户端会把 message
-            // 原样展示给用户（`submitPat` 的 catch 分支就是这么写的）。
+
+          // ⚠️ 判据是「`pat` 这个**键**在不在载荷里」，不是「它的值非不非空」：
+          // `{ pat: '' }` 是「用户提交了一个空 PAT」，属于 PAT 路径的非法输入
+          // （应回「PAT 格式不正确」）；把它当成「无 pat」会静默改走设备流、
+          // 开出一个用户没要求的授权页。客户端提交 PAT 表单时**总是**带这个键。
+          const hasPat = typeof req.pat === 'string'
+
+          if (hasPat) {
+            // ===== 形态一：PAT 粘贴（**同步完成，无两段式**） =====
             //
-            // 前缀带上产品展示名：两区共用一条分支后，只说「Qoder 登录失败」
-            // 会让拿着 CN PAT 的用户分不清该去哪张签发页重签（两区的 PAT 与
-            // 签发页都不通用）。
-            throw new Error(
-              `${region.product.displayName} 登录失败：${error instanceof Error ? error.message : String(error)}`,
-            )
+            // PAT 验证是一次即时请求，不存在「等用户操作 10 分钟」的手势窗口，
+            // 故这里**不建占位账号**：失败时没有「后台第二段」会去清理，
+            // 先建占位就会留下一个永远没有凭据的幽灵账号。
+            //
+            // 四条契约（region 无关）：
+            //   1. **同步完成**：`loginWithPat` 内部是「前缀校验 → exchange →
+            //      落凭据 + 落账号」，返回时凭据已在盘上，客户端那套按「凭据
+            //      可解析」判定的 `login.poll` 天然兼容；
+            //   2. **PAT 绝不回显**：错误信息里不含 PAT 本体、长度或任何片段；
+            //   3. **失败即拒绝**：`loginWithPat` 抛出的原因（前缀不对 /
+            //      exchange 401 判 PAT 失效 / 网络失败）原样透传；
+            //   4. **`loginUrl` 恒为空串**（无事可开）。客户端按 `loginUrl`
+            //      决定是否开窗，空串正好表达这一点。
+            try {
+              const result = await region.auth.loginWithPat(req.pat as string, { refName, accountId: id, pool })
+              return { ok: true, value: { accountId: id, loginUrl: result.loginUrl } }
+            } catch (error) {
+              // 前缀带上产品展示名：两区共用一条分支后，只说「Qoder 登录失败」
+              // 会让拿着 CN PAT 的用户分不清该去哪张签发页重签。
+              throw new Error(
+                `${region.product.displayName} 登录失败：${error instanceof Error ? error.message : String(error)}`,
+              )
+            }
           }
+
+          // ===== 形态二：浏览器设备流（**两段式**） =====
+          //
+          //   1. **第一段（同步返回）**：`prepareLogin` 只建会话（本地生成
+          //      PKCE、读写 machine_id，**一次网都不出**），拿到 `loginUrl` 后
+          //      写占位条目并**立即** `return`；
+          //   2. **宿主 opener 置空**：打开动作归客户端（宿主再开一次会变成
+          //      两个标签页）。本分支根本不接收 `openBrowser`，用「不打开」
+          //      表达同一约束；
+          //   3. **第二段（后台）**：`persistLoginResult` 完成后写凭据并补全
+          //      占位账号；失败则登记失败终态 + 移除占位。
+          //
+          // ⚠️ **第一段绝不能 await 用户操作**：设备流最长 5 分钟，等它返回时
+          // 用户手势早已过期，客户端拿到 URL 再开窗会被弹窗拦截、兜底逻辑于是
+          // 自行开窗把 DSH 页面顶掉 —— 这正是两段式要消灭的缺陷形态。
+          let prepared
+          try {
+            prepared = await region.auth.prepareLogin()
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error)
+            throw new Error(`无法启动 ${region.product.displayName} 登录：${reason}`)
+          }
+          if (!prepared.ok) {
+            // provider 级互斥：已有未结算的登录会话。**原样返回可判别错误码**，
+            // 而不是抛异常 —— 抛异常会被包装成 jet-hub/handler-failed，
+            // 客户端就无法据以提示「已有登录进行中」。
+            return { ok: false, error: { code: prepared.error, message: prepared.message } }
+          }
+          const loginSession = prepared.session
+          // 占位条目：满足 `login.poll` 的检测路径（它按「该 credentialRef
+          // 能否解析到凭据」判完成）。三项 pending 形态字段都等第二段补全。
+          await pool.addAccount({
+            id,
+            provider,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now(),
+          })
+          pendingQoderDeviceLogins.set(id, { accountId: id, session: loginSession })
+          void region.auth.persistLoginResult(loginSession, { refName, accountId: id, pool })
+            .catch(async (error: unknown) => {
+              ctx.logger.warn(
+                `[jet-hub] background ${provider} device login failed for ${id}: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+              )
+              // 登录失败是**终态**：登记后再删占位（顺序不可反 —— 见
+              // `recordLoginFailure` 的说明）。
+              recordLoginFailure(id, error)
+              await pool.removeAccount(id).catch(() => {})
+            })
+            .finally(() => {
+              pendingQoderDeviceLogins.delete(id)
+            })
+          return { ok: true, value: { accountId: id, loginUrl: loginSession.loginUrl } }
         } else {
           // 刻意**不做** `poolProviderFor()` 映射：`trae-cn-work` 没有独立登录，
           // 面板也不渲染「+ 新建账号」。若这里把它映射成 `trae-cn`，多出来的
@@ -1014,6 +1090,14 @@ function registerJetHubEndpoints(
         // Trae CN 同理（互斥同样是 provider 级的）。
         pendingTraeCnLogins.get(req.accountId)?.session.cancel('账号已删除，登录已取消')
         pendingTraeCnLogins.delete(req.accountId)
+        // Qoder 设备流同理，但后果更重：它不占端口，却**每 1 秒轮询一次**，
+        // 且互斥槽位不释放会让用户此后所有登录都被 `login-in-progress` 挡住。
+        // ⚠️ 必须走 `cancelQoderDeviceLogin` 而不是只调会话的 `cancel()` ——
+        // 槽位表在设备流模块内部，会话句柄的 cancel 已经会释放它，但这里
+        // 还要覆盖「会话句柄拿不到」的兜底路径（登记表按 accountId 索引，
+        // 而槽位按 provider 索引，两者不是同一把键）。
+        pendingQoderDeviceLogins.get(req.accountId)?.session.cancel('账号已删除，登录已取消')
+        pendingQoderDeviceLogins.delete(req.accountId)
         // 失败终态随账号一起清：账号已被用户主动删除，不该再有一条针对它的
         // 失败登记等着被下一次 poll 读到（那会让新登录的窗口无端收到旧失败）。
         loginFailures.delete(req.accountId)

@@ -21,11 +21,11 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
   [Trae CN Work provider](#trae-cn-work-providertraework-网页协议)；Account Hub
   面板**共用 Trae CN 的账号**，只提供积分行（**显示 Work 池**）与模型开关。
 - **qoder（Qoder）** — 见 [Qoder provider](#qoder-providerqoder)；
-  **唯一的非浏览器登录形态**（粘贴 PAT）；不支持「一键领取积分」（该权益只能在
-  Qoder 桌面 App 里手动领取，服务端没有公开的签到端点）。
+  **两种登录形态并存**（浏览器设备流 + 粘贴 PAT）；不支持「一键领取积分」
+  （该权益只能在 Qoder 桌面 App 里手动领取，服务端没有公开的签到端点）。
 - **qoder-cn（Qoder CN）** — Qoder 的**国内版 region**（同协议、另一组 host，
   见 [Qoder provider](#qoder-providerqoder) 的「Qoder CN：第二个 region」）；
-  同样是 PAT 粘贴登录，**账号池与 Credits 与国际版完全独立、令牌互不承认**；
+  同样是设备流 + PAT 两种形态，**账号池与 Credits 与国际版完全独立、令牌互不承认**；
   亦不支持「一键领取积分」（疑似有该权益，但**端点未知**，见能力矩阵说明）。
 
 八个 provider 的 Account Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
@@ -2217,42 +2217,102 @@ CN 的地方外，两个 region 行为一致。
 
 该 provider 与既有各条线**均不同源**，其中两项是本插件里的头一份：
 
-- **登录形态是 PAT 粘贴**，不是浏览器 OAuth —— 其余六条线全是浏览器登录
-  （两段式 RPC + 轮询）或本地回调；CN 沿用同一形态（**同一套表单、零改动**，
-  只有 `patUrl` 与 `provider` 取值不同）；
-- **凭据只有一件长效物**（PAT），换来的 job token 是**进程内运行时缓存**、
+- **两种登录形态并存**（2026-09-21 起）：**浏览器设备流**（官方 CLI / 桌面端
+  同款，两段式 RPC + 轮询）与 **PAT 粘贴**（不依赖浏览器）。CN 沿用同一套实现
+  （**同一套流程、零分叉**，只有域名与 `machine_id` 目录不同）；
+- **凭据只有一件长效物**（令牌或 PAT），换来的 job token 是**进程内运行时缓存**、
   **不落盘**。
 
 | 项 | 腾讯系（Buddy CN / Buddy） | LobsterAI | Trae CN | **Qoder / Qoder CN** |
 |---|---|---|---|---|
-| 登录 | 轮询后端 API | 本地回调收 `authCode` | 本地回调 + PKCE(S256) | **粘贴 PAT（无浏览器、无回调）** |
-| 长期凭据 | access + refresh | access + refresh + 身份字段 | 五件套 | **PAT 一件**（`pt-`） |
+| 登录 | 轮询后端 API | 本地回调收 `authCode` | 本地回调 + PKCE(S256) | **设备流（PKCE + 轮询）或粘贴 PAT** |
+| 长期凭据 | access + refresh | access + refresh + 身份字段 | 五件套 | **一件**（设备流 `token` 或 PAT `pt-`） |
 | 鉴权 | `Bearer` + 归属头 | `Bearer` | `Cloud-IDE-JWT` | **`Bearer`（但分红：目录用 PAT、chat/额度用 `jt-`）** |
-| 续期 | `X-Refresh-Token` 头 | `POST /api/auth/refresh` | exchange（body 四字段） | **重打 exchange**（PAT 不变，随时可重打） |
+| 续期 | `X-Refresh-Token` 头 | `POST /api/auth/refresh` | exchange（body 四字段） | **重打 exchange**（令牌不变，随时可重打） |
 | 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **不做**（国际版无此活动；CN **疑似有但端点未知**） |
 
-### 登录与凭据：PAT 粘贴（本插件唯一的非浏览器登录形态）
+### 登录：浏览器设备流（默认）与 PAT 粘贴**并存**
+
+「+ 新建账号」点开的是一个**登录形态选择器**，两个按钮：
+
+| 形态 | 用户做什么 | 宿主做什么 |
+|---|---|---|
+| **浏览器登录**（默认） | 在新标签页的官方授权页上选账号并确认 | 两段式：`loginUrl` 秒回 → 轮询换令牌 → 补全占位账号 |
+| **粘贴 PAT** | 去 Integrations 页面签发一个 PAT，复制、粘回来 | 即时请求：一次 exchange 验证并当场落凭据 |
+
+两条路**写同一种凭据形态**（见下），故 `refresh` / 额度 / 目录三条下游链路一行未改。
+它们**刻意不合并成一条**：PAT 是即时请求（同步完成、无占位中间态），设备流是
+「等用户在浏览器点授权」（两段式），时序契约完全不同。
+
+#### 设备流协议（三步，全部照抄官方 CLI 取证）
+
+1. **PKCE**：`verifier` 64 字符随机（48 字节 base64url）、
+   `challenge = base64url(sha256(verifier))`、`challenge_method: "S256"`；
+   `nonce = randomUUID()`；
+2. **登录 URL**：`{authBaseUrl}/device/selectAccounts?challenge&challenge_method
+   &nonce&machine_id&client_id` —— ⚠️ **CN 的 `redirect_uri` 是 null，不带该参数**；
+3. **轮询**：`GET {openapiBase}/api/v1/deviceToken/poll?nonce&verifier
+   &challenge_method&machine_id`，**404 → 1 秒后重试**、总超时 **5 分钟**；
+   成功判据是「`token` 与 `refresh_token` **都是 string**」。
+
+| 常量 | 取值 | 说明 |
+|---|---|---|
+| `client_id` | `e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb` | **两区同一个**（官方就是一个 CLI 应用覆盖两区） |
+| `authBaseUrl`（国际版 / CN） | `https://qoder.com` / `https://qoder.cn` | ⚠️ **授权页在主站**，不是 openapi host |
+| `openApiBaseUrl`（国际版 / CN） | `https://openapi.qoder.sh` / `https://openapi.qoder.com.cn` | 轮询打这里 |
+
+⚠️ **桌面端另有一套 `client_id`（`732aef47-…`），刻意不用** —— 本插件复刻的是
+**CLI** 设备流。混用会让设备流以「应用未授权」类形态失败，而登录 URL 表面上完全
+正常（只差一个 query 参数的值），故单测从两个方向钉死。
+
+#### `machine_id`：与官方 CLI 同路径同格式
+
+每个产品持久化一个 UUID（36 字符文本）：
+
+| region | 落盘路径 |
+|---|---|
+| 国际版 | `~/.qoder/.auth/machine_id` |
+| CN | `~/.qoder-cn/.auth/machine_id` |
+
+⚠️ **与官方 CLI 共用同一个文件是刻意的**：用户混用官方 CLI 时两边读同一个机器
+身份，wasm 签名链才不会因机器码漂移失效。已存在则读用（绝不覆盖），不存在则生成
+并落盘（目录递归创建）；**读取 / 落盘失败时退回内存态 UUID 继续用** —— 磁盘不可写
+是环境问题，不是「用户没资格登录」。
+
+#### 登录互斥与取消
+
+- **provider 级互斥**：同一 region 已有未结算会话时返回
+  `{ok:false, error:'login-in-progress'}`（不新建、不复用）。两区**各自独立** ——
+  一区的登录窗口不挡另一区（两区是两批账号、两套令牌）；
+- **`account.delete` 会取消**：删掉占位账号即终止轮询并释放互斥槽位。不取消的
+  后果比另外几个 provider 更重 —— 它不占端口，却**每 1 秒轮询一次**，且槽位不
+  释放会让用户此后所有登录都被 `login-in-progress` 挡住。
+
+### 登录与凭据：PAT 粘贴（不依赖浏览器的备用形态）
 
 - **PAT 签发页**：`https://qoder.com/account/integrations`（登录 → Account →
   Integrations → 创建 → 立即复制）。前缀 **`pt-`**，官方明示**不自动刷新**：
   PAT 在用户吊销前一直有效，**失效只能重新粘贴一个**。
-- **Account Hub 的「+ 新建账号」点开的是一个内联 PAT 表单**（输入框
-  `type=password`），**不是登录弹窗、也不新开浏览器标签** —— Qoder 根本没有
-  浏览器登录流程，用户要做的只有「去签发页复制一串字符、粘回来」。这也是它
-  与其余各面板最大的一处形态差异。
+- **Account Hub 的「粘贴 PAT」点开的是一个内联表单**（输入框 `type=password`），
+  **不是登录弹窗、也不新开浏览器标签**：用户要做的只有「去签发页复制一串字符、
+  粘回来」，弹窗只会多一层关闭动作。
 - 凭据 ref：单账号 `QODER_PERSONAL_TOKEN`；多账号
   `QODER_ACCOUNT_<SHORTID>`，由「+ 新建账号」生成。
 - 凭据结构（JSON 字符串，字段一律 snake_case）：
 
   | 字段 | 含义 |
   |---|---|
-  | `access_token` | **PAT 本体** —— 既是模型目录端点的 `Bearer`，也是换 `jt-` 的输入 |
-  | `refresh_token` | `jrt-…`（48h）；**未启用**（主路径是重打 exchange） |
+  | `access_token` | **长效令牌本体** —— 设备流的 `token` 或粘贴的 PAT；既是模型目录端点的 `Bearer`，也是换 `jt-` 的输入 |
+  | `refresh_token` | 设备流的 `refresh_token`（或 `jrt-…`，48h）；**未启用**（主路径是重打 exchange） |
   | `token_expires_at` | `jt-` 的过期时刻，**仅元数据**（`jt-` 本体**不落盘**） |
   | `user_id` / `user_type` | 身份字段，有则带 |
 
-- **三段令牌，三种生命周期**：PAT 长期（**不刷新**）／`jrt-` 48h／`jt-` 24h。
-  `jt-` 是**进程内运行时缓存**、**按 PAT 分键**，进程重启即冷 —— 冷启动会多打
+  ⚠️ **两条路写同一种形态**不是图省事：`AccountPool.findAccountIdByCredential` 对
+  非 codearts 的 provider 统一取 `access_token` 作身份标识，换字段会让限流记账
+  **静默**失配。
+
+- **三段令牌，三种生命周期**：长效令牌（**不刷新**）／`refresh_token` 48h／`jt-` 24h。
+  `jt-` 是**进程内运行时缓存**、**按令牌分键**，进程重启即冷 —— 冷启动会多打
   一次 exchange，这是设计如此，不是故障。剩余有效期不足 1 小时时主动重换。
 
 > **`status().expiresAt` 对 Qoder 恒不返回**（账号条目也不写 `expiresAt`）：
@@ -2438,7 +2498,10 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
   账号条目 `provider` 为 `qoder-cn`。两个面板**互相看不到对方的账号**，
   且 `poolProviderFor('qoder-cn')` 是**恒等映射**（与 `trae-cn-work` 那条
   映射到 `trae-cn` 的规则**方向相反**，不要照抄）；
-- **PAT 不通用**：CN 面板的签发链接指向 `qoder.cn`，不是国际版那一页。
+- **PAT 与设备流授权页都不通用**：CN 面板的签发链接指向 `qoder.cn`，浏览器登录
+  也打在 `qoder.cn` 的授权页上 —— 不是国际版那一页/那一站。设备流两区共用同一个
+  `client_id`（官方就是一个 CLI 应用覆盖两区），但 `machine_id` **各存各的**
+  （`~/.qoder-cn` vs `~/.qoder`）。
 
 **CN 的三个基址**（与国际版逐个不同，且**不带 `-v2` 段**，不要按同形替换去猜）：
 
@@ -2446,7 +2509,7 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
 |---|---|---|
 | 换 job token / 额度 | `openapi.qoder.com.cn` | ✅ 真机实测 200 |
 | 模型目录 | `api.qoder.com.cn` | ✅ 真机实测 200 |
-| chat | `gateway.qoder.com.cn` | 🔴 host 是官方源码值，但**该路径不存在** —— chat 对 PAT **结构性不可用**（见下） |
+| chat | `gateway.qoder.com.cn` | 🔴 host 是官方源码值，但**该路径不存在** —— chat 对本插件的凭据形态**结构性不可用**（见下） |
 
 ⚠️ **CN 的 chat 不是「上游未就绪」，而是路径不存在 —— 不会恢复，也不需要等**。
 
@@ -2464,9 +2527,12 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
    `prepareInferRequest` 生成，构造需要 `machineId` + `cosyVersion` +
    **`userInfoJson` 里的登录用户密钥**。用有效 `jt-` 直接打会得到 200 + SSE，
    但**帧内**是 `{"code":"101","message":"Signature invalid"}`。
-   **PAT 型凭据给不出用户密钥 ⇒ 永远过不去。**
+   **两种登录形态都给不出用户密钥 ⇒ 永远过不去。**
+   ⚠️ 这与「怎么登录」无关，而与**凭据形态**有关：设备流拿到的令牌与粘贴的 PAT
+   在这一点上完全一样（都不是官方 IDE 里那份带用户密钥的登录态），故设备流落地
+   **不改变** CN chat 的这条结论。
 
-⇒ **CN 的 chat 对本插件的登录形态（PAT）结构性不可用**，不是待恢复的瞬时故障。
+⇒ **CN 的 chat 对本插件的凭据形态结构性不可用**，不是待恢复的瞬时故障。
 故 host 常量**保留**（逃生阀与未来协议变化仍用它），但错误分类**按 region 分流**：
 CN 的 chat 503 **直报、不退避、不换号**（退避重试一个不可能成功的请求纯属误导），
 国际版的 503 维持「网关瞬时故障 → 退避重试同一账号」不变。

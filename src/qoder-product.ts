@@ -167,6 +167,47 @@ export const QODER_CN_USER_AGENT = 'qoder/1.1.58'
 /** PAT 前缀（官方文档：`QODER_PAT="pt-your-token-here"`）。 */
 export const QODER_PAT_PREFIX = 'pt-'
 
+// ── 浏览器设备流（第二登录形态，与 PAT 并存） ──
+
+/**
+ * CLI 的 OAuth `client_id`（**两个 region 同一个**）。
+ *
+ * 取自官方 CLI 的 `nec()` 与桌面端 `startDeviceFlow` 解码后的常量 —— 两处
+ * 同构、只有域名不同，`client_id` 是同一个。
+ *
+ * ⚠️ **test 环境是另一个值**（`e93fe488-5778-4c35-a6fc-0f54ed7b3139`）：
+ * 本插件**不接** test 环境（接它需要先有「切环境」的开关，那是独立决策）。
+ *
+ * ⚠️ **桌面端另有一套 `client_id`（`732aef47-…`），不要用** —— 我们复刻的是
+ * **CLI** 设备流。混用会让设备流以「应用未授权」类形态失败，而登录 URL
+ * 表面上完全正常（只差一个 query 参数的值），故由单测从两个方向钉死。
+ */
+export const QODER_CLI_CLIENT_ID = 'e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb'
+
+/**
+ * **国际版** 设备流授权页基址。
+ *
+ * 登录 URL 是 `{authBaseUrl}/device/selectAccounts?…` —— ⚠️ 它与
+ * {@link QODER_OPENAPI_BASE}（`openapi.qoder.sh`）**不是同一个 host**：
+ * 授权页在**主站**上，轮询才在 openapi 上。混用会让授权页 404。
+ */
+export const QODER_AUTH_BASE = 'https://qoder.com'
+
+/** **CN** 设备流授权页基址（同一个路径，host 换成 `.cn`）。 */
+export const QODER_CN_AUTH_BASE = 'https://qoder.cn'
+
+/**
+ * machine_id 的**产品目录**（相对 home）。
+ *
+ * 与官方 CLI **同路径同格式**：国际版 `~/.qoder/.auth/machine_id`、
+ * CN `~/.qoder-cn/.auth/machine_id`。共用同一个文件会让「装了 CN CLI 又装
+ * 国际版 CLI」的用户两边机器码互相覆盖 —— 而机器码漂移会让 wasm 签名链失效。
+ */
+export const QODER_MACHINE_ID_DIR = '.qoder'
+
+/** CN 的 machine_id 产品目录。 */
+export const QODER_CN_MACHINE_ID_DIR = '.qoder-cn'
+
 /**
  * PAT 签发页（官方入口：登录 → Account → Integrations → 创建 → **立即复制**）。
  *
@@ -609,6 +650,29 @@ export interface QoderProduct {
   patPrefix: string
   /** PAT 签发页 URL（供前端展示）。 */
   patUrl: string
+  /**
+   * 设备流授权页基址（`{authBaseUrl}/device/selectAccounts`）。
+   *
+   * ⚠️ 它**不是** {@link QoderProduct.openapiBase}：授权页在主站（`qoder.com` /
+   * `qoder.cn`），轮询才在 openapi 上。两区只有 host 不同、路径相同。
+   */
+  authBaseUrl: string
+  /**
+   * OAuth `client_id`。
+   *
+   * 两区**同一个值**（{@link QODER_CLI_CLIENT_ID}）—— 官方两区共用同一个 CLI
+   * 应用。⚠️ 桌面端另有一套，不要混用（见该常量的说明）。
+   *
+   * 仍然做成**产品字段**而不是在实现里 import 常量：一旦某个消费点直接 import
+   * 常量，它就被钉死在一个取值上，将来某区需要不同 client_id 时会**静默**打错。
+   */
+  clientId: string
+  /**
+   * machine_id 的**产品目录**（相对 home）。
+   *
+   * 国际版 `.qoder`、CN `.qoder-cn` —— 与官方 CLI **同路径同格式**。
+   */
+  machineIdDir: string
   /** 默认凭据 ref（无账号池时的单凭据回退）。 */
   defaultCredentialRef: string
   /** 账号池凭据 ref 前缀。 */
@@ -669,6 +733,9 @@ export const QODER: QoderProduct = {
   userAgent: QODER_USER_AGENT,
   patPrefix: QODER_PAT_PREFIX,
   patUrl: QODER_PAT_URL,
+  authBaseUrl: QODER_AUTH_BASE,
+  clientId: QODER_CLI_CLIENT_ID,
+  machineIdDir: QODER_MACHINE_ID_DIR,
   defaultCredentialRef: QODER_DEFAULT_CREDENTIAL_REF,
   accountCredentialRefPrefix: QODER_ACCOUNT_REF_PREFIX,
 }
@@ -720,6 +787,10 @@ export const QODER_CN: QoderProduct = {
   userAgent: QODER_CN_USER_AGENT,
   patPrefix: QODER_PAT_PREFIX,
   patUrl: QODER_CN_PAT_URL,
+  authBaseUrl: QODER_CN_AUTH_BASE,
+  // 与两区共用同一个 CLI `client_id`（官方就是一个应用覆盖两个 region）。
+  clientId: QODER_CLI_CLIENT_ID,
+  machineIdDir: QODER_CN_MACHINE_ID_DIR,
   defaultCredentialRef: 'QODER_CN_PERSONAL_TOKEN',
   accountCredentialRefPrefix: 'QODER_CN_ACCOUNT',
   clientType: '5',

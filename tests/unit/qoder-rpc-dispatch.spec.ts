@@ -35,6 +35,10 @@
  */
 
 import { Context } from '@deepseek-ai/cordis'
+import { mkdtempSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
@@ -129,6 +133,9 @@ interface Harness {
 
 const harnesses: Harness[] = []
 
+/** 设备流用例建的临时 home 目录；afterEach 统一删除。 */
+const tempHomes: string[] = []
+
 /**
  * 构造 ctx / pool / 真实 `QoderAuth` + 全局 fetch 替身并注册端点。
  *
@@ -138,6 +145,10 @@ const harnesses: Harness[] = []
 function createHarness(responds: (call: CapturedCall) => Response | undefined): Harness {
   const credentials = new FakeCredentials()
   const calls: CapturedCall[] = []
+  // ⚠️ **临时 home**：设备流会读写 `~/.qoder/.auth/machine_id`，那是用户与
+  // 官方 CLI **共用**的机器身份。不隔离就会污染用户真实环境。
+  const homeDir = mkdtempSync(join(tmpdir(), 'qoder-rpc-'))
+  tempHomes.push(homeDir)
 
   const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
     const call: CapturedCall = {
@@ -176,10 +187,18 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
   // host 都按实例/产品取值，用错实例的失败形态是假的「PAT 失效」。
   const serviceCtx = new Context()
   serviceCtx.provide('credentials', credentials as never)
-  const qoder = new QoderAuth(serviceCtx, { fetcher: fetcher as unknown as typeof fetch })
+  // 设备流注入：临时 home + 快速超时（默认 5 分钟会让「等授权」的用例空转）。
+  const deviceFlow = {
+    homeDir,
+    sleep: (ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, Math.min(ms, 1)) }),
+    intervalMs: 1,
+    timeoutMs: 60,
+  }
+  const qoder = new QoderAuth(serviceCtx, { fetcher: fetcher as unknown as typeof fetch, deviceFlow })
   const qoderCn = new QoderAuth(serviceCtx, {
     product: QODER_CN,
     fetcher: fetcher as unknown as typeof fetch,
+    deviceFlow,
   })
 
   let handler: ((request: Request) => Promise<Response>) | undefined
@@ -235,6 +254,9 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
     credentials,
     calls,
     async teardown() {
+      // 设备流的互斥槽位是模块级单例：不结算会泄漏到下一个用例。
+      qoder.cancelPendingLogin('测试清理')
+      qoderCn.cancelPendingLogin('测试清理')
       qoder.stop()
       qoderCn.stop()
     },
@@ -246,6 +268,7 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
 afterEach(async () => {
   for (const harness of harnesses) await harness.teardown()
   harnesses.length = 0
+  for (const dir of tempHomes.splice(0)) await rm(dir, { recursive: true, force: true })
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
@@ -310,7 +333,12 @@ describe('account.create —— qoder 的 PAT 粘贴式登录（非两段式）'
     const h = createHarness(successResponder)
     // 前缀校验是**本地**的（`isQoderPersonalToken`），故它必须发生在 exchange 之前：
     // 把一次必然失败的往返换成一条可读提示。
-    for (const pat of [undefined, '', '   ', 'nope', 'dt-device-token', 'pt-']) {
+    //
+    // ⚠️ 2026-09-21 设备流落地后，**`pat: undefined`（键缺失）不再属于这一组**：
+    // 那是「用户要浏览器登录」，走设备流。这里只列**显式提交了非法 PAT 值**的形态
+    // —— 包括空串与纯空白（客户端 PAT 表单提交时总是带 `pat` 键，空值就是
+    // 「用户提交了空 PAT」，必须回格式错误而不是静默开一个授权页）。
+    for (const pat of ['', '   ', 'nope', 'dt-device-token', 'pt-']) {
       const result = await h.call<unknown>('account.create', { provider: 'qoder', pat })
       expect(result.ok, JSON.stringify(pat)).toBe(false)
       if (result.ok) continue
@@ -321,6 +349,17 @@ describe('account.create —— qoder 的 PAT 粘贴式登录（非两段式）'
     // 失败是**终态**：没有占位账号、没有半成品凭据。
     expect(await h.accounts('qoder')).toHaveLength(0)
     expect(h.credentials.writes).toEqual([])
+  })
+
+  it('键缺失（`pat: undefined`）走**设备流**，不再回「PAT 格式不正确」', async () => {
+    // 这是设备流落地带来的**有意**语义变更，单独一条钉死，免得将来有人
+    // 「顺手」把它并回上面那组（那会让浏览器登录永远打不开）。
+    const h = createHarness(() => new Response('', { status: 404 }))
+    const result = await h.call<{ loginUrl: string }>('account.create', { provider: 'qoder' })
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    if (!result.ok) return
+    // 回的是授权页 URL，而不是一条「请粘贴 PAT」的指引。
+    expect(new URL(result.value.loginUrl).pathname).toBe('/device/selectAccounts')
   })
 
   it('PAT 被服务端拒绝（exchange 401）时给出「重新粘贴」的可读原因', async () => {
