@@ -1163,7 +1163,7 @@ provider id 是 `trae-cn`（带连字符，对齐用户与生态叫法），但 
 | `function` | **模型来源 function**：CN 区为 `solo_work_remote`（40 项）/ `solo_work_lite` |
 | `messages[].content` | **`[{type:'text',text}]` 数组**（不是裸字符串） |
 | `role:"developer"` | **归一为 `"system"`**（上游不认 developer） |
-| assistant `tool_calls[].function` | **出站改名 `function_call`**（无 er；入站帧仍是 `function`，故解析侧不动） |
+| assistant `tool_calls[].function` | **出站改名 `function_call`**（无 er；⚠️ **入站也是 `function_call`**，与出站同源 —— 早前记的「入站仍是 `function`」是错的，正是工具调用被丢弃的认知成因，见下「SSE 帧」） |
 | `tools[].function.parameters` | **JSON 字符串**（传对象会 `4001 parameter type does not match binding data`） |
 | `reasoning_effort_level` | **维持不变**（见下「思考档位」的说明） |
 
@@ -1242,6 +1242,7 @@ User-Agent:          Trae/0.1.61          ← SOLO 代际（旧通道是 TraeCli
 event:metadata      data:{"conversation_id":…}      ← 忽略（`meta` 亦识别）
 event:timing_cost   data:{provider_model_name:…}    ← 忽略
 event:output        data:{"response":"片段"}         ← 正文增量
+event:output        data:{"response":"","tool_calls":[…]}  ← **工具调用也走这一帧**（见下）
 event:token_usage   data:{prompt_tokens,…}          ← usage
 event:done          data:{…}                        ← 流结束
 event:error         data:{"code":4008,"message":…}  ← 失败（HTTP 仍为 200）
@@ -1250,8 +1251,15 @@ event:error         data:{"code":4008,"message":…}  ← 失败（HTTP 仍为 2
 事件名同样取自本机客户端字符串池：Rust 侧
 `…/adapter/llm/event.rs` 有一份权威事件类型清单，每个变体都带一条
 `Failed to deserialize <name> event` 诊断串（实测提取到 22 条）。
-`tool_calls[].function_call`（无 er）是**出站改名**，入站帧里仍是 `function` ——
-故解析侧不需要任何改动。
+
+⚠️ **工具调用**：上游**不**发独立的 `event:tool_call` 帧，而是把它内嵌在
+`event:output` 的 `tool_calls` 数组里（2026-09-21 真机帧定案）：
+`{"index":0,"id":"call_…","type":"function","function_call":{"name":"glob","arguments":""}}`，
+后续增量片 `id` / `name` 为空串、只有 `arguments` 增长（OpenAI 式累积，空串不覆盖）。
+⚠️ 字段名 `function_call`（无 er）与**出站改名同源** —— 早前本条记的「入站帧里仍是
+`function`，故解析侧不需要任何改动」**是错的**：`tool_calls` 起初根本没被读取，
+工具调用被整块丢弃，trae-cn 因此**从未成功调用过一次工具**（343 个历史会话 0/10）。
+详见 `AGENTS.md` 的对应 ⚠️ 条目。
 
 **错误分类按业务码，不按 HTTP 状态码**（`src/trae-cn-errors.ts`，纯函数）：
 

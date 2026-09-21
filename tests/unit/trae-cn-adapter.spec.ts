@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 import { version as osVersion } from 'node:os'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -132,6 +133,26 @@ function errorStream(code: number, message = '限流中'): string {
 
 function sseResponse(body: string, status = 200): Response {
   return new Response(body, { status, headers: { 'Content-Type': 'text/event-stream' } })
+}
+
+/**
+ * 读取**真机录制**的 SSE 帧夹具。
+ *
+ * 夹具来源：探针实录 `%TEMP%\dsh-trunc-probe\run-{notokens,maxtokens}.frames.json`，
+ * 逐帧还原为 SSE 文本后入库。拷入前已人工核对**不含任何凭据 / token**
+ * （探针只落 `event` / `keys` / `data` 三列，不落请求头）。
+ *
+ * 两个变体是同一请求在两组 max-tokens 参数下的实录：帧结构（含 `tool_calls`
+ * 的首片与增量片）完全一致，只有 session id、工具调用 id 与 token 计数不同 ——
+ * 正因如此，它证明的是**协议形态**而不是某一次偶然输出。
+ */
+function readTraeCnFixture(name: string): string {
+  return readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')
+}
+
+/** 按类型过滤 chunk（断言里高频使用，避免每处都写一次 cast）。 */
+function chunksOfType(chunks: unknown[], type: string): Array<Record<string, unknown>> {
+  return chunks.filter((c): c is Record<string, unknown> => (c as { type?: unknown }).type === type)
 }
 
 /** 收集 `stream()` 的全部 chunk；返回 chunk 与抛出的错误。 */
@@ -512,6 +533,30 @@ describe('Trae CN SSE 帧解析（纯函数）', () => {
     expect(parseTraeCnToolCall({ nothing: true })).toBeUndefined()
   })
 
+  it('`function_call` 嵌套形态（output 帧内嵌 tool_calls 的原生形态）与顶层形态都从同一入口解析', () => {
+    // 真机帧实录：字段名是 `function_call`（**无 er**），与出站改名约定同源 ——
+    // assistant 的 `tool_calls[].function` 出站改名 `function_call`，入站按同名读回。
+    // 这里钉死「不要顺手修正成 function」，否则这条链路会静默断掉。
+    expect(parseTraeCnToolCall({
+      index: 0,
+      id: 'call_e73ac491c3ae4cf783f02af4',
+      type: 'function',
+      function_call: { name: 'glob', arguments: '', partial_arguments: null, namespace: null },
+    })).toEqual({ id: 'call_e73ac491c3ae4cf783f02af4', name: 'glob', argumentsDelta: '' })
+
+    // 增量片：id / name 是**空串**，只有 arguments 是增量。
+    expect(parseTraeCnToolCall({
+      index: 0,
+      id: '',
+      type: 'function',
+      function_call: { name: '', arguments: '{"pattern": "*"}', partial_arguments: null, namespace: null },
+    })).toEqual({ argumentsDelta: '{"pattern": "*"}' })
+
+    // 顶层形态（没有 `tool_call` 包裹）同样认。
+    expect(parseTraeCnToolCall({ id: 'c9', function_call: { name: 'ls', arguments: '{}' } }))
+      .toEqual({ id: 'c9', name: 'ls', argumentsDelta: '{}' })
+  })
+
   it('usage 帧只把未命中缓存部分计入 inputTokens', () => {
     expect(parseTraeCnUsage({ prompt_tokens: 100, completion_tokens: 20 }))
       .toEqual({ inputTokens: 100, outputTokens: 20 })
@@ -688,6 +733,190 @@ describe('Trae CN SSE 流消费', () => {
     const body = 'event:output\r\ndata:{"response":"crlf"}\r\n\r\nevent:done\r\ndata:{}\r\n\r\n'
     const { outcome } = await consume(body)
     expect(outcome.produced).toBe(true)
+  })
+})
+
+/**
+ * `output` 帧内嵌 `tool_calls`（2026-09-21 真机定案）。
+ *
+ * ## 缺陷本体
+ *
+ * 上游把工具调用嵌在 **`event:output` 帧的 `tool_calls` 字段**里返回，而 output
+ * 分支只读 `response` / `reasoning_content` ⇒ 工具调用被整块丢弃 ⇒ 该步既无正文
+ * 也无 tool-call 块 ⇒ 适配器走 `{kind:'stop'}` ⇒ 回合终止且零报错。
+ * 后果是 **trae-cn 从未成功调用过一次工具**（343 个历史会话扫描 0/10）。
+ *
+ * 下面第一条用例用真机帧序列端到端钉死这条链路；其余用例锁单帧语义。
+ */
+describe('Trae CN output 帧内嵌 tool_calls（真机帧夹具）', () => {
+  /** 直接消费一段 SSE 文本，返回 chunk 与 outcome。 */
+  async function consume(body: string, status = 200) {
+    const chunks: unknown[] = []
+    const generator = consumeTraeCnStream(sseResponse(body, status), {
+      label: 'trae-cn',
+      httpStatus: status,
+      timeouts: { firstFrameMs: 1000, chunkMs: 1000 },
+    })
+    let outcome
+    for (;;) {
+      const next = await generator.next()
+      if (next.done === true) { outcome = next.value; break }
+      chunks.push(next.value)
+    }
+    return { chunks, outcome }
+  }
+
+  for (const variant of ['notokens', 'maxtokens']) {
+    it(`真机帧序列（${variant}）：工具调用被解析为 tool-call 块，收尾为 tool-calls`, async () => {
+      const { chunks, outcome } = await consume(readTraeCnFixture(`trae-cn-output-tool-calls-${variant}.sse.txt`))
+
+      // ① 建块 + 增量：id / name / 累积 arguments 三项全断言。
+      expect(chunksOfType(chunks, 'block-start')).toEqual([
+        { type: 'block-start', index: 0, blockType: 'reasoning' },
+        { type: 'block-start', index: 1, blockType: 'tool-call' },
+      ])
+      const deltas = chunksOfType(chunks, 'tool-call-delta')
+      expect(deltas).toHaveLength(2)
+      expect(deltas[0]).toMatchObject({ index: 1, name: 'glob', argumentsDelta: '' })
+      expect(deltas[1]).toMatchObject({ index: 1, argumentsDelta: '{"pattern": "*"}' })
+      // id 只出现在首片；两个分片的 id 必须**同值**（增量片的空串不得覆盖已记录值）。
+      expect(deltas[0]!.id).toEqual(deltas[1]!.id)
+      expect(String(deltas[0]!.id).startsWith('call_')).toBe(true)
+
+      // 收尾块按「工具调用 → 正文 → 思考」的创建顺序闭合，故这里按块类型取，
+      // 不能假定 `at(-1)` 就是工具块（本夹具里最后闭合的是 reasoning 块）。
+      const toolEnd = chunksOfType(chunks, 'block-end')
+        .find(e => (e.block as { type?: unknown }).type === 'tool-call')!
+      expect(toolEnd.index).toBe(1)
+      expect(toolEnd.block).toMatchObject({ type: 'tool-call', name: 'glob', arguments: '{"pattern": "*"}' })
+
+      // ② outcome 三项：都收到 done 帧、参数不残缺、确实存在工具调用。
+      expect(outcome).toMatchObject({ done: true, produced: true, hasToolCalls: true, argumentsTruncated: false })
+
+      // ③ 适配器收尾必须是 tool-calls —— 修复前这里是 stop，回合就此终止。
+      const { adapter } = makeAdapter(() => sseResponse(
+        readTraeCnFixture(`trae-cn-output-tool-calls-${variant}.sse.txt`),
+      ))
+      const result = await collect(adapter, generateOptions())
+      expect(result.error).toBeUndefined()
+      expect(result.chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'tool-calls' } })
+    })
+  }
+
+  it('`response` 正文与 `tool_calls` 同帧共存时**两者都产出**', async () => {
+    const { chunks } = await consume(traeSse([
+      {
+        event: 'output',
+        data: {
+          response: '我先看一下目录',
+          tool_calls: [{
+            index: 0,
+            id: 'c1',
+            type: 'function',
+            function_call: { name: 'glob', arguments: '{"pattern":"*"}' },
+          }],
+        },
+      },
+      { event: 'done', data: {} },
+    ]))
+    expect(chunksOfType(chunks, 'text-delta')).toEqual([{ type: 'text-delta', index: 0, text: '我先看一下目录' }])
+    expect(chunksOfType(chunks, 'tool-call-delta')).toHaveLength(1)
+  })
+
+  it('`tool_calls` 为空数组 / 非数组 / 缺 `function_call` 时不产出块', async () => {
+    const empty = await consume(traeSse([
+      { event: 'output', data: { response: 'x', tool_calls: [] } },
+      { event: 'done', data: {} },
+    ]))
+    expect(empty.outcome.hasToolCalls).toBe(false)
+    expect(chunksOfType(empty.chunks, 'tool-call-delta')).toEqual([])
+
+    const notArray = await consume(traeSse([
+      { event: 'output', data: { response: 'x', tool_calls: null } },
+      { event: 'done', data: {} },
+    ]))
+    expect(notArray.outcome.hasToolCalls).toBe(false)
+
+    // 单项缺 `function_call`（id / name / arguments 全落空）→ 跳过该项，
+    // 而不是伪造出一个 `unknown tool ""` 的空调用污染会话历史。
+    const missingFn = await consume(traeSse([
+      { event: 'output', data: { response: 'x', tool_calls: [{ index: 0, type: 'function' }] } },
+      { event: 'done', data: {} },
+    ]))
+    expect(missingFn.outcome.hasToolCalls).toBe(false)
+    expect(chunksOfType(missingFn.chunks, 'tool-call-delta')).toEqual([])
+  })
+
+  it('既有独立 `event:tool_call` 帧不受影响（两种投递形态并存）', async () => {
+    const { chunks, outcome } = await consume(traeSse([
+      { event: 'tool_call', data: { id: 'c1', name: 'read', arguments: '{"a":1}' } },
+      { event: 'done', data: {} },
+    ]))
+    expect(outcome.hasToolCalls).toBe(true)
+    const end = chunks.at(-1) as { block: { name: string; arguments: string } }
+    expect(end.block).toMatchObject({ name: 'read', arguments: '{"a":1}' })
+  })
+
+  it('同一帧内多个 tool_calls（并行调用）按 `index` 各建一块，后续分片各归其位', async () => {
+    const { chunks, outcome } = await consume(traeSse([
+      {
+        event: 'output',
+        data: {
+          response: '',
+          tool_calls: [
+            { index: 0, id: 'c1', type: 'function', function_call: { name: 'read', arguments: '{"a":1}' } },
+            // glob 的参数**故意只给前半截**，由后一帧补齐。
+            { index: 1, id: 'c2', type: 'function', function_call: { name: 'glob', arguments: '{"pattern":"*"' } },
+          ],
+        },
+      },
+      // 后续帧只带 index=1 的增量：它必须落到 glob 那一块，而不是并吞进 read。
+      {
+        event: 'output',
+        data: {
+          response: '',
+          tool_calls: [
+            { index: 1, id: '', type: 'function', function_call: { name: '', arguments: ',"x":1}' } },
+          ],
+        },
+      },
+      { event: 'done', data: {} },
+    ]))
+
+    expect(chunksOfType(chunks, 'block-start')).toEqual([
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'block-start', index: 1, blockType: 'tool-call' },
+    ])
+    expect(outcome.hasToolCalls).toBe(true)
+    const ends = chunksOfType(chunks, 'block-end').map(e => e.block as Record<string, unknown>)
+    expect(ends.map(b => b.name)).toEqual(['read', 'glob'])
+    expect(ends[0]!.arguments).toBe('{"a":1}')
+    expect(ends[1]!.arguments).toBe('{"pattern":"*","x":1}')
+  })
+
+  it('**只有工具调用、零正文**时适配器收尾仍为 tool-calls（不得判成空回复）', async () => {
+    // 这条是缺陷的第二个后果面：工具调用被丢弃后该步既无 text 也无 tool-call，
+    // 适配器会把「上游明明给了工具调用」误判为 EMPTY_RESPONSE / stop。
+    const body = traeSse([
+      {
+        event: 'output',
+        data: {
+          response: '',
+          reasoning_content: null,
+          tool_calls: [{
+            index: 0,
+            id: 'c1',
+            type: 'function',
+            function_call: { name: 'glob', arguments: '{"pattern":"*"}' },
+          }],
+        },
+      },
+      { event: 'done', data: { finish_reason: 'stop' } },
+    ])
+    const { adapter } = makeAdapter(() => sseResponse(body))
+    const { chunks, error } = await collect(adapter, generateOptions())
+    expect(error).toBeUndefined()
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'tool-calls' } })
   })
 })
 

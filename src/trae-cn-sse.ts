@@ -86,6 +86,27 @@ export const TRAE_CN_THOUGHT_EVENT = 'thought'
 /** 工具调用帧的事件名。 */
 export const TRAE_CN_TOOL_CALL_EVENT = 'tool_call'
 
+/**
+ * `output` 帧内**内嵌工具调用**的字段名（2026-09-21 真机定案）。
+ *
+ * ⚠️ 上游把工具调用直接挂在 `event:output` 帧的 data 里返回，形如：
+ *
+ * ```
+ * event:output
+ * data:{"response":"","reasoning_content":null,
+ *       "tool_calls":[{"index":0,"id":"call_e73a…","type":"function",
+ *                      "function_call":{"name":"glob","arguments":"",…}}],…}
+ * ```
+ *
+ * 而 output 分支原先只读 `response` / `reasoning_content` ⇒ 工具调用被**整块
+ * 丢弃** ⇒ 该步既无正文也无 tool-call 块 ⇒ 适配器按「空步」收尾为 `stop`，
+ * 回合就此终止且零报错。后果是 trae-cn **从未成功调用过一次工具**。
+ *
+ * 字段名是 `tool_calls`（复数，与 OpenAI 的 assistant 消息字段同名），
+ * 而**调用项内部**用的是 `function_call` —— 详见 {@link parseTraeCnToolCall}。
+ */
+export const TRAE_CN_TOOL_CALLS_FIELD = 'tool_calls'
+
 /** 排队相关帧的事件名（均按「等待」处理，不产生内容）。 */
 export const TRAE_CN_QUEUE_EVENTS: readonly string[] = [
   'request_wait_in_queue', 'queue_begin', 'queue_end', 'queue_continue',
@@ -243,28 +264,39 @@ export interface TraeCnToolCallDelta {
 }
 
 /**
- * 解析 `tool_call` 帧。
+ * 解析一**项**工具调用（不管它来自哪种投递形态）。
  *
- * ⚠️ **T7 待校准**：调研给出了事件名（Rust 事件清单里的 `tool_call`），
- * 但**未给出载荷结构**。这里按客户端里出现过的三种常见形态做**容忍式读取**，
- * 而不是发明一个精确 schema：
- * - `{tool_call: {id, name, arguments}}`
- * - `{id, name, arguments}`（平铺）
- * - `{tool_call: {function: {name, arguments}}}`（OpenAI 式嵌套）
+ * ## 两种投递形态（2026-09-21 真机定案）
  *
- * 全部落空时返回 `undefined`（该帧被忽略，而不是产出一个空工具调用）——
+ * 1. **`output` 帧内嵌**：`event:output` 的 data 里带 `tool_calls` 数组，
+ *    每项是 `{index, id, type, function_call:{name, arguments}}` ——
+ *    这是真机实录的**主要形态**（见 {@link TRAE_CN_TOOL_CALLS_FIELD}）；
+ * 2. **独立 `event:tool_call` 帧**：载荷结构未真机取证，按
+ *    `{tool_call:{…}}` / 平铺 / OpenAI 式嵌套三种常见形态容忍式读取
+ *    （⚠️ **T7 仍待校准**）。
+ *
+ * 两者共用**这一个**解析入口（不是两份逻辑）：形态 2 的 `{tool_call:{…}}`
+ * 外壳在这里剥掉，形态 1 直接传数组里的一项即可。
+ *
+ * ## ⚠️ 字段名是 `function_call`（**无 er**），不要「修正」成 `function`
+ *
+ * 这不是笔误，是**同一条协议约定**：出站时 assistant 的
+ * `tool_calls[].function` 要**改名 `function_call`** 再发（`buildTraeCnSoloBody`
+ * 里那条改名约定，已有逐字节测试钉死），入站就按同名读回。把这里改成
+ * `function` 会让整条工具链路**静默**断掉 —— 上游给的字段读不到，表现为
+ * 「工具调用凭空消失」，与本次修复的缺陷一模一样。
+ * `function` 这个键**仍保留**在读取链上：形态 2 的 OpenAI 式嵌套用它。
+ *
+ * 全部落空时返回 `undefined`（该项被忽略，而不是产出一个空工具调用）——
  * 这样「结构猜错」表现为工具调用不出现（可观测），而不是伪造出一个
  * `unknown tool ""` 的错误调用污染会话历史。
  */
 export function parseTraeCnToolCall(payload: unknown): TraeCnToolCallDelta | undefined {
   if (typeof payload !== 'object' || payload === null) return undefined
   const outer = payload as Record<string, unknown>
-  const inner = typeof outer.tool_call === 'object' && outer.tool_call !== null
-    ? outer.tool_call as Record<string, unknown>
-    : outer
-  const fn = typeof inner.function === 'object' && inner.function !== null
-    ? inner.function as Record<string, unknown>
-    : undefined
+  const inner = asRecord(outer.tool_call) ?? outer
+  // `function_call` 优先（内嵌形态的原生字段名），`function` 作为形态 2 的嵌套回退。
+  const fn = asRecord(inner.function_call) ?? asRecord(inner.function)
 
   const id = firstString(inner, ['id', 'tool_call_id', 'toolCallId', 'call_id'])
   const name = firstString(inner, ['name', 'tool_name', 'toolName'])
@@ -282,6 +314,109 @@ export function parseTraeCnToolCall(payload: unknown): TraeCnToolCallDelta | und
     ...name === undefined ? {} : { name },
     ...argumentsDelta === undefined ? {} : { argumentsDelta },
   }
+}
+
+/** 取出对象形态的值；标量 / null / 数组一律视为不存在。 */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  return value as Record<string, unknown>
+}
+
+/**
+ * 一个**待累积**的工具调用分片：统一的 wire 编号 + 待解析载荷。
+ *
+ * 两种投递形态（内嵌数组的一项、独立帧的整包）都先归一成这个形状，
+ * 再由 {@link accumulateTraeCnToolCall} 走**同一条**累积路径。
+ */
+interface TraeCnToolCallEntry {
+  /** wire 层调用编号：同一批次内不同调用靠它分块。 */
+  wireIndex: number
+  /** 交给 {@link parseTraeCnToolCall} 的载荷。 */
+  payload: unknown
+}
+
+/**
+ * 从 `output` 帧的 data 里取出内嵌的工具调用条目。
+ *
+ * 只认**数组**形态的 `tool_calls`：`null` / `undefined` / 标量一律当「本帧没有
+ * 工具调用」（上游在纯正文帧里发的是 `"tool_calls":null`，实测如此）。
+ * 数组**为空**同样不产出任何东西（不是错误，只是没有调用）。
+ */
+function traeCnEmbeddedToolCallEntries(data: unknown): TraeCnToolCallEntry[] {
+  const record = asRecord(data)
+  if (record === undefined) return []
+  const raw = record[TRAE_CN_TOOL_CALLS_FIELD]
+  if (!Array.isArray(raw)) return []
+  return raw.map((item, position) => ({ wireIndex: readTraeCnToolCallIndex(item, position), payload: item }))
+}
+
+/**
+ * 读内嵌调用项自带的 wire 编号；缺失 / 非法时回退到它在数组中的位置。
+ *
+ * 回退值是**位置**而不是 0：并行调用里若某一项漏发 `index`，写死 0 会让它
+ * 悄悄并进第一个调用的参数串（表现为「第一个工具的参数突然多出一段」）。
+ */
+function readTraeCnToolCallIndex(item: unknown, fallback: number): number {
+  const record = asRecord(item)
+  if (record === undefined) return fallback
+  const value = record.index
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : fallback
+}
+
+/** 累积中的工具调用块（`callId` 可被后续分片更新，`text` 是参数全文）。 */
+export interface TraeCnToolCallBlock {
+  /** harness 侧的块序号（按创建顺序分配）。 */
+  index: number
+  /** 已累积的参数片段（可能是半截 JSON，收尾时才判定）。 */
+  text: string
+  /** 调用 id。 */
+  callId: string
+  /** 工具名（只允许非空覆盖）。 */
+  name?: string
+}
+
+/**
+ * 把一**个**工具调用分片累积进已有块（或建新块），返回应产出的 chunk。
+ *
+ * ⚠️ 两种投递形态共用这一个函数是刻意的：内嵌 `tool_calls` 与独立
+ * `event:tool_call` 帧的**累积语义完全一致**（OpenAI 式：首片带 `id` / `name`，
+ * 后续片为空串 + 参数增量），复制第二份迟早会分叉。
+ *
+ * 三条判据与既有行为逐字相同：
+ * - `id` 允许覆盖（首片缺 id 时后续片可补上）；
+ * - **`name` 只允许非空覆盖** —— 后续分片带的空串会清掉首片解析出的工具名，
+ *   表现为 `unknown tool ""`；
+ * - 参数片段**无条件拼接**（空串拼接是无副作用的）。
+ */
+function accumulateTraeCnToolCall(
+  state: Map<number, TraeCnToolCallBlock>,
+  allocateIndex: () => number,
+  wireIndex: number,
+  delta: TraeCnToolCallDelta,
+): StreamChunk[] {
+  const chunks: StreamChunk[] = []
+  let block = state.get(wireIndex)
+  if (block === undefined) {
+    const callId = delta.id ?? `call_${wireIndex}`
+    block = { index: allocateIndex(), text: '', callId, ...delta.name === undefined ? {} : { name: delta.name } }
+    state.set(wireIndex, block)
+    chunks.push({ type: 'block-start', index: block.index, blockType: 'tool-call' })
+  } else if (delta.id !== undefined) {
+    block.callId = delta.id
+  }
+  // 只允许非空名字覆盖：后续分片若带空串会清空首个分片解析出的工具名，
+  // 表现为 `unknown tool ""`。
+  if (delta.name !== undefined && delta.name.length > 0) block.name = delta.name
+  const fragment = delta.argumentsDelta ?? ''
+  block.text += fragment
+  chunks.push({
+    type: 'tool-call-delta',
+    index: block.index,
+    id: ToolCallId(block.callId),
+    ...block.name === undefined ? {} : { name: block.name },
+    argumentsDelta: fragment,
+  })
+  return chunks
 }
 
 /** 依次尝试若干键，返回首个非空字符串。 */
@@ -386,7 +521,7 @@ export async function* consumeTraeCnStream(
   let produced = false
   let done = false
   let sseError: TraeCnSseError | undefined
-  const toolCalls = new Map<number, { index: number; text: string; callId: string; name?: string }>()
+  const toolCalls = new Map<number, TraeCnToolCallBlock>()
 
   try {
     while (!done && sseError === undefined) {
@@ -472,28 +607,9 @@ export async function* consumeTraeCnStream(
           if (delta === undefined) continue
           // 上游未给 index 时按「同一批次的后续分片」处理：单工具场景下分片
           // 必然同属一个调用，用 0 作 wire index 与 OpenAI 侧口径一致。
-          const wireIndex = 0
-          let block = toolCalls.get(wireIndex)
-          if (block === undefined) {
-            const callId = delta.id ?? `call_${wireIndex}`
-            block = { index: nextIndex++, text: '', callId, ...delta.name === undefined ? {} : { name: delta.name } }
-            toolCalls.set(wireIndex, block)
-            yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
-          } else if (delta.id !== undefined) {
-            block.callId = delta.id
-          }
-          // 只允许非空名字覆盖：后续分片若带空串会清空首个分片解析出的工具名，
-          // 表现为 `unknown tool ""`。
-          if (delta.name !== undefined && delta.name.length > 0) block.name = delta.name
-          const fragment = delta.argumentsDelta ?? ''
-          block.text += fragment
-          produced = true
-          yield {
-            type: 'tool-call-delta',
-            index: block.index,
-            id: ToolCallId(block.callId),
-            ...block.name === undefined ? {} : { name: block.name },
-            argumentsDelta: fragment,
+          for (const chunk of accumulateTraeCnToolCall(toolCalls, () => nextIndex++, 0, delta)) {
+            produced = true
+            yield chunk
           }
           continue
         }
@@ -501,6 +617,11 @@ export async function* consumeTraeCnStream(
         if (eventName === TRAE_CN_OUTPUT_EVENT) {
           const piece = extractTraeCnOutputText(data)
           const thoughtPiece = extractTraeCnThoughtText(data)
+          // ⚠️ **工具调用与正文共存于同一帧时两者都要产出**（不是二选一）：
+          // 上游确实会在一帧里同时给「一句话说明 + 一个工具调用」（实测形态）。
+          // 这里的次序（正文 → 思考 → 工具调用）与块的创建顺序一致，harness
+          // 按 `index` 组装，先后不影响正确性。
+          const toolCallEntries = traeCnEmbeddedToolCallEntries(data)
           if (piece.length > 0) {
             if (textIndex === undefined) {
               textIndex = nextIndex++
@@ -518,6 +639,16 @@ export async function* consumeTraeCnStream(
             produced = true
             thought += thoughtPiece
             yield { type: 'reasoning-delta', index: thoughtIndex, text: thoughtPiece }
+          }
+          for (const entry of toolCallEntries) {
+            const delta = parseTraeCnToolCall(entry.payload)
+            // 单项缺 `function_call`（id / name / arguments 全落空）→ **跳过该项**，
+            // 而不是伪造出一个空调用。
+            if (delta === undefined) continue
+            for (const chunk of accumulateTraeCnToolCall(toolCalls, () => nextIndex++, entry.wireIndex, delta)) {
+              produced = true
+              yield chunk
+            }
           }
           continue
         }

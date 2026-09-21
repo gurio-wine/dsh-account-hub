@@ -1,0 +1,51 @@
+event:metadata
+data:{"model":"","session_id":"2a192dbf-60c8-4cf8-8f01-4850fc3c7cfe","prompt_completion_id":0,"ab_versions":null,"app_version":"","ide_version":null,"ide_version_type":null,"prompt_cache_pool_record":null}
+
+event:timing_cost
+data:{"name":"llm_raw_chat_v2","preprocess_timing":67,"postprocess_timing":0,"queue_timing":16,"platform_first_token_timing":965,"account_type":"","is_retry":false,"middleware_processing_time":87,"server_processing_time":1120,"first_sse_event_time":1118,"preprocessing_detail":{"check_risk":25,"build_llm_prompt":0,"chat_completion_prepare":0,"other":42},"platform_detail":{"preprocess_timing":61,"first_token_timing":871,"network_latency":24,"provider_first_token":0,"provider_network_latency":0,"other":9},"post_processing_detail":{"post_security_check":0,"other":0},"provider_model_name":"glm-5.3"}
+
+event:output
+data:{"response":"","reasoning_content":"The","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":" user wants me to use","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":" the glob tool with pattern","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":" \"*\" to list all files","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":" in the current working directory","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":", then","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":" summarize in one sentence.","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":" Let","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":" me call","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":" the glob tool.","tool_calls":null,"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":null,"tool_calls":[{"index":0,"id":"call_67722e0bdac0467287024cea","type":"function","function_call":{"name":"glob","arguments":"","partial_arguments":null,"namespace":null}}],"multimodal_contents":null,"phase":null}
+
+event:output
+data:{"response":"","reasoning_content":null,"tool_calls":[{"index":0,"id":"","type":"function","function_call":{"name":"","arguments":"{\"pattern\": \"*\"}","partial_arguments":null,"namespace":null}}],"multimodal_contents":null,"phase":null}
+
+event:extra_info
+data:{"model":"glm-5.3","version":1,"content":"{\"reasoning_content\":\"The user wants me to use the glob tool with pattern \\\"*\\\" to list all files in the current working directory, then summarize in one sentence. Let me call the glob tool.\"}","input_token":35,"expire_time":2736031313767}
+
+event:token_usage
+data:{"name":"","prompt_tokens":15938,"completion_tokens":46,"total_tokens":15984,"cache_creation_input_tokens":0,"cache_read_input_tokens":384,"reasoning_tokens":35,"prompt_tokens_total":0,"completion_tokens_total":0,"total_tokens_total":0,"cache_creation_input_tokens_total":0,"cache_read_input_tokens_total":0,"reasoning_tokens_total":0,"cluster":"normal_context"}
+
+event:done
+data:{"finish_reason":"stop"}
+
