@@ -66,7 +66,7 @@ function toCjs(source: string): string {
   }
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   return out.concat(
-    '\nmodule.exports.__testExports = { formatCapacity: formatCapacity, ModelTierPicker: ModelTierPicker };\n',
+    '\nmodule.exports.__testExports = { formatCapacity: formatCapacity, ModelTierPicker: ModelTierPicker, tierOptionsOf: tierOptionsOf };\n',
   )
 }
 
@@ -92,9 +92,10 @@ afterAll(() => {
   if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true })
 })
 
-const { formatCapacity, ModelTierPicker } = loadClientModule() as {
+const { formatCapacity, ModelTierPicker, tierOptionsOf } = loadClientModule() as {
   formatCapacity: (value: unknown) => string
   ModelTierPicker: (props: Record<string, unknown>) => TierNode | null
+  tierOptionsOf: (model: Record<string, unknown>) => number[] | null
 }
 
 /** `createElement` 占位的产物形态。 */
@@ -187,5 +188,100 @@ describe('ModelTierPicker：标签用缩写、title 保留精确值', () => {
     ]) {
       expect(ModelTierPicker({ model: bad, busy: false, onSelect: () => {} }), JSON.stringify(bad)).toBeNull()
     }
+  })
+})
+
+/**
+ * 多档渲染（「档位选择器推广到全部供应商」的客户端侧）。
+ *
+ * 推广前客户端只认「默认 / Max」两个 radio；推广后 Host 会带出
+ * `contextTiers` 数组（Qoder 真机三档、Buddy 两档），客户端必须**数据驱动**：
+ * 有几档画几个 radio，选中态由 `contextBudget` **精确等于**哪一档决定。
+ *
+ * ⚠️ 判据是 `tierOptionsOf` 一个函数，UI 与提示行共用 —— 否则会出现「提示行说
+ * 能选档、行上却没有控件」这类分叉。
+ */
+describe('ModelTierPicker：多档通用（数据驱动，档数不限）', () => {
+  /** Qoder 真机三档形态（默认档是最小档）。 */
+  const qoder = {
+    id: 'qmodel_38max',
+    name: 'Qwen3.8-Max',
+    contextWindow: 200_000,
+    contextTiers: [200_000, 400_000, 1_000_000],
+  }
+
+  it('三档模型渲染三个 radio（默认档标「默认」，其余用容量缩写）', () => {
+    const tree = ModelTierPicker({ model: qoder, busy: false, onSelect: () => {} })
+    expect(textsOf(tree)).toEqual(['默认 200K', '400K', '1M'])
+    expect(titlesOf(tree)).toEqual([
+      '默认档 · 200000 token',
+      '400K档 · 400000 token',
+      '1M档 · 1000000 token',
+    ])
+  })
+
+  it('选中态 = `contextBudget` 精确等于该档；未设预算 / 编造值都是默认档', () => {
+    const checkedOf = (budget: number | undefined) => {
+      const tree = ModelTierPicker({ model: { ...qoder, contextBudget: budget }, busy: false, onSelect: () => {} })!
+      return tree.children
+        .map((child) => (child as TierNode).children.find((node) => (node as TierNode)?.type === 'input') as TierNode)
+        .map((input) => input.props.checked)
+    }
+    // 未设预算 → 默认档；设中间档 → 中间档；设编造值 → 静默回默认档
+    // （与宿主 `effectiveContextWindow` 同向：界面显示的选中项就是宿主会用的窗口）。
+    expect(checkedOf(undefined)).toEqual([true, false, false])
+    expect(checkedOf(400_000)).toEqual([false, true, false])
+    expect(checkedOf(1_000_000)).toEqual([false, false, true])
+    expect(checkedOf(200_000)).toEqual([true, false, false])
+    expect(checkedOf(500_000)).toEqual([true, false, false])
+  })
+
+  it('点击某一档把**该档的值**交给回调（宿主据此校验与写入）', () => {
+    const seen: Array<[string, number]> = []
+    const tree = ModelTierPicker({ model: qoder, busy: false, onSelect: (id: string, w: number) => seen.push([id, w]) })!
+    const inputs = tree.children.map((child) =>
+      (child as TierNode).children.find((node) => (node as TierNode)?.type === 'input') as TierNode)
+    for (const input of inputs) (input.props.onChange as () => void)()
+    expect(seen).toEqual([
+      ['qmodel_38max', 200_000],
+      ['qmodel_38max', 400_000],
+      ['qmodel_38max', 1_000_000],
+    ])
+  })
+
+  it('**Trae CN 同时带数组与两字段**时仍渲染「默认 / Max」两个 radio（文案不降级）', () => {
+    // Host 侧对 Trae CN 也会把 dev / max 归一进 `contextTiers`（同一套通用路径），
+    // 故这条形态在真机上会同时出现 —— 「Max」这个词不能因此消失。
+    const trae = { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 200_000, maxContextWindow: 1_000_000 }
+    const tree = ModelTierPicker({
+      model: { ...trae, contextTiers: [200_000, 1_000_000] }, busy: false, onSelect: () => {},
+    })
+    expect(textsOf(tree)).toEqual(['默认 200K', 'Max 1M'])
+  })
+
+  it('单档 / 无窗口 / 无 data 一律不渲染（宁缺毋编）', () => {
+    expect(ModelTierPicker({ model: { ...qoder, contextTiers: [200_000] }, busy: false, onSelect: () => {} })).toBeNull()
+    expect(ModelTierPicker({ model: { ...qoder, contextTiers: [] }, busy: false, onSelect: () => {} })).toBeNull()
+    expect(ModelTierPicker({
+      model: { id: 'x', contextWindow: 200_000 }, busy: false, onSelect: () => {},
+    })).toBeNull()
+    expect(ModelTierPicker({
+      model: { id: 'x', contextTiers: [200_000, 400_000] }, busy: false, onSelect: () => {},
+    })).toBeNull()  // 缺默认档：无法表达选中态，故不画
+  })
+
+  it('tierOptionsOf：默认档并入列表、升序去重、非法值剔除', () => {
+    // Buddy 的 `min(maxInputTokens, 档位表最大档)` 会产出「默认档不落在档位表里」
+    // 的组合 —— 不并入则「当前是默认档」无法表达（radio 全不选中）。
+    expect(tierOptionsOf({ contextWindow: 200_000, contextTiers: [100_000, 524_288] }))
+      .toEqual([100_000, 200_000, 524_288])
+    expect(tierOptionsOf({ contextWindow: 1_048_576, contextTiers: [300_000, 1_048_576, 300_000] }))
+      .toEqual([300_000, 1_048_576])
+    expect(tierOptionsOf({
+      contextWindow: 200_000, contextTiers: [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 400_000],
+    })).toEqual([200_000, 400_000])
+    // 老形态（无数组）走两字段分支；`max <= dev` 不算第二档。
+    expect(tierOptionsOf({ contextWindow: 200_000, maxContextWindow: 1_000_000 })).toEqual([200_000, 1_000_000])
+    expect(tierOptionsOf({ contextWindow: 200_000, maxContextWindow: 200_000 })).toBeNull()
   })
 })

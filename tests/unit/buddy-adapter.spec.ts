@@ -309,6 +309,117 @@ describe('BuddyAdapter', () => {
   })
 })
 
+/**
+ * 上下文窗口档位（推广到全部供应商后的 Buddy 侧）。
+ *
+ * Buddy 的目录公布 `contextWindow.supportedLengths`，而**生效档已经是最大档**
+ * （`min(maxInputTokens, 档位表最大档)`，2026-09-21 钳制实测口径）—— 故这里的
+ * 「档位」是**降档**选项，与 Qoder（默认档是最小档、其余是升档）方向相反。
+ * 三个落点必须同源同口径：
+ *
+ * 1. `contextTiers()` —— Host 的「显示列表」据此渲染单选列并校验用户提交值；
+ * 2. `resolveModel()` —— 用户选中的档位在这里变成向 DSH 声明的窗口；
+ * 3. **出站请求体一个字段都不动**（红线）。
+ */
+describe('BuddyAdapter 上下文窗口档位（生效档已是最大档）', () => {
+  /** 远端目录：`supportedLengths: [300000, 1048576]` 的两档模型。 */
+  const REMOTE = [{
+    id: 'glm-5.3',
+    name: 'GLM-5.3',
+    contextWindow: 1_048_576,
+    contextTiers: [300_000, 1_048_576],
+  }]
+
+  /** 造适配器；`budgets` 是账号池里存的用户选择。 */
+  function makeTierAdapter(budgets: Record<string, number> = {}, overrides: Record<string, unknown> = {}) {
+    return makeAdapter({
+      fetchRemoteModels: async () => REMOTE as never,
+      accountPool: {
+        contextBudget: (_provider: string, model: string) => budgets[model],
+        // 让 `stream()` 的账号登记路径走通（缺了会打一条无害的 warn，把逐字节
+        // 用例的输出弄脏）。**档位读取路径不看它们**。
+        findAccountIdByCredential: async () => 'acct-1',
+        updateModelRateLimit: async () => {},
+      },
+      ...overrides,
+    })
+  }
+
+  it('contextTiers() 播报远端目录的整张档位表（经产品兜底表校正后仍在）', async () => {
+    // ⚠️ 这条同时钉死 `reconcileWithFallback` 的**字段透传**：它会重建条目对象，
+    // 漏掉 `contextTiers` 就等于把档位能力静默删掉 —— 而 CN 与国际版**都带兜底
+    // 表**、都走这条重建路径，故那种漏失会让两个产品的档位列一起消失。
+    const tiers = await makeTierAdapter().contextTiers()
+    expect(tiers.get('glm-5.3')).toEqual({
+      contextWindow: 1_048_576,
+      contextTiers: [300_000, 1_048_576],
+    })
+  })
+
+  it('目录不可用时 contextTiers() 为空表（静态兜底表是快照，不编造档位）', async () => {
+    const adapter = makeAdapter({ fetchRemoteModels: async () => { throw new Error('network down') } })
+    expect((await adapter.contextTiers()).size).toBe(0)
+  })
+
+  it('resolveModel：未设置预算 = 最大档（接线前逐字段一致）', async () => {
+    const resolved = await makeTierAdapter().resolveModel('buddy-cn', 'glm-5.3')
+    expect(resolved.context).toEqual({ contextWindow: 1_048_576 })
+  })
+
+  it('resolveModel：预算精确命中降档 → 用该档；编造值静默回退最大档', async () => {
+    expect((await makeTierAdapter({ 'glm-5.3': 300_000 }).resolveModel('buddy-cn', 'glm-5.3')).context)
+      .toEqual({ contextWindow: 300_000 })
+    for (const bogus of [500_000, 1, 0, 999_999_999]) {
+      expect((await makeTierAdapter({ 'glm-5.3': bogus }).resolveModel('buddy-cn', 'glm-5.3')).context,
+        String(bogus)).toEqual({ contextWindow: 1_048_576 })
+    }
+  })
+
+  /**
+   * ⚠️ **红线：出站请求体零变更**。
+   *
+   * 档位只改 `resolveModel().context.contextWindow`。若有人把 supportedLengths /
+   * defaultLength 之类顺手塞进请求体，上游就按另一个口径服务了 —— 那是协议变更。
+   *
+   * ⚠️ **必须复用同一个适配器实例**：`prompt_cache_key` 由构造时的 `sessionId`
+   * 派生，两次各造一个实例会得到两个不同的 key，逐字节比对必然失败 ——
+   * 而那个差异与档位无关（`sessionId` 是会话标识，本来就该每会话不同）。
+   * 复用一个实例、只改账号池里的预算值，才是「唯一变量 = 档位」的对照。
+   */
+  it('**逐字节红线**：三种档位下发出的请求体完全相同', async () => {
+    const budgets: Record<string, number> = {}
+    const bodies: string[] = []
+    const adapter = makeTierAdapter(budgets, {
+      fetchImpl: async (_url: unknown, init: { body?: unknown }) => {
+        bodies.push(String(init?.body))
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+
+    for (const budget of [undefined, 300_000, 1_048_576]) {
+      if (budget === undefined) delete budgets['glm-5.3']
+      else budgets['glm-5.3'] = budget
+      // 先确认这一轮的档位**真的不同**，否则「body 相同」可能只是因为档位压根
+      // 没生效（那样这条用例就成了同义反复）。
+      expect((await adapter.resolveModel('buddy-cn', 'glm-5.3')).context?.contextWindow)
+        .toBe(budget ?? 1_048_576)
+      await collectChunks(adapter, {
+        model: 'glm-5.3',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+      } as never)
+    }
+
+    expect(bodies.length).toBe(3)
+    expect(bodies[0]!.length).toBeGreaterThan(0)
+    expect(bodies[1]).toBe(bodies[0])
+    expect(bodies[2]).toBe(bodies[0])
+    for (const forbidden of ['supportedLengths', 'defaultLength', 'contextWindow', 'maxInputTokens']) {
+      expect(bodies[0], forbidden).not.toContain(forbidden)
+    }
+  })
+})
+
 describe('BuddyAdapter credential handling', () => {
   it('stream throws MISSING_CREDENTIAL when no credential is configured', async () => {
     // credential 缺失且刷新也拿不到凭据（postRefreshCredential: undefined）。
@@ -1791,11 +1902,18 @@ describe('产品兜底模型目录校正', () => {
  * 构建的。此处断言适配器确实把黑名单里的模型摘掉了。
  */
 describe('BuddyAdapter 模型黑名单', () => {
-  /** 只实现 listModels 所需方法的账号池替身。 */
+  /**
+   * 只实现 listModels / resolveModel 所需方法的账号池替身。
+   *
+   * `contextBudget` 是 `resolveModel` 读档位预算的入口（未接线时返回 undefined =
+   * 默认档）。缺了它 `resolveModel` 会以 `contextBudget is not a function` 抛错 ——
+   * 那测的就不是路由能力了。
+   */
   function poolWithDisabled(provider: string, ids: string[]) {
     const disabled = new Set(ids)
     return {
       disabledModelsFor: (value: string) => (value === provider ? disabled : new Set<string>()),
+      contextBudget: () => undefined,
     } as never
   }
 
@@ -1828,6 +1946,7 @@ describe('BuddyAdapter 模型黑名单', () => {
       accountPool: {
         // 只对 workbuddy 报告黑名单
         disabledModelsFor: (value: string) => (value === 'buddy' ? new Set(['glm-5.2']) : new Set<string>()),
+        contextBudget: () => undefined,
       } as never,
     })
     const ids = (await adapter.listModels('buddy-cn')).map((m) => m.id)

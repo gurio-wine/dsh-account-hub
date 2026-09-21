@@ -107,10 +107,17 @@ function adapterOptions(overrides: Partial<QoderAdapterOptions> = {}): QoderAdap
   }
 }
 
-/** 造一个只提供 `disabledModelsFor` 的账号池 stub。 */
+/**
+ * 造一个只提供 `disabledModelsFor` 与 `contextBudget` 的账号池 stub。
+ *
+ * `contextBudget` 是 `resolveModel` 读档位预算的入口（未设置 → undefined = 默认档）。
+ * 缺了它，凡是要走 `resolveModel` 的用例都会以 `contextBudget is not a function`
+ * 抛错 —— 那测的就不是黑名单 / 路由了。
+ */
 function poolWithDisabled(disabled: readonly string[]): AccountPool {
   return {
     disabledModelsFor: () => new Set(disabled),
+    contextBudget: () => undefined,
   } as unknown as AccountPool
 }
 
@@ -191,6 +198,91 @@ describe('parseQoderDirectory：T1 快照（17 项）', () => {
     const entries = parseQoderDirectory(T1_SNAPSHOT, { includeDisabled: true })
     for (const id of ['auto', 'efficient', 'qmodel_latest', 'qmodel', 'mmodel']) {
       expect(entries.find((entry) => entry.id === id)?.reasoningEfforts).toBeUndefined()
+    }
+  })
+
+  /**
+   * 上下文窗口档位（`contextTiers`）—— 供 Account Hub 的档位选择器。
+   *
+   * Qoder 的目录公布 `available_context_windows`（真机 `[200000, 400000,
+   * 1000000]`），**默认档是最小档**，其余是升档选项。这与 Trae CN 的
+   * `{dev, max}` 两档形态不同，但「用户能选的档位精确等于目录公布的那些数」
+   * 这条原则一致 —— 故走通用层（`src/context-tiers.ts`）。
+   */
+  it('**目录的多档窗口记进 contextTiers**（升序去重，默认档是最小档）', () => {
+    const entries = parseQoderDirectory(T1_SNAPSHOT)
+    const max = entries.find((entry) => entry.id === 'qmodel_38max')
+    expect(max?.contextTiers).toEqual([200_000, 400_000, 1_000_000])
+    // 生效默认档仍是目录的 `default_context_window`（口径未变）。
+    expect(max?.contextWindow).toBe(200_000)
+  })
+
+  it('`272000` 这类非整值档位照收（不规整化成 272K 或 200000）', () => {
+    // 真机 `performance`：default 272000 + [272000, 400000, 1000000]。
+    const performance = parseQoderDirectory(T1_SNAPSHOT, { includeDisabled: true })
+      .find((entry) => entry.id === 'performance')
+    expect(performance?.contextTiers).toEqual([272_000, 400_000, 1_000_000])
+  })
+
+  it('**单档项不产出 contextTiers**（`[200000]` 等于没有可选项，宁缺毋编）', () => {
+    // 真机 CN 快照的 `mmodel`（MiniMax）只公布一个窗口。
+    const entries = parseQoderDirectory({
+      data: [{
+        id: 'mmodel', display_name: 'MiniMax', is_enabled: true,
+        default_context_window: 200_000, available_context_windows: [200_000],
+      }],
+    })
+    expect(entries[0]?.contextWindow).toBe(200_000)
+    expect(entries[0]).not.toHaveProperty('contextTiers')
+  })
+
+  it('**没有 `available_context_windows` 的项不产出 contextTiers**（只有默认档 = 无档位可选）', () => {
+    const entries = parseQoderDirectory({
+      data: [{ id: 'only-default', display_name: 'Only', is_enabled: true, default_context_window: 200_000 }],
+    })
+    expect(entries[0]?.contextWindow).toBe(200_000)
+    expect(entries[0]).not.toHaveProperty('contextTiers')
+  })
+
+  it('**没有窗口的项不产出 contextTiers**（auto / efficient 两项目录里两个字段都缺）', () => {
+    const entries = parseQoderDirectory(T1_SNAPSHOT, { includeDisabled: true })
+    for (const id of ['auto', 'efficient']) {
+      const entry = entries.find((candidate) => candidate.id === id)
+      expect(entry?.contextWindow).toBeUndefined()
+      expect(entry, id).not.toHaveProperty('contextTiers')
+    }
+  })
+
+  it('默认档**不在** available_context_windows 里时并入档位表（UI 才能表达「当前是默认档」）', () => {
+    // `default_context_window` 落在列表内是实测观测、**不是契约**。目录若哪天
+    // 给出不落在列表里的默认档，不并入会让 radio 全不选中。
+    const entries = parseQoderDirectory({
+      data: [{
+        id: 'drift', display_name: 'Drift', is_enabled: true,
+        default_context_window: 180_000, available_context_windows: [400_000, 1_000_000],
+      }],
+    })
+    expect(entries[0]?.contextWindow).toBe(180_000)
+    expect(entries[0]?.contextTiers).toEqual([180_000, 400_000, 1_000_000])
+  })
+
+  it('档位表**排序去重**且剔除非法项（上游数组顺序不可信）', () => {
+    const entries = parseQoderDirectory({
+      data: [{
+        id: 'dirty', display_name: 'Dirty', is_enabled: true,
+        default_context_window: 200_000,
+        // 倒序 + 重复 + 混入非法项（`readPositiveArray` 已先在入口剔除一轮）。
+        available_context_windows: [1_000_000, 200_000, 200_000, 0, -1, Number.NaN, 400_000],
+      }],
+    })
+    expect(entries[0]?.contextTiers).toEqual([200_000, 400_000, 1_000_000])
+  })
+
+  it('**静态兜底表一律不产出 contextTiers**（快照里没有档位表可抄，不编造）', () => {
+    // 兜底表的定位是「目录不可用时的极小可用集」，只照抄 T1 快照的
+    // `default_context_window`。给它编一张档位表就是无中生有。
+    for (const entry of fallbackQoderCatalog()) {
+      expect(entry, entry.id).not.toHaveProperty('contextTiers')
     }
   })
 

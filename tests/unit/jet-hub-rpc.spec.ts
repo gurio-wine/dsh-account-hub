@@ -10,6 +10,7 @@ import {
 } from '../../src/jet-hub-rpc.js'
 import type { CreditsEndpointDeps } from '../../src/jet-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
+import { createContextTierRegistry } from '../../src/context-tiers.js'
 import type { ClaimOutcome, CheckinStatus, CreditBalance } from '../../src/credits.js'
 import { BUDDY } from '../../src/product.js'
 import { TRAE_CN } from '../../src/trae-cn-product.js'
@@ -591,15 +592,16 @@ describe('model.list / model.setDisabled 端点', () => {
     accounts?: Array<Record<string, unknown>>
     /** 预置数据版本号（断言它将随 replace 一起被携带）。 */
     schemaVersion?: number
-    /** 预置上下文窗口预算（Trae CN 的 dev / Max 档位）。 */
+    /** 预置上下文窗口预算（按 provider → 模型存）。 */
     contextBudgets?: Record<string, Record<string, number>>
     /**
-     * 窗口档位来源（`registerJetHubRpc` 的第 10 个参数）。
+     * 窗口档位来源（`registerJetHubRpc` 的第 10 个参数）—— **按 provider id 分键**
+     * 的注册表，缺省的键就是「该 provider 不参与档位机制」。
      *
      * 省略即「未接线」：`model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝
      * （headless / 未传适配器时的既定降级）。
      */
-    contextTiers?: { contextTiers(): Promise<Map<string, { contextWindow?: number; maxContextWindow?: number }>> }
+    contextTiers?: Record<string, { contextTiers(): Promise<Map<string, { contextWindow?: number; maxContextWindow?: number; contextTiers?: number[] }>> } | undefined>
   }) {
     // settings 替身：内存里保存 namespace 的值，语义与真实服务一致的
     // 「整体 replace」。
@@ -673,7 +675,10 @@ describe('model.list / model.setDisabled 端点', () => {
     registerJetHubRpc(
       ctx as never, pool, {} as never, {} as never, {} as never,
       {} as never, {} as never, {} as never, {} as never,
-      options.contextTiers as never,
+      // 生产路径传的是 `createContextTierRegistry(...)` 的产物；这里**走同一个
+      // 构造函数**，而不是手搓一个带 `sourceFor` 的对象 —— 否则测试可能在一个
+      // 与生产不同的分派实现上通过（注册表的丢弃 undefined 键等语义要一起覆盖）。
+      options.contextTiers === undefined ? undefined : createContextTierRegistry(options.contextTiers) as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -1079,27 +1084,49 @@ describe('model.list / model.setDisabled 端点', () => {
   })
 
   /**
-   * 上下文窗口档位（Trae CN 的 dev / Max）。
+   * 上下文窗口档位（推广后覆盖全部有档位数据的 provider）。
    *
-   * 三条必须一起成立的事：
-   * 1. `model.list` 把目录公布的 dev / Max 与**当前存储的预算**一起播报，
-   *    UI 才能渲染单选列并显示选中项；
-   * 2. `model.setContextBudget` 只接受**精确等于目录档位**的值 ——
+   * 四条必须一起成立的事：
+   * 1. `model.list` 把目录公布的档位与**当前存储的预算**一起播报，UI 才能渲染
+   *    单选列并显示选中项；
+   * 2. 档位数据**按 provider 分派**（问注册表，而不是对 provider 名写特判）：
+   *    注册了就带窗口字段（Trae CN 的两档、Qoder 的三档都走同一条路径），
+   *    没注册就一个字都不带（`trae-cn-work` / CodeArts 这类无档位数据的 provider）；
+   * 3. `model.setContextBudget` 只接受**精确等于目录公布的某个档位**的值 ——
    *    编造值被拒，且错误信息里带着可用档位（用户唯一能据以改正的信息）；
-   * 3. 只对 Trae CN 开放（其余 provider 直接拒绝，而不是静默写一个永不生效的值）。
+   * 4. 未注册的 provider 直接拒绝，而不是静默写一个永不生效的值。
    */
   describe('model.list 窗口档位 / model.setContextBudget', () => {
-    /** 目录档位替身：一个两档模型 + 一个单档模型（id 取自下面共用的 MODELS）。 */
+    /** 目录档位替身：Trae CN 的两字段形态（一多档 + 一单档，id 取自共用的 MODELS）。 */
     const TIERS = new Map([
       ['glm-5.2', { contextWindow: 119_040, maxContextWindow: 1_048_576 }],
       ['deepseek-v4-flash', { contextWindow: 119_040 }],
     ])
     const tierSource = { contextTiers: async () => TIERS }
+    /**
+     * Qoder 形态：挂 `contextTiers` 数组（**默认档是最小档**，真机
+     * `[200000, 400000, 1000000]` 三档）。三档是为了证明 UI / 校验都不假设
+     * 「只有默认 / Max 两档」—— 两档形态下「多档」与「两档」的实现无法区分。
+     */
+    const QODER_TIERS = new Map([
+      ['qmodel_38max', { contextWindow: 200_000, contextTiers: [200_000, 400_000, 1_000_000] }],
+      // 单档项：目录有窗口但只有一档（UI 据此不渲染档位列）。
+      ['qauto', { contextWindow: 200_000, contextTiers: [200_000] }],
+    ])
+    /** 按 provider 分键的注册表：Trae CN + Qoder 有来源，其余键缺席。 */
+    const TIER_REGISTRY = {
+      'trae-cn': tierSource,
+      'qoder': { contextTiers: async () => QODER_TIERS },
+    }
+    /** Buddy 形态：生效档已是**最大**档（`min(maxInputTokens, 档位表最大档)`）。 */
+    const BUDDY_TIERS = new Map([
+      ['glm-5.2', { contextWindow: 1_048_576, contextTiers: [300_000, 1_048_576] }],
+    ])
 
     it('model.list 播报 dev / Max / 当前预算（有则带，无则缺省）', async () => {
       const { call } = registerEndpoints({
         models: MODELS,
-        contextTiers: tierSource,
+        contextTiers: TIER_REGISTRY,
         contextBudgets: { 'trae-cn': { 'glm-5.2': 1_048_576 } },
       })
 
@@ -1117,7 +1144,7 @@ describe('model.list / model.setDisabled 端点', () => {
     })
 
     it('单档模型只带 dev，且**没有预算时 contextBudget 缺省**（而非 0）', async () => {
-      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
       const result = await call('model.list', { provider: 'trae-cn' })
       const byId = new Map((result.value as { models: Array<Record<string, unknown>> }).models.map(m => [m.id, m]))
       expect(byId.get('deepseek-v4-flash')).toMatchObject({ contextWindow: 119_040 })
@@ -1141,7 +1168,7 @@ describe('model.list / model.setDisabled 端点', () => {
       // 先拿「开启」状态下的那一行做基准。
       const enabled = await (async () => {
         const { call } = registerEndpoints({
-          models: MODELS, contextTiers: tierSource,
+          models: MODELS, contextTiers: TIER_REGISTRY,
           contextBudgets: { 'trae-cn': { 'glm-5.2': 1_048_576 } },
         })
         const result = await call('model.list', { provider: 'trae-cn' })
@@ -1151,7 +1178,7 @@ describe('model.list / model.setDisabled 端点', () => {
 
       // 再拿同一个模型被关闭后的那一行：它已被适配器过滤掉，由**回填侧**产出。
       const { call } = registerEndpoints({
-        models: MODELS, contextTiers: tierSource,
+        models: MODELS, contextTiers: TIER_REGISTRY,
         contextBudgets: { 'trae-cn': { 'glm-5.2': 1_048_576 } },
         disabledModels: { 'trae-cn': { 'glm-5.2': true } },
       })
@@ -1173,7 +1200,7 @@ describe('model.list / model.setDisabled 端点', () => {
       // UI 现在会在回填行上渲染档位 radio，那条路径必须真的能写进去 ——
       // 否则就成了「点了没反应」，比不渲染更糟。
       const { call, storedValue } = registerEndpoints({
-        models: MODELS, contextTiers: tierSource,
+        models: MODELS, contextTiers: TIER_REGISTRY,
         disabledModels: { 'trae-cn': { 'glm-5.2': true } },
       })
 
@@ -1187,13 +1214,69 @@ describe('model.list / model.setDisabled 端点', () => {
       expect(glm.contextBudget).toBe(1_048_576)
     })
 
-    it('其它 provider **一个窗口字段都不带**（档位只在 Trae CN 存在）', async () => {
-      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
-      const result = await call('model.list', { provider: 'trae-cn-work' })
-      for (const model of (result.value as { models: Array<Record<string, unknown>> }).models) {
-        expect(model).not.toHaveProperty('contextWindow')
-        expect(model).not.toHaveProperty('maxContextWindow')
+    /**
+     * 推广后的**分派语义**：窗口字段的有无由**注册表**决定，不由 provider 名决定。
+     *
+     * 这一对用例是「推广」这件事的核心防线 —— 早前 `model.list` 写死
+     * `req.provider === TRAE_CN.id`，于是 buddy / qoder 的目录数据即使存在也带不出来。
+     */
+    it('未注册的 provider **一个窗口字段都不带**（trae-cn-work / codearts 刻意不注册）', async () => {
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
+      for (const provider of ['trae-cn-work', 'codearts', 'lobsterai']) {
+        const result = await call('model.list', { provider })
+        for (const model of (result.value as { models: Array<Record<string, unknown>> }).models) {
+          expect(model, provider).not.toHaveProperty('contextWindow')
+          expect(model, provider).not.toHaveProperty('maxContextWindow')
+          expect(model, provider).not.toHaveProperty('contextTiers')
+          expect(model, provider).not.toHaveProperty('contextBudget')
+        }
       }
+    })
+
+    it('注册了的 provider 各自按**自己的目录**带档位（buddy 的最大档形态 / qoder 的三档形态）', async () => {
+      // Buddy 形态：生效档已是**最大**档（`supportedLengths` 的其余项是降档选项）。
+      const buddy = await (async () => {
+        const { call } = registerEndpoints({
+          models: MODELS,
+          contextTiers: { 'buddy-cn': { contextTiers: async () => BUDDY_TIERS } },
+          contextBudgets: { 'buddy-cn': { 'glm-5.2': 300_000 } },
+        })
+        const result = await call('model.list', { provider: 'buddy-cn' })
+        return (result.value as { models: Array<Record<string, unknown>> }).models.find(m => m.id === 'glm-5.2')!
+      })()
+      expect(buddy).toMatchObject({
+        contextWindow: 1_048_576,
+        contextTiers: [300_000, 1_048_576],
+        contextBudget: 300_000,
+      })
+      // Buddy 没有 `maxContextWindow` 这个概念（那是 Trae CN 的两字段形态），
+      // 整张表由 `contextTiers` 承载 —— 不为了「统一」而编造一个 max 字段。
+      expect(buddy).not.toHaveProperty('maxContextWindow')
+
+      // Qoder 形态：默认档是**最小**档，三档可选。
+      const { call } = registerEndpoints({
+        models: [{ id: 'qmodel_38max', name: 'Qwen3.8-Max' }],
+        contextTiers: TIER_REGISTRY,
+        contextBudgets: { 'qoder': { qmodel_38max: 1_000_000 } },
+      })
+      const result = await call('model.list', { provider: 'qoder' })
+      const qwen = (result.value as { models: Array<Record<string, unknown>> }).models[0]!
+      expect(qwen).toMatchObject({
+        contextWindow: 200_000,
+        contextTiers: [200_000, 400_000, 1_000_000],
+        contextBudget: 1_000_000,
+      })
+    })
+
+    it('**单档模型不带 `contextTiers`**（一档等于没有可选项，宁缺毋编）', async () => {
+      const { call } = registerEndpoints({
+        models: [{ id: 'qauto', name: 'Auto' }],
+        contextTiers: TIER_REGISTRY,
+      })
+      const result = await call('model.list', { provider: 'qoder' })
+      const auto = (result.value as { models: Array<Record<string, unknown>> }).models[0]!
+      expect(auto).toMatchObject({ contextWindow: 200_000 })
+      expect(auto).not.toHaveProperty('contextTiers')
     })
 
     it('未接线（没有档位来源）时 model.list 不带窗口字段，也不报错', async () => {
@@ -1206,7 +1289,7 @@ describe('model.list / model.setDisabled 端点', () => {
     })
 
     it('设置 Max 档：写入预算，且后续 model.list 立刻反映', async () => {
-      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
 
       const set = await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window: 1_048_576 })
       expect(set.ok).toBe(true)
@@ -1219,7 +1302,7 @@ describe('model.list / model.setDisabled 端点', () => {
     })
 
     it('**编造值被拒**，且错误信息里带着该模型实际可用的档位', async () => {
-      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
 
       for (const window of [999_999_999, 119_041, 0, -1]) {
         const result = await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window })
@@ -1234,7 +1317,7 @@ describe('model.list / model.setDisabled 端点', () => {
     })
 
     it('**单档模型**只接受 dev（= 恢复默认），任何 Max 值都被拒', async () => {
-      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
       const rejected = await call('model.setContextBudget', {
         provider: 'trae-cn', model: 'deepseek-v4-flash', window: 1_048_576,
       })
@@ -1249,7 +1332,7 @@ describe('model.list / model.setDisabled 端点', () => {
     it('省略 window 或恰好等于 dev = **恢复默认档**（清除预算，而不是写入 dev）', async () => {
       const { call, storedValue } = registerEndpoints({
         models: MODELS,
-        contextTiers: tierSource,
+        contextTiers: TIER_REGISTRY,
         contextBudgets: { 'trae-cn': { 'glm-5.2': 1_048_576 } },
       })
 
@@ -1266,20 +1349,77 @@ describe('model.list / model.setDisabled 端点', () => {
     })
 
     it('目录里没有该模型 / 模型未声明窗口 → 拒绝（不写任何东西）', async () => {
-      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const { call, storedValue } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
       const unknown = await call('model.setContextBudget', { provider: 'trae-cn', model: 'brand-new', window: 1_048_576 })
       expect(unknown.ok).toBe(false)
       expect((unknown.error as { message: string }).message).toContain('未声明上下文窗口')
       expect(storedValue().contextBudgets ?? {}).toEqual({})
     })
 
-    it('**非 Trae CN 一律拒绝**（先只对它开放）', async () => {
-      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
-      for (const provider of ['trae-cn-work', 'buddy-cn', 'codearts']) {
+    it('**非注册 provider 一律拒绝**（`trae-cn-work` 刻意不在注册表里）', async () => {
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
+      for (const provider of ['trae-cn-work', 'codearts', 'lobsterai']) {
         const result = await call('model.setContextBudget', { provider, model: 'glm-5.2', window: 1_048_576 })
         expect(result.ok, provider).toBe(false)
         expect((result.error as { message: string }).message, provider).toContain('不支持上下文窗口档位')
       }
+    })
+
+    /**
+     * 多档校验（推广的核心行为）：**接受档位表里的任意一项**，
+     * 不再只认「dev 或 max」两个值。
+     *
+     * Qoder 真机目录给 `[200000, 400000, 1000000]`，中间那档 400000 在旧实现里
+     * 既不是默认档也不是 Max 档 —— 旧实现只比对 `tier.maxContextWindow`，
+     * 而 Qoder 的档位用 `contextTiers` 数组承载，`maxContextWindow` 根本不存在
+     * ⇒ 三档模型的每一个非默认档都会被拒（UI 上点了没反应）。
+     * 这条用例把「任意档都收」钉死。
+     */
+    it('**多档模型**：列表里的每一档都能设，编造值被拒且提示列出**全部**档位', async () => {
+      const { call, storedValue } = registerEndpoints({
+        models: [{ id: 'qmodel_38max', name: 'Qwen3.8-Max' }],
+        contextTiers: TIER_REGISTRY,
+      })
+
+      // 三档逐个设进去（含中间档 —— 旧实现唯一接不住的那个）。
+      for (const window of [400_000, 1_000_000, 200_000]) {
+        const set = await call('model.setContextBudget', { provider: 'qoder', model: 'qmodel_38max', window })
+        expect(set.ok, String(window)).toBe(true)
+        // 设成默认档 = **清除预算**（而不是写入默认档值）。
+        const expected = window === 200_000 ? {} : { qoder: { qmodel_38max: window } }
+        expect(storedValue().contextBudgets, String(window)).toEqual(expected)
+      }
+
+      // 编造值：错误信息里要列出**三个**档位（用户据此改正），默认档要有标注。
+      const rejected = await call('model.setContextBudget', {
+        provider: 'qoder', model: 'qmodel_38max', window: 500_000,
+      })
+      expect(rejected.ok).toBe(false)
+      const message = (rejected.error as { message: string }).message
+      expect(message).toContain('可用档位为 200000（默认） / 400000 / 1000000')
+      // 拒绝时一个字节都没写。
+      expect(storedValue().contextBudgets).toEqual({})
+    })
+
+    it('**档位数据按 provider 隔离**：同一个模型 id 在两个 provider 上各按各的档位校验', async () => {
+      // 同一批账号的两个 provider（trae-cn / trae-cn-work）在存储上也是分开的；
+      // 这里用 trae-cn 与 qoder 造同样的「同名模型、不同档位」场景，确认校验读的是
+      // **该 provider 自己的目录**，而不是某个全局表。
+      const { call, storedValue } = registerEndpoints({
+        models: MODELS,
+        contextTiers: {
+          'trae-cn': tierSource,
+          'qoder': { contextTiers: async () => new Map([['glm-5.2', { contextWindow: 200_000, contextTiers: [200_000, 400_000] }]]) },
+        },
+      })
+
+      // trae-cn 的 glm-5.2 没有 400000 这一档 → 拒绝。
+      const wrong = await call('model.setContextBudget', { provider: 'trae-cn', model: 'glm-5.2', window: 400_000 })
+      expect(wrong.ok).toBe(false)
+      // qoder 的同名模型有 → 接受，且写进 **qoder** 的键下。
+      const right = await call('model.setContextBudget', { provider: 'qoder', model: 'glm-5.2', window: 400_000 })
+      expect(right.ok).toBe(true)
+      expect(storedValue().contextBudgets).toEqual({ qoder: { 'glm-5.2': 400_000 } })
     })
 
     it('未接线时同样拒绝（没有目录就无法校验，宁可拒绝也不盲写）', async () => {
@@ -1290,7 +1430,7 @@ describe('model.list / model.setDisabled 端点', () => {
     })
 
     it('参数缺失时拒绝（provider / model 必填）', async () => {
-      const { call } = registerEndpoints({ models: MODELS, contextTiers: tierSource })
+      const { call } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
       for (const payload of [{}, { provider: 'trae-cn' }, { provider: 'trae-cn', model: '' }, { model: 'glm-5.2' }]) {
         const result = await call('model.setContextBudget', payload)
         expect(result.ok, JSON.stringify(payload)).toBe(false)

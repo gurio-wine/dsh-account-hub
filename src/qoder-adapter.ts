@@ -61,6 +61,7 @@ import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk, TokenUsage,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
+import { availableContextTiers, effectiveContextWindow, type ContextTier } from './context-tiers.js'
 import { QODER, QODER_CHAT_PATH, qoderClientType, qoderJobTokenHeaders } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { QODER_SIGNED_CHAT_PATH } from './qoder-wasm-context.js'
@@ -1257,7 +1258,16 @@ export class QoderAdapter extends LlmAdapter {
     // 上下文窗口：目录的 `default_context_window`（缺它时取
     // `available_context_windows` 首项）。272000 这类非整值**照收** —— 它是目录
     // 的实测值，按「常见整数」规整化会让 DSH 的压缩时机与上游实际窗口不符。
-    if (entry?.contextWindow !== undefined) resolved.context = { contextWindow: entry.contextWindow }
+    //
+    // 用户选了别的档位时换成那一档（`available_context_windows` 里的值，默认档
+    // 是最小档）。**档位是纯声明值切换**：只影响宿主的压缩阈值与保留预算，请求体
+    // 一个字段都不动 —— 见 `tests/unit/qoder-adapter.spec.ts` 的逐字节比对用例。
+    const contextWindow = effectiveContextWindow(
+      entry?.contextWindow,
+      availableContextTiers(entry),
+      this.options.accountPool?.contextBudget(this.product.id, model),
+    )
+    if (contextWindow !== undefined) resolved.context = { contextWindow }
     // 思考档位：DSH 的「思考程度」选择器**唯一**的数据源是本字段 —— 不声明时
     // 模型选择器里整行不渲染（显示「当前模型未提供推理等级」）。
     //
@@ -1280,6 +1290,51 @@ export class QoderAdapter extends LlmAdapter {
       }
     }
     return resolved
+  }
+
+  /**
+   * 当前生效目录的逐模型上下文窗口档位（id → 默认档 + 完整档位表）。
+   *
+   * ## 为什么在适配器上而不是 RPC 层现算
+   *
+   * 目录的持有者是本实例（12h TTL、失败回退本产品的静态表）。`ctx.llm.listModels()`
+   * 帮不上忙 —— `LlmRuntime` 会把条目重建成
+   * `{provider, id, name, description?, inputModalities?}`，`contextTiers` 这类额外
+   * 字段在那一层被丢掉。故由 `src/index.ts` 把本实例交给 `registerJetHubRpc`
+   * （见 `ContextTierRegistry`）；两个 region 各有一个实例，档位互不顶替。
+   *
+   * ## 数据源与 `resolveModel` **同源同口径**
+   *
+   * 读的就是 `resolveModel` 查找所用的同一份 `catalogEntries()`。Qoder 的默认档是
+   * **最小档**（`default_context_window`），其余是升档选项 —— 与 Buddy 的
+   * 「生效档已是最大档」方向相反，但两处都只把目录公布的数带出去。
+   *
+   * ⚠️ **静态兜底表不带 `contextTiers`**（T1 快照里没有档位表可抄，不编造）：
+   * 目录拉取失败时本方法返回的条目只有单个窗口 ⇒ UI 不渲染档位列。
+   *
+   * ⚠️ **第二级查找（静态表）里的条目不算「表外」**：`lite` 按设计不在动态目录里，
+   * 但它有窗口（国际版静态表）—— 校验用户提交的档位时同样要查得到它，故这里
+   * 与 `resolveModel` 一样按「生效目录 → 本产品静态表」两级取条目。
+   */
+  async contextTiers(): Promise<ReadonlyMap<string, ContextTier>> {
+    await this.ensureCatalog()
+    const effective = this.catalogEntries()
+    const sources = [
+      ...effective,
+      // 静态表只补 `effective` 里没有的 id（`lite` 这种），已有的以生效目录为准。
+      ...fallbackQoderCatalog(this.product).filter(
+        (candidate) => !effective.some((entry) => entry.id === candidate.id),
+      ),
+    ]
+    const tiers = new Map<string, ContextTier>()
+    for (const entry of sources) {
+      if (entry.contextWindow === undefined && entry.contextTiers === undefined) continue
+      tiers.set(entry.id, {
+        ...entry.contextWindow === undefined ? {} : { contextWindow: entry.contextWindow },
+        ...entry.contextTiers === undefined ? {} : { contextTiers: [...entry.contextTiers] },
+      })
+    }
+    return tiers
   }
 
   /**
@@ -1917,11 +1972,17 @@ interface ConsumeCell {
  * `settingsNs` **必须**与 `src/index.ts` 的 `registerProviderSettings` 注册的
  * namespace 一致，否则模型设置页会因未注册 namespace 在
  * `refFor → deriveKeyRef(provider)` 处崩溃。
+ *
+ * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerJetHubRpc`，
+ *          供 Account Hub 读取逐模型的窗口档位（`contextTiers`）与校验用户选择。
+ *          适配器是**动态目录的唯一持有者**，RPC 层拿不到目录就只能靠猜。
  */
-export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): void {
+export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): QoderAdapter {
   const product = options.product ?? QODER
   ctx.llm.registerConfigurableProviders([
     { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([product.id], new QoderAdapter(options))
+  const adapter = new QoderAdapter(options)
+  ctx.llm.registerAdapter([product.id], adapter)
+  return adapter
 }

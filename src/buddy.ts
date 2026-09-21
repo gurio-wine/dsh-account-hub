@@ -426,6 +426,22 @@ export interface BuddyRemoteModel {
    * ⚠️ **不是 `defaultLength`** —— 它是纯 UI 默认值、不是硬限（2026-09-21 实测）。
    */
   contextWindow?: number
+  /**
+   * **完整的上下文窗口档位表**（上游 `contextWindow.supportedLengths`，
+   * 升序去重；**只在真正有两个及以上档位时**存在）。
+   *
+   * ⚠️ **本节于 2026-09-21 被用户需求推翻**：原口径是「`supportedLengths`
+   * 只做最小解析、只取最大正整数，不存整档列表、不做 UI」。用户随后要求把
+   * Trae CN 已有的「上下文窗口档位选择」推广到**所有**供应商，而档位选择的前提
+   * 就是保留完整档位列表 —— 故改为保留。
+   *
+   * ⚠️ **出站请求体一个字段都不动（红线）**：本字段与 {@link contextWindow}
+   * 同一性质，纯声明值，只喂 `resolveModel().context`（宿主压缩阈值与保留预算）。
+   * `buddy-adapter.spec.ts` 有逐字节比对请求体的用例钉死。
+   *
+   * 缺省 = 该模型**没有档位可选**（无 `supportedLengths`，或表里只有一个值）。
+   */
+  contextTiers?: number[]
   /** 是否接受图片输入（data.models[].supportsImages）。 */
   supportsImages?: boolean
   /** 可选思考等级（data.models[].reasoning.supportedEfforts）；无等级可选的模型缺省。 */
@@ -595,10 +611,10 @@ function isChatModel(id: string, meta: Record<string, unknown> | undefined): boo
  * 2. 只有其一 → 取那个；
  * 3. 都无 → 最后回退 `defaultLength`（正整数）；再无不声明。
  *
- * ⚠️ `supportedLengths` **只做这一处最小解析**（取最大正整数）：不存档位列表、
- * 不做选档 UI、不做任何出站用途 —— 选档属于**出站协议变更**（见 AGENTS.md 的
- * Buddy 章节）。非正整数（0 / 负数 / 非数字）逐项剔除，与「只保留正数」的既有
- * 口径一致。
+ * ⚠️ `supportedLengths` 的**整张档位表**由 {@link readSupportedLengthTiers}
+ * 归一后记进 `contextTiers`（升序去重、单档不记），供 Account Hub 的档位选择器
+ * 使用；它**不出站**（选档是纯声明值切换，见 `BuddyRemoteModel.contextTiers`）。
+ * 非正整数（0 / 负数 / 非数字）逐项剔除，与「只保留正数」的既有口径一致。
  *
  * 能力字段只在远端**显式**下发时保留：缺失即 undefined，交由适配器的静态
  * 兜底表决定，而不是猜成 false。
@@ -608,6 +624,9 @@ function parseModelMeta(record: Record<string, unknown> | undefined): Omit<Buddy
   const meta: Omit<BuddyRemoteModel, 'id' | 'name'> = {}
   const limit = readMaxContextLength(record)
   if (limit !== undefined) meta.contextWindow = limit
+  // 档位表：只在**两个及以上**档位时记（单档模型没有可选项，UI 不该渲染档位列）。
+  const tiers = readSupportedLengthTiers(record)
+  if (tiers !== undefined) meta.contextTiers = tiers
   if (typeof record.supportsImages === 'boolean') meta.supportsImages = record.supportsImages
   const reasoning = record.reasoning
   if (typeof reasoning === 'object' && reasoning !== null) {
@@ -648,20 +667,45 @@ function readMaxContextLength(record: Record<string, unknown>): number | undefin
  * 形如 `[300000, 1000000]`，也可以混入非法项（0 / 负数 / 字符串 / NaN），
  * 逐项剔除后取最大值；数组缺失 / 非数组 / 无合法项时返回 undefined。
  *
- * ⚠️ 只返回这一个数，**不返回整张档位表** —— 本模块不选档、不做出站用途。
+ * ⚠️ 本函数只返回那**一个**数（`contextWindow` 的取值链用它）；整张档位表由
+ * {@link readSupportedLengthTiers} 另取 —— 两个函数读同一个数组但**用途不同**：
+ * 这个决定「声明多大的窗口」，那个决定「用户能选哪些窗口」。
  */
 function readMaxSupportedLength(record: Record<string, unknown>): number | undefined {
+  const tiers = readSupportedLengthTiers(record, { keepSingle: true })
+  if (tiers === undefined) return undefined
+  return tiers[tiers.length - 1]
+}
+
+/**
+ * 读取 `contextWindow.supportedLengths` 的**完整档位表**（升序去重）。
+ *
+ * 上游的数组顺序不可信（真机出现过倒序），故一律排序；重复项合并。
+ * 非法项（0 / 负数 / 字符串 / NaN / Infinity）逐项剔除，与「只保留正有限数」
+ * 的既有口径一致。
+ *
+ * ⚠️ **默认要求至少两个档位**（`keepSingle` 未置）：只有一个档位的列表在 UI 上
+ * 等价于「无档位可选」，带出去只会让 Host 多算一轮、客户端多判一次 ——
+ * 这正是「宁缺毋编」。{@link readMaxSupportedLength} 需要那个单元素情形来算
+ * 最大值，故显式传 `keepSingle`。
+ */
+function readSupportedLengthTiers(
+  record: Record<string, unknown>,
+  options: { keepSingle?: boolean } = {},
+): number[] | undefined {
   const window = record.contextWindow
   if (typeof window !== 'object' || window === null) return undefined
   const lengths = (window as Record<string, unknown>).supportedLengths
   if (!Array.isArray(lengths)) return undefined
-  let max: number | undefined
+  const valid: number[] = []
   for (const value of lengths) {
     const candidate = readPositiveLimit(value)
-    if (candidate === undefined) continue
-    if (max === undefined || candidate > max) max = candidate
+    if (candidate !== undefined) valid.push(candidate)
   }
-  return max
+  if (valid.length === 0) return undefined
+  const unique = [...new Set(valid)].sort((a, b) => a - b)
+  if (options.keepSingle !== true && unique.length < 2) return undefined
+  return unique
 }
 
 /**

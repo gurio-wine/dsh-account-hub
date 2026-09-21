@@ -188,8 +188,10 @@ const STYLES = `
 .dim-jh-switch:focus-visible { outline: none; box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 30%, transparent); }
 .dim-jh-switch:disabled { opacity: 0.5; cursor: default; }
 
-/* 上下文窗口档位（Trae CN）：两个原生 radio + 文案，标签即点击热区 */
-.dim-jh-modelTier { flex: none; display: flex; align-items: center; gap: 10px; }
+/* 上下文窗口档位：每档一个原生 radio + 文案，标签即点击热区。
+   档数由数据决定（Trae CN 两档、Buddy 两档、Qoder 三档），故允许换行 —— 挤在一行
+   会把模型名压成省略号，而档位本身是低频操作。 */
+.dim-jh-modelTier { flex: none; display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
 .dim-jh-tierOption { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #4e5969); white-space: nowrap; cursor: pointer; }
 .dim-jh-tierOption input { margin: 0; accent-color: #1677ff; cursor: pointer; }
 .dim-jh-tierOption input:disabled { cursor: default; }

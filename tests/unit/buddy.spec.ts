@@ -385,10 +385,22 @@ describe('buddy model config parsing', () => {
       ])
     })
 
-    it('supportedLengths 只用来取最大值，不发明字段（不存整档列表、不出站）', () => {
-      // supportedLengths 只参与这一个算术；本模块不存档位列表、不做 UI、不做任何
-      // 出站用途（选档属于出站协议变更，见 AGENTS.md 的 Buddy 章节）。这里钉死
-      //「解析结果里只有 contextWindow 一个字段」。
+    /**
+     * ⚠️ **本用例于 2026-09-21 被用户需求推翻，原文保留在下方说明里**。
+     *
+     * 推翻前它锁死的是「`supportedLengths` 只用来取最大值，**不存整档列表**」，
+     * 理由是「选档属于出站协议变更」。用户随后明确要求把 Trae CN 已有的
+     * 「上下文窗口档位选择」推广到**所有**供应商 —— 而档位选择的前提正是
+     * **保留完整的档位列表**。于是本节改为钉死新的契约：
+     *
+     * 1. `contextWindow` 仍是**最大档**（口径一字未改，见上面的取值链）；
+     * 2. **新增** `contextTiers` 携带全部档位（升序去重）；
+     * 3. 出站请求体**一个字段都不动**（红线，见 `buddy-adapter.spec.ts` 的逐字节用例）。
+     *
+     * 第 3 条是这次推翻之所以安全的全部理由：`contextTiers` 是**纯声明值**的
+     * 数据来源，不进出站请求体 —— 与 `contextWindow` 本身完全同一性质。
+     */
+    it('supportedLengths 的**整张档位表**记进 contextTiers（`contextWindow` 仍是最大档）', () => {
       const models = parseModelsFromConfig({
         data: {
           agents: [{ name: 'craft', models: ['glm-5.3'] }],
@@ -399,7 +411,55 @@ describe('buddy model config parsing', () => {
           }],
         },
       })
-      expect(models[0]).toEqual({ id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_048_576 })
+      expect(models[0]).toEqual({
+        id: 'glm-5.3',
+        name: 'GLM-5.3',
+        // 生效默认档 = 最大档（口径未变）。
+        contextWindow: 1_048_576,
+        // 新增：整张档位表（升序去重），供 Account Hub 渲染档位单选。
+        contextTiers: [300_000, 1_048_576],
+      })
+    })
+
+    it('档位表**排序去重**、非法项逐项剔除（上游的数组顺序不可信）', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['m'] }],
+          models: [{
+            id: 'm',
+            maxInputTokens: 1048576,
+            // 倒序 + 重复项 + 0 / 负数 / 字符串 / NaN 混入。
+            contextWindow: { supportedLengths: [1048576, 300000, 300000, 0, -1, 'x', Number.NaN, 524288] },
+          }],
+        },
+      })
+      expect(models[0]?.contextTiers).toEqual([300_000, 524_288, 1_048_576])
+    })
+
+    it('**没有档位表**的单档模型不产出 contextTiers（宁缺毋编）', () => {
+      // 国际版 8 个「1M 且无 contextWindow 字段」的模型就是这一形态：
+      // 它们只有一个窗口，没有档位可选，UI 因此不该渲染档位列。
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['gpt-5.6-sol'] }],
+          models: [{ id: 'gpt-5.6-sol', maxInputTokens: 1048576 }],
+        },
+      })
+      expect(models[0]).toEqual({ id: 'gpt-5.6-sol', name: 'gpt-5.6-sol', contextWindow: 1_048_576 })
+      expect(models[0]).not.toHaveProperty('contextTiers')
+    })
+
+    it('**只有一个档位**的档位表不产出 contextTiers（单元素列表没有可选项）', () => {
+      // 「宁缺毋编」的边界：一个只含单个档位的列表在 UI 上等价于「无档位」，
+      // 带出去只会让 Host 多算一轮、客户端多判一次。
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['solo'] }],
+          models: [{ id: 'solo', contextWindow: { supportedLengths: [524288] } }],
+        },
+      })
+      expect(models[0]?.contextWindow).toBe(524_288)
+      expect(models[0]).not.toHaveProperty('contextTiers')
     })
   })
 

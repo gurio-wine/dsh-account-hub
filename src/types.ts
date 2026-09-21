@@ -296,26 +296,39 @@ export interface RpcModelListEntry {
   /** true = 已关闭（不出现在对话框的模型选择里）。 */
   disabled: boolean
   /**
-   * 该模型**目录公布的默认窗口**（dev 档，token 数）。
+   * 该模型**目录公布的默认窗口**（token 数；未设置预算时向宿主声明的值）。
    *
-   * 只有 Trae CN 会带：它的动态目录对部分模型下发 `{dev, max}` 两档，其余
-   * provider 的适配器不产出窗口元数据。缺省 = 无窗口信息，UI 不渲染档位列。
+   * 只有**有档位数据的 provider** 会带（Trae CN 的 `context_window_tokens.dev`、
+   * Qoder 的 `default_context_window`、Buddy 的 `min(maxInputTokens, 档位表最大档)`）。
+   * 其余 provider（CodeArts / LobsterAI / Trae CN Work…）的适配器不产出窗口元数据。
+   * 缺省 = 无窗口信息，UI 不渲染档位列。
    */
   contextWindow?: number
   /**
    * 该模型**目录公布的 Max 档**（token 数）。
    *
-   * 只在**严格大于 {@link contextWindow}** 时出现（判据在目录解析侧），故 UI 用
-   * `maxContextWindow > contextWindow` 即可判定「这一行有没有档位可选」。
+   * ⚠️ **Trae CN 两档形态专有**：它的目录把两档分成 `dev` / `max` 两个字段，故
+   * 这里也只带两个字段。其余 provider 用 {@link contextTiers} 承载整张表。
+   * 只在**严格大于 {@link contextWindow}** 时出现（判据在目录解析侧）。
    */
   maxContextWindow?: number
   /**
+   * 该模型**可选的全部上下文窗口档位**（升序去重，**只在两个及以上档位时**出现）。
+   *
+   * 这是「档位选择器推广到全部供应商」后客户端的**主数据源**：每项渲染一个 radio，
+   * 档数不限（Qoder 真机 `[200000, 400000, 1000000]` 三档、Buddy 两档）。
+   * 默认档必在列表内（Host 侧归一化时并入），客户端据此标「默认」。
+   *
+   * 缺省 = 无档位可选（单档模型 / 目录未达）—— UI 不渲染档位列。
+   */
+  contextTiers?: number[]
+  /**
    * 当前**已存储的预算值**（`undefined` = 用默认档）。
    *
-   * 规格只点明了上面两个窗口字段，这个字段是为 UI 补的：档位单选需要知道
+   * 规格只点明了上面几个窗口字段，这个字段是为 UI 补的：档位单选需要知道
    * 「现在选中的是哪一个」，否则每次打开面板都只能显示成默认档。
-   * 它要么等于 {@link contextWindow}（默认档）要么等于 {@link maxContextWindow}，
-   * 不会出现第三个值 —— 写入侧（`model.setContextBudget`）就是这么校验的。
+   * 它要么等于 {@link contextWindow}（默认档）要么等于 {@link contextTiers} 里的
+   * 某个非默认档，不会出现别的值 —— 写入侧（`model.setContextBudget`）就是这么校验的。
    */
   contextBudget?: number
 }
@@ -341,9 +354,9 @@ export interface RpcModelSetDisabledResponse {
 /**
  * RPC: 设置某个模型的上下文窗口档位请求。
  *
- * `window` 必须是**该模型目录公布的档位之一**（dev 或 Max）。省略（或等于 dev）
- * = **恢复默认档**（清除预算），而不是「设成 dev」—— 两者在存储上刻意区分
- * （见 `AccountPool.writeContextBudget`）。
+ * `window` 必须是**该模型目录公布的档位之一**（任意档，不限于两档）。省略
+ * （或等于默认档）= **恢复默认档**（清除预算），而不是「设成默认档」—— 两者在
+ * 存储上刻意区分（见 `AccountPool.writeContextBudget`）。
  */
 export interface RpcModelSetContextBudgetRequest {
   provider: string

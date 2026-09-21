@@ -270,6 +270,22 @@ export interface QoderModelEntry {
   maxInputTokens?: number
   /** 目录的 `available_context_windows`（原样保留，含 272000 这类非整值）。 */
   availableContextWindows?: readonly number[]
+  /**
+   * **完整的上下文窗口档位表**（升序去重；**只在两个及以上档位时**存在）。
+   *
+   * Qoder 的目录公布 `available_context_windows`（真机 `[200000, 400000,
+   * 1000000]`），**默认档是最小档**（`default_context_window`），其余是升档选项
+   * —— 与 Buddy 的 `supportedLengths`（生效档已是最大档、其余是降档选项）
+   * 方向相反，但「用户能选的档位精确等于目录公布的那些数」这条原则一致。
+   *
+   * ⚠️ **纯声明值，不出站**：只喂 `resolveModel().context`（宿主压缩阈值与保留
+   * 预算）。`qoder-adapter.spec.ts` 有逐字节比对请求体的用例钉死。
+   *
+   * 缺省 = 没有档位可选（目录只给一个窗口，或 `available_context_windows`
+   * 缺席）。动态目录与**静态兜底表**两条路径的产物都不带它 —— 静态表照抄的是
+   * T1 快照的 `default_context_window`，没有档位表可抄，**不编造**。
+   */
+  contextTiers?: number[]
   /** 可选思考档位；缺省 = 不声明。 */
   reasoningEfforts?: readonly string[]
   /** 默认档位，必须落在 {@link reasoningEfforts} 内。 */
@@ -363,6 +379,7 @@ export interface QoderDirectoryParseOptions {
  * | `default_context_window` | `contextWindow` | 首选；**272000 这类非整值照收** |
  * | `available_context_windows` | `availableContextWindows` | 正数数组原样保留（非空才收） |
  * | `available_context_windows[0]` | `contextWindow` | 仅当 `default_context_window` 缺席时兜底 |
+ * | `available_context_windows` + 默认档 | `contextTiers` | 升序去重，**≥2 档才收**（见 `buildTiers`） |
  * | `efforts` | `reasoningEfforts` | 非空字符串数组（去空白）才收 |
  * | `default_effort` | `defaultReasoningEffort` | **仅当它落在 `efforts` 内**才收（见下） |
  *
@@ -402,6 +419,14 @@ export function parseQoderDirectory(
     // `default_context_window` 优先；缺它时取可用窗口首项 —— 实测两者一致
     // （200000/[200000,…]、272000/[272000,…]），故这是有依据的兜底而非猜测。
     const contextWindow = declaredWindow ?? (contextWindows === undefined ? undefined : contextWindows[0])
+    // 档位表：目录公布的完整可用窗口（升序去重、单档不记）。
+    //
+    // 默认档**单独并入**：`default_context_window` 与 `available_context_windows[0]`
+    // 实测一致，但那是观测而非契约 —— 目录若哪天给出不落在列表里的默认档，
+    // 不并入会让 UI 无法表达「当前是默认档」（radio 全不选中）。
+    const contextTiers = contextWindow === undefined
+      ? undefined
+      : buildTiers(contextWindow, contextWindows)
     const maxInputTokens = readPositive(record.max_input_tokens)
     const reasoning = readReasoning(record)
 
@@ -413,6 +438,7 @@ export function parseQoderDirectory(
       ...contextWindow === undefined ? {} : { contextWindow },
       ...maxInputTokens === undefined ? {} : { maxInputTokens },
       ...contextWindows === undefined ? {} : { availableContextWindows: contextWindows },
+      ...contextTiers === undefined ? {} : { contextTiers },
       ...reasoning,
     })
   }
@@ -463,6 +489,22 @@ function readPositiveArray(value: unknown): number[] | undefined {
     (item): item is number => typeof item === 'number' && Number.isFinite(item) && item > 0,
   )
   return numbers.length === 0 ? undefined : numbers
+}
+
+/**
+ * 归一档位表：目录公布的可用窗口 + 生效的默认档，升序去重。
+ *
+ * ⚠️ **至少两个档位才返回**（否则 `undefined`）：只有一个档位的列表在 UI 上
+ * 等价于「无档位可选」，带出去只会让 Host 多算一轮、客户端多判一次 ——
+ * 与 Buddy 的 `supportedLengths` 侧同一取舍（宁缺毋编）。
+ *
+ * 默认档**单独并入**的理由见调用点：`default_context_window` 落在列表内是实测
+ * 观测而非契约，不并入会让 UI 无法表达「当前是默认档」。
+ */
+function buildTiers(fallback: number, declared: readonly number[] | undefined): number[] | undefined {
+  const candidates = [fallback, ...(declared ?? [])]
+  const unique = [...new Set(candidates)].sort((a, b) => a - b)
+  return unique.length < 2 ? undefined : unique
 }
 
 // ── 目录拉取 ──

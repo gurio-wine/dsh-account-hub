@@ -920,3 +920,123 @@ describe('本地字节闸', () => {
     expect(seen.join('\n')).toContain(String(QODER_MAX_REQUEST_BYTES))
   })
 })
+
+// ── 11. 上下文窗口档位（推广到全部供应商后的 Qoder 侧） ──────────────────────
+
+/**
+ * Qoder 的目录公布 `available_context_windows`（真机 `[200000, 400000, 1000000]`），
+ * **默认档是最小档** —— 与 Buddy（生效档已是最大档、其余是降档选项）方向相反。
+ * 三个落点必须**同源同口径**：
+ *
+ * 1. `contextTiers()` —— Host 的「显示列表」据此渲染单选列并校验用户提交值；
+ * 2. `resolveModel()` —— 用户选中的档位在这里变成向 DSH 声明的窗口；
+ * 3. **出站请求体一个字段都不动**（红线）：档位是纯声明值切换。
+ */
+describe('上下文窗口档位（默认档是最小档）', () => {
+  /** 真机 T1 快照里的三档形态（只留本组用到的字段）。 */
+  const DIRECTORY = [
+    {
+      id: 'qmodel_38max',
+      name: 'Qwen3.8-Max',
+      enabled: true,
+      contextWindow: 200_000,
+      availableContextWindows: [200_000, 400_000, 1_000_000],
+      contextTiers: [200_000, 400_000, 1_000_000],
+    },
+    // 单档项：目录有窗口、但只有一个可用窗口（无档位可选）。
+    { id: 'qauto', name: 'Auto', enabled: true, contextWindow: 200_000 },
+  ]
+
+  /** 造一个「目录可用」的适配器；`budgets` 是账号池里存的用户选择。 */
+  function makeAdapter(budgets: Record<string, number> = {}, overrides: Partial<QoderAdapterOptions> = {}) {
+    return new QoderAdapter(adapterOptions({
+      fetchRemoteModels: async () => DIRECTORY,
+      accountPool: {
+        contextBudget: (_provider: string, model: string) => budgets[model],
+        // 下面两个只是让 `stream()` 的账号登记路径走通（缺了会打一条无害的
+        // warn，把逐字节用例的输出弄脏）。**档位读取路径不看它们**。
+        findAccountIdByCredential: async () => 'acct-1',
+        updateModelRateLimit: async () => {},
+      } as unknown as AccountPool,
+      ...overrides,
+    }))
+  }
+
+  it('contextTiers() 播报目录公布的整张档位表（升序去重，含默认档）', async () => {
+    const tiers = await makeAdapter().contextTiers()
+    expect(tiers.get('qmodel_38max')).toEqual({
+      contextWindow: 200_000,
+      contextTiers: [200_000, 400_000, 1_000_000],
+    })
+    // 单档项照样带出去（由 RPC / UI 用「长度 ≥ 2」判定要不要渲染），
+    // 但**不伪造**一个 contextTiers 数组。
+    expect(tiers.get('qauto')).toEqual({ contextWindow: 200_000 })
+  })
+
+  it('目录失败时 contextTiers() 回退静态表：不编造档位表（UI 因此不渲染档位列）', async () => {
+    const adapter = new QoderAdapter(adapterOptions())  // fetchRemoteModels → []
+    const tiers = await adapter.contextTiers()
+    expect(tiers.get('qmodel_38max')).toEqual({ contextWindow: 200_000 })
+    expect(tiers.get('qmodel_38max')).not.toHaveProperty('contextTiers')
+  })
+
+  it('resolveModel：未设置预算 = 默认档（行为与接线前逐字段一致）', async () => {
+    const resolved = await makeAdapter().resolveModel('qoder', 'qmodel_38max')
+    expect(resolved.context).toEqual({ contextWindow: 200_000 })
+  })
+
+  it('resolveModel：预算精确命中某档 → 用该档（升档，两个方向都要能走）', async () => {
+    expect((await makeAdapter({ qmodel_38max: 400_000 }).resolveModel('qoder', 'qmodel_38max')).context)
+      .toEqual({ contextWindow: 400_000 })
+    expect((await makeAdapter({ qmodel_38max: 1_000_000 }).resolveModel('qoder', 'qmodel_38max')).context)
+      .toEqual({ contextWindow: 1_000_000 })
+  })
+
+  it('resolveModel：**编造值 / 目录漂移后的旧值**静默回退默认档（不报错）', async () => {
+    for (const bogus of [500_000, 999_999_999, 0, -1]) {
+      expect((await makeAdapter({ qmodel_38max: bogus }).resolveModel('qoder', 'qmodel_38max')).context,
+        String(bogus)).toEqual({ contextWindow: 200_000 })
+    }
+  })
+
+  it('resolveModel：单档模型即使被写入预算也不生效（列表里没有第二个档）', async () => {
+    const resolved = await makeAdapter({ qauto: 1_000_000 }).resolveModel('qoder', 'qauto')
+    expect(resolved.context).toEqual({ contextWindow: 200_000 })
+  })
+
+  /**
+   * ⚠️ **红线：出站请求体零变更**。
+   *
+   * 档位只改 `resolveModel().context.contextWindow`（宿主压缩阈值 `0.8×窗口` 与
+   * 保留预算）。若哪天有人「顺手」把档位也塞进请求体（如加个
+   * `context_window` / `max_tokens` 字段），上游会开始按另一个口径服务 ——
+   * 那是**协议变更**，不是 UI 偏好。故这里对同一请求在三种预算下抓两次 body，
+   * 逐字节比对。
+   */
+  it('**逐字节红线**：三种档位下发出的请求体完全相同', async () => {
+    async function captureBody(budgets: Record<string, number>): Promise<string> {
+      let body = ''
+      const adapter = makeAdapter(budgets, {
+        fetchImpl: (async (_url: unknown, init: { body?: unknown }) => {
+          body = String(init?.body)
+          return sseResponse(NORMAL_STREAM)
+        }) as unknown as typeof fetch,
+      })
+      await collect(adapter.stream(generateOptions({ model: 'qmodel_38max' })))
+      return body
+    }
+
+    const [def, mid, top] = [
+      await captureBody({}),
+      await captureBody({ qmodel_38max: 400_000 }),
+      await captureBody({ qmodel_38max: 1_000_000 }),
+    ]
+    expect(def.length).toBeGreaterThan(0)
+    expect(mid).toBe(def)
+    expect(top).toBe(def)
+    // 顺带钉死「档位字段没有泄漏进请求体」。
+    for (const forbidden of ['context_window', 'contextWindow', 'available_context_windows', 'max_tokens']) {
+      expect(def, forbidden).not.toContain(forbidden)
+    }
+  })
+})

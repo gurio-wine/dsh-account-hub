@@ -545,16 +545,67 @@ function formatCapacity(value) {
 }
 
 /**
- * 单个模型的上下文窗口档位选择（「默认 xxx」/「Max xxx」两个 radio）。
+ * 一行模型**可选的上下文窗口档位**（升序去重）；`null` = 没有档位可选。
  *
- * ## 只在真正有 Max 档时渲染
+ * ## 两个数据源，优先多档数组
  *
- * 判据是 `maxContextWindow > contextWindow`（Host 侧已按此过滤过一遍，这里再判一次
- * 是为了防御脏数据）。没有 Max 档的模型**不渲染这一列** —— 那正是
- * 「用户能选的档位永远精确等于目录公布的档位之一」这条原则在 UI 上的样子：
- * 宁可少一个控件，也不给一个切过去毫无效果的选项。
+ * 1. `contextTiers`（Host 归一后的**完整档位表**，≥2 项才带）—— 档数不限：
+ *    Qoder 真机 `[200000, 400000, 1000000]` 三档、Buddy 的 `supportedLengths`
+ *    两档、Trae CN 的 `dev` / `max` 也会被 Host 一并归一进这张表；
+ * 2. 只有 `maxContextWindow` 的两字段形态 —— **旧 Host**（升级插件后页面还没重建
+ *    bundle 的窗口期）以及「本轮目录只公布了 max」的防御路径。
  *
- * ## 为什么不是 label 包住整行
+ * 默认档（`contextWindow`）**并入**列表：目录给的默认档理论上可能不落在档位表里
+ * （Buddy 的 `min(maxInputTokens, 档位表最大档)` 就会产出这种组合），不并入则
+ * 「当前是默认档」这个状态在界面上无法表达（radio 全不选中）。
+ *
+ * ⚠️ **判据只看数据，不看 provider 名**：数据在，档位列就在；数据不在（LobsterAI /
+ * Trae CN Work / CodeArts 的目录只有一个窗口，或目录未达）就整列不渲染 ——
+ * 宁可少一个控件，也不给一个切过去毫无效果的选项（同一原则见 Host 侧
+ * `availableContextTiers`）。
+ *
+ * ⚠️ **没有默认档就不渲染**：缺 `contextWindow` 时既无法标出「默认」也无法表达
+ * 选中态，与其画一组全不选中的 radio，不如不画。
+ */
+function tierOptionsOf(model) {
+  const dev = model.contextWindow;
+  if (typeof dev !== 'number' || !Number.isFinite(dev) || dev <= 0) return null;
+  const declared = Array.isArray(model.contextTiers) ? model.contextTiers : [];
+  const valid = declared.filter(v => typeof v === 'number' && Number.isFinite(v) && v > 0);
+  const tiers = [...new Set([...valid, dev])].sort((a, b) => a - b);
+  if (tiers.length >= 2) return tiers;
+  // 老形态兜底：只有 dev / max 两个字段（`max` 必须严格大于 `dev` 才算第二档）。
+  const max = model.maxContextWindow;
+  if (typeof max === 'number' && Number.isFinite(max) && max > dev) return [dev, max];
+  return null;
+}
+
+/**
+ * 该档位在界面上的名字。
+ *
+ * - 默认档恒为「默认」（它就是未设置预算时宿主用的那一档）；
+ * - `maxContextWindow` 命中时叫「Max」（Trae CN 的既有文案，不要因为推广到多档
+ *   就把它降级成一串裸数字）；
+ * - 其余用容量缩写（`400K` / `1M`）—— 多档 provider 没有「Max 档」这个概念，
+ *   最大的那一档也只是目录公布的众多窗口之一。
+ */
+function tierLabelOf(window, dev, max) {
+  if (window === dev) return '默认';
+  if (typeof max === 'number' && window === max) return 'Max';
+  return formatCapacity(window);
+}
+
+/**
+ * 单个模型的上下文窗口档位选择（每档一个 radio，档数由 Host 数据决定）。
+ *
+ * ## 选中态
+ *
+ * `contextBudget` **精确等于**某个非默认档 → 选中它；否则（未设置预算 / 预算等于
+ * 默认档 / 预算因目录漂移而失效）一律选中默认档。这与 Host 侧
+ * `effectiveContextWindow` 的判据**同源**：界面上显示的选中项，就是宿主真正会用的
+ * 那个窗口 —— 否则会出现「界面显示 1M、实际按 200K 压缩」这种看不见的分叉。
+ *
+ * ## 为什么 radio 不在包住显示开关的 label 里
  *
  * 这个组件挂在模型行的右侧、与「显示开关」同级。若把 radio 放进**包住开关的那个
  * `<label>`** 里，点 radio 会连带激活 label 的隐式控件（那个 checkbox），
@@ -563,31 +614,38 @@ function formatCapacity(value) {
  */
 function ModelTierPicker({ model, busy, onSelect }) {
   const dev = model.contextWindow;
-  const max = model.maxContextWindow;
-  if (typeof dev !== 'number' || typeof max !== 'number' || max <= dev) return null;
-  // 选中态由 Host 回传的预算值决定：等于 max 才是 Max 档，其余（含 undefined）都是默认档。
-  const selected = model.contextBudget === max ? 'max' : 'default';
+  const tiers = tierOptionsOf(model);
+  if (tiers === null) return null;
+  const budget = model.contextBudget;
+  // 预算命中某个**非默认档**才算选了它；其余一切情况都是默认档。
+  const selected = typeof budget === 'number' && budget !== dev && tiers.includes(budget) ? budget : dev;
   const name = model.name || model.id;
-  const option = (tier, window, text) => React.createElement('label', {
-    className: 'dim-jh-tierOption',
-    // 精确值放 title：缩写是给一眼扫过的，tooltip 是给要核对数字的人的。
-    title: `${text}档 · ${window} token`,
-  },
-    React.createElement('input', {
-      type: 'radio',
-      name: `dim-jh-tier-${model.id}`,
-      checked: selected === tier,
-      disabled: busy,
-      onChange: () => onSelect(model.id, window),
-    }),
-    React.createElement('span', null, `${text} ${formatCapacity(window)}`));
+  const option = (window) => {
+    const label = tierLabelOf(window, dev, model.maxContextWindow);
+    const capacity = formatCapacity(window);
+    // 有名档位（默认 / Max）是「名字 + 容量」，无名档位（多档 provider 的中间档）
+    // 的容量本身就是它的名字，重复一遍会渲染成 `400K 400K`。
+    const text = label === capacity ? capacity : `${label} ${capacity}`;
+    return React.createElement('label', {
+      className: 'dim-jh-tierOption',
+      key: `dim-jh-tier-${model.id}-${window}`,
+      // 精确值放 title：缩写是给一眼扫过的，tooltip 是给要核对数字的人的。
+      title: `${label}档 · ${window} token`,
+    },
+      React.createElement('input', {
+        type: 'radio',
+        name: `dim-jh-tier-${model.id}`,
+        checked: selected === window,
+        disabled: busy,
+        onChange: () => onSelect(model.id, window),
+      }),
+      React.createElement('span', null, text));
+  };
   return React.createElement('div', {
     className: 'dim-jh-modelTier',
     role: 'radiogroup',
     'aria-label': `${name} 上下文窗口档位`,
-  },
-    option('default', dev, '默认'),
-    option('max', max, 'Max'));
+  }, ...tiers.map(option));
 }
 
 /**
@@ -708,11 +766,11 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   /**
    * 切换某个模型的上下文窗口档位。
    *
-   * 成功后**本地刷新**选中态：`contextBudget` 与 `contextWindow` 的关系就是
-   * 单选列的选中判据（见 ModelTierPicker）。刻意不做乐观更新 —— 与显示开关同理，
-   * 档位是否被接受由 Host 校验决定（它手上有目录），本地先翻会让「编造值被拒绝」
-   * 看起来像成功了。失败时把 RPC 返回的原文显示出来：那句话里带着该模型
-   * **实际可用的档位值**，是用户唯一能据以改正的信息。
+   * 成功后**本地刷新**选中态：`contextBudget` 与该行档位表的关系就是单选列的选中
+   * 判据（见 ModelTierPicker）。刻意不做乐观更新 —— 与显示开关同理，档位是否被
+   * 接受由 Host 校验决定（它手上有目录），本地先翻会让「编造值被拒绝」看起来像
+   * 成功了。失败时把 RPC 返回的原文显示出来：那句话里带着该模型**实际可用的档位
+   * 值**，是用户唯一能据以改正的信息。
    */
   const selectTier = async (modelId, window) => {
     setTierBusyIds(prev => new Set(prev).add(modelId));
@@ -738,12 +796,12 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     }
   };
 
-  // 档位列只在 Trae CN 出现：只有它的 `model.list` 会带 `contextWindow` /
-  // `maxContextWindow`（Work 侧目录实测 dev==max 故判成无 Max 档，其余 provider
-  // 的适配器不产出窗口元数据）。故这里不需要按 provider 名再判一次 ——
-  // 数据在，列就在；数据不在，ModelTierPicker 自己返回 null。
-  const tierHint = all.some(m => typeof m.maxContextWindow === 'number' && m.maxContextWindow > m.contextWindow)
-    ? '「Max」档只切换向对话宿主声明的上下文窗口（影响自动压缩时机），不改变发给上游的请求内容。'
+  // 档位列按**数据**出现，不按 provider 名出现：只要有一行带出了档位（多档数组或
+  // 老形态的 max / dev 两字段），整列就渲染 —— 数据在，列就在；数据不在（LobsterAI /
+  // Trae CN Work / CodeArts 的目录只有一个窗口），ModelTierPicker 自己返回 null。
+  // 判据与组件共用同一个 `tierOptionsOf`，避免「提示行说能选、行上却没有控件」。
+  const tierHint = all.some(m => tierOptionsOf(m) !== null)
+    ? '上下文窗口档位只切换向对话宿主声明的窗口（影响自动压缩时机），不改变发给上游的请求内容。'
     : null;
 
   const dialog = React.createElement('div', {

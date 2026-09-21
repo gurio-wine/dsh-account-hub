@@ -14,6 +14,7 @@ import { LobsteraiAuth } from './lobsterai-auth.js'
 import { TraeCnAuth } from './trae-cn-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
+import { createContextTierRegistry } from './context-tiers.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
 import { BUDDY_CN, BUDDY } from './product.js'
@@ -359,7 +360,10 @@ export function apply(ctx: Context): void {
   // 不注册斜杠命令：登录/状态/续期都在 Account Hub 设置页完成（多账号 + 账号池），
   // 命令式的单凭据入口已无必要。
   const buddyCn = new BuddyAuth(ctx)
-  registerBuddyLlm(ctx, {
+  // 适配器实例要交给 RPC 层（理由见 `src/context-tiers.ts` 的 `ContextTierSource`）：
+  // Buddy 的目录公布 `contextWindow.supportedLengths` 整张档位表，而那是**远端
+  // 目录持有者**独有的数据。两个产品各一个实例，键不同、档位互不顶替。
+  const buddyCnAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
     // 池中账号按 `product.id` 归属；provider 实参必须与产品一致，否则查不到账号。
     resolveCredential: makeCredentialResolver<BuddyCredential>(
@@ -378,7 +382,7 @@ export function apply(ctx: Context): void {
   // ctx.buddyCnAuth / ctx.buddyAuth，互不覆盖。
   // 同样不注册斜杠命令：入口在 Account Hub 的 Buddy 面板。
   const buddy = new BuddyAuth(ctx, { product: BUDDY })
-  registerBuddyLlm(ctx, {
+  const buddyAdapter = registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY.defaultCredentialRef),
     // 只从 buddy 的账号池取账号，回退到 Buddy 自己的单凭据 ref，
     // 保证不会串用 Buddy CN 的凭据。
@@ -548,7 +552,11 @@ export function apply(ctx: Context): void {
   const resolveQoderCredential = makeCredentialResolver<QoderCredential>(
     ctx, pool, QODER.id, QODER.defaultCredentialRef,
   )
-  registerQoderLlm(ctx, {
+  // 适配器实例要交给 RPC 层：Account Hub 的「显示列表」需要逐模型的窗口档位
+  // （`contextWindow` / `contextTiers`），而那是**目录持有者**独有的数据 ——
+  // `ctx.llm.listModels()` 会把适配器返回的额外字段丢掉，ctx 上也没有「按 provider
+  // 取适配器」的入口（见 `src/context-tiers.ts` 的 `ContextTierSource`）。
+  const qoderAdapter = registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER.defaultCredentialRef),
     // 只从 Qoder 自己的账号池取账号，回退到自己的单凭据 ref，
     // 保证不会串用其它六条线的凭据。
@@ -659,7 +667,11 @@ export function apply(ctx: Context): void {
       return instantiateQoderWasm(artifact.bytes)
     },
   })
-  registerQoderLlm(ctx, {
+  // 与国际版同因：目录持有者才能回答「这个模型有哪些窗口档位」。
+  // ⚠️ **必须是 CN 自己的实例** —— 两个 region 的目录是两套（CN 静态表不含
+  // `lite`、目录项也不同），把国际版的实例注册到 `qoder-cn` 键上会让 CN 面板
+  // 显示国际版的档位。
+  const qoderCnAdapter = registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER_CN.defaultCredentialRef),
     // 只从 Qoder CN 自己的账号池取账号，回退到自己的单凭据 ref
     // （`QODER_CN_PERSONAL_TOKEN`）—— 保证不会串用国际版的凭据。
@@ -759,9 +771,28 @@ export function apply(ctx: Context): void {
 
   // ===== Account Hub RPC 注册 =====
   // 参数次序照既有惯例：provider 服务的排列顺序与上面注册顺序一致，
-  // 新增的 `qoderCn` 排在尾（`qoder` 之后）；末位是**可选的**窗口档位来源
-  // （目前由 Trae CN 适配器实现，见 `ContextTierSource`），省略时
-  // `model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝。
-  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, traeCnAdapter)
+  // 新增的 `qoderCn` 排在尾（`qoder` 之后）；末位是**按 provider 分派**的窗口档位
+  // 注册表（见 `ContextTierRegistry`），省略时 `model.list` 不带窗口字段、
+  // `model.setContextBudget` 一律拒绝（headless / 测试的既定降级）。
+  //
+  // ## 键 = provider id（**不是**面板 id、不是池键）
+  //
+  // 与 `contextBudgets` 的存储分键同构。故：
+  // - `trae-cn-work` **刻意不在表里** —— 它的目录实测 `dev == max`（无档位可选），
+  //   且与 `trae-cn` 是同批账号的不同池（模型池、黑名单都不重合），注册进去只会让
+  //   Work 面板多出一列切了没反应的选项；
+  // - CodeArts / LobsterAI 同理不在表里：它们的目录根本没有窗口元数据，
+  //   「无数据不显示」是铁律，不是漏接线。
+  //
+  // 用 `*.id` 而不是字面量：写死字面量在改名 / 多产品场景下会静默不匹配
+  // （本插件在 workbuddy 改名上踩过同类坑）。
+  const contextTierRegistry = createContextTierRegistry({
+    [TRAE_CN.id]: traeCnAdapter,
+    [BUDDY_CN.id]: buddyCnAdapter,
+    [BUDDY.id]: buddyAdapter,
+    [QODER.id]: qoderAdapter,
+    [QODER_CN.id]: qoderCnAdapter,
+  })
+  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTierRegistry)
   ctx.provide('accountPool', pool)
 }

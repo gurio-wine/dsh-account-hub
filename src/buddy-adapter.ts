@@ -18,6 +18,7 @@ import {
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
+import { availableContextTiers, effectiveContextWindow, type ContextTier } from './context-tiers.js'
 import { isQuotaExhausted, isRateLimited, parseQuotaExhausted, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -567,7 +568,11 @@ export class BuddyAdapter extends LlmAdapter {
    * - 只保留兜底表里声明的 id（远端多出来的别名/内部模型被丢弃）；
    * - 兜底表声明但远端缺失的模型补进来（用兜底表的元数据）。
    *
-   * 没有产品兜底表（如 Buddy CN）时原样返回远端结果，保持既有行为。
+   * 没有产品兜底表时原样返回远端结果，保持既有行为。
+   *
+   * ⚠️ **现行两个产品都带兜底表**（`BUDDY_CN_FALLBACK_MODELS` /
+   * `BUDDY_FALLBACK_MODELS`），故生产路径上「原样返回」那一支不会走到 ——
+   * 它是给未声明 `fallbackModels` 的自定义产品与测试留的。
    */
   private reconcileWithFallback(models: readonly BuddyRemoteModel[]): BuddyRemoteModel[] {
     const fallback = this.product.fallbackModels
@@ -582,6 +587,12 @@ export class BuddyAdapter extends LlmAdapter {
         ...entry.contextWindow !== undefined || remote?.contextWindow !== undefined
           ? { contextWindow: remote?.contextWindow ?? entry.contextWindow }
           : {},
+        // ⚠️ **档位表必须一并透传**：本函数重建了条目对象，漏掉哪个字段就等于
+        // 在该产品上删掉哪个能力。**两个产品都带兜底表**（`BUDDY_CN_FALLBACK_MODELS`
+        // / `BUDDY_FALLBACK_MODELS`），故两侧都走这条重建路径 —— 漏了这一行，
+        // CN 与国际版的档位列会一起消失，而目录里明明有数据。
+        // 兜底表侧没有档位数据（那是快照，不编造），故这里只认远端。
+        ...remote?.contextTiers === undefined ? {} : { contextTiers: [...remote.contextTiers] },
         ...entry.supportsImages !== undefined || remote?.supportsImages !== undefined
           ? { supportsImages: remote?.supportsImages ?? entry.supportsImages }
           : {},
@@ -669,9 +680,18 @@ export class BuddyAdapter extends LlmAdapter {
     await this.ensureRemoteModels()
     // 三级查找：远端最大档窗口 → 产品兜底表 → 通用静态表
     // （对齐 Rust context_limit_for_model 的两级查找，多一层产品级）。
-    const contextWindow = this.remoteContextWindows.get(model)
+    const declared = this.remoteContextWindows.get(model)
       ?? this.productFallbackContextWindows.get(model)
       ?? CONTEXT_WINDOWS.get(model)
+    // 用户选的档位只可能落在**远端目录公布的窗口**上：静态兜底表是快照、没有
+    // 档位数据，故远端条目缺席时列表为空，`effectiveContextWindow` 原样返回
+    // `declared`（与接线前逐字节等价）。
+    // ⚠️ 档位是**纯声明值切换**（只影响宿主压缩阈值与保留预算），请求体一个
+    // 字段都不动 —— 见 `tests/unit/buddy-adapter.spec.ts` 的逐字节比对用例。
+    const tiers = availableContextTiers(this.remoteMeta.get(model))
+    const contextWindow = effectiveContextWindow(
+      declared, tiers, this.options.accountPool?.contextBudget(this.product.id, model),
+    )
     const resolved: LlmResolvedModelInfo = {
       provider,
       id: model,
@@ -697,6 +717,45 @@ export class BuddyAdapter extends LlmAdapter {
       }
     }
     return resolved
+  }
+
+  /**
+   * 当前生效目录的逐模型上下文窗口档位（id → 默认档 + 完整档位表）。
+   *
+   * ## 为什么在适配器上而不是 RPC 层现算
+   *
+   * 目录的持有者是本实例（懒加载一次、失败静默回退静态表）。`ctx.llm.listModels()`
+   * 帮不上忙 —— `LlmRuntime` 会把适配器返回的条目重建成
+   * `{provider, id, name, description?, inputModalities?}`，`contextTiers` 这类
+   * 额外字段在那一层被丢掉。故由 `src/index.ts` 把本实例交给
+   * `registerJetHubRpc`（见 `ContextTierRegistry`）。
+   *
+   * ## 数据源与 `resolveModel` **同源同口径**
+   *
+   * 读的就是 `resolveModel` 用的那份 `remoteMeta`（`parseModelMeta` 的产物）：
+   * `contextWindow` 是**生效的默认档**（最大档口径），`contextTiers` 是
+   * `supportedLengths` 的整张表。三处（UI 渲染 / RPC 校验 / 实际声明值）读同一份
+   * 数据，否则会出现「UI 上有档位、切过去却不生效」这种自相矛盾。
+   *
+   * ⚠️ **静态兜底表不参与**：它是快照，没有档位数据（不编造）。远端不可用时本
+   * 方法返回空表 ⇒ `model.list` 不带窗口字段、档位列整行不渲染 —— 与 Trae CN
+   * 静态回退路径同一处置。
+   *
+   * ⚠️ **过滤条件只看「有没有窗口」**：单档模型（无 `contextTiers`）照样带出去，
+   * 由 RPC / UI 用「列表长度 ≥ 2」判定要不要渲染 —— 与 Trae CN 的
+   * `contextTiers()` 同一判据，两处都不在这里替 UI 做决定。
+   */
+  async contextTiers(): Promise<ReadonlyMap<string, ContextTier>> {
+    await this.ensureRemoteModels()
+    const tiers = new Map<string, ContextTier>()
+    for (const model of this.remoteMeta.values()) {
+      if (model.contextWindow === undefined && model.contextTiers === undefined) continue
+      tiers.set(model.id, {
+        ...model.contextWindow === undefined ? {} : { contextWindow: model.contextWindow },
+        ...model.contextTiers === undefined ? {} : { contextTiers: [...model.contextTiers] },
+      })
+    }
+    return tiers
   }
 
   /**
@@ -1196,11 +1255,18 @@ function isCredentialExpired(credential: BuddyCredential): boolean {
  * Buddy 得到 `buddy` / `llm-buddy`。
  * 注意 settingsNs 必须与 `src/index.ts` 的 registerProviderSettings 注册的
  * namespace 保持一致，否则模型设置页会因未注册 namespace 崩溃。
+ *
+ * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerJetHubRpc`，
+ *          供 Account Hub 读取逐模型的窗口档位（`contextTiers`）与校验用户选择。
+ *          适配器是**模型目录的唯一持有者**，RPC 层拿不到目录就只能靠猜
+ *          （与 `registerTraeCnLlm` / `registerQoderLlm` 同一约定）。
  */
-export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): void {
+export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? BUDDY_CN
   ctx.llm.registerConfigurableProviders([
     { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([product.id], new BuddyAdapter(options))
+  const adapter = new BuddyAdapter(options)
+  ctx.llm.registerAdapter([product.id], adapter)
+  return adapter
 }
