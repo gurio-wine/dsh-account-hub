@@ -110,6 +110,64 @@ SSE 帧原文**、只有 `details.error.message`/根层 `message`（无 code）�
 **流内** `provider_error` 帧的真因同样只在 `details` 里 —— 故 `parseQoderStreamErrorPayload` 带出 `details`、
 适配器流内分支必须把它作为 `body` 传给分类器（此前两者都缺，是真因被藏的次要成因）。
 
+### Qoder wasm 签名链（两区共用）—— CN chat 复活的关键（2026-09-21 真机实证）
+
+⚠️ **`/algo/api/v2/service/pro/sse/agent_chat_generation` 是签名路径，必须整包替换 URL + headers + body**（返回的 `body` 是**密文**，
+`url` 由 wasm 拼好含 `?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`，`headers` 20 项含 `Authorization: Bearer COSY.…` /
+`Cosy-Key` / `Cosy-Date` / `Cosy-MachineId` / `Cosy-User` / `X-Model-Key` / `X-Model-Source`）。**只补签名头不换 body 必回 `101 Signature invalid`**
+—— 那是 CN chat 长期不可用的头号原因。⚠️ **`endpoint` 参数是 host 基址**（`https://gateway.qoder.com.cn`），**不是完整 URL**（传完整 URL 会得到路径重复两遍的 URL，实测）。
+
+⚠️ **`uid` 必须是真实用户 id，空串会签出无效身份（真机根因）**：取自 `GET {openapiBase}/api/v1/userinfo`（Bearer `jt-`，官方 `fetchOpenApiUserInfo` 的端点），
+字段回退序 `id → user_id → uid`。真机 A/B（同一请求只改这一处）：**空串 → `{"code":"101","message":"Signature invalid"}`**；
+**真实 uid → HTTP 200 + SSE 真内容**（`{"choices":[{"delta":{"content":"pong","role":"assistant"}…}],"model":"auto"}`）。
+⚠️ `exchange` 响应**不含** userId（只有 token/refresh_token/expires_*）；`quota/usage` 的 `userId` 同值但不是权威来源。
+
+⚠️ **`machineId` 由签名器自己走登录链取，调用方不必传**（`QoderWasmSignerOptions.machineIdOptions` / `readMachineId` 是测试注入面）：
+默认调 `readOrCreateQoderMachineId(product)`，即设备流落盘的**同一份文件**（`~/.qoder/.auth/machine_id` / `~/.qoder-cn/…`）——
+真机核对 `Cosy-MachineId` == 磁盘内容（两区各一次）。**不要**自己读文件或自己生成：那份函数承载「已存在绝不覆盖 / 缺失则生成落盘 /
+落盘失败退回内存态且不抛」三条契约，另写一份就可能与登录侧**不同源**，而上游对机器身份不一致的回复是 `101 Signature invalid`（与凭据失效同形）。
+⚠️ **取用必须发生在复用判据之前**（判据含机器码）—— 顺序反了会「先决定复用、再用另一个机器码去签」。测试里**必传** `machineIdOptions.homeDir`，否则读写用户真实 home。
+
+⚠️ **`product` 绑定在签名器构造时，不在 `contextFor()` 入参**：同一实例被两个 region 交替使用会拿 CN 的机器码签国际版的请求。
+调用方按 region 各建一个 `QoderWasmSigner`（与「一个 provider 一个适配器」同向）。
+
+⚠️ **构造要跑两段，漏一段直接失败**：先用**五个业务字段**（`uid`/`security_oauth_token`/`organization_id`/`organization_tags`/`data_policy_agreed`）
+调 `generate_runtime_auth_fields` 拿 `{encrypt_user_info, key}`，**再并进** `userInfoJson` 才 `qodercontext_new`；缺 `encrypt_user_info` 时 wasm 抛
+``Invalid user info: missing field `encrypt_user_info` ``。这是官方 `regenerateRuntimeFields()` 的做法，**PAT 路径同样要跑**（官方 `loginWithPAT` 末尾也调）。
+
+⚠️ **wasm 是内联 base64，不是独立文件**：单条 base64 字面量（398 144 字符 → 298 606 字节）内联在 worker runtime（`$9s="AGFzbQ…"`）。
+**抠取按前缀定位、不写死偏移** —— 四来源实测偏移各异（25371 / 25438 / 25442 / 25447）。前缀用 **5 字符 `AGFzb`** 而非官方源码那 6 字符的 `AGFzbQ`：
+第 6 字符由第 5 字节高位决定，写死它等于假设「wasm 版本恒为 1」。
+
+**三级提取**（缓存是快路径，不算第四级）：① 本机已装 Qoder（`…/app.asar.unpacked/node_modules/@qoder-ai/<包名>/dist/_worker/qoder-worker-runtime[.obf].mjs`）
+→ ② npm tarball → ③ 官方 CDN。**每级提取后 SHA-256 校验，不匹配即当该级失败继续降级**；全败抛「未找到 Qoder 签名组件（wasm）…」+ 各级原因。
+
+| 来源 | 实测形态 |
+|---|---|
+| 哈希 | `6419471effa631519def7797d76d7ede38b9fcfa9a83c2148c8ef5d43355b43d`（298 606 B）—— **四来源同值**：本机国际版 1.1.57 / 本机 CN 1.1.57 / CN npm 1.1.59 / 官方 CDN 1.1.59 |
+| ① 本机 | 两区 worker 都在（35 MB 上下） |
+| ② 国际版 npm | `@qoder-ai/qoder-agent-sdk`（1.0.47）**不含 worker**（99 个 `.d.ts`，162 KB）⇒ 该级落空、由 ③ 兜住 |
+| ② CN npm | 包名是 **`@qodercn-ai/qoderclicn`**（⚠️ **不是** `@qoder-ai/qoder-cn-agent-sdk`，后者 404），31.8 MB，含 `bundle/qoder-worker-runtime.mjs` |
+| ③ CDN | `https://download.qoder.com/qodercli/releases/{版本}/qodercli-worker-runtime-win32-x64.tgz`（⚠️ 平台 token 是 Go 风格 **`win32-x64`**，写 `windows-x64` 会 404） |
+
+**缓存** `~/.dsh/qoder-wasm/qoder_auth_wasm_bg.wasm`（原子替换：临时文件 + rename），两区共用同一份字节。
+**许可红线**：只做运行时提取，**不把 wasm 字节提交进仓库、不随插件包分发**；`src/` 里只有提取/加载代码。
+
+**glue 是手写复刻的**（`src/qoder-wasm-glue.ts`）：官方那份内联在 35 MB worker 里，本插件不整体加载它（自带 CLI 全家桶、有无关副作用），
+故按取证的 31 个 import 语义重新实现。⚠️ **两个同名不同义的坑必须按完整名分派**：`__wbg_getRandomValues_*` 有两个（一个用 `globalThis.crypto`、
+一个用宿主对象的 `getRandomValues`）、`__wbg_new_*` 两个变体（`new Uint8Array(len)` vs `new Map()`）。分派顺序「精确名 → 前缀兜住哈希后缀漂移」，
+**未知 import 显式抛错**（塞空函数会让 wasm 深处以「签名算错」失败，比立即报错难查得多）。
+
+**真机验证结果（2026-09-21，预算 6 次推理请求内）**：
+
+| 步骤 | 结果 | 证据 |
+|---|---|---|
+| ① CN 签名路径 | ✅ **通过（CN chat 复活实锤）** | `POST https://gateway.qoder.com.cn/algo/…/agent_chat_generation` → **HTTP 200 + SSE 真内容**，**不再有 `101 Signature invalid`**。真机 A/B：空 uid ⇒ `101`，真实 uid ⇒ 通过 |
+| ② 国际版同路径 | ⚠️ **签名通过、业务 400** | host **不是 `api2-v2.qoder.sh`**（该 host 404）而是 **`api1.qoder.sh`**（实测 200）。签名有效（无 `101`），但 body 形态未被接受：`{"code":"400","message":"[FAIL]node:agent_router msg:None flow nodes found for router agent_router"}` ⇒ **协议可达、参数待校准** |
+| ③ 大 body 字节墙 | ⏸ **未测**（②未通过，按「失败即停」跳过） | 国际版大上下文是否顺带解决**仍未知** |
+
+⚠️ **本次不改错误分类、不改适配器**（接入是后续任务）；上述①②③只作为证据记录。
+
 ### Qoder CN（`qoder-cn`）—— 第二 region 的两条要点
 
 `qoder-cn`（显示名 **Qoder CN**）与 `qoder`（国际版）**同协议双 region**：exchange / quota / models 三个端点的错误信封逐字节同构、PAT 前缀同为 `pt-`、目录字段同构，故**代码只有一份**（`src/qoder*.ts` 按传入的 `product` 现算），差异全部收敛在 `src/qoder-product.ts` 的两份 `QoderProduct` 配置里。

@@ -2544,6 +2544,47 @@ CN 的 chat 503 **直报、不退避、不换号**（退避重试一个不可能
 > **控制面不受影响**：CN 的目录（14 项）与额度两条线**都实测 200**，
 > 换令牌（exchange）也正常 —— 只有 chat 这一条对 PAT 走不通。
 
+### Qoder 签名链（wasm）—— 上面第 3 条的结论已被推翻（2026-09-21 真机实证）
+
+⚠️ **上面「两种登录形态都给不出用户密钥 ⇒ 永远过不去」不成立，保留原文以存档推理过程。**
+真机实测（CN PAT 凭据）：**`POST https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation`
+→ HTTP 200，SSE 出真内容** `{"choices":[{"delta":{"content":"pong","role":"assistant"}…}],"model":"auto"}`，
+`101 Signature invalid` 不再出现。
+
+**密钥不是「给不出」，而是由 wasm 自己派生**：先用**五个业务字段**
+（`uid` / `security_oauth_token` / `organization_id` / `organization_tags` / `data_policy_agreed`）
+调 `generate_runtime_auth_fields` 拿 `{encrypt_user_info, key}`，**再并进** `userInfoJson` 才能构造上下文
+（漏了 wasm 直接抛 ``Invalid user info: missing field `encrypt_user_info` ``）。这正是官方
+`regenerateRuntimeFields()` 的做法，PAT 路径同样要跑。
+
+**真正的门槛是 `uid` 必须是真实用户 id**（真机单变量 A/B，同一请求只改这一处）：
+
+| `uid` | 结果 |
+|---|---|
+| 空串 | `{"code":"101","message":"Signature invalid"}` |
+| 真实 id | **HTTP 200 + SSE 真内容** |
+
+`uid` 取自 `GET {openapiBase}/api/v1/userinfo`（Bearer `jt-`，官方 `fetchOpenApiUserInfo` 的端点），
+字段回退序 `id → user_id → uid`。⚠️ `exchange` 响应**不含** userId。
+
+**实现**（两区共用一份，`src/qoder-wasm*.ts`）：
+
+- **wasm 来源**：运行时三级提取（本机已装 Qoder → npm → 官方 CDN），每级提取后 SHA-256 校验
+  （`6419471e…`，298 606 B，**四个来源同值**），缓存到 `~/.dsh/qoder-wasm/`。
+  ⚠️ **wasm 字节不提交进仓库、不随插件包分发**，`src/` 里只有提取/加载代码。
+- **调用形态**：`prepareInferRequest(host基址, body, modelKey, modelSource)` 返回
+  **`{url, headers, body, free}` —— 三者必须整包替换**。返回的 `body` 是**密文**；
+  只补签名头不换 body 必回 `101`。
+  ⚠️ 第一个参数是 **host 基址**（`https://gateway.qoder.com.cn`），**不是完整 URL**（传完整 URL 会得到路径重复两遍的 URL）。
+- **`machineId` 走登录链落盘的那一份**（设备流写的同一个文件），调用方不必传。
+- **glue 是手写复刻的**：官方那份内联在 35 MB worker runtime 里，本插件不整体加载它。
+
+⚠️ **本次只落地签名链，未改错误分类、未改适配器**（接入是后续任务）。
+国际版同路径的签名**有效**（无 `101`），但其 host **不是 `api2-v2.qoder.sh`**（该 host 404）
+而是 **`api1.qoder.sh`**（实测 200）；即便签名通过，body 形态仍回业务
+`400 flow nodes found for router agent_router` ⇒ **协议可达、参数待校准**，
+国际版大上下文的字节墙问题因此**尚未验证**。
+
 **逃生阀**：`QODER_MODEL_SERVER_HOST` 环境变量可覆盖 chat 的 host（含显式 scheme），
 用于指向自建网关或本地抓包调试：
 
