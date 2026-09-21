@@ -11,16 +11,11 @@
  *
  * ## 为什么 2402 个测试全绿却真机白屏
  *
- * 根因是 `ProviderPanel` 里这一行：
- *
- * ```js
- * loginChoiceOpen && patLogin
- *   ? React.createElement(LoginChoiceForm, {
- *       productLabel: label,   // ← label 在 ProviderPanel 作用域里根本不存在
- * ```
+ * 根因是 `ProviderPanel` 里给 `LoginChoiceForm` 传 props 的那一行写成了
+ * `productLabel: label`，而 `label` 在那个位置**没有任何绑定**：
  *
  * `label` 只作为**局部变量**存在于两个完全无关的地方：
- *   - `formatClaimFailureLine`（第 520 行）里的 `const label = result?.nickname || …`；
+ *   - `formatClaimFailureLine` 里的 `const label = result?.nickname || …`；
  *   - `PROVIDERS` 条目的 `label` 字段。
  * 二者都不是 `ProviderPanel` 能看到的绑定，故这一行是 `ReferenceError: label is
  * not defined`，而**不是** `undefined`。
@@ -47,11 +42,18 @@
  * 这精确复现了报障措辞：「点击新建账号**直接**空了」—— 点击**之前**页面是好的，
  * 点击**那一瞬间**才炸，且没有任何可见错误（异常只进控制台）。
  *
- * ## 本文件的做法：真的把 `ProviderPanel` 渲染出来
+ * ## ⚠️ 本次改动后本文件守护什么
  *
- * 与既有的源码切片断言不同，这里补一个**带 hooks 的最小 react 运行器**，
- * 让面板真的渲染、真的派发点击、真的重渲染。这样「自由变量」会在测试里以
- * 与真机**同一个异常**暴露出来，而不是靠人去读正则。
+ * PAT 登录形态已于同日按用户要求整体移除（「我说不要pat登录，只要浏览器登录了」），
+ * 故 `LoginChoiceForm` / `patLogin` 那条具体路径**已不存在**，上面那段根因叙述
+ * 是历史记录。本文件继续守的是**这一类缺陷**，而不是那一行代码：
+ *
+ *   - 真的渲染 `ProviderPanel` / `JetHubPage`、真的派发点击、真的重渲染；
+ *   - 八个 provider 逐个冒烟，点击必须**有反应**（浏览器登录 → 开窗）；
+ *   - 面板标题必须取显示名而不是裸 id。
+ *
+ * 换句话说：再有人在 render 路径上写一个自由变量、或在某个 provider 分支上
+ * 访问了不存在的字段，都会在这里以真机同一个异常炸出来。
  */
 
 import { createRequire } from 'node:module'
@@ -202,7 +204,7 @@ function toCjs(source: string): string {
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   return out.concat(
     '\nmodule.exports.__testExports = {'
-    + ' JetHubPage: JetHubPage, ProviderPanel: ProviderPanel, LoginChoiceForm: LoginChoiceForm };\n',
+    + ' JetHubPage: JetHubPage, ProviderPanel: ProviderPanel };\n',
   )
 }
 
@@ -266,7 +268,6 @@ function installWindowStub(): { opened: StubWindow[]; restore: () => void } {
 function loadClientModule(): {
   JetHubPage: (props: Record<string, unknown>) => unknown
   ProviderPanel: (props: Record<string, unknown>) => unknown
-  LoginChoiceForm: (props: Record<string, unknown>) => unknown
   hooks: HookedReact
 } {
   const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8'))
@@ -287,7 +288,6 @@ function loadClientModule(): {
   return {
     JetHubPage: exported.JetHubPage as (props: Record<string, unknown>) => unknown,
     ProviderPanel: exported.ProviderPanel as (props: Record<string, unknown>) => unknown,
-    LoginChoiceForm: exported.LoginChoiceForm as (props: Record<string, unknown>) => unknown,
     hooks,
   }
 }
@@ -400,75 +400,71 @@ function makeRpc() {
 }
 
 describe('「+ 新建账号」点击后 Hub 白屏（真机首跑暴露的自由变量）', () => {
-  it('点击 qoder 的「+ 新建账号」不得抛出 ReferenceError', async () => {
-    const { rpcCall } = makeRpc()
-    const tree = await renderStable(
-      client.ProviderPanel,
-      { provider: 'qoder', rpcCall },
-      client.hooks,
-    )
+  it('点击 qoder 的「+ 新建账号」不得抛错，且必须真的开窗', async () => {
+    // 根因叙述见文件头：当年崩在 `LoginChoiceForm` 的 props 对象字面量里那个
+    // 自由变量上。PAT 形态移除后那条具体路径没有了，但**这一类**缺陷仍会在这
+    // 三条断言上炸出来（渲染 → 点击 → 点击后重渲染）。
+    const windowStub = installWindowStub()
+    try {
+      const { rpcCall } = makeRpc()
+      const tree = await renderStable(
+        client.ProviderPanel,
+        { provider: 'qoder', rpcCall },
+        client.hooks,
+      )
 
-    const button = findButtonByText(tree, '+ 新建账号')
-    expect(button, '面板里找不到「+ 新建账号」按钮').toBeDefined()
+      const button = findButtonByText(tree, '+ 新建账号')
+      expect(button, '面板里找不到「+ 新建账号」按钮').toBeDefined()
 
-    // 真机路径：点击 → setLoginChoiceOpen(true) → 重渲染。
-    // 修复前这一步**本身**不抛（它只是 setState），真正的崩溃点是紧接着的
-    // 那一轮渲染 —— 见下面的断言。
-    const onClick = button!.props.onClick as () => void
-    expect(typeof onClick).toBe('function')
-    expect(() => onClick()).not.toThrow()
+      const onClick = button!.props.onClick as () => void
+      expect(typeof onClick).toBe('function')
+      expect(() => onClick()).not.toThrow()
 
-    // 重渲染就是崩溃点：`label` 在 LoginChoiceForm 的 props 对象字面量里，
-    // 而对象字面量只在条件为真时求值 —— 所以异常必然发生在点击后的这一轮，
-    // 点击之前的所有渲染都是好的（正是报障措辞「点击新建账号**直接**空了」）。
-    client.hooks.__clearDirty()
-    expect(() => client.hooks.__renderComponent(client.ProviderPanel, { provider: 'qoder', rpcCall }))
-      .not.toThrow()
+      // 点击后重渲染（真机上 setState 之后必然发生）：
+      // 任何在 render 路径上求值的坏表达式都会在这里抛。
+      client.hooks.__clearDirty()
+      expect(() => client.hooks.__renderComponent(client.ProviderPanel, { provider: 'qoder', rpcCall }))
+        .not.toThrow()
+
+      // 反向锚点：点击必须**有反应**。少了这条，「onClick 被改成空实现」
+      // 也能让上面那句 not.toThrow() 绿着 —— 那只证明了没炸，没证明能用。
+      // PAT 移除后 Qoder 走的正是浏览器登录，故必须开窗。
+      expect(windowStub.opened.length, 'Qoder 点击应当走浏览器登录并开窗').toBe(1)
+    } finally {
+      windowStub.restore()
+    }
   })
 
-  it('选择器渲染出来的产品名取自 PROVIDERS，而不是未绑定标识符', async () => {
-    const { rpcCall } = makeRpc()
-    const tree = await renderStable(
-      client.ProviderPanel,
-      { provider: 'qoder', rpcCall },
-      client.hooks,
-    )
-    const button = findButtonByText(tree, '+ 新建账号')
-    expect(button, '面板里找不到「+ 新建账号」按钮').toBeDefined()
-    ;(button!.props.onClick as () => void)()
+  it('Qoder 两区都走浏览器登录：点击一律开窗、且不再有任何 PAT 表单', async () => {
+    // 用户要求「不要 pat 登录，只要浏览器登录」的可执行形式：
+    // 两个 region 的登录入口都**只有**浏览器设备流这一条。
+    const windowStub = installWindowStub()
+    try {
+      for (const provider of ['qoder', 'qoder-cn']) {
+        const { rpcCall } = makeRpc()
+        const tree = await renderStable(client.ProviderPanel, { provider, rpcCall }, client.hooks)
+        const button = findButtonByText(tree, '+ 新建账号')
+        expect(button, `${provider} 缺少「+ 新建账号」按钮`).toBeDefined()
 
-    // 展开子组件：选择器是嵌在面板返回树里的一个 `React.createElement(LoginChoiceForm, …)`，
-    // 不展开就看不清它渲染出来的文案。
-    client.hooks.__clearDirty()
-    const afterClick = expandTree(
-      client.hooks.__renderComponent(client.ProviderPanel, { provider: 'qoder', rpcCall }),
-      client.hooks,
-    )
+        const before = windowStub.opened.length
+        ;(button!.props.onClick as () => void)()
+        expect(windowStub.opened.length, `${provider} 点击没有开窗`).toBe(before + 1)
 
-    // 面板 id 是 `qoder`，而**显示名**是 `Qoder`（PROVIDERS 条目的 label）。
-    // 断言显示名而不是 id：这条同时排除「随手写成 provider」的替代修法。
-    expect(textsOf(afterClick).join('')).toContain('Qoder 支持两种登录方式')
-    // 反面锚点：选择器确实出来了（否则上面那句在回归成「点击无反应」时也会绿）。
-    expect(findButtonByText(afterClick, '浏览器登录'), '选择器没有渲染出来').toBeDefined()
-  })
-})
-
-describe('LoginChoiceForm 的 productLabel 取自 PROVIDERS 表', () => {
-  it('两个 region 各自拿到自己的显示名（不是 id、也不是同一个值）', () => {
-    const qoder = client.LoginChoiceForm({
-      productLabel: 'Qoder',
-      onBrowserLogin: () => {},
-      onPatLogin: () => {},
-      onCancel: () => {},
-    })
-    const qoderCn = client.LoginChoiceForm({
-      productLabel: 'Qoder CN',
-      onBrowserLogin: () => {},
-      onPatLogin: () => {},
-      onCancel: () => {},
-    })
-    expect(textsOf(qoder).join('')).toContain('Qoder 支持两种登录方式')
-    expect(textsOf(qoderCn).join('')).toContain('Qoder CN 支持两种登录方式')
+        // 面板里不得再有 PAT 相关的输入框/链接（表单已整体删除）。
+        client.hooks.__clearDirty()
+        const after = expandTree(
+          client.hooks.__renderComponent(client.ProviderPanel, { provider, rpcCall }),
+          client.hooks,
+        )
+        const nodes = flatten(after).filter(isElement)
+        expect(nodes.filter((el) => el.type === 'input'), `${provider} 出现了输入框（PAT 表单残留？）`)
+          .toHaveLength(0)
+        expect(textsOf(after).join(''), `${provider} 文案里仍有 PAT`)
+          .not.toContain('PAT')
+      }
+    } finally {
+      windowStub.restore()
+    }
   })
 })
 
@@ -541,18 +537,14 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
           client.hooks,
         )
         expect(() => afterClick, `${provider} 点击后重渲染抛错`).not.toThrow()
-        // 点击必须**产生效果**，不能是「点了没反应」：
-        //   - 浏览器登录 → 手势内开窗（`window.open` 被调用）；
-        //   - 形态选择器 → 选择器渲染出来。
-        // 两条满足其一即可（Qoder 两区当前走后者；PAT 形态移除后走前者）。
+        // 点击必须**产生效果**，不能是「点了没反应」：PAT 形态移除后七个
+        // 面板（除共用账号的 Trae CN Work）全部走浏览器设备流，故一律必须开窗。
         // 这条反向锚点很关键：若将来有人把 onClick 改成空实现，
         // 上面那句「不抛错」照样是绿的。
-        const openedWindow = windowStub.opened.length > openedBefore
-        const showedChooser = findButtonByText(afterClick, '浏览器登录') !== undefined
         expect(
-          openedWindow || showedChooser,
-          `${provider} 点击后既没有开窗、也没有渲染选择器（点了没反应）`,
-        ).toBe(true)
+          windowStub.opened.length,
+          `${provider} 点击后没有开窗（点了没反应）`,
+        ).toBe(openedBefore + 1)
       }
     } finally {
       windowStub.restore()

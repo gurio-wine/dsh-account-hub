@@ -218,9 +218,9 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     { id: 'lobsterai', label: 'LobsterAI', logoClass: 'lobsterai' },
     { id: 'trae-cn', label: 'Trae CN', logoClass: 'trae-cn' },
     { id: 'trae-cn-work', label: 'Trae CN Work', logoClass: 'trae-cn-work' },
-    // Qoder 排在 Trae CN Work 之后。它比上面六条多一个**全新的
-    // 登录形态**：PAT 粘贴（其余六条全是浏览器登录），见 jet-hub.js 的
-    // PAT_LOGIN_PROVIDERS。
+    // Qoder 排在 Trae CN Work 之后。它与上面六条的差别只在**产品自身**
+    // （另一套 host / 另一套凭据体系），登录形态同样是浏览器设备流 ——
+    // PAT 粘贴曾在 2015b03 起并存，已于 2026-09-21 按用户要求移除。
     { id: 'qoder', label: 'Qoder', logoClass: 'qoder' },
     // Qoder CN 紧跟在 Qoder 之后（= PROVIDERS 的书写顺序）：同一个形态的
     // 第二个 region。`label` 是 `Qoder CN` —— 显示名只留产品名、不带公司注记
@@ -251,13 +251,15 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     }
     expect(source).toContain('与 Trae CN 共用账号')
     // ⚠️ Qoder 的区分（与上面那条断言是**两个方向**，别混为一谈）：
-    // 它**没有** loginHint，但原因**不是**「没有登录入口」—— 它有自己的入口，
-    // 只是形态不同（PAT 粘贴表单，见 jet-hub.js 的 PAT_LOGIN_PROVIDERS）。
-    // loginHint 的语义是「去**隔壁面板**登录」，与「在本面板换个形态登录」
-    // 是两件事：前者删掉入口、后者替换入口。
+    // 它**没有** loginHint，因为**它有自己的登录入口**（浏览器设备流）。
+    // loginHint 的语义是「去**隔壁面板**登录」（只用于 Trae CN Work 那种共用账号），
+    // 与「在本面板登录」是两件事：前者删掉入口、后者保留入口。
     // 若哪天给 qoder 补上 loginHint，`canCreateAccount` 会变成 false，
-    // 面板的「+ 新建账号」整块消失，PAT 表单的唯一入口就没了 —— 而且不报错，
-    // 只会变成一个没有入口的死面板。故这里把「qoder 没有 loginHint」也钉死。
+    // 面板的「+ 新建账号」整块消失 —— 而且不报错，只会变成一个没有入口的死面板。
+    // 故这里把「qoder 没有 loginHint」也钉死。
+    //
+    // （2026-09-21：Qoder 的登录形态已收敛为**只有浏览器设备流** ——
+    //   PAT 粘贴按用户要求移除，但那条与 loginHint 无关，见 jet-hub.js 文件头。）
     const providerEntryOf = (id: string) =>
       [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)].find((m) => m[1] === id)
     expect(providerEntryOf('qoder')?.[5]).toBeUndefined()

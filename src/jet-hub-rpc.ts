@@ -941,12 +941,32 @@ function registerJetHubEndpoints(
           })
           return { ok: true, value: { accountId: id, loginUrl: loginSession.loginUrl } }
         } else if (provider === QODER.id || provider === QODER_CN.id) {
-          // Qoder 有**两种登录形态并存**，本分支按「载荷里有没有 pat」分流：
+          // 本分支按「载荷里有没有 pat」分流：
           //
           // | 载荷 | 形态 | 时序 |
           // |---|---|---|
           // | `{ provider, pat }` | PAT 粘贴 | **同步完成**（即时 exchange 验证） |
           // | `{ provider }` | 浏览器设备流 | **两段式**（占位 → loginUrl → 后台补全） |
+          //
+          // ## ⚠️ 客户端 UI 已移除 PAT 形态，但这条分支**不是死代码**（2026-09-21）
+          //
+          // 用户要求「不要 pat 登录，只要浏览器登录」，故 `plugin-src/client/jet-hub.js`
+          // 里的 PAT 表单与形态选择器已整体删除 —— **客户端不再发含 `pat` 的载荷**。
+          // 但下面这条 `hasPat` 分支**刻意保留**，理由是它是**协议层**的分派
+          // （对载荷形态的防御），不是 UI：
+          //
+          //   1. **headless / 脚本调用**：RPC 是对外协议面，不只有我们这个 UI 在调。
+          //      带 `pat` 的请求仍然应当被正确处理，而不是收到一个含糊的
+          //      `bad-request`；删掉它等于把「协议仍支持 PAT」这件事悄悄收回。
+          //   2. **测试**：`qoder-rpc-dispatch` / `qoder-cn-rpc-dispatch` /
+          //      `qoder-device-flow-rpc` 三处都直接驱动真实 HTTP 处理器发
+          //      `{ provider, pat }`。它们是**协议分派**的回归，与 UI 形态无关，
+          //      删实现就会连带删掉这些覆盖。
+          //   3. **未来形态**：PAT 是不依赖浏览器的那条路（企业策略禁用弹窗、
+          //      无头环境）。UI 入口收起来是产品决定，能力本身留着成本为零。
+          //
+          // 故**不要**因为「客户端不再发 pat」就删这一支 —— 那属于把产品决定
+          // 误读成协议决定。库层（`src/qoder-auth.ts` 的 `loginWithPat`）同理保留。
           //
           // ## 两个 region 共用这两条分支（**同协议**，不要拆成四份）
           //

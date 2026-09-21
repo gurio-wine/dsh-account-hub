@@ -139,241 +139,22 @@ function providerLoginHint(provider) {
 }
 
 /**
- * Qoder PAT 签发页。
+ * ⚠️ **PAT 粘贴式登录形态已于 2026-09-21 按用户要求整体移除**，此处不再有
+ * `PAT_LOGIN_PROVIDERS` / `providerPatLogin` / `normalizePatInput` /
+ * `createAccountWithPat` / `PatLoginForm` / `LoginChoiceForm` 任何一项。
  *
- * 与宿主侧 `src/qoder-product.ts` 的 `QODER_PAT_URL` **同值**（客户端 bundle
- * 不能 import 宿主 TS —— 一侧是 esbuild 打包的浏览器代码、一侧是 tsc 编译的
- * Node 代码），故此处是副本。副本的风险是「改了宿主、忘了客户端」：表现只是
- * 面板上的链接指向一个旧地址（用户点过去 404），**不报任何错**，
- * 故有单测钉死两处字面量相等。
+ * 用户原话：「我说不要pat登录，只要浏览器登录了」。故 Qoder 两个 region 的
+ * 「+ 新建账号」现在**只有一条路**：直接走 `createAccount()`（浏览器设备流）。
+ * 曾经的二选一选择器与它带来的 `loginChoiceOpen` 状态一并删除 ——
+ * 保留了选择器却只留一个选项，等于多一次无意义的点击。
+ *
+ * ⚠️ **删的是 UI 入口，不是能力**：`src/qoder-auth.ts` 的 `login({ pat })` /
+ * `loginWithPat` 一行未动（库层能力，与设备流共用写凭据逻辑），宿主
+ * `src/jet-hub-rpc.ts` 对 `account.create` 的 `hasPat` 分派也保留 ——
+ * 那两处服务的是 headless / 测试 / 未来形态，不是本文件的死代码。
+ *
+ * 样式表里只服务这个表单的 `.dim-jh-pat*` 规则一并删除（留着就是死类）。
  */
-const QODER_PAT_URL = 'https://qoder.com/account/integrations';
-
-/**
- * Qoder **CN（国内版）** 的 PAT 签发页。
- *
- * 与宿主 `src/qoder-product.ts` 的 `QODER_CN_PAT_URL` **同值**（同样的跨侧副本
- * 理由见上）。⚠️ **两个 region 的 PAT 互不通用**：把 CN 面板的链接指向国际版
- * 签发页，用户拿到的 PAT 在 CN 上会被判「凭据失效」，而**不报任何错** ——
- * 只是「我明明签发了却用不了」。单测钉死两处字面量相等。
- */
-const QODER_CN_PAT_URL = 'https://qoder.cn/account/integrations';
-
-/**
- * PAT 粘贴式登录的面板：provider → 该形态需要的元数据。
- *
- * 只有 Qoder 一条 —— 其余六个 provider 全是浏览器登录（两段式 RPC + 轮询）。
- *
- * **单独立表而不是往 `PROVIDERS` 条目里塞第三个可选字段**：条目形态被
- * `tests/unit/credits-capabilities.spec.ts` 的 FULL 匹配器逐字锁死
- * （id/label/icon/logoClass + 可选 loginHint），多一个字段会让那条「抓全七条」
- * 的断言失效 —— 而且失效方式是**条目整个抓不到**，报错信息里看不出是字段多了。
- *
- * 缺省即浏览器登录（`providerPatLogin` 返回 null）：将来新增 provider 忘记登记时，
- * 最坏结果是多出一个本来就用得上的浏览器登录入口，与 `loginHint` 的默认方向一致。
- */
-const PAT_LOGIN_PROVIDERS = Object.freeze({
-  qoder: Object.freeze({ patUrl: QODER_PAT_URL }),
-  // Qoder CN 与 Qoder 是**同一个形态的第二个 region** —— 但 `patUrl` **必须是
-  // CN 自己的**：两个 region 的 PAT 互不通用，让 CN 面板把用户送到国际版签发页，
-  // 他拿回来的 PAT 会被 CN 判「凭据失效」，而面板上看不出是链接指错了。
-  // 表单本身（`normalizePatInput` / `createAccountWithPat` / `PatLoginForm`）
-  // 是**provider 无关**的，故这里只登记这一条元数据，别处零改动。
-  'qoder-cn': Object.freeze({ patUrl: QODER_CN_PAT_URL }),
-});
-
-/**
- * 该面板是否用 PAT 粘贴建号；`null` = 走浏览器登录（默认）。
- *
- * 面板里**不得**出现 `provider === 'qoder'` 这类散落字面量比较：散落的条件
- * 将来漏改一处，表现就是「按钮还在，点了报 unknown provider」—— 用户只会觉得
- * 功能坏了。一切经本函数。
- */
-function providerPatLogin(provider) {
-  // hasOwnProperty 而不是直接下标：`PAT_LOGIN_PROVIDERS['__proto__']` 会命中
-  // Object.prototype（**真值**），于是一个叫 `__proto__` 的 provider 会被误判成
-  // PAT 形态。PROVIDERS 里当然不可能出现它，但能力矩阵那边已专门测过 `__proto__`
-  // 这个键，这里保持同一口径的健壮性，省得将来接手的人踩到。
-  return Object.prototype.hasOwnProperty.call(PAT_LOGIN_PROVIDERS, provider)
-    ? PAT_LOGIN_PROVIDERS[provider]
-    : null;
-}
-
-/**
- * PAT 粘贴归一化：**只去尾部换行**，其余字符一律不动。
- *
- * 网页复制或终端 `cat` 出来的 PAT 常带一个（有时两个）尾部换行，而宿主是拿它
- * 当 exchange 的 body 与目录端点的 Bearer 用的 —— 带着 `\n` 会被服务端当成
- * 令牌正文的一部分。故这里只削掉尾部的 `\r` / `\n`。
- *
- * **刻意不做 `trim()`**：那会顺手删掉**开头**的空白，而开头的空白往往是
- * 「粘错了东西」的信号（粘进了别处的缩进、粘了半截 YAML）。把它悄悄修好，用户
- * 只会在「我明明粘对了却报无效」里绕圈，不如原样送去让服务端明确拒绝。
- * 同理**不做 `pt-` 前缀校验**：那是宿主侧 `isQoderPersonalToken` 的职责，
- * 客户端再判一次就是两处口径，改了一处另一处就静默失效。
- *
- * 非字符串（粘贴事件给了 null、或调用方传了数字）一律回空串，由调用方按「空」处理。
- */
-function normalizePatInput(raw) {
-  return typeof raw === 'string' ? raw.replace(/[\r\n]+$/, '') : '';
-}
-
-/**
- * 提交 PAT 建号：发 `account.create`，再按 `login.poll` 的惯例轮询「凭据是否可解析」。
- *
- * **刻意抽成模块级异步函数**（不依赖 ProviderPanel 的 hooks）：这样「载荷形状」
- * 与「不吞错误」这两条契约能被单测**直接驱动**，而不是靠正则扫源码 ——
- * 正则只能证明「源码里提过 rpcCall」，证明不了实际发出去的载荷长什么样。
- *
- * 与浏览器登录的三个差异：
- *   1. **没有 `loginUrl`、不等用户操作**：PAT 是即时请求，宿主收到就已完成
- *      exchange，故轮询窗口是 20 秒（40 x 500ms），而不是浏览器登录那套 5 分钟；
- *      第一次轮询前先等一个间隔，与浏览器登录的 `setInterval` 惯例一致
- *      （也避免在宿主还没写完凭据时白打一发）。
- *   2. **`rpcCall` 抛错时原样抛出**，绝不吞：宿主在步骤 6 落地之前会对 qoder 回
- *      `unknown provider: qoder`，那正是**预期**行为；吞掉它只会让按钮变成
- *      「点了没反应」，用户拿不到任何原因。
- *   3. **不特判任何 code**（尤其不特判 `unknown provider`）：错误分类是宿主的
- *      事，客户端多判一条就多一处将来会分叉的口径。
- *
- * `sleep` 可注入（默认 `setTimeout`），单测用假 sleep 让轮询瞬时完成。
- *
- * @returns 判别联合：
- *   - `{ kind: 'created', accountId }`       轮询结算且无 error（PAT 即时落盘，通常第一次就中）
- *   - `{ kind: 'failed', accountId, error }`  宿主给出**失败终态**（`done` 且带 `error`）
- *   - `{ kind: 'unconfirmed', accountId }`    次数用尽仍未 `done`（凭据可能稍后才落盘）
- *   - `{ kind: 'incomplete' }`                响应缺 `accountId`（无从轮询，且**不轮询**）
- */
-async function createAccountWithPat({ provider, pat, rpcCall, sleep, attempts = 40, intervalMs = 500 }) {
-  const wait = sleep || ((ms) => new Promise(resolve => setTimeout(resolve, ms)));
-  // 载荷形状是本函数的**核心契约**：`pat` 是归一化后的值、`provider` 是面板 id
-  // （'qoder'）。写成别的键名宿主只会回一个 bad-request，而这里看不出来。
-  const res = await rpcCall('account.create', { provider, pat });
-  const accountId = res?.accountId;
-  // 缺 accountId 就连轮询的入参都没有，直接判定，**不浪费时间轮询**。
-  if (!accountId) return { kind: 'incomplete' };
-  for (let i = 0; i < attempts; i++) {
-    await wait(intervalMs);
-    const pollRes = await rpcCall('login.poll', { accountId, provider });
-    if (pollRes?.done !== true) continue;
-    // 失败终态：宿主已结算但带 error，如实回报原因，不重试（PAT 被拒是确定性的，
-    // 重试只会让用户多等 20 秒）。
-    if (pollRes.error) return { kind: 'failed', accountId, error: pollRes.error };
-    return { kind: 'created', accountId };
-  }
-  return { kind: 'unconfirmed', accountId };
-}
-
-/**
- * Qoder 的 PAT 粘贴表单。
- *
- * **内联展开**，不是弹窗、也**不新开浏览器标签**：用户要做的只有「去签发页
- * 复制一串字符、粘回来」，弹窗只会多一层关闭动作。与 `manualLogin`（弹窗被
- * 拦截时的兜底链接）的做法一致：都用原生 `<a>` 由浏览器自己导航，不受脚本
- * 开窗策略影响。
- *
- * ⚠️ **文案不得声称「Qoder 不支持浏览器登录」**（2026-09-21 设备流落地后那
- * 是事实错误）：浏览器登录是**默认形态**，PAT 只是并存的备选。说错会让用户
- * 以为没有那条路 —— 而他就站在一个刚刚提供该选项的面板里。
- *
- * **刻意抽成模块级组件而不是在 ProviderPanel 里内联**：ProviderPanel 用了 hooks，
- * 单元测试加载不了它（react 不在依赖里，见 `tests/unit/jet-hub-credit-balance-row.spec.ts`
- * 的文件头），抽出来才能对这棵树做整树深比较。
- *
- * 输入框用 `type: 'password'`：PAT 是**长期凭据**（官方明确不自动过期），
- * 明文显示会让它出现在肩窥视野与随手截的屏里；用户核对开头是不是 `pt-` 看
- * 掩码后的长度也够用。这不是「怕别人偷看」的过度设计 —— 它比面板里任何别的
- * 字段都值钱。
- */
-function PatLoginForm({ patUrl, value, busy, error, onChange, onSubmit, onCancel }) {
-  return React.createElement('div', { className: 'dim-jh-patForm' },
-    React.createElement('p', null,
-      '请先在官方的 Integrations 页面签发一个 PAT（Personal Access Token），再把它粘贴到这里。'),
-    React.createElement('p', null,
-      React.createElement('a', {
-        href: patUrl,
-        target: '_blank',
-        rel: 'noreferrer noopener',
-      }, '打开 Qoder 的 Integrations 页面签发 PAT')),
-    React.createElement('div', { className: 'dim-jh-patField' },
-      React.createElement('input', {
-        type: 'password',
-        value,
-        placeholder: 'pt-…',
-        spellCheck: false,
-        autoComplete: 'off',
-        disabled: busy,
-        onChange: (e) => onChange(e.target.value),
-      })),
-    // 错误复用既有的提示块样式（.dim-jh-probeNotice + data-tone），不新造一套：
-    // 同一个面板里两处提示长得不一样只会让人以为是两类问题。
-    error
-      ? React.createElement('div', {
-          className: 'dim-jh-probeNotice',
-          'data-tone': 'error',
-          role: 'alert',
-        }, error)
-      : null,
-    React.createElement('div', { className: 'dim-jh-patActions' },
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        'data-kind': 'primary',
-        disabled: busy,
-        onClick: () => onSubmit(),
-      }, busy ? '提交中…' : '确认'),
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        disabled: busy,
-        onClick: () => onCancel(),
-      }, '取消')),
-    React.createElement('p', { className: 'dim-jh-patHint' },
-      'PAT 只保存在本地，用于换取短期 job token；面板不会把它发给任何第三方。'));
-}
-
-/**
- * 登录**形态选择器**：让用户在「浏览器登录」与「粘贴 PAT」之间二选一。
- *
- * ## 为什么需要它（而不是默认走某一条）
- *
- * 设备流落地后 Qoder 有**两种并存**的登录形态，两者都不是「高级选项」：
- * 浏览器登录是官方 CLI / 桌面端的主路径，PAT 是不依赖浏览器的备用路径
- * （无头环境、企业策略禁用弹窗、官方授权页打不开时）。替用户默认选一条，
- * 都会让另一条**无法触达** —— 而用户根本不知道它存在。
- *
- * ## 为什么抽成模块级组件
- *
- * 与 {@link PatLoginForm} 同因：`ProviderPanel` 用了 hooks，单测加载不了它。
- * 抽出来才能对这棵树做整树深比较（含两个按钮的文案与回调）。
- *
- * ## 两个动作都**只转发**，不自己实现
- *
- * `onBrowserLogin` 接到既有的 `createAccount()`（它负责手势内开空窗 + 导航 +
- * 轮询），`onPatLogin` 只是把 PAT 表单展开。这里**不新增** `window.open` 调用点
- * —— 多一处开窗就是多一张被拦截的白页。
- */
-function LoginChoiceForm({ productLabel, onBrowserLogin, onPatLogin, onCancel }) {
-  return React.createElement('div', { className: 'dim-jh-patForm' },
-    React.createElement('p', null,
-      `${productLabel} 支持两种登录方式：`),
-    React.createElement('p', null,
-      '浏览器登录会在新标签页打开官方授权页，登录后自动回到本面板；'
-      + '粘贴 PAT 适合无法打开浏览器或授权页不可用的环境。'),
-    React.createElement('div', { className: 'dim-jh-patActions' },
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        'data-kind': 'primary',
-        onClick: () => onBrowserLogin(),
-      }, '浏览器登录'),
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        onClick: () => onPatLogin(),
-      }, '粘贴 PAT'),
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        onClick: () => onCancel(),
-      }, '取消')));
-}
-
 /**
  * 积分能力判定见 `./credits-capabilities.js`。
  *
@@ -1058,21 +839,6 @@ function ProviderPanel({ provider, rpcCall }) {
    * `<a href>` —— 用户手势由浏览器直接识别，不经过任何 await。
    */
   const [manualLogin, setManualLogin] = React.useState(null);
-  // PAT 粘贴登录（只有 Qoder 走这条）：表单展开状态 / 输入值 / 提交中 / 表单内错误。
-  // 与浏览器登录的 `creating` 分开：两者不会同时发生（`patLogin` 与浏览器登录
-  // 互斥），共用一个状态只会让「谁在忙」变得含糊。
-  const [patOpen, setPatOpen] = React.useState(false);
-  const [patValue, setPatValue] = React.useState('');
-  const [patBusy, setPatBusy] = React.useState(false);
-  const [patError, setPatError] = React.useState(null);
-  /**
-   * 登录**形态选择器**的展开状态（只有「两种形态并存」的 provider 用）。
-   *
-   * 与 `patOpen` 是**两个独立状态**：选择器是「还没决定用哪条路」，PAT 表单是
-   * 「已经决定粘贴 PAT」。合成一个状态会让「点浏览器登录」与「点粘贴 PAT」
-   * 在渲染上无法区分（选择器该收起来，而 PAT 表单该展开）。
-   */
-  const [loginChoiceOpen, setLoginChoiceOpen] = React.useState(false);
   const mounted = React.useRef(true);
   /**
    * 最新账号列表的 ref 镜像。
@@ -1121,37 +887,28 @@ function ProviderPanel({ provider, rpcCall }) {
   /**
    * 本面板的**显示名**（`PROVIDERS` 条目的 `label`，找不到时回退 `provider` id）。
    *
-   * ⚠️ 这是**本函数作用域内**的绑定，不是随手一个 `label` —— 2026-09-21 的
-   * 白屏报障正是因为下面 `LoginChoiceForm` 的 props 写成了 `productLabel: label`，
-   * 而 `label` 在那个位置**没有任何绑定**（该标识符只作为局部变量存在于
-   * `formatClaimFailureLine`，以及 `PROVIDERS` 条目的字段名里）。
+   * ⚠️ 这是**本函数作用域内**的绑定，不是随手一个 `label` —— 2026-09-21 的白屏
+   * 报障正是因为某处把显示名写成了裸 `label`，而那个标识符在该位置**没有任何
+   * 绑定**（它只作为局部变量存在于 `formatClaimFailureLine`，以及 `PROVIDERS`
+   * 条目的字段名里），于是抛的是 `ReferenceError` 而不是拿到 `undefined`。
    *
    * 那个错法的恶劣之处在于**三重闸门全都看不见**：`plugin-src/` 不在
    * `tsconfig.json` 的 include 里（tsc 不查）；`ProviderPanel` 用了 hooks、
    * react 不在依赖里，既有单测只能做源码切片与正则断言（从不真的渲染它）；
    * 而 `build:client` 的冒烟只求值 bundle **顶层**，函数体从未被调用。
-   * 于是它一路活到真机：`loginChoiceOpen` 初始为 false ⇒ 对象字面量不求值 ⇒
-   * 页面正常；用户点「+ 新建账号」⇒ 重渲染时求值 ⇒ `ReferenceError` 从 render
-   * 抛出 ⇒ 整棵 React 树（无错误边界）卸载 ⇒ **Hub 整页空白**。
+   * 于是它一路活到真机：那个对象字面量在条件为假时不求值 ⇒ 页面正常；
+   * 用户点「+ 新建账号」⇒ 重渲染时求值 ⇒ `ReferenceError` 从 render 抛出 ⇒
+   * 整棵 React 树（无错误边界）卸载 ⇒ **Hub 整页空白**。
    *
-   * 故这里刻意**只**用 `providerLabel` 这个名字，并把三处用它的地方统一到
-   * 同一个绑定上（与 `ModelListPanel` 的写法一致）—— 再写一次裸 `label`
-   * 就会是同一个缺陷。`tests/unit/qoder-hub-blank-screen.spec.ts` 真的渲染面板
-   * 并派发点击，钉死这一类自由变量。
+   * 故这里统一用 `providerLabel` 这一个绑定（与 `ModelListPanel` 的写法一致），
+   * 面板标题与领取按钮 title 都由它来 —— 再写一次裸 `label` 就会是同一个缺陷。
+   * `tests/unit/qoder-hub-blank-screen.spec.ts` 真的渲染面板并派发点击，
+   * 钉死这一类自由变量。
    */
   const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
   // 本面板是否自己提供登录入口（null = 提供；见 providerLoginHint 的说明）。
   const loginHint = providerLoginHint(provider);
   const canCreateAccount = loginHint === null;
-  /**
-   * 本面板的登录形态：null = 浏览器登录（默认），否则是 PAT 粘贴的元数据。
-   *
-   * `loginHint` 与 `patLogin` 答的是**两个不同的问题**，不可互相顶替：
-   *   - `loginHint` 非空 = 本面板**没有**登录入口（去隔壁面板）；
-   *   - `patLogin` 非空 = 本面板**有**入口，但形态是粘贴 PAT 而不是开浏览器。
-   * 故 `canCreateAccount` 只管「要不要渲染按钮」，按钮**点了做什么**由本值决定。
-   */
-  const patLogin = providerPatLogin(provider);
 
   /**
    * 拉取本页全部账号的积分余额。
@@ -1363,62 +1120,6 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
-  /**
-   * 提交粘贴进来的 PAT 建号（PAT 形态的唯一入口）。
-   *
-   * 归一化后为空就**不发请求**：空 PAT 打过去只会换回一个 after-the-fact 的
-   * 服务端错误，不如当场给一句可读提示。
-   *
-   * 结果按 `createAccountWithPat` 的判别联合分流，**三档提示位置刻意不同**：
-   *   - `incomplete` → 留在表单内（`patError`）：这是「这次粘贴」的问题，
-   *     用户要做的动作就是改一下再点一次，表单不该关掉。
-   *   - `failed` / `unconfirmed` → 用面板既有的 `probeNotice`：账号确实建了
-   *     （或建了但没确认），表单要关掉、列表要刷新，提示属于「这次操作的结果」，
-   *     与 `createAccount` 失败时用 `setError`+`phase='error'` 是同一类东西，
-   *     只是不再整页替换（那会把刚刷新的账号列表盖掉）。
-   */
-  const submitPat = async () => {
-    const pat = normalizePatInput(patValue);
-    if (pat.length === 0) {
-      setPatError('请先粘贴 PAT。');
-      return;
-    }
-    setPatBusy(true);
-    setPatError(null);
-    try {
-      const outcome = await createAccountWithPat({ provider, pat, rpcCall });
-      if (outcome.kind === 'incomplete') {
-        // 表单**不关**：账号没建成，用户的下一步就是再点一次。
-        if (mounted.current) setPatError('后端返回的账号信息不完整（缺少 accountId）。');
-        return;
-      }
-      if (!mounted.current) return;
-      setPatOpen(false);
-      setPatValue('');
-      if (outcome.kind === 'failed') {
-        setProbeNotice({ tone: 'error', text: '新建账号失败：' + outcome.error, details: [] });
-      } else if (outcome.kind === 'unconfirmed') {
-        // 既不说成功也不说失败：宿主没在窗口内确认凭据可解析，但它可能稍后才落盘。
-        setProbeNotice({
-          tone: 'warn',
-          text: 'PAT 已提交，但未确认凭据写入；请稍后刷新账号列表确认。',
-          details: [],
-        });
-      }
-      await loadAccounts();
-      // 新建的账号此刻还没有任何余额数据，顺带拉一次，免得卡片停在「读取中」。
-      if (canLoadCredits) await loadCredits();
-    } catch (caught) {
-      // **不特判任何 code**（尤其不特判 `unknown provider`）：宿主在 qoder 落地
-      // 之前回的那条错误正是预期，这里如实展示，绝不吞掉。
-      console.error('[jet-hub] create account with pat failed:', caught);
-      if (!mounted.current) return;
-      setPatError('新建账号失败：' + (caught?.message || '未知错误'));
-    } finally {
-      if (mounted.current) setPatBusy(false);
-    }
-  };
-
   const toggleAccount = async (accountId, enabled) => {
     try {
       await rpcCall('account.update', { accountId, patch: { enabled } });
@@ -1522,58 +1223,23 @@ function ProviderPanel({ provider, rpcCall }) {
         // 「+ 新建账号」按 provider 的能力渲染：共用账号的 provider（Trae CN Work）
         // 不渲染按钮，改为下面那行提示文案 —— 见 providerLoginHint。
         //
-        // 按钮**点了做什么**再看登录形态：PAT 形态（Qoder）只是把本面板的
-        // PAT 表单展开，**绝不**调用 createAccount()、**绝不** window.open ——
-        // 走错了就是「点一下弹出一个空白登录窗，而后端收不到 pat 直接拒绝」。
+        // 登录形态**只剩浏览器设备流一种**（PAT 粘贴已于 2026-09-21 按用户要求
+        // 移除）：故这里直接接 `createAccount()`，不再有二选一的选择器，
+        // 也不再需要「点了做什么」的分支。
         canCreateAccount
           ? React.createElement('button', {
               className: 'dim-jh-btn',
               'data-kind': 'primary',
-              title: patLogin
-                ? '浏览器登录 Qoder，或粘贴一个 PAT（Personal Access Token）加入账号池。'
-                : '通过浏览器登录一个新的账号并加入账号池。',
-              onClick: patLogin
-                ? () => { setLoginChoiceOpen(true); setPatError(null); }
-                : () => void createAccount(),
-              disabled: patLogin ? patBusy : creating,
-            }, patLogin
-              ? (patBusy ? '提交中…' : '+ 新建账号')
-              : (creating ? '正在登录…' : '+ 新建账号'))
+              title: '通过浏览器登录一个新的账号并加入账号池。',
+              onClick: () => void createAccount(),
+              disabled: creating,
+            }, creating ? '正在登录…' : '+ 新建账号')
           : null)),
     // 共用账号的 provider（Trae CN Work）在这里说明登录入口在哪。
     // 刻意做成**常驻提示行**而不是「+ 新建账号」按钮的 disabled 形态：
     // 按钮点了没反应只会让用户以为坏了，而这里要传达的是「去别处登录」。
     loginHint
       ? React.createElement('p', { className: 'dim-jh-loginHint' }, loginHint)
-      : null,
-    // 登录**形态选择器**（只有「两种形态并存」的 provider，即 Qoder 两区）：
-    // 与 PAT 表单同位置、同门控理由 —— 点开就在按钮旁边，是一次登录操作的 UI。
-    // ⚠️ 门控是 `loginChoiceOpen && patLogin`（**两个**都要）而不是只看标志位：
-    // 非 PAT 形态的 provider 若标志位为真会误渲染，那时 `patLogin` 是 null，
-    // 节点照样出来而不报错。
-    loginChoiceOpen && patLogin
-      ? React.createElement(LoginChoiceForm, {
-          // ⚠️ 必须是上面那个 `providerLabel` 绑定 —— 这里曾经写成裸 `label`
-          // （未绑定标识符 ⇒ ReferenceError ⇒ 整页白屏），见它的声明处说明。
-          productLabel: providerLabel,
-          onBrowserLogin: () => { setLoginChoiceOpen(false); void createAccount(); },
-          onPatLogin: () => { setLoginChoiceOpen(false); setPatOpen(true); },
-          onCancel: () => { setLoginChoiceOpen(false); setPatError(null); },
-        })
-      : null,
-    // PAT 粘贴表单（只有 Qoder）：渲染在标题区之后的第一个位置，紧邻驱动它的
-    // 「+ 新建账号」按钮，点开就在原地 —— 它是一次登录操作的 UI，
-    // 排在「账号列表 / 提示块」之后会离按钮太远。
-    patOpen && patLogin
-      ? React.createElement(PatLoginForm, {
-          patUrl: patLogin.patUrl,
-          value: patValue,
-          busy: patBusy,
-          error: patError,
-          onChange: setPatValue,
-          onSubmit: () => void submitPat(),
-          onCancel: () => { setPatOpen(false); setPatError(null); },
-        })
       : null,
     probeNotice
       ? React.createElement('div', {
@@ -1619,12 +1285,10 @@ function ProviderPanel({ provider, rpcCall }) {
               // 共用账号的 provider（Trae CN Work）账号为空时的下一步不是
               // 「在本面板新建」，而是「回 Trae CN 面板登录」—— 否则用户点进
               // 这里看到空白，会以为这个 provider 没接通。
-              // PAT 形态（Qoder）仍是**在本面板新建**，只是动作不是「浏览器登录」——
-              // 文案说错会让用户去找一个根本不存在的登录页。
+              // 其余 provider（含 Qoder 两区）都是**在本面板浏览器登录**：
+              // PAT 形态移除后文案只剩这一种，不再按登录形态分支。
               React.createElement('p', null, canCreateAccount
-                ? (patLogin
-                    ? '点击"+ 新建账号"，选择浏览器登录或粘贴 PAT。'
-                    : '点击"+ 新建账号"进行浏览器登录。')
+                ? '点击"+ 新建账号"进行浏览器登录。'
                 : '请先在上方提示的 Trae CN 面板登录账号。'))
           : React.createElement('div', null,
               accounts.map(account => React.createElement(AccountCard, {
