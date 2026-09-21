@@ -9,19 +9,19 @@
 ## 子代理路由（2026-09-19 更新）
 
 - **派发子代理一律不指定 provider / model / reasoning effort**：宿主已装插件自动选择（按 `~/.dsh` 的路由配置与可用性现算），本体手动指定会与该机制竞争并导致路由漂移。提示词里也不要写「用某模型」这类字样。
-- 历史路由记录（`buddy` / `deepseek-v4.1-flash` / `max` 等）已作废，仅当自动选择插件失效、派发报「无可用供应商/模型」时才回退人工核实 `list_subagent_models` 并临时指定。
+- 仅当自动选择插件失效、派发报「无可用供应商/模型」时才回退人工核实 `list_subagent_models` 并临时指定。
 
 ## 项目概述
 
 本项目是 DeepSeek Harness 的插件 `dsh-account-hub`，提供华为云 Codearts 浏览器登录与凭据管理，并附带八个 LLM provider 路由：`buddy-cn`（**Buddy CN**，腾讯 CodeBuddy 中国版）、`buddy`（**Buddy**，腾讯 WorkBuddy **国际版**）、`lobsterai`（**LobsterAI**，有道）、`trae-cn` / `trae-cn-work`（字节跳动 **Trae 国内版**及其 TraeWork 路径）、`qoder` / `qoder-cn`（**Qoder** 国际版与国内版**两个 region**）。
 
-> **命名（2026-09-18 改名后）**：显示名与 provider id 一律按**产品品牌**，不再用历史代号。`buddy-cn` / `buddy` 是新命名；旧命名 `buddy`（中国版）/ `workbuddy`（国际版）已作废，仅在下文的历史叙述、迁移映射与**出站协议值**里出现。迁移见 README「provider 改名与数据迁移」。
+> **命名（2026-09-18 改名后）**：显示名与 provider id 一律按**产品品牌**，旧命名 `buddy`（中国版）/ `workbuddy`（国际版）已作废，仅出现在历史叙述、迁移映射与**出站协议值**里。迁移见 README「provider 改名与数据迁移」。
 
 `buddy-cn` 与 `buddy` 同源：共用同一 CLI 内核与认证协议，差异全部收敛在 `src/product.ts` 的 `BuddyProduct` 配置。关键差异是 **`endpoint`**（中国版 `copilot.tencent.com` / 国际版 `www.workbuddy.ai`，返回不同模型池，**不可当全局常量**）与 `platform`（`ide` / `workbuddy-ai`），国际版登录 URL 还追加 `version` / `loginSessionId`。
 
 `lobsterai` 与两者**完全不同源**（登录方式、请求头、续期载荷、签到流程、版本号来源都不同），实现是独立一套 `src/lobsterai*.ts`。它只**共用架构模式**（产品配置驱动、账号池、限流切换、模型黑名单），**不共用 `BuddyProduct` 类型** —— 其中 `apiDomain` / `productCode` / `attributionName` / `userAgentByModelFamily` / `appendSessionParams` 对 LobsterAI 全部无意义。详见 README「LobsterAI provider」与 `docs/lobsterai-integration-plan.md`。
 
-`trae-cn` 同样完全不同源（独立 `src/trae-cn*.ts`）。**登录**：本地回调 + PKCE(S256)，回调投递 `authCodeInfo`（双重编码 JSON）→ `POST /trae/api/v3/oauth/ExchangeToken`（body 五字段 `{ClientID,AuthCode,CodeVerifier,DeviceInfo,IDEVersion}`）；续期走 `POST /cloudide/api/v3/trae/oauth/ExchangeToken`（四字段），鉴权 `Cloud-IDE-JWT`。⚠️ 登录 URL 的 `client_id` **必须 snake_case**（`clientID` 会让授权页停在「认证中」，曾是报障根因），且必带 `auth_type=local` / `login_channel=native_ide` / `login_version=1` + PKCE 参数。三条结构级事实：SSE 是具名事件流（`event:output`）；业务失败在 HTTP 200 的 `event:error` 帧里（换号循环必须接住流内失败，按业务码而非状态码分类，见 `src/trae-cn-errors.ts`）；签到必须带设备头。⚠️ `/api/ide/*` 在 IDE 网关 `TRAE_CN_IDE_API_BASE`、不在 `api.trae.cn`（真因是 host 非路径），必须带齐 `x-app-id` / `x-ide-version-code` 等全套网关头。⚠️ 「签到不校验设备号形态」观测对、推论错 —— 不校验形态 ≠ 不校验设备（`9074` 真根因）。
+`trae-cn` 同样完全不同源（独立 `src/trae-cn*.ts`）。**登录**：本地回调 + PKCE(S256)，回调投递 `authCodeInfo`（双重编码 JSON）→ `POST /trae/api/v3/oauth/ExchangeToken`（body 五字段 `{ClientID,AuthCode,CodeVerifier,DeviceInfo,IDEVersion}`）；续期走 `POST /cloudide/api/v3/trae/oauth/ExchangeToken`（四字段），鉴权 `Cloud-IDE-JWT`。⚠️ 登录 URL 的 `client_id` **必须 snake_case**（`clientID` 会让授权页停在「认证中」，曾是报障根因），且必带 `auth_type=local` / `login_channel=native_ide` / `login_version=1` + PKCE 参数。三条结构级事实：SSE 是具名事件流（`event:output`）；业务失败在 HTTP 200 的 `event:error` 帧里（换号循环必须接住流内失败，按业务码而非状态码分类，见 `src/trae-cn-errors.ts`）；签到必须带设备头。⚠️ `/api/ide/*` 在 IDE 网关 `TRAE_CN_IDE_API_BASE`、不在 `api.trae.cn`（真因是 host 非路径），必须带齐 `x-app-id` / `x-ide-version-code` 等全套网关头。
 
 ⚠️ **chat 走 SOLO 通道**：`TRAE_CN_CHAT_PATH = '/api/agent/v3/llm_utils_chat'`（host 不变）。旧 `/api/ide/v1/chat` 是 aiserver 通道（只认 5 项旧池，恒回 `3003`、历史零成功），**不要再接回去**。**成败在端点 + body 的 `config_name` / `function`**：`config_name` = `model`，`function` = **模型来源**（`glm-5.3` 只在 `solo_work_remote`，写死 `solo_work_lite` 必 `4001`）；`content` 必须是 `[{type:'text',text}]`、`role:"developer"` 归一为 `system`、assistant 的 `tool_calls[].function` **出站改名 `function_call`**、`tools[].function.parameters` **字符串化**；思考字段名维持 `reasoning_effort_level` 不盲改。分类：`3003` 可重试（退避、不换号），`4023` / `4001` 直报；流内 `event:error` **必须直报业务码**（转成优雅关闭会让 DSH 报「Stream ended without finish_reason」，真因丢失）。
 
@@ -55,7 +55,7 @@
 
 ### Buddy 系（`buddy-cn` / `buddy`）—— 上下文窗口取值口径（2026-09-21 真机定案）
 
-⚠️ **声明值取「最大档」≈1M** = `min(maxInputTokens, supportedLengths 最大档)`，**不是 `defaultLength`**。⚠️ 09-20 曾写「取默认档」并推断「上游按默认档服务」，**已被单变量实测推翻，不要改回去**。钳制二分（`buddy-cn`/`glm-5.3`）：320,307 / 500,507 / 900,910 / 1,000,970 token 全 200，1.2M 才回 400 `{"code":11115,"msg":"prompt is too long: …","extError":{"code":"400001",…}}` ⇒ `defaultLength`(300K) 非硬限、只是纯 UI 默认值，真实窗口 ≈1M（官方客户端的档位选择器**不发任何出站字段**，只驱动它自己的压缩触发点）。
+⚠️ **声明值取「最大档」≈1M** = `min(maxInputTokens, supportedLengths 最大档)`，**不是 `defaultLength`**。⚠️ **不要按 `defaultLength` 取值（09-20 的旧结论已被单变量实测推翻）。** 钳制二分（`buddy-cn`/`glm-5.3`）：320,307 / 500,507 / 900,910 / 1,000,970 token 全 200，1.2M 才回 400 `{"code":11115,"msg":"prompt is too long: …","extError":{"code":"400001",…}}` ⇒ `defaultLength`(300K) 非硬限、只是纯 UI 默认值，真实窗口 ≈1M（官方客户端的档位选择器**不发任何出站字段**，只驱动它自己的压缩触发点）。
 
 ⚠️ **取值链**（`parseModelMeta`）：a = `maxInputTokens`、b = `supportedLengths` 最大正整数 —— ① 都有取 `min(a,b)`（档位表是上游刻意公布的上限，更小时听它的：`minimax-m3` `[300K,512K]` ⇒ **512K**）；② 只有其一取那个；③ 都无才回退 `defaultLength`，再无**不声明**。⚠️ `supportedLengths` **只此一处最小解析**（只取最大正整数，不存整档列表、不做 UI、不出站）。⚠️ **出站请求体一个字段都不动（红线）**：只改 `resolveModel().context.contextWindow`（压缩阈值 `0.8×窗口` + 保留预算 16%），有逐字节比对请求体的用例钉死。
 
@@ -183,7 +183,7 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 `AccountPool`（`src/account-pool.ts`）在 `jet-hub` settings 命名空间下保存账号索引，凭据本体存于 `ctx.credentials`：
 
-- 账号条目以 `provider` 字段区分归属，`getAvailableAccount` / `listAccounts` 均按该字段过滤；**适配器必须以 `this.product.id` 作为 provider 实参查询账号池**（写死 `'buddy-cn'` 会让 Buddy 永远匹配不到账号 —— 旧命名下两者恰好对调，这个坑更隐蔽）
+- 账号条目以 `provider` 字段区分归属，`getAvailableAccount` / `listAccounts` 均按该字段过滤；**适配器必须以 `this.product.id` 作为 provider 实参查询账号池**（写死 `'buddy-cn'` 会让 Buddy 永远匹配不到账号）
 - 限流后按池中「已启用且不在重置时间内」的下一个账号自动重试；全部耗尽才抛 `QUOTA_EXCEEDED`
 - **凭据必须在发请求前按目标模型挑选**：`resolveCredential` / `refresh` 都接受可选 `model` 参数，适配器的 `stream()` 必须把 `options.model` 传下去（`src/index.ts` 的 `makeCredentialResolver` / `makeAccountPicker` 是**各 provider 共用的唯一接线**，新增 provider 一律走它们，不要再写一份）。`getAvailableAccount` 的限流过滤是**逐模型**的，传空串时按设计不过滤 —— 传空串会让每次请求都先白跑一遍已限额/积分耗尽的账号。**仅 `fetchModels` 拉模型目录**（目录对所有模型一致）与「全部账号都在冷却期」的退化路径用空串，两者都刻意保留，不要改成「一并过滤」
 
@@ -211,7 +211,7 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 ## 常见开发任务
 
-新增功能：在 `src/`（客户端 UI 改 `plugin-src/client/`）实现 → 补单元测试 → `pnpm build:all`（host + client 两侧）→ `pnpm test` → 更新文档。调试用 `pnpm typecheck` 快速验证类型；构建报错先查 `lib/` 是否存在与 `tsconfig.json` 的 include/exclude。单元测试覆盖核心逻辑（签名、续期、参数构造、账号池），不依赖网络；测试文件放 `tests/unit/` 与 `tests/e2e/`。
+新增功能：在 `src/`（客户端 UI 改 `plugin-src/client/`）实现 → 补单元测试 → `pnpm build:all`（host + client 两侧）→ `pnpm test` → 更新文档。调试用 `pnpm typecheck` 快速验证类型；构建报错先查 `lib/` 是否存在与 `tsconfig.json` 的 include/exclude。单元测试覆盖核心逻辑（签名、续期、参数构造、账号池），不依赖网络。
 
 ## LLM Provider 约定
 
@@ -239,8 +239,8 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 - **Buddy CN** —— `src/credits.ts`（Buddy 国际版后端无签到接口）：状态 `POST /v2/billing/meter/checkin-activity-status`（**不是** `checkin-status`，后者返回全空占位）→ 领取 `POST /v2/billing/meter/daily-checkin`。幂等：重复领取回 HTTP 400 + `code:10001`，判定**以响应体 code 为准**。**不需要** `X-Device-Token`（图灵盾）—— 实测服务端未强制校验。
 - **LobsterAI** —— `src/lobsterai-credits.ts`（三步）：槽位 `GET /api/client-activities/slot` → 上下文 `GET /api/client-activities/{code}/context` → 领取 `POST /api/client-activities/{code}/actions/check_in`。幂等是**客户端**保证的：`idempotencyKey`（UUID4）+ 先读 `claimedToday` / `actions`。`clientVersion` 是**必填** query 参数，动态拉取（缓存 12h），失败回退 `product.fallbackClientVersion`；`platform=win32` 等是客户端形态伪装，非 Windows 也照发。
-- **Trae CN** —— `src/trae-cn-credits.ts`（两步 + 设备头）：状态 `POST /trae/api/v2/ug/checkin_credits/status` → 未领则 `…/claim`，body 均为 `{"req_source":1}`。**幂等判据用 `checked_in`（账号级当日）**；`did_checked_in` 是**设备级**语义（换设备仍 false），**不要用**。**claim 必须带设备头**：`x-device-id`（**取自凭据的 `checkin_device_id`**，即登录时生成并上报的 16 位号）+ `x-device-type: windows` + `x-os-version` + `x-app-version: 3.3.102`，缺了回 `code:9004`。⚠️ `x-os-version` 是运行时取值（真机发 `os.version()` 返回值，本机是 `Windows 10 Home` 这种市场营销名），用 `node:os` 的 `os.version()`（`traeCnOsVersion()`）—— **这不是 `9074` 的解药**。
-  - ⚠️ **`9074` = 设备身份**（前两次定性「瞬时频次软限流」「活动名额 / 账号风控」**均已作废**）：服务端按 `x-device-id` 记设备维度签到状态，`BoundDeviceID` **不被活动系统认可**。决定性单变量证据（status 端点 A/B）：全套头不变、仅把 `x-device-id` 换成官方 16 位号 → `did_checked_in` 由 `false` 翻转为 `true`。**修复**：登录时那个 16 位号落盘进凭据字段 `checkin_device_id`；**旧凭据**该号随机生成、服务端不回传、**无法恢复**，需**重新登录**（降级发 `BoundDeviceID`，**不伪造**）。
+- **Trae CN** —— `src/trae-cn-credits.ts`（两步 + 设备头）：状态 `POST /trae/api/v2/ug/checkin_credits/status` → 未领则 `…/claim`，body 均为 `{"req_source":1}`。**幂等判据用 `checked_in`（账号级当日）**；`did_checked_in` 是**设备级**语义（换设备仍 false），**不要用**。**claim 必须带设备头**：`x-device-id`（**取自凭据的 `checkin_device_id`**，即登录时生成并上报的 16 位号）+ `x-device-type: windows` + `x-os-version` + `x-app-version: 3.3.102`，缺了回 `code:9004`。⚠️ `x-os-version` 是运行时取值（运行时取 `os.version()`），用 `node:os` 的 `os.version()`（`traeCnOsVersion()`）—— **这不是 `9074` 的解药**。
+  - ⚠️ **`9074` = 设备身份**（旧定性已作废）：服务端按 `x-device-id` 记设备维度签到状态，`BoundDeviceID` **不被活动系统认可**。决定性单变量证据（status 端点 A/B）：全套头不变、仅把 `x-device-id` 换成官方 16 位号 → `did_checked_in` 由 `false` 翻转为 `true`。**修复**：登录时那个 16 位号落盘进凭据字段 `checkin_device_id`；**旧凭据**该号随机生成、服务端不回传、**无法恢复**，需**重新登录**（降级发 `BoundDeviceID`，**不伪造**）。
   - **claim 段有界重试**：`TRAE_CN_CLAIM_RETRY_CODES = [9074, 4007, 3004]`（**同时**要求命中共享的 `TRAE_CN_BACKOFF_CODES`），按 `[1000, 3000]` 退避 2 次，耗尽后按**最后一次**的 code/message/logid 返回。**status（读）段一次都不重试**；`9004` / `1001` **绝不重试**；`3003` 属 chat 通道码，**刻意不在**签到清单内；`9074` **不记冷却徽章**（等多久都不会自愈）。
   - **「设备号」是两个位置，不要混**：**登录 URL 的 `device_id`**（`generateTraeCnDeviceId`）**必须 16 位纯十进制**、**且它就是设备身份**（落盘为 `checkin_device_id`）；**凭据的 `device_id`** 是 exchange 返回的 `BoundDeviceID`（**活动系统不认**）。
   - **签到侧与 chat 侧头集已分开**（防「顺手统一」）：`traeCnCreditsHeaders` 自建 6 个头，删掉了官方不发的 `Accept` / `Origin` / `Referer` / `X-Ide-Token` / `X-Cloudide-Token`；`x-device-brand` **刻意不发**（不猜硬件型号）。`traeCnAccessHeaders` 仍带 `Accept` 与两个等值 token 头，**chat 继续用它、一行未动**。
@@ -266,10 +266,10 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 **`dailyCheckin` 为 true 的只有三个**：`buddy-cn`（中国版后端）、`lobsterai`（`client-activities` 三步）、`trae-cn`（`checkin_credits` 两步 + 设备头）。**`balance` 为 true 的是除 `codearts` 外的七个**，含 `buddy`（国际版无签到接口）、`trae-cn-work`（同一批账号同一实现，只显示 Work 池；签到刻意留在 Trae CN 面板以免重复领取）、`qoder`（三池之和 `userQuota` / `addOnQuota` / `orgResourcePackage`，后两池容缺）、`qoder-cn`（同一实现、CN 端点，实测两池）。⚠️ **Qoder 两区 `dailyCheckin` 都是 `false` 但理由不同、不可合并叙述**：`qoder` 是**活动不存在**（每日 100 Credits 只能在桌面 App 手动领 —— 与 `buddy` 的「后端压根没有该接口」不是一回事），`qoder-cn` 是**端点未知**（待办，拿到端点后翻 `true`）；`credits-capabilities.spec.ts` 断言钉死取值。
 
-⚠️ **改名的语义翻转点**：矩阵里 `buddy` 这个键**换了主人** —— 旧 `buddy`（中国版 ✓✓）让位给 `buddy-cn`，旧 `workbuddy`（国际版 ✓✗）改名成 `buddy`；迁移由 `src/provider-rename-migration.ts` 搬运。改动矩阵后必须同步 `PROVIDERS`（断言锁死两者条目集合相等），⚠️ **匹配器必须写 `[a-z-]+` 而非 `[a-z]+`** —— 后者让带连字符的 id（`trae-cn`）在 `PROVIDERS` 里隐形，漏登记时断言反而是绿的。**历史缺陷**（用户报障）：客户端曾在面板挂载时对所有 provider 无条件调 `credits.balances`，CodeArts 面板每次打开都报 `unsupported provider: codearts` —— 后端 `productById()` 的拒绝是正确契约，不该当成运行时故障。
+⚠️ **改名的语义翻转点**：矩阵里 `buddy` 这个键**换了主人**（新主人是国际版）；迁移由 `src/provider-rename-migration.ts` 搬运。改动矩阵后必须同步 `PROVIDERS`（断言锁死两者条目集合相等），⚠️ **匹配器必须写 `[a-z-]+` 而非 `[a-z]+`** —— 后者让带连字符的 id（`trae-cn`）在 `PROVIDERS` 里隐形，漏登记时断言反而是绿的。CodeArts 面板报 `unsupported provider: codearts` 是后端 `productById()` 的正确契约，不是运行时故障。
 
 ## X-Domain 必须跟随产品，而非凭据
 
-`checkinHeaders`（`src/credits.ts`）用 `product.apiDomain` 构造 `X-Domain`，**不优先用 `credential.domain`**。凭据里的 domain 是登录时的快照，跨产品迁移后会留下旧值（早期国际版那条路由名叫 `workbuddy` 时曾指向中国版），跟着它走会让请求的 baseURL 与身份标识自相矛盾。
+`checkinHeaders`（`src/credits.ts`）用 `product.apiDomain` 构造 `X-Domain`，**不优先用 `credential.domain`**。凭据里的 domain 是登录时的快照，跨产品迁移后会留下旧值，跟着它走会让请求的 baseURL 与身份标识自相矛盾。
 
 LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束是「`apiBase` 与 `portalBase` 都是编译期常量，不从凭据推断」。
