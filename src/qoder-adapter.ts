@@ -62,14 +62,16 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool } from './account-pool.js'
 import { availableContextTiers, effectiveContextWindow, type ContextTier } from './context-tiers.js'
-import { QODER, QODER_CHAT_PATH, qoderClientType, qoderJobTokenHeaders } from './qoder-product.js'
+import { QODER, QODER_CHAT_PATH, qoderClientType, qoderJobTokenHeaders, resolveQoderChatBase } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { QODER_SIGNED_CHAT_PATH } from './qoder-wasm-context.js'
-import type { QoderSigningSource } from './qoder-signing.js'
+import type { QoderSigningSource, QoderDirectorySigningSource } from './qoder-signing.js'
 import { isQoderWasmUnavailableError } from './qoder-wasm.js'
 import {
+  QODER_DIRECTORY_NEGATIVE_TTL_MS,
   QODER_OFF_CATALOG_HINT,
   QoderCatalogStore,
+  QoderDirectoryNegativeCache,
   effectiveQoderCatalog,
   fallbackQoderCatalog,
   fetchQoderDirectory,
@@ -154,40 +156,12 @@ const QODER_MODEL_SOURCE_DEFAULT = 'system'
  * 会让「只换 chat 出口」的用法直接失效（且失败形态是「凭据失效」，难诊断）。
  *
  * ⚠️ **两个 region 都生效**（不按 product 分）：它是环境级逃生阀，不是产品配置。
+ *
+ * 设备流目录链接线后，本函数**本体搬到了 `qoder-product.ts`**（目录 host 与
+ * chat host 共用同一个逃生阀语义，而 `qoder-models.ts` 不能反向 import 适配器）；
+ * 这里 re-export 保持既有 import 路径（`qoder-cn.spec.ts` 等从本模块取它）。
  */
-const QODER_MODEL_SERVER_HOST_ENV = 'QODER_MODEL_SERVER_HOST'
-
-/**
- * 应用 {@link QODER_MODEL_SERVER_HOST_ENV} 覆盖（仅 host 部分）。
- *
- * **请求时读取**（不是构造时缓存）：逃生阀的语义就是「运行时可切」——
- * 进程启动后再设环境变量也应生效，故不能像模块常量那样在 import 时定型。
- *
- * 取值按官方语义只认「主机」：`host` 或 `host:port`。额外容忍两种书写——
- * - 带 scheme（`http://host`）：**显式 scheme 优先**。这是有意的超集：裸主机名
- *   在官方语义里没有 scheme 可继承，只能沿用原基址的 `https`；而写全
- *   `http://localhost:8080` 的人几乎一定是在指向本地代理，把它悄悄升级成
- *   https 会得到一个 TLS 失败，排查方向完全跑偏。
- * - 带路径 / 查询串：**一律丢弃**。路径恒为 {@link QODER_CHAT_PATH}，
- *   否则「覆盖主机」会顺带改掉端点路径，与变量名和官方语义都不符。
- *
- * 空串 / 全空白视为**未设置**（与其它 provider 读环境变量的口径一致：
- * 空值不是有效覆盖）。
- *
- * @param chatBase - `product.chatBase`（如 `https://api2-v2.qoder.sh`）。
- */
-export function resolveQoderChatBase(chatBase: string): string {
-  const raw = process.env[QODER_MODEL_SERVER_HOST_ENV]
-  if (typeof raw !== 'string' || raw.trim().length === 0) return chatBase
-  const declaredScheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(raw.trim())?.[1]
-  const withoutScheme = raw.trim().replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '')
-  const authority = withoutScheme.split(/[/?#]/, 1)[0] ?? ''
-  if (authority.length === 0) return chatBase
-  // scheme：显式给出的优先，否则沿用原基址（逃生阀只换主机，不该顺带把 https
-  // 降级成 http）。
-  const scheme = declaredScheme ?? /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(chatBase)?.[1] ?? 'https'
-  return `${scheme}://${authority}`
-}
+export { resolveQoderChatBase } from './qoder-product.js'
 
 /** 安全读取 `Error.message`。 */
 function errorMessage(error: unknown): string {
@@ -1157,6 +1131,21 @@ export interface QoderAdapterOptions {
    * CN 的机器码签国际版的请求（上游回 `101 Signature invalid`）。
    */
   signing?: QoderSigningSource
+  /**
+   * **目录签名来源**（设备流目录链专用，两区都可注入；与 chat 的
+   * {@link QoderSigningSource} 并列、互不顶替）。
+   *
+   * 注入后，设备流令牌（`dt-`）的目录请求改走 wasm 签名链
+   * （`GET {inferenceHost}/algo/api/v2/model/list?Encode=1`，stage-a 结论 B）
+   * —— `dt-` 打 PAT 目录端点恒 401（总根因），这条链是设备流账号拿到动态
+   * 目录的**唯一**通路。PAT 令牌（`pt-`）的目录路径**不经过这里**（一行不动）。
+   *
+   * ⚠️ **与 chat 的 `signing` 分开注入**：国际版 chat 走 REST（一行不动），
+   * 但国际版目录链需要签名 —— 故国际版接线是「`signing` 不传、
+   * `directorySigning` 传」。wasm 失败时目录侧静默回退静态表（经 onDebug 报
+   * debug 级原因），**不像 CN chat 那样直报**：目录是尽力而为的数据。
+   */
+  directorySigning?: QoderDirectorySigningSource
 }
 
 /** Qoder LLM 适配器。使用 `Bearer jt-…` 鉴权，仅支持流式（SSE）。 */
@@ -1165,6 +1154,8 @@ export class QoderAdapter extends LlmAdapter {
   private readonly fetchImpl: typeof fetch
   /** 模型目录缓存（12h TTL，成功才写；见 {@link ensureCatalog}）。 */
   private readonly catalog = new QoderCatalogStore()
+  /** 目录失败负缓存（5 分钟，仅生产路径生效；见 {@link ensureCatalog}）。 */
+  private readonly negativeCache = new QoderDirectoryNegativeCache(QODER_DIRECTORY_NEGATIVE_TTL_MS)
 
   constructor(private readonly options: QoderAdapterOptions) {
     super()
@@ -1338,7 +1329,7 @@ export class QoderAdapter extends LlmAdapter {
   }
 
   /**
-   * 确保目录就绪（带 12h TTL）。
+   * 确保目录就绪（带 12h TTL + 失败负缓存）。
    *
    * `listModels` / `resolveModel` / `stream` 三处都会调用：`resolveModel` 可能先于
    * `listModels` 被调用（直接从历史会话进入），`stream` 需要它来判定目标模型是否
@@ -1349,6 +1340,11 @@ export class QoderAdapter extends LlmAdapter {
    * - **成功**：写缓存 + 记时刻，{@link QODER_MODELS_TTL_MS} 内不再拉取；
    * - **失败/空**：**不写缓存**（`store` 对空数组是 no-op），也**不清**已有缓存
    *   —— 一次网络抖动不该把目录从「上次成功的完整目录」打回 3 项静态表；
+   *   同时记**负缓存**（{@link QODER_DIRECTORY_NEGATIVE_TTL_MS}，E1）：
+   *   设备流目录链失败后 5 分钟内不再重试，消除每次 `model.list` 都白打一个
+   *   必失败请求的浪费。⚠️ 负缓存**只在生产路径**（未注入 `fetchRemoteModels`）
+   *   生效 —— 注入面语义是「调用方接管目录拉取」，重试节奏归注入方，两者
+   *   不抢方向盘（既有「失败后重试」用例即钉这一语义）。
    * - **无凭据**：直接跳过（回退静态表），不发一次必然 401 的请求。
    *
    * 并发调用会各自触发一次拉取（没有 in-flight 去重）：目录是幂等 GET，重复一次的
@@ -1356,23 +1352,70 @@ export class QoderAdapter extends LlmAdapter {
    */
   private async ensureCatalog(): Promise<void> {
     if (this.catalog.fresh() !== undefined) return
+    const productionPath = this.options.fetchRemoteModels === undefined
+    if (productionPath && this.negativeCache.blocked) return
     try {
       // 目录端点用 **PAT** 直连（不传 model：目录对所有模型一致，故不做逐模型
-      // 限流过滤，见 AGENTS.md 的账号池约定）。
+      // 限流过滤，见 AGENTS.md 的账号池约定）。设备流令牌（dt-）在
+      // `fetchQoderDirectory` 内部按令牌族分派到 wasm 签名目录链。
       const credential = await this.options.resolveCredential()
       if (credential === undefined || credential.access_token.length === 0) return
       const entries = this.options.fetchRemoteModels === undefined
-        ? await fetchQoderDirectory(credential, { fetchImpl: this.fetchImpl, product: this.product })
+        ? await fetchQoderDirectory(credential, {
+            fetchImpl: this.fetchImpl,
+            product: this.product,
+            ...this.options.directorySigning === undefined
+              ? {}
+              : { deviceSigning: this.options.directorySigning },
+            ...this.options.onDebug === undefined ? {} : { onDebug: this.options.onDebug },
+          })
         : await this.options.fetchRemoteModels(credential)
+      if (productionPath) {
+        if (entries.length > 0) this.negativeCache.clear()
+        else this.negativeCache.mark()
+      }
       this.catalog.store(entries)
     } catch {
-      // 远端不可用：回退静态目录（由 catalogEntries 提供）。
+      // 远端不可用：回退静态目录（由 catalogEntries 提供）。负缓存同样生效
+      // （一次抛错也是一次白打，下一轮按同一条 TTL 压住）。
+      if (productionPath) this.negativeCache.mark()
     }
   }
 
   /** 当前生效的目录（动态优先，失败/空回退本产品的静态表）。 */
   private catalogEntries(): readonly QoderModelEntry[] {
     return effectiveQoderCatalog(this.catalog.entries(), this.product)
+  }
+
+  /**
+   * 按 id 查**当前生效目录**里的展示名（两级：生效目录 → 静态表）。
+   *
+   * {@link ContextTierSource} 的可选能力（B1）：Account Hub「显示列表」的黑名单
+   * 并集回填行用它替换写死的 `name = id`（症状一）—— 用户关掉的模型若是目录
+   * 里的正常模型（或静态表成员），回填行应带**人话名字**，而不是一串短 key。
+   *
+   * ## 刻意是**同步**方法、且**刻意不触发目录拉取**
+   *
+   * `model.list` RPC 在调用它之前必然已经跑过 `llm.listModels` →
+   * `ensureCatalog`，目录状态已经是「这一刻的最新值」；再拉一次只会拖慢响应
+   * 并引入第二份时序。冷缓存时读到的就是回退值（静态表名或 undefined）——
+   * 与 resolveModel 的两级查找同构，宁缺毋编。
+   */
+  displayName(modelId: string): string | undefined {
+    const entry = this.catalogEntries().find((candidate) => candidate.id === modelId)
+      ?? fallbackQoderCatalog(this.product).find((candidate) => candidate.id === modelId)
+    return entry?.name
+  }
+
+  /**
+   * 当前目录来源（B3）：**远端成功过一次 = remote，否则 fallback**。
+   *
+   * 判据是 {@link QoderCatalogStore.entries}（最近一次成功写入）而非
+   * `fresh()`：TTL 过期但曾成功的目录对用户来说仍是「远端目录」（抖动期间
+   * `entries()` 仍在播报它），报 fallback 会让客户端显示一条与现状矛盾的提示。
+   */
+  catalogSource(): 'remote' | 'fallback' {
+    return this.catalog.entries() !== undefined ? 'remote' : 'fallback'
   }
 
   /**

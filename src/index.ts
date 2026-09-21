@@ -23,7 +23,7 @@ import { TRAE_CN } from './trae-cn-product.js'
 import { TRAE_CN_WORK } from './trae-cn-work-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { checkQoderQuotaExhausted } from './qoder-credits.js'
-import { QoderSigningProvider } from './qoder-signing.js'
+import { QoderSigningProvider, qoderDirectorySigningSource } from './qoder-signing.js'
 import { extractQoderWasm } from './qoder-wasm.js'
 import { instantiateQoderWasm } from './qoder-wasm-glue.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
@@ -556,6 +556,20 @@ export function apply(ctx: Context): void {
   // （`contextWindow` / `contextTiers`），而那是**目录持有者**独有的数据 ——
   // `ctx.llm.listModels()` 会把适配器返回的额外字段丢掉，ctx 上也没有「按 provider
   // 取适配器」的入口（见 `src/context-tiers.ts` 的 `ContextTierSource`）。
+  // **目录签名来源**（设备流目录链）：wasm 懒加载形态与 chat 签名一致 ——
+  // 提取要扫 35 MB 的 worker 文本或下载 30 MB 的 tarball，放在插件启动期会拖慢
+  // 启动。⚠️ **只在目录路径使用**：国际版 chat 走 REST（一行不动），
+  // `QoderAdapterOptions.signing` **刻意不传**；`directorySigning` 只被
+  // `ensureCatalog → fetchQoderDirectory` 的 `dt-` 分派消费。
+  // wasm 失败时目录侧静默回退静态表（经 onDebug 报 debug 级原因），不炸面板。
+  const qoderSigning = new QoderSigningProvider({
+    product: QODER,
+    loadGlue: async () => {
+      const artifact = await extractQoderWasm({ product: QODER })
+      ctx.logger?.debug?.(`[qoder] wasm 来源 ${artifact.source}：${artifact.detail}`)
+      return instantiateQoderWasm(artifact.bytes)
+    },
+  })
   const qoderAdapter = registerQoderLlm(ctx, {
     credentialRef: credentialRef(QODER.defaultCredentialRef),
     // 只从 Qoder 自己的账号池取账号，回退到自己的单凭据 ref，
@@ -600,6 +614,9 @@ export function apply(ctx: Context): void {
     },
     accountPool: pool,
     product: QODER,
+    // 设备流目录链（dt- → wasm 签名目录）：本 region 专用实例。⚠️ chat 的
+    // `signing` 位**刻意留空**（国际版 chat 是 REST，一行不动）。
+    directorySigning: qoderDirectorySigningSource(qoderSigning),
     // 每次发送报出请求体字节数（**debug 级**）：Qoder 国际版有一条 256 KiB 的
     // 字节墙，闸门在 240 KiB（见 `src/qoder-errors.ts` 的
     // `QODER_MAX_REQUEST_BYTES`）。报字节数是让「贴着墙」这件事在**用户报障
@@ -703,6 +720,10 @@ export function apply(ctx: Context): void {
     product: QODER_CN,
     // 签名来源（本 region 专用实例，见上方的构造点）。
     signing: qoderCnSigning,
+    // 设备流目录链：CN 的目录 host 与 chat 签名是**同一个** gateway（
+    // `resolveQoderDirectoryEndpoint` 复用 `product.chatBase`）。共用同一个
+    // provider 实例（uid 缓存/签名器复用判据都在实例内按凭据分键）。
+    directorySigning: qoderDirectorySigningSource(qoderCnSigning),
     // 与上面 QODER 段**同源同口径**（同一个回调、同一级 debug）：两个 region 共用
     // 同一份发送代码，观测也必须共用同一处语义 —— 只给国际版接会让 CN 的
     // bodyBytes 静默消失。

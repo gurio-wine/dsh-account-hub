@@ -171,6 +171,26 @@ export function effectiveContextWindow(
 export interface ContextTierSource {
   /** 当前生效目录的逐模型档位（模型 id → 档位）。 */
   contextTiers(): Promise<ReadonlyMap<string, ContextTier>>
+  /**
+   * 按模型 id 查**当前生效目录**里的展示名（可选能力）。
+   *
+   * 为 Account Hub「显示列表」的黑名单并集回填行服务：被适配器过滤掉的模型
+   * `ctx.llm.listModels` 拿不到原始展示名，此前回填行写死 `name = id`（症状一）。
+   * 有这个能力时回填行带**人话名字**；查不到（目录没拉到 / 未知 id）返回
+   * `undefined`，RPC 层回退为 id —— 与既有行为一致，宁缺毋编。
+   *
+   * ⚠️ **同步、纯内存查询**：调用它的 RPC 必然已先跑过一次目录拉取
+   * （`llm.listModels`），实现方不得在此再次触发网络。
+   */
+  displayName?(modelId: string): string | undefined
+  /**
+   * 当前目录来源（可选能力）：`remote` = 远端目录成功过（含 TTL 内的历史成功），
+   * `fallback` = 当前播报的是静态兜底表。
+   *
+   * 只有「远端目录可能整体不可达」的 provider 需要实现（现为 Qoder 两区）；
+   * 未实现时 RPC 响应不带 `catalogSource`，客户端不渲染来源提示行。
+   */
+  catalogSource?(): 'remote' | 'fallback'
 }
 
 /**

@@ -160,6 +160,90 @@ export const QODER_CN_MODELS_BASE = 'https://api.qoder.com.cn'
  */
 export const QODER_CN_USER_AGENT = 'qoder/1.1.58'
 
+/**
+ * **国际版** inference host（目录链与 chat 签名同一条防线的官方默认主机）。
+ *
+ * 取自官方 worker runtime 的选区常量 `wR`（stage-a 取证 E7/E8：
+ * `_o ? "gateway.qoder.com.cn" : "api2.qoder.sh"`，且 inference 端点默认
+ * `pZt = https://${wR}`）。官方按 region 选举（us → api1 / sg → api2 /
+ * jp → api3），第一版用**默认 api2**（sg），真机验证若 403/404 再查 region 判定。
+ *
+ * ⚠️ **不是** chat 的 `QODER_CHAT_BASE`（`api2-v2.qoder.sh`）—— 两个 host
+ * 长得像但不同（`-v2` 段），不要按「同形替换」去猜。CN 的 inference host 与
+ * CN chat 签名是**同一个** `gateway.qoder.com.cn`（复用 {@link QoderProduct.chatBase}，
+ * 见 {@link resolveQoderDirectoryEndpoint}），故本常量只有国际版用。
+ */
+export const QODER_INFER_HOST = 'https://api2.qoder.sh'
+
+/**
+ * 官方逃生阀环境变量：覆盖 **chat / 目录签名主机**的 host 部分。
+ *
+ * 语义照官方 CN CLI（本插件不发明新开关）：官方支持用该环境变量把 chat 请求
+ * 指向别的主机（自建网关 / 代理 / 灰度环境）。
+ *
+ * ⚠️ **只影响 chat 与 wasm 目录链**：`openapiBase`（exchange / quota）与
+ * `modelsBase`（PAT 目录）**不受影响** —— 官方语义就是替换模型服务主机，把
+ * 另外两条控制面也一并改掉会让「只换 chat 出口」的用法直接失效（且失败形态
+ * 是「凭据失效」，难诊断）。
+ *
+ * ⚠️ **两个 region 都生效**（不按 product 分）：它是环境级逃生阀，不是产品配置。
+ */
+const QODER_MODEL_SERVER_HOST_ENV = 'QODER_MODEL_SERVER_HOST'
+
+/**
+ * 应用 {@link QODER_MODEL_SERVER_HOST_ENV} 覆盖（仅 host 部分）。
+ *
+ * **请求时读取**（不是构造时缓存）：逃生阀的语义就是「运行时可切」——
+ * 进程启动后再设环境变量也应生效，故不能像模块常量那样在 import 时定型。
+ *
+ * 取值按官方语义只认「主机」：`host` 或 `host:port`。额外容忍两种书写——
+ * - 带 scheme（`http://host`）：**显式 scheme 优先**。这是有意的超集：裸主机名
+ *   在官方语义里没有 scheme 可继承，只能沿用原基址的 `https`；而写全
+ *   `http://localhost:8080` 的人几乎一定是在指向本地代理，把它悄悄升级成
+ *   https 会得到一个 TLS 失败，排查方向完全跑偏。
+ * - 带路径 / 查询串：**一律丢弃**。路径由各调用方决定（chat 是
+ *   `QODER_CHAT_PATH`，目录链的路径在 wasm 里），否则「覆盖主机」会顺带改掉
+ *   端点路径，与变量名和官方语义都不符。
+ *
+ * 空串 / 全空白视为**未设置**（与其它 provider 读环境变量的口径一致：
+ * 空值不是有效覆盖）。
+ *
+ * 本函数原在 `qoder-adapter.ts`（chat 专用），设备流目录链接线后**搬进
+ * product 层**：目录 host（`resolveQoderDirectoryEndpoint`）与 chat host 共用
+ * 同一个逃生阀语义，而 `qoder-models.ts` 不能 import 适配器（反向依赖）。
+ * `qoder-adapter.ts` 原地 re-export，既有 import 路径不变。
+ *
+ * @param chatBase - 默认基址（如 `product.chatBase` 或 {@link QODER_INFER_HOST}）。
+ */
+export function resolveQoderChatBase(chatBase: string): string {
+  const raw = process.env[QODER_MODEL_SERVER_HOST_ENV]
+  if (typeof raw !== 'string' || raw.trim().length === 0) return chatBase
+  const declaredScheme = /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(raw.trim())?.[1]
+  const withoutScheme = raw.trim().replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '')
+  const authority = withoutScheme.split(/[/?#]/, 1)[0] ?? ''
+  if (authority.length === 0) return chatBase
+  // scheme：显式给出的优先，否则沿用原基址（逃生阀只换主机，不该顺带把 https
+  // 降级成 http）。
+  const scheme = declaredScheme ?? /^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//.exec(chatBase)?.[1] ?? 'https'
+  return `${scheme}://${authority}`
+}
+
+/**
+ * 目录链的 inference host 基址（`prepareRequest` 的 endpoint 参数）。
+ *
+ * | region | 取值 | 依据 |
+ * |---|---|---|
+ * | `qoder-cn` | `product.chatBase`（gateway.qoder.com.cn） | CN 目录与 CN chat 签名是**同一个 host**（stage-a §1.2），复用既有基址不新抄字面量 |
+ * | `qoder` | {@link QODER_INFER_HOST}（api2.qoder.sh） | 官方 inference 端点默认值（stage-a E8） |
+ *
+ * 两者都过 {@link resolveQoderChatBase}（逃生阀 `QODER_MODEL_SERVER_HOST`
+ * 照 chat 侧既有约定沿用：只换 host、请求时读取、路径丢弃）。
+ */
+export function resolveQoderDirectoryEndpoint(product: QoderProduct): string {
+  const base = product.id === 'qoder-cn' ? product.chatBase : QODER_INFER_HOST
+  return resolveQoderChatBase(base)
+}
+
 // ── PAT ──
 
 /** PAT 前缀（官方文档：`QODER_PAT="pt-your-token-here"`）。 */

@@ -699,6 +699,9 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   // 单次开关操作的失败提示。与 `error` 分开：列表本身的读取失败要用整页
   // 错误态替换，而单次切换失败只需顶部提示、列表必须保留。
   const [toggleError, setToggleError] = React.useState(null);
+  // 目录来源（C3）：'fallback' 时顶部渲染一行「兜底清单」提示 —— 用户需要知道
+  // 这份列表是静态兜底（远端目录不可达），而不是该 Provider 的全部模型。
+  const [catalogSource, setCatalogSource] = React.useState(null);
   // 正在提交的模型 id 集合：只禁用被点的那一行，避免整表锁死。
   const [busyIds, setBusyIds] = React.useState(() => new Set());
   // 正在提交档位的模型 id 集合。与 `busyIds` 分开：两者是同两行上的**两件独立的事**
@@ -713,6 +716,9 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
       const res = await rpcCall('model.list', { provider });
       if (!mounted.current) return;
       setModels(res.models || []);
+      // 目录来源（C3）：Host 只对实现了该能力的适配器（Qoder 两区）带出该字段，
+      // 缺省（undefined）时保持 null —— 不给其余 provider 渲染无意义的提示行。
+      setCatalogSource(res?.catalogSource || null);
       setPhase('ready');
     } catch (caught) {
       if (!mounted.current) return;
@@ -836,6 +842,12 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
           }, '完成'))),
       React.createElement('p', { className: 'dim-jh-modalHint' },
         '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
+      // 目录来源提示（C3）：仅当 Host 明确播报 fallback 时显示 —— 措辞与
+      // 「当前为兜底清单」风格一致，说清「为什么列表这么短」与「它是可用的」。
+      catalogSource === 'fallback'
+        ? React.createElement('p', { className: 'dim-jh-modalHint' },
+          '当前为兜底清单（远端目录不可达），仅含少量实测可用模型；远端恢复后将自动回到完整目录。')
+        : null,
       tierHint
         ? React.createElement('p', { className: 'dim-jh-modalHint' }, tierHint)
         : null,

@@ -130,6 +130,22 @@ export interface QoderInferRequest {
   free: () => void
 }
 
+/**
+ * `prepareRequest`（**目录 GET**）的产物。
+ *
+ * 与 {@link QoderInferRequest} 的差别只有一个：**没有 body**（GET 无请求体，
+ * wasm 的 RequestResult 也按无 body 处理）。URL 与 headers 的语义完全相同
+ * —— **原样发出，不做任何二次加工**。
+ */
+export interface QoderPreparedRequest {
+  /** 签名后的完整 URL（wasm 已拼好 `/algo` 前缀与查询串）。 */
+  url: string
+  /** 签名头（`Map` 保持 wasm 侧给的顺序）。 */
+  headers: Map<string, string>
+  /** wasm 资源的释放函数（值拷进 JS 后调用；本实现里 RequestResult 已即时释放）。 */
+  free: () => void
+}
+
 // ── clientMetadata ──────────────────────────────────────────────────────────
 
 /**
@@ -287,6 +303,26 @@ function callStringExport(
   }
 }
 
+/**
+ * 解码目录响应（官方 `kfe` 的语义逐字复刻）。
+ *
+ * 官方（stage-a 取证 E4）：`try { return SE().decrypt_server_response(A) }
+ * catch { return A }` —— **解码失败原样返回输入**（明文兼容）。这个 catch
+ * 包的是**整个调用**（glue 层与 wasm 侧都算），不是只包 wasm：官方没法区分
+ * 失败发生在哪一层，我们也照抄，因为「响应是密文还是明文」只有试过才知道。
+ */
+export function decryptQoderServerResponse(glue: QoderGlue, text: string): string {
+  try {
+    return callStringExport(
+      glue,
+      (rp, ptr, len) => { glue.wasm.decrypt_server_response(rp, ptr, len) },
+      text,
+    )
+  } catch {
+    return text
+  }
+}
+
 // ── 上下文句柄 ──────────────────────────────────────────────────────────────
 
 /** 构造 `QoderContext` 所需的全部输入。 */
@@ -379,6 +415,71 @@ export class QoderSigningContext {
       body: read.body,
       // 官方 ari() 的 free 只释放 RequestResult（上下文由调用方持有更久）。
       free: () => { /* RequestResult 已在上方释放，这里保持接口形态 */ },
+    }
+  }
+
+  /**
+   * 构造**目录 GET** 的签名请求（官方 `sri()` 普通账号分支的逐字复刻）。
+   *
+   * 官方调用形态（stage-a 取证 E2/E3）：`prepareRequest(endpoint, path,
+   * "GET", "auth", void 0, void 0)` —— 返回的 `RequestResult` 与
+   * `prepareInferRequest` 同形（url / headers），**没有 body**（GET）。
+   * wasm ABI 里那 4 个 None 槽位（两个 `Option<String>`）按 wasm-bindgen
+   * 语义传 `(0, 0)`。
+   *
+   * ⚠️ **`/algo` 前缀由 wasm 内部拼**（官方 service-account 分支才用 JS 侧的
+   * `Aoe()` 拼；普通账号分支直接拿 `i.url`）—— 返回的 `url` 原样发，**不要**
+   * 在 JS 侧再补前缀或过任何「修正」，否则签名作废（`101 Signature invalid`）。
+   *
+   * @param endpoint **host 基址**（同 {@link QoderSigningContext.prepareInferRequest}）。
+   * @param path 目录路径（含查询串，如 `/api/v2/model/list?Encode=1`）。
+   * @param method HTTP 方法（官方恒 `"GET"`）。
+   * @param requestClass 官方的请求类（目录链恒 `"auth"`，与 chat 的 body 签名同类）。
+   */
+  prepareRequest(
+    endpoint: string,
+    path: string,
+    method: string,
+    requestClass: string,
+  ): QoderPreparedRequest {
+    if (this.disposed) throw new Error('Qoder 签名上下文已释放（不要再复用）')
+    const { wasm, internals } = this.glue
+    const { getDataView, passString, takeObject } = internals
+    const rp = wasm.__wbindgen_add_to_stack_pointer(-16)
+    let rr = 0
+    try {
+      const ep = passString(endpoint, wasm.__wbindgen_export2, wasm.__wbindgen_export3)
+      const epLen = internals.vectorLen()
+      const pa = passString(path, wasm.__wbindgen_export2, wasm.__wbindgen_export3)
+      const paLen = internals.vectorLen()
+      const me = passString(method, wasm.__wbindgen_export2, wasm.__wbindgen_export3)
+      const meLen = internals.vectorLen()
+      const rc = passString(requestClass, wasm.__wbindgen_export2, wasm.__wbindgen_export3)
+      const rcLen = internals.vectorLen()
+      wasm.qodercontext_prepareRequest(
+        rp, this.ptr, ep, epLen, pa, paLen, me, meLen, rc, rcLen,
+        0, 0, 0, 0,
+      )
+      const ptr = getDataView().getInt32(rp + 0, true)
+      const errPtr = getDataView().getInt32(rp + 4, true)
+      if (getDataView().getInt32(rp + 8, true)) throw takeObject(errPtr)
+      rr = ptr
+    } finally {
+      wasm.__wbindgen_add_to_stack_pointer(16)
+    }
+
+    let read: { url: string; headers: Map<string, string>; body: string }
+    try {
+      read = readRequestResult(this.glue, rr)
+    } finally {
+      this.glue.wasm.__wbg_requestresult_free(rr, 0)
+    }
+
+    return {
+      url: read.url,
+      headers: read.headers,
+      // RequestResult 已在上方释放（值已拷进 JS）；free 仅为接口形态保留。
+      free: () => {},
     }
   }
 

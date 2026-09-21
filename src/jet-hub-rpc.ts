@@ -1533,8 +1533,8 @@ function registerJetHubEndpoints(
         // 想顺手改档，档位列整个不见了。修法就是把同一份 tiers 也用在回填行上，
         // 而不是另算一套判据。
         //
-        // 回填行走 `name = id`（拿不到原始展示名，见下），`withWindows` 只加字段、
-        // 不改 name，两者天然相容。
+        // 回填行的名字走 `tierSource.displayName` 两级查名（2026-09-21 修复，见
+        // 下方组装处）；`withWindows` 只加字段、不改 name，两者天然相容。
         //
         // ⚠️ **三个窗口字段的判据都只依赖目录数据**（`tier` 与 `budget`），不依赖
         // 用户提交过什么：
@@ -1566,10 +1566,23 @@ function registerJetHubEndpoints(
               name: model.name,
               disabled: disabledMap[model.id] === true,
             })),
-            // 这些模型已被适配器过滤掉，拿不到原始 name，回退为 id。
+            // 回填行：名字两级查（2026-09-21 修复，症状一）—— 黑名单并集回填
+            // 此前写死 `name = id`，目录不可达时用户看到的每行都是一串短 key。
+            // 现在 `tierSource.displayName` 能查到目录/静态表的原始展示名就带名
+            // （Qoder 两区），查不到仍回退 id（与既有行为一致，宁缺毋编）——
+            // 但静态表有名的必须带名（`qmodel_38max` → `Qwen3.8-Max`）。
             // 档位字段照常补（见上面 `withWindows` 的说明）。
-            ...filteredOut.map((id) => withWindows({ id, name: id, disabled: true })),
+            ...filteredOut.map((id) => withWindows({
+              id,
+              name: tierSource?.displayName?.(id) ?? id,
+              disabled: true,
+            })),
           ],
+          // 目录来源（C3）：只有实现了该能力的适配器（Qoder 两区）会带；
+          // 缺省 = 客户端不渲染「兜底清单」提示行。
+          ...(tierSource?.catalogSource !== undefined
+            ? { catalogSource: tierSource.catalogSource() }
+            : {}),
         }
         // **顺手清尸**：把命中垃圾判定的键从黑名单里真正剔除并写回 settings。
         // 只过滤不清理的话，僵尸键会永远留在配置文件里 —— 列表虽然干净了，

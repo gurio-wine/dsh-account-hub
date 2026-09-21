@@ -86,10 +86,18 @@
 
 import {
   QODER_MODELS_PATH,
+  isQoderDeviceToken,
   qoderPatHeaders,
+  resolveQoderDirectoryEndpoint,
 } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
+import type { QoderDirectorySigningSource } from './qoder-signing.js'
+import { QODER_DEFAULT_SCENE } from './qoder-wasm-context.js'
+
+// 目录 host 的解析在 product 层（与 chat 逃生阀同源）；这里 re-export 让
+// 目录链的消费方只 import 本模块。
+export { resolveQoderDirectoryEndpoint } from './qoder-product.js'
 
 // ── 常量 ──
 
@@ -349,6 +357,153 @@ export interface QoderDirectoryParseOptions {
 }
 
 /**
+ * 条目记录 → 目录条目（**两个端点形态共享的字段读取**）。
+ *
+ * PAT 端点（`parseQoderDirectory`）与新端点（`parseQoderSceneDirectory`）的
+ * 字段**语义**完全相同，条目 id / 启用标记两个键名不同（`id`/`is_enabled` vs
+ * `key`/`enable`），窗口与档位两族各有**平铺与嵌套两种物理形态**：
+ *
+ * | 字段 | PAT 端点 | 新端点（真机 2026-09-21 两区 200 实测） |
+ * |---|---|---|
+ * | 模型 id | `id` | `key` |
+ * | 启用标记 | `is_enabled` | `enable` |
+ * | 窗口 | `default_context_window` + `available_context_windows`（平铺） | **`context_config`**：`{档名: {token_count, is_default?}}` |
+ * | 档位 | `efforts` 数组 + `default_effort`（平铺） | **`thinking_config.enabled.efforts`**：`{档名: {is_default?}}` |
+ *
+ * ⚠️ stage-a 报告从 worker 代码 27 处 `available_context_windows` 命中推断的
+ * 平铺形态**与真机响应不符**（真机是嵌套形态）—— 代码字面量描述的是另一条
+ * 链的形态。解析器**以真机为准**（嵌套优先），平铺字段保留作兜底读取（两套
+ * 读取都收敛在本函数一处，防止两条路径各自演化分叉）。
+ */
+function entryFromDirectoryRecord(
+  record: Record<string, unknown>,
+  idField: 'id' | 'key',
+  enabledField: 'is_enabled' | 'enable',
+  includeDisabled: boolean,
+): QoderModelEntry | undefined {
+  const id = readString(record[idField])
+  if (id === undefined) return undefined
+  const enabled = record[enabledField] === true
+  if (!enabled && !includeDisabled) return undefined
+
+  // 窗口族：嵌套 `context_config` 优先（真机形态），平铺字段兜底（PAT 端点 /
+  // 上游回退形态）。两族读取规则同构：正数才收、默认档优先、升序去重 ≥2 档。
+  const sceneWindows = readContextConfig(record)
+  const contextWindows = sceneWindows.available
+    ?? readPositiveArray(record.available_context_windows)
+  const declaredWindow = sceneWindows.default ?? readPositive(record.default_context_window)
+  // `default_context_window`（或 `context_config` 的 is_default 档）优先；缺它时
+  // 取可用窗口首项 —— 实测两者一致（200000/[200000,…]），有依据的兜底而非猜测。
+  const contextWindow = declaredWindow ?? (contextWindows === undefined ? undefined : contextWindows[0])
+  // 档位表：目录公布的完整可用窗口（升序去重、单档不记）。
+  //
+  // 默认档**单独并入**：默认档与列表首项实测一致，但那是观测而非契约 —— 目录
+  // 若哪天给出不落在列表里的默认档，不并入会让 UI 无法表达「当前是默认档」。
+  const contextTiers = contextWindow === undefined
+    ? undefined
+    : buildTiers(contextWindow, contextWindows)
+  const maxInputTokens = readPositive(record.max_input_tokens)
+
+  // 思考档位族：嵌套 `thinking_config` 优先（真机形态），平铺 `efforts` 兜底。
+  const sceneReasoning = readThinkingConfig(record)
+  const reasoning = sceneReasoning ?? readReasoning(record)
+
+  return {
+    id,
+    name: readString(record.display_name) ?? id,
+    enabled,
+    ...record.is_vl === true || record.is_vl === false ? { supportsImages: record.is_vl } : {},
+    ...contextWindow === undefined ? {} : { contextWindow },
+    ...maxInputTokens === undefined ? {} : { maxInputTokens },
+    ...contextWindows === undefined ? {} : { availableContextWindows: contextWindows },
+    ...contextTiers === undefined ? {} : { contextTiers },
+    ...reasoning,
+  }
+}
+
+/** `isRecord`：分支里的窄化辅助（结构化值才进字段读取）。 */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * 读**嵌套窗口形态** `context_config`（真机 2026-09-21 两区 200 实测）。
+ *
+ * ```json
+ * "context_config": {
+ *   "1M":   { "token_count": 1000000 },
+ *   "200K": { "token_count": 200000, "is_default": true },
+ *   "400K": { "token_count": 400000 }
+ * }
+ * ```
+ *
+ * - `token_count` 必须是正有限数才收（0 / 负数 / 缺失 → 该档丢弃，不编造）；
+ * - 默认档 = `is_default === true` 的那档；**没有标记时 `default` 缺省**（不猜
+ *   「最大档即默认」—— 与 buddy 的「取最大档」是不同产品的不同判据，Qoder
+ *   目录明确标了 is_default，照抄比推断诚实）；
+ * - 档名（`"1M"` 等）**只作分组键，不进输出** —— 出站与 UI 用的都是数值。
+ */
+function readContextConfig(record: Record<string, unknown>): {
+  default?: number
+  available?: readonly number[]
+} {
+  const config = record.context_config
+  if (!isRecord(config)) return {}
+  const values: number[] = []
+  let declared: number | undefined
+  for (const value of Object.values(config)) {
+    if (!isRecord(value)) continue
+    const count = readPositive(value.token_count)
+    if (count === undefined) continue
+    values.push(count)
+    if (value.is_default === true) declared = count
+  }
+  if (values.length === 0) return {}
+  return {
+    ...declared === undefined ? {} : { default: declared },
+    available: values,
+  }
+}
+
+/**
+ * 读**嵌套档位形态** `thinking_config`（真机 2026-09-21 两区 200 实测）。
+ *
+ * ```json
+ * "thinking_config": {
+ *   "disabled": {},
+ *   "enabled": {
+ *     "efforts": { "xhigh": {}, "low": {}, "medium": { "is_default": true } },
+ *     "is_default": true
+ *   }
+ * }
+ * ```
+ *
+ * - 档位集 = `enabled.efforts` 的**对象键序**（官方即此顺序，照抄不排序 ——
+ *   它会原样进 DSH 的「思考程度」选择器）；
+ * - 默认档 = 带 `is_default:true` 的键；`enabled.is_default` 是「默认开启思考」
+ *   的标记，与默认档位无关，**不混读**；
+ * - 空对象 / 缺 `enabled` / 缺 `efforts` → 返回 undefined，外层回退平铺字段。
+ */
+function readThinkingConfig(record: Record<string, unknown>): {
+  reasoningEfforts?: readonly string[]
+  defaultReasoningEffort?: string
+} | undefined {
+  const config = record.thinking_config
+  if (!isRecord(config)) return undefined
+  const enabled = config.enabled
+  if (!isRecord(enabled)) return undefined
+  const effortsRecord = enabled.efforts
+  if (!isRecord(effortsRecord)) return undefined
+  const efforts = Object.keys(effortsRecord).filter((key) => key.trim().length > 0)
+  if (efforts.length === 0) return undefined
+  const declared = efforts.find((key) => isRecord(effortsRecord[key]) && effortsRecord[key].is_default === true)
+  return {
+    reasoningEfforts: efforts,
+    ...declared === undefined ? {} : { defaultReasoningEffort: declared },
+  }
+}
+
+/**
  * 解析 `GET /api/v1/cloud/models` 的响应（**只认实测形态**）。
  *
  * ```json
@@ -408,39 +563,53 @@ export function parseQoderDirectory(
   const entries: QoderModelEntry[] = []
   for (const item of list) {
     if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
-    const record = item as Record<string, unknown>
-    const id = readString(record.id)
-    if (id === undefined) continue
-    const enabled = record.is_enabled === true
-    if (!enabled && !includeDisabled) continue
+    const entry = entryFromDirectoryRecord(item as Record<string, unknown>, 'id', 'is_enabled', includeDisabled)
+    if (entry !== undefined) entries.push(entry)
+  }
+  return entries
+}
 
-    const contextWindows = readPositiveArray(record.available_context_windows)
-    const declaredWindow = readPositive(record.default_context_window)
-    // `default_context_window` 优先；缺它时取可用窗口首项 —— 实测两者一致
-    // （200000/[200000,…]、272000/[272000,…]），故这是有依据的兜底而非猜测。
-    const contextWindow = declaredWindow ?? (contextWindows === undefined ? undefined : contextWindows[0])
-    // 档位表：目录公布的完整可用窗口（升序去重、单档不记）。
-    //
-    // 默认档**单独并入**：`default_context_window` 与 `available_context_windows[0]`
-    // 实测一致，但那是观测而非契约 —— 目录若哪天给出不落在列表里的默认档，
-    // 不并入会让 UI 无法表达「当前是默认档」（radio 全不选中）。
-    const contextTiers = contextWindow === undefined
-      ? undefined
-      : buildTiers(contextWindow, contextWindows)
-    const maxInputTokens = readPositive(record.max_input_tokens)
-    const reasoning = readReasoning(record)
-
-    entries.push({
-      id,
-      name: readString(record.display_name) ?? id,
-      enabled,
-      ...record.is_vl === true || record.is_vl === false ? { supportsImages: record.is_vl } : {},
-      ...contextWindow === undefined ? {} : { contextWindow },
-      ...maxInputTokens === undefined ? {} : { maxInputTokens },
-      ...contextWindows === undefined ? {} : { availableContextWindows: contextWindows },
-      ...contextTiers === undefined ? {} : { contextTiers },
-      ...reasoning,
-    })
+/**
+ * 解析**新端点**（设备流 wasm 目录链）的响应：**按 scene 键控的对象**。
+ *
+ * ```json
+ * {"assistant":[{"key":"qmodel_38max","display_name":"Qwen3.8-Max","enable":true,
+ *   "is_vl":true,"max_input_tokens":180000,"default_context_window":200000,
+ *   "available_context_windows":[200000,400000,1000000],
+ *   "efforts":["xhigh","low","medium"],"default_effort":"medium"}, ...]}
+ * ```
+ *
+ * ## 为什么取 `assistant` 键
+ *
+ * 官方解析器（stage-a 取证 E5）就是 `let u=kg().scene, w=d[u]` —— 键是**请求方
+ * `clientMetadata` 的 `scene` 值**，不是什么全局约定。本插件构造上下文时发的
+ * `scene` 恒为 {@link QODER_DEFAULT_SCENE}（`assistant`），所以收到的键就是它；
+ * 「发送的键」与「读取的键」同源于一个常量，不是两处独立写死的字面量。
+ *
+ * ## 双形态兼容是刻意的（不是懦弱）
+ *
+ * 响应先过 wasm `decrypt_server_response`（失败**原样返回** = 明文兼容），
+ * 解出来的 JSON 可能是加密形态也可能撞上明文形态。scene 键控对象是新端点的
+ * 定案形态（官方解析器只认它）；`{data:[…]}` 是 PAT 端点的形态 —— 解码兜底
+ * 场景下两条解析路径都保留，**数据能用就不该因为形态猜测被丢掉**。两者的
+ * 字段读取已收敛在 {@link entryFromDirectoryRecord} 一处，不存在两套语义。
+ */
+export function parseQoderSceneDirectory(
+  body: unknown,
+  options: QoderDirectoryParseOptions = {},
+): QoderModelEntry[] {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return []
+  const record = body as Record<string, unknown>
+  // 明文老形态（{data:[…]})：交给既有解析器（同一套字段读取）。
+  if (Array.isArray(record.data)) return parseQoderDirectory(body, options)
+  const list = record[QODER_DEFAULT_SCENE]
+  if (!Array.isArray(list)) return []
+  const includeDisabled = options.includeDisabled === true
+  const entries: QoderModelEntry[] = []
+  for (const item of list) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
+    const entry = entryFromDirectoryRecord(item as Record<string, unknown>, 'key', 'enable', includeDisabled)
+    if (entry !== undefined) entries.push(entry)
   }
   return entries
 }
@@ -509,35 +678,62 @@ function buildTiers(fallback: number, declared: readonly number[] | undefined): 
 
 // ── 目录拉取 ──
 
+/**
+ * 新端点（设备流 wasm 目录链）的路径常量（官方 `JHA`，两区逐字相同）。
+ *
+ * ⚠️ **不含 `/algo` 前缀**：前缀由 wasm `prepareRequest` 内部拼（官方
+ * service-account 分支才用 JS 侧拼，普通账号分支的 URL 直接来自 wasm），
+ * 调用方拿 `prepareGetRequest` 的产物原样发。
+ */
+export const QODER_DEVICE_MODELS_PATH = '/api/v2/model/list?Encode=1'
+
 /** {@link fetchQoderDirectory} 的入参。 */
 export interface QoderDirectoryOptions {
   /** 注入 fetch（测试用）。 */
   fetchImpl?: typeof fetch
-  /** 覆盖目录基址（默认 `product.modelsBase`）。 */
+  /** 覆盖目录基址（默认 `product.modelsBase`，**仅 PAT 路径**）。 */
   modelsBase?: string
   /** 产品配置；默认 `QODER`。 */
   product?: QoderProduct
   /** 取消信号。 */
   signal?: AbortSignal
+  /**
+   * 设备流令牌的 wasm 目录签名链（`dt-` 路径必需）。
+   *
+   * ⚠️ 省略时 `dt-` 凭据**不发任何请求**（直接回空数组 + onDebug 提示）：
+   * 设备流令牌打 PAT 目录端点恒 401（本任务的总根因），继续发是白打。
+   */
+  deviceSigning?: QoderDirectorySigningSource
+  /** 调试观测回调（目录链失败原因，debug 级；省略时静默）。 */
+  onDebug?: (message: string) => void
 }
 
 /**
- * 拉取动态模型目录（**PAT 直连，不需要 job token**）。
+ * 拉取动态模型目录（**按令牌族分派**）。
+ *
+ * ## 两条路径（互不顶替）
+ *
+ * | 令牌族 | 路径 | 证据 |
+ * |---|---|---|
+ * | `dt-`（设备流） | wasm 签名 `GET {inferenceHost}/algo/api/v2/model/list?Encode=1` | stage-a 结论 B（官方客户端即此路径）；`dt-` 打 PAT 端点恒 401 |
+ * | `pt-`（PAT） | `GET {modelsBase}/api/v1/cloud/models`（**一行不动**） | T1 实测 200；既有回归用例钉死 |
+ *
+ * 判据是 {@link isQoderDeviceToken}（前缀 `dt-`），显式列举不分「其它前缀
+ * 反推 PAT」—— 分派错误的表现是「凭据失效」的假象，比白打一次请求难查得多。
  *
  * ## 失败语义：返回空数组，**绝不抛错**
  *
- * 目录是「尽力而为」的数据：任何网络失败、非 2xx、响应不是 JSON、`data` 不是
- * 数组，一律返回 `[]`，由调用方回退静态表。抛错只会让一次目录抖动升级成
- * 「模型选择器整块炸掉」。
+ * 两条路径一致：任何网络失败、非 2xx、响应不是 JSON、解析失败，一律返回 `[]`，
+ * 由调用方回退静态表。抛错只会让一次目录抖动升级成「模型选择器整块炸掉」。
  *
- * ⚠️ **只认 HTTP 2xx 才算成功**：401（PAT 失效）也走这条「空目录」路径 ——
- * 目录的 401 与 chat 的 401 语义不同（后者有「jt 过期，重换一次」的动作），
- * 本模块**不解释错误**，只回空（错误分类属 `src/qoder-errors.ts`）。
+ * ⚠️ **只认 HTTP 2xx 才算成功**：401（PAT 失效）/ 403（签名未对齐，`101`）
+ * 都走这条「空目录」路径，本模块**不解释错误**，只经 `onDebug` 报原因
+ * （debug 级），错误分类属 `src/qoder-errors.ts`。
  *
  * ## 返回的是**已过滤**的目录
  *
- * 只含 `is_enabled === true` 的项（定案），且**不含 `lite`**（它不在目录里）。
- * 调用方拿到非空结果即可直接播报，不需要再过滤一次。
+ * 只含启用项（PAT 端点 `is_enabled === true` / 新端点 `enable === true`），
+ * 且**不含 `lite`**（它不在目录里）。调用方拿到非空结果即可直接播报。
  */
 export async function fetchQoderDirectory(
   credential: QoderCredential,
@@ -545,6 +741,19 @@ export async function fetchQoderDirectory(
 ): Promise<QoderModelEntry[]> {
   const product = options.product ?? QODER
   const fetcher = options.fetchImpl ?? fetch
+  const token = credential.access_token
+  if (isQoderDeviceToken(token)) {
+    const signing = options.deviceSigning
+    if (signing === undefined) {
+      // ⚠️ **不发 PAT 端点**：dt- 打它恒 401（总根因），一次都不该白打。
+      options.onDebug?.(
+        `${product.id}: 设备流令牌（dt-）无目录签名链可用（未注入 deviceSigning），回退静态目录`,
+      )
+      return []
+    }
+    return fetchQoderDeviceDirectory(credential, signing, product, fetcher, options)
+  }
+  // ── PAT 路径（一行不动：T1 实测 200 的既有通路，回归用例钉死）──
   const base = options.modelsBase ?? product.modelsBase
   try {
     const response = await fetcher(`${base}${QODER_MODELS_PATH}`, {
@@ -555,6 +764,54 @@ export async function fetchQoderDirectory(
     if (!response.ok) return []
     return parseQoderDirectory(await response.json() as unknown)
   } catch {
+    return []
+  }
+}
+
+/**
+ * 设备流目录链：签名 → GET → 解码 → scene 解析（stage-a 结论 B 的照抄实现）。
+ *
+ * 每一步失败都收敛成 `[]`（经 `onDebug` 报 debug 级原因）；**不消耗积分**
+ * （只读 GET），也不做任何重试 —— 重试归调用方的负缓存（`QoderAdapter` 侧
+ * {@link QoderDirectoryNegativeCache}），网络层重试会把一次失败放大成多次白打。
+ */
+async function fetchQoderDeviceDirectory(
+  credential: QoderCredential,
+  signing: QoderDirectorySigningSource,
+  product: QoderProduct,
+  fetcher: typeof fetch,
+  options: QoderDirectoryOptions,
+): Promise<QoderModelEntry[]> {
+  const token = credential.access_token
+  try {
+    // endpoint 是 host 基址（CN 与 CN chat 同一 host；intl 官方默认 api2）。
+    const endpoint = resolveQoderDirectoryEndpoint(product)
+    const prepared = await signing.prepareGetRequest(token, endpoint, QODER_DEVICE_MODELS_PATH)
+    let response: Response
+    try {
+      response = await fetcher(prepared.url, {
+        method: 'GET',
+        headers: prepared.headers,
+        ...options.signal === undefined ? {} : { signal: options.signal },
+      })
+    } finally {
+      // 头与 URL 已拷出（值传递），wasm 侧载体不再需要。
+      prepared.free()
+    }
+    if (!response.ok) {
+      options.onDebug?.(
+        `${product.id}: 设备流目录请求失败（HTTP ${response.status} ${prepared.url}）—— 回退静态目录`,
+      )
+      return []
+    }
+    const text = await response.text()
+    // 官方 kfe 语义：解码失败原样返回（明文兼容），故这里拿到的**总是字符串**。
+    const decoded = await signing.decryptResponse(text)
+    return parseQoderSceneDirectory(JSON.parse(decoded) as unknown)
+  } catch (error) {
+    options.onDebug?.(
+      `${product.id}: 设备流目录链失败：${error instanceof Error ? error.message : String(error)} —— 回退静态目录`,
+    )
     return []
   }
 }
@@ -613,5 +870,51 @@ export class QoderCatalogStore {
   /** 丢弃缓存（下次必重新拉取）；供登出 / 测试使用。 */
   clear(): void {
     this.cached = undefined
+  }
+}
+
+/**
+ * 目录失败的**负缓存 TTL**（5 分钟，E1）。
+ *
+ * 设备流目录链失败（403 签名未对齐 / 网关抖动 / wasm 不可用）后，下一次
+ * `model.list` / `resolveModel` / `contextTiers` 都会再触发一次 `ensureCatalog`
+ * —— 每次都白打一个注定失败的请求。短 TTL 的内存态负缓存把重试风暴压到
+ * 5 分钟一次。
+ *
+ * ⚠️ **内存态，不写盘**：失败原因多半是瞬时或环境性的，持久化负缓存会让
+ * 「用户修好了环境但目录五分钟不恢复」变成跨重启的谜题。
+ */
+export const QODER_DIRECTORY_NEGATIVE_TTL_MS = 5 * 60 * 1000
+
+/**
+ * 目录失败的内存态负缓存（短 TTL，**独立于** {@link QoderCatalogStore}）。
+ *
+ * ⚠️ **不碰 `QoderCatalogStore` 的「失败不写缓存、不清已有缓存」契约**：
+ * 负缓存是独立字段/时间戳，`entries()` 语义原样 —— 负缓存期间旧目录（若有）
+ * 仍然可用，只是「重新拉取」这个动作被压住。
+ *
+ * `now` 可注入（与 `QoderCatalogStore` 同一口径，TTL 判定可确定性单测）。
+ */
+export class QoderDirectoryNegativeCache {
+  private until?: number
+
+  constructor(
+    private readonly ttlMs: number = QODER_DIRECTORY_NEGATIVE_TTL_MS,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  /** 负缓存生效中（期限内不重拉目录）。 */
+  get blocked(): boolean {
+    return this.until !== undefined && this.now() < this.until
+  }
+
+  /** 记一次失败（从现在起 TTL 内不重拉）。 */
+  mark(): void {
+    this.until = this.now() + this.ttlMs
+  }
+
+  /** 清除（目录成功后调用；登出 / 测试用）。 */
+  clear(): void {
+    this.until = undefined
   }
 }

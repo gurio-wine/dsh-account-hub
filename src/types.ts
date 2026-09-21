@@ -336,6 +336,14 @@ export interface RpcModelListEntry {
 /** RPC: 列出某 provider 的模型响应 */
 export interface RpcModelListResponse {
   models: RpcModelListEntry[]
+  /**
+   * 目录来源（C3，只有 Qoder 两区会带）：`remote` = 远端目录成功过（含 TTL 内
+   * 的历史成功），`fallback` = 当前播报的是**静态兜底表**（远端不可达）。
+   *
+   * 缺省 = 该 provider 的适配器未实现此能力（其余 provider 不区分来源，
+   * 客户端对缺省不渲染任何提示行）。
+   */
+  catalogSource?: 'remote' | 'fallback'
 }
 
 /** RPC: 打开/关闭某个模型请求 */

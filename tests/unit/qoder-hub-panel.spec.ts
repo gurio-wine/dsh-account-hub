@@ -77,7 +77,17 @@ function codeLinesOf(source: string): string {
  * `registerJetHubRpc` 注册出来的**真实 HTTP 处理器**，而不是断言源码里出现过
  * 某个字符串 —— 前者能证明「分派真的走对了」，后者只能证明「提到过」。
  */
-function makeHarness(accounts: ProviderAccountEntry[]) {
+function makeHarness(
+  accounts: ProviderAccountEntry[],
+  overrides: {
+    /** 注入的档位来源（第 10 参注册表只含它；缺省 = 未注册，与旧形态一致）。 */
+    tierSource?: unknown
+    /** `ctx.llm.listModels` 替身返回的目录（缺省为旧的硬编码一项）。 */
+    models?: Array<{ id: string; name: string }>
+    /** 黑名单替身返回的表（缺省空表）。 */
+    disabledModels?: Record<string, boolean>
+  } = {},
+) {
   let handler: ((request: Request) => Promise<Response>) | undefined
   /** `account.list` 实际拿去查池的 provider。 */
   const listAccountsCalls: string[] = []
@@ -105,7 +115,7 @@ function makeHarness(accounts: ProviderAccountEntry[]) {
       ? {
           listModels: async (provider: string) => {
             listModelsCalls.push(provider)
-            return [{ id: 'qwen3-coder', name: 'Qwen3 Coder' }]
+            return overrides.models ?? [{ id: 'qwen3-coder', name: 'Qwen3 Coder' }]
           },
         }
       : undefined,
@@ -118,9 +128,10 @@ function makeHarness(accounts: ProviderAccountEntry[]) {
     },
     // 返回一个**总是为空**的黑名单：`model.list` 会把「在黑名单里却不在这份
     // 目录里」的模型补回列表，替身若造假键，目录里就会凭空多出一项。
+    // （需要回填行的用例经 `overrides.disabledModels` 提供真键。）
     listDisabledModels: (provider: string) => {
       listDisabledCalls.push(provider)
-      return {}
+      return overrides.disabledModels ?? {}
     },
     setModelDisabled: async (provider: string, modelId: string, disabled: boolean) => {
       setModelDisabledCalls.push({ provider, modelId, disabled })
@@ -139,6 +150,11 @@ function makeHarness(accounts: ProviderAccountEntry[]) {
     // 的分派（不建号、不查余额），两条 Qoder 分支都不会被进入。
     {} as never,
     {} as never,
+    // 档位来源注册表（第 10 参，可选）：注入时按 provider 恒返回同一个来源 ——
+    // 生产形态是「provider id → 适配器」，这里只需要「有没有被问到」。
+    ...(overrides.tierSource === undefined
+      ? []
+      : [{ sourceFor: () => overrides.tierSource }]),
   )
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 
@@ -434,5 +450,85 @@ describe('qoder 不作为比较表达式出现（判据是表达式，不是子�
     // ⚠️ 两区的 `icon` **刻意复用同一个 `QODER_ICON`**（同一品牌）：这条钉死
     // 「复用的是同一个常量，而不是又内联了一份新图标」。
     expect(code).toMatch(/id: 'qoder-cn', label: 'Qoder CN', icon: QODER_ICON/)
+  })
+})
+
+// ── model.list 的回填行显示名与目录来源（B1 / C3，2026-09-21） ────────────────
+
+describe('model.list：黑名单回填行的显示名与 catalogSource', () => {
+  /** 一个最小的档位来源替身（RPC 层只消费这三个方法的形状）。 */
+  function makeTierSource(overrides: {
+    displayName?: (id: string) => string | undefined
+    catalogSource?: () => 'remote' | 'fallback'
+  } = {}) {
+    return {
+      contextTiers: async () => new Map(),
+      ...overrides.displayName === undefined ? {} : { displayName: overrides.displayName },
+      ...overrides.catalogSource === undefined ? {} : { catalogSource: overrides.catalogSource },
+    }
+  }
+
+  it('回填行用 tierSource.displayName 查名，查到就不再写死 name=id', async () => {
+    const h = makeHarness([qoderEntry('qoder-1')], {
+      // 目录只播报一项；黑名单里有两个不在目录的键 → 都要回填。
+      models: [{ id: 'qwen3-coder', name: 'Qwen3 Coder' }],
+      disabledModels: { qmodel_38max: true, mystery_model: true },
+      tierSource: makeTierSource({
+        displayName: (id) => (id === 'qmodel_38max' ? 'Qwen3.8-Max' : undefined),
+        catalogSource: () => 'fallback',
+      }),
+    })
+    const result = await h.call('model.list', { provider: 'qoder' })
+    expect(result.ok, result.error?.message).toBe(true)
+    const value = result.value as { models: Array<{ id: string; name: string; disabled: boolean }> }
+    const backfilled = value.models.filter((m) => m.disabled)
+    expect(backfilled).toContainEqual({
+      id: 'qmodel_38max', name: 'Qwen3.8-Max', disabled: true,
+    })
+    // 查不到名字（未知 id）→ 仍回退 id（与既有行为一致，宁缺毋编）。
+    expect(backfilled).toContainEqual({
+      id: 'mystery_model', name: 'mystery_model', disabled: true,
+    })
+  })
+
+  it('tierSource 实现了 catalogSource 时，响应带出该字段（fallback）', async () => {
+    const h = makeHarness([qoderEntry('qoder-1')], {
+      tierSource: makeTierSource({ catalogSource: () => 'fallback' }),
+    })
+    const result = await h.call('model.list', { provider: 'qoder' })
+    expect(result.ok, result.error?.message).toBe(true)
+    expect((result.value as { catalogSource?: string }).catalogSource).toBe('fallback')
+  })
+
+  it('tierSource 实现 catalogSource 为 remote 时同样带出（远端成功过）', async () => {
+    const h = makeHarness([qoderEntry('qoder-1')], {
+      tierSource: makeTierSource({ catalogSource: () => 'remote' }),
+    })
+    const result = await h.call('model.list', { provider: 'qoder' })
+    expect((result.value as { catalogSource?: string }).catalogSource).toBe('remote')
+  })
+
+  it('未注入 tierSource 时响应不带 catalogSource（其余 provider 不渲染提示行）', async () => {
+    const h = makeHarness([qoderEntry('qoder-1')])
+    const result = await h.call('model.list', { provider: 'qoder' })
+    expect(result.ok, result.error?.message).toBe(true)
+    expect((result.value as { catalogSource?: string }).catalogSource).toBeUndefined()
+  })
+
+  it('旧形态 tierSource（只有 contextTiers，无可选方法）不炸、不带字段、回填回退 id', async () => {
+    const h = makeHarness([qoderEntry('qoder-1')], {
+      models: [{ id: 'qwen3-coder', name: 'Qwen3 Coder' }],
+      disabledModels: { off_catalog: true },
+      // 向后兼容：既有适配器实现（buddy / trae 系）没有这两个可选方法。
+      tierSource: { contextTiers: async () => new Map() },
+    })
+    const result = await h.call('model.list', { provider: 'qoder' })
+    expect(result.ok, result.error?.message).toBe(true)
+    const value = result.value as {
+      catalogSource?: string
+      models: Array<{ id: string; name: string }>
+    }
+    expect(value.catalogSource).toBeUndefined()
+    expect(value.models).toContainEqual({ id: 'off_catalog', name: 'off_catalog', disabled: true })
   })
 })

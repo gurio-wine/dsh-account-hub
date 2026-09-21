@@ -50,8 +50,10 @@
 
 import type { QoderWasmSigner } from './qoder-wasm-context.js'
 import type { QoderGlue } from './qoder-wasm-glue.js'
-import type { QoderInferRequest, QoderUserInfoInput } from './qoder-wasm-context.js'
+import type { QoderInferRequest, QoderPreparedRequest, QoderUserInfoInput } from './qoder-wasm-context.js'
+import { QoderSigningContext } from './qoder-wasm-context.js'
 import { QoderWasmSigner as QoderWasmSignerClass } from './qoder-wasm-context.js'
+import { decryptQoderServerResponse } from './qoder-wasm-context.js'
 import type { QoderMachineIdOptions } from './qoder-device-flow.js'
 import type { QoderProduct } from './qoder-product.js'
 import { qoderJobTokenHeaders } from './qoder-product.js'
@@ -242,6 +244,43 @@ export interface QoderSigningSource {
   dispose(): void
 }
 
+/** 一次**目录 GET** 要用的签名请求（wasm 给的 URL 与头，原样发出）。 */
+export interface QoderSignedDirectoryRequest {
+  /** 签名后的完整 URL（`/algo` 前缀与查询串已由 wasm 拼好）。 */
+  url: string
+  /** 签名头（**Record 形态**，直接交给 fetch；wasm 侧顺序不保证保留）。 */
+  headers: Record<string, string>
+  /** wasm 资源释放（值已拷出后调用）。 */
+  free: () => void
+}
+
+/**
+ * **目录签名来源**（设备流目录链的注入面，与 chat 的 {@link QoderSigningSource}
+ * 并列、互不顶替）。
+ *
+ * ## 为什么不复用 `QoderSigningSource`
+ *
+ * chat 的 `contextFor(pat, jobToken)` 两参在 PAT 路径是「PAT + 换出来的 jt」；
+ * 设备流**没有换令牌这一步**，`security_oauth_token` 就是 `dt-` 本体。目录链
+ * 把这个差异收在自己的注入面里（token 只传一次），适配器与 `fetchQoderDirectory`
+ * 不需要知道「jt 与 dt 的区别」。
+ *
+ * ⚠️ **一个 region 一个实例**（同 chat 来源的理由：机器码/身份绑在 product 上）。
+ */
+export interface QoderDirectorySigningSource {
+  /**
+   * 生成目录 GET 请求。
+   *
+   * @param token 设备流令牌（`dt-`；同时用作 userinfo 的 Bearer 与签名身份的
+   *   `security_oauth_token` —— 官方语义，stage-a §1.5）。
+   * @param endpoint inference host 基址（`resolveQoderDirectoryEndpoint` 的产物）。
+   * @param path 目录路径（`QODER_DEVICE_MODELS_PATH`）。
+   */
+  prepareGetRequest(token: string, endpoint: string, path: string): Promise<QoderSignedDirectoryRequest>
+  /** 解码目录响应（解密失败**原样返回**——明文兼容，官方 `kfe` 语义）。 */
+  decryptResponse(text: string): Promise<string>
+}
+
 /** {@link QoderSigningProvider} 的构造选项。 */
 export interface QoderSigningProviderOptions {
   /** 目标 region（决定 machine_id 路径、`cosyVersion`、`clientMetadata`）。 */
@@ -292,7 +331,15 @@ export class QoderSigningProvider implements QoderSigningSource {
     this.machineIdOptions = options.machineIdOptions
   }
 
-  async contextFor(pat: string, jobToken: string): Promise<QoderSigningContextLike> {
+  /**
+   * 取（必要时重建）签名上下文。
+   *
+   * 返回类型标注为**具体类** {@link QoderSigningContext}（接口
+   * {@link QoderSigningSource} 仍按 `QoderSigningContextLike` 声明，类方法的
+   * 收窄返回是合法协变）：目录链的 `prepareDirectoryRequest` 需要 wasm 上下文
+   * 的 `prepareRequest`，那个方法不在结构子集接口上。
+   */
+  async contextFor(pat: string, jobToken: string): Promise<QoderSigningContext> {
     // ⚠️ **先取 uid，再碰 wasm**：取不到就直接抛，「不签」是硬约束。
     // 顺序反了会先加载 35 MB 的 wasm 再发现 uid 取不到，白付一次启动开销。
     const identity = await this.identity(pat, jobToken)
@@ -308,6 +355,40 @@ export class QoderSigningProvider implements QoderSigningSource {
     // 重建判据（凭据 / 机器码变化）交给签名器 —— 它已经含 machineId 与
     // userInfoFingerprint，这里再判一次必然与之分叉。
     return signer.contextFor({ userInfo })
+  }
+
+  /**
+   * 生成**目录 GET** 的签名请求（设备流目录链专用）。
+   *
+   * ⚠️ **`jobToken` 位就是 `token` 本体**：设备流没有换令牌这一步，
+   * `security_oauth_token` 是 `dt-` 令牌（stage-a §1.5 官方语义）；uid 的
+   * Bearer 也是它（quota 端点同 Token 族实测 200，openapi 侧认 `dt-`）。
+   * chat 路径的 `contextFor(pat, jt)` 两参形态**不受影响**。
+   */
+  async prepareDirectoryRequest(
+    token: string,
+    endpoint: string,
+    path: string,
+  ): Promise<QoderSignedDirectoryRequest> {
+    const context = await this.contextFor(token, token)
+    const prepared = context.prepareRequest(endpoint, path, 'GET', 'auth')
+    // Map → Record：目录链的 fetch 需要 `Record<string, string>`；wasm 侧的
+    // 顺序不保证跨版本稳定，fetch 不在乎顺序。
+    const headers: Record<string, string> = {}
+    for (const [key, value] of prepared.headers) headers[key] = value
+    return { url: prepared.url, headers, free: prepared.free }
+  }
+
+  /**
+   * 解码目录响应（{@link decryptQoderServerResponse} 的异步包装）。
+   *
+   * 解码失败**原样返回输入**（明文兼容）—— catch 在该函数内部，本方法只负责
+   * 确保 glue 已加载（glue 懒加载的语义与签名一致：第一次用到才加载）。
+   */
+  async decryptResponse(text: string): Promise<string> {
+    this.gluePromise ??= this.loadGlue()
+    const glue = await this.gluePromise
+    return decryptQoderServerResponse(glue, text)
   }
 
   dispose(): void {
@@ -353,5 +434,19 @@ export class QoderSigningProvider implements QoderSigningSource {
     })
     this.signersByPat.set(pat, signer)
     return signer
+  }
+}
+
+/**
+ * 把 {@link QoderSigningProvider} 包成目录签名来源（`src/index.ts` 的接线点）。
+ *
+ * 两区各传**自己的** provider 实例（region 绑定纪律与 chat 侧相同）；适配器
+ * 拿到的是 {@link QoderDirectorySigningSource} 窄接口，看不见 provider 的
+ * chat 方法 —— chat 出站路径与目录链在类型层就分开。
+ */
+export function qoderDirectorySigningSource(provider: QoderSigningProvider): QoderDirectorySigningSource {
+  return {
+    prepareGetRequest: (token, endpoint, path) => provider.prepareDirectoryRequest(token, endpoint, path),
+    decryptResponse: (text) => provider.decryptResponse(text),
   }
 }
