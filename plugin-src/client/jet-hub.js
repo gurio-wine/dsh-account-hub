@@ -1118,6 +1118,28 @@ function ProviderPanel({ provider, rpcCall }) {
   const canLoadCredits = supportsCreditBalance(provider);
   // 只有支持签到能力的 provider（当前是 Buddy CN / LobsterAI / Trae CN）渲染领取按钮。
   const supportsCredits = supportsDailyCheckin(provider);
+  /**
+   * 本面板的**显示名**（`PROVIDERS` 条目的 `label`，找不到时回退 `provider` id）。
+   *
+   * ⚠️ 这是**本函数作用域内**的绑定，不是随手一个 `label` —— 2026-09-21 的
+   * 白屏报障正是因为下面 `LoginChoiceForm` 的 props 写成了 `productLabel: label`，
+   * 而 `label` 在那个位置**没有任何绑定**（该标识符只作为局部变量存在于
+   * `formatClaimFailureLine`，以及 `PROVIDERS` 条目的字段名里）。
+   *
+   * 那个错法的恶劣之处在于**三重闸门全都看不见**：`plugin-src/` 不在
+   * `tsconfig.json` 的 include 里（tsc 不查）；`ProviderPanel` 用了 hooks、
+   * react 不在依赖里，既有单测只能做源码切片与正则断言（从不真的渲染它）；
+   * 而 `build:client` 的冒烟只求值 bundle **顶层**，函数体从未被调用。
+   * 于是它一路活到真机：`loginChoiceOpen` 初始为 false ⇒ 对象字面量不求值 ⇒
+   * 页面正常；用户点「+ 新建账号」⇒ 重渲染时求值 ⇒ `ReferenceError` 从 render
+   * 抛出 ⇒ 整棵 React 树（无错误边界）卸载 ⇒ **Hub 整页空白**。
+   *
+   * 故这里刻意**只**用 `providerLabel` 这个名字，并把三处用它的地方统一到
+   * 同一个绑定上（与 `ModelListPanel` 的写法一致）—— 再写一次裸 `label`
+   * 就会是同一个缺陷。`tests/unit/qoder-hub-blank-screen.spec.ts` 真的渲染面板
+   * 并派发点击，钉死这一类自由变量。
+   */
+  const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
   // 本面板是否自己提供登录入口（null = 提供；见 providerLoginHint 的说明）。
   const loginHint = providerLoginHint(provider);
   const canCreateAccount = loginHint === null;
@@ -1462,7 +1484,7 @@ function ProviderPanel({ provider, rpcCall }) {
     // 并允许换行，窄面板下也能完整显示。
     React.createElement('div', { className: 'dim-jh-panelHead' },
       React.createElement('h2', { className: 'dim-jh-panelTitle' },
-        `${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号管理`),
+        `${providerLabel} 账号管理`),
       React.createElement('div', { className: 'dim-jh-headerActions' },
         React.createElement('button', {
           className: 'dim-jh-btn',
@@ -1480,7 +1502,7 @@ function ProviderPanel({ provider, rpcCall }) {
         supportsCredits
           ? React.createElement('button', {
               className: 'dim-jh-btn',
-              title: `领取全部 ${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号（含已停用）的每日签到积分`,
+              title: `领取全部 ${providerLabel} 账号（含已停用）的每日签到积分`,
               disabled: claiming || accounts.length === 0,
               onClick: () => void claimCredits(),
             }, claiming ? '领取中…' : '一键领取积分')
@@ -1531,7 +1553,9 @@ function ProviderPanel({ provider, rpcCall }) {
     // 节点照样出来而不报错。
     loginChoiceOpen && patLogin
       ? React.createElement(LoginChoiceForm, {
-          productLabel: label,
+          // ⚠️ 必须是上面那个 `providerLabel` 绑定 —— 这里曾经写成裸 `label`
+          // （未绑定标识符 ⇒ ReferenceError ⇒ 整页白屏），见它的声明处说明。
+          productLabel: providerLabel,
           onBrowserLogin: () => { setLoginChoiceOpen(false); void createAccount(); },
           onPatLogin: () => { setLoginChoiceOpen(false); setPatOpen(true); },
           onCancel: () => { setLoginChoiceOpen(false); setPatError(null); },
