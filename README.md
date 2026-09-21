@@ -2259,15 +2259,15 @@ CN 的地方外，两个 region 行为一致。
   > 只要浏览器登录」）：客户端不再有 PAT 表单与形态选择器。**库层与协议层保留** ——
   > `src/qoder-auth.ts` 的 `loginWithPat`、`src/jet-hub-rpc.ts` 对
   > `account.create` 载荷里 `pat` 的分派一行未动，服务 headless / 测试 / 未来形态。
-- **凭据只有一件长效物**（令牌），换来的 job token 是**进程内运行时缓存**、
-  **不落盘**。
+- **凭据只有一件长效物**（令牌），PAT 路径换来的 job token 是**进程内运行时
+  缓存**、**不落盘**；设备流路径连 job token 都不需要（`dt-` 直接当 Bearer）。
 
 | 项 | 腾讯系（Buddy CN / Buddy） | LobsterAI | Trae CN | **Qoder / Qoder CN** |
 |---|---|---|---|---|
 | 登录 | 轮询后端 API | 本地回调收 `authCode` | 本地回调 + PKCE(S256) | **设备流（PKCE + 轮询）** |
-| 长期凭据 | access + refresh | access + refresh + 身份字段 | 五件套 | **一件**（设备流 `token`） |
-| 鉴权 | `Bearer` + 归属头 | `Bearer` | `Cloud-IDE-JWT` | **`Bearer`（但分红：目录用长效令牌、chat/额度用 `jt-`）** |
-| 续期 | `X-Refresh-Token` 头 | `POST /api/auth/refresh` | exchange（body 四字段） | **重打 exchange**（令牌不变，随时可重打） |
+| 长期凭据 | access + refresh | access + refresh + 身份字段 | 五件套 | **两件**（设备流 `token` + `refresh_token`） |
+| 鉴权 | `Bearer` + 归属头 | `Bearer` | `Cloud-IDE-JWT` | **`Bearer`（但分令牌族：设备令牌直接用，PAT 先换 `jt-`）** |
+| 续期 | `X-Refresh-Token` 头 | `POST /api/auth/refresh` | exchange（body 四字段） | **按令牌族分派**：PAT 重打 exchange、设备令牌打 `deviceToken/refresh` |
 | 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **不做**（国际版无此活动；CN **疑似有但端点未知**） |
 
 ### 登录：浏览器设备流
@@ -2276,7 +2276,7 @@ CN 的地方外，两个 region 行为一致。
 
 | 形态 | 用户做什么 | 宿主做什么 |
 |---|---|---|
-| **浏览器登录** | 在新标签页的官方授权页上选账号并确认 | 两段式：`loginUrl` 秒回 → 轮询换令牌 → 补全占位账号 |
+| **浏览器登录** | 在新标签页的官方授权页上选账号并确认 | 两段式：`loginUrl` 秒回 → 轮询拿到令牌（**无换令牌步骤**）→ 补全占位账号 |
 
 > **PAT 粘贴形态已移除**（2026-09-21）。宿主仍接受 `{ provider, pat }` 载荷
 > （协议层分派），但**客户端不再发出**它，故上面这张表只剩一行。
@@ -2290,7 +2290,25 @@ CN 的地方外，两个 region 行为一致。
    &nonce&machine_id&client_id` —— ⚠️ **CN 的 `redirect_uri` 是 null，不带该参数**；
 3. **轮询**：`GET {openapiBase}/api/v1/deviceToken/poll?nonce&verifier
    &challenge_method&machine_id`，**404 → 1 秒后重试**、总超时 **5 分钟**；
-   成功判据是「`token` 与 `refresh_token` **都是 string**」。
+   成功判据照抄官方 `nec()`：**`token` 是非空 string**（`refresh_token` 不作要求）。
+
+> ⚠️⚠️ **轮询返回的就是令牌本体，设备流没有「换令牌」这一步**
+> （2026-09-21 真机 400 报障的根因）：官方 `Veo()` 把 poll 的 `token`（`dt-…`）
+> 直接写进 `security_oauth_token` / `access_token`，**全程不调
+> `exchangePersonalToken`**。`/api/v1/jobToken/exchange` 是 **PAT 专用**端点
+> （body `personal_token`），拿 `dt-` 打它恒回 **HTTP 400
+> `{"errorCode":"BadRequest"}`** —— 那正是「浏览器授权成功、却卡在换令牌」的来路。
+>
+> 两代令牌的分工（**两个体系，不可互换**）：
+>
+> | 令牌族 | 前缀 | 来源 | 换 job token？ | 续期端点 |
+> |---|---|---|---|---|
+> | PAT | `pt-` | 用户在 Integrations 页签发 | ✅ 打 `jobToken/exchange` | 重打 `jobToken/exchange` |
+> | 设备令牌 | `dt-` | 浏览器设备流 poll | ❌ **它本身就是可用 Bearer** | `deviceToken/refresh` |
+>
+> 官方用显式的 `refreshStrategy` 分派（`'pat'` / `'device-token'`），本插件同构：
+> `QoderAuth.getJobToken()` 对 `dt-` **原样返回**（零网络），
+> `refreshCredential()` 对 `dt-` 走 `deviceToken/refresh`。
 
 | 常量 | 取值 | 说明 |
 |---|---|---|
@@ -2331,8 +2349,8 @@ CN 的地方外，两个 region 行为一致。
 > 将来参考；当前面板上**没有**「粘贴 PAT」入口。库层能力与宿主协议分派仍在
 > （见上文「PAT 粘贴形态已于 2026-09-21 从 UI 移除」）。
 
-- **长效令牌**：设备流换来的 `token`（PAT 形态则是 `pt-` 前缀的 PAT，
-  官方明示**不自动刷新**：吊销前一直有效，失效只能重签）。
+- **长效令牌**：设备流 poll 返回的 `token`（`dt-…`；PAT 形态则是 `pt-` 前缀的
+  PAT，官方明示**不自动刷新**：吊销前一直有效，失效只能重签）。
 - **Account Hub 的「+ 新建账号」走浏览器登录**：手势内开空窗 → 导航到授权页 →
   轮询补齐账号。PAT 表单（曾经的 `type=password` 内联输入框）已删除。
 - 凭据 ref：单账号 `QODER_PERSONAL_TOKEN`；多账号
@@ -2341,32 +2359,37 @@ CN 的地方外，两个 region 行为一致。
 
   | 字段 | 含义 |
   |---|---|
-  | `access_token` | **长效令牌本体** —— 设备流的 `token`（PAT 形态下是 PAT）；既是模型目录端点的 `Bearer`，也是换 `jt-` 的输入 |
-  | `refresh_token` | 设备流的 `refresh_token`（或 `jrt-…`，48h）；**未启用**（主路径是重打 exchange） |
-  | `token_expires_at` | `jt-` 的过期时刻，**仅元数据**（`jt-` 本体**不落盘**） |
+  | `access_token` | **长效令牌本体** —— 设备流的 `dt-…`（PAT 形态下是 `pt-…`）；设备令牌**直接**当 chat / 额度的 `Bearer`，PAT 则要先换 `jt-` |
+  | `refresh_token` | 设备流的 `drt-…`（或 PAT 形态的 `jrt-…`）；设备令牌族用它打 `deviceToken/refresh` 续期 |
+  | `token_expires_at` | 令牌过期时刻（设备流是 `dt-` 的 ≈30 天，PAT 形态是 `jt-` 的 24h）—— 调度武装用 |
   | `user_id` / `user_type` | 身份字段，有则带 |
 
   ⚠️ **两种登录形态写同一种凭据形态**不是图省事：`AccountPool.findAccountIdByCredential`
   对非 codearts 的 provider 统一取 `access_token` 作身份标识，换字段会让限流记账
   **静默**失配。（PAT 形态虽已从 UI 移除，这条契约仍被 headless 路径依赖。）
 
-- **三段令牌，三种生命周期**：长效令牌（**不刷新**）／`refresh_token` 48h／`jt-` 24h。
+- **三段令牌，三种生命周期**：长效令牌（设备流 `dt-…` ≈30 天；PAT **不刷新**）／
+  `refresh_token`（`drt-…` ≈360 天，或 PAT 形态的 `jrt-…` 48h）／`jt-` 24h。
+  ⚠️ **只有 PAT 路径才有 `jt-`**：设备令牌自己就是 Bearer，不经 `jt-`。
   `jt-` 是**进程内运行时缓存**、**按令牌分键**，进程重启即冷 —— 冷启动会多打
   一次 exchange，这是设计如此，不是故障。剩余有效期不足 1 小时时主动重换。
+  设备令牌族走 `deviceToken/refresh`，同样只在剩余不足 1 小时（或缺失过期
+  声明）时才打，避免每 30 分钟的批量续期做无用功。
 
 > **`status().expiresAt` 对 Qoder 恒不返回**（账号条目也不写 `expiresAt`）：
-> PAT 的过期时间本地无从得知，而 `jt-` 的 24h 是**运行时缓存**的有效期 ——
-> 把它填进去会让账号卡片在闲置 24h 后显示「已过期」，而实际上下次请求会按需
-> 重换、一切正常。宁可少显示一行，也不报一个假的过期。
+> 令牌的过期时间口径两代不同，而账号卡片的口径只能有一个 —— 填错会让卡片在
+> 闲置后显示「已过期」，而实际上下次请求会按需重换、一切正常。
+> 宁可少显示一行，也不报一个假的过期。
 
 ### 端点：同一件事分散在三个 host，凭据还分红
 
 | 用途 | 端点 | 凭据 |
 |---|---|---|
-| 换 job token | `POST https://openapi.qoder.sh/api/v1/jobToken/exchange`，body `{"personal_token":"<PAT>"}` | 无（匿名头） |
-| chat | `POST https://api2-v2.qoder.sh/model/v1/chat/completions` | `Bearer jt-…` |
+| 换 job token（**仅 PAT**） | `POST https://openapi.qoder.sh/api/v1/jobToken/exchange`，body `{"personal_token":"<PAT>"}` | 无（匿名头） |
+| 设备令牌续期 | `POST https://openapi.qoder.sh/api/v1/deviceToken/refresh`，body `{"refresh_token":"<drt-…>","machine_id":…}` | 无（匿名头） |
+| chat | `POST https://api2-v2.qoder.sh/model/v1/chat/completions` | `Bearer jt-…`（PAT）或 `Bearer dt-…`（设备流） |
 | 模型目录 | `GET https://api.qoder.com/api/v1/cloud/models` | **`Bearer <PAT>`** |
-| 额度 | `GET https://openapi.qoder.sh/api/v2/quota/usage` | **`Bearer jt-…`** |
+| 额度 | `GET https://openapi.qoder.sh/api/v2/quota/usage` | **`Bearer jt-…`**（PAT）或 `Bearer dt-…`（设备流） |
 
 ⚠️ **两条最易错的地方**（都在实测里踩过）：
 

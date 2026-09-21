@@ -30,26 +30,33 @@ import { AccountPool } from './account-pool.js'
 import {
   cancelQoderDeviceLogin,
   prepareQoderDeviceLogin,
+  readOrCreateQoderMachineId,
   type QoderDeviceLoginPrepareOutcome,
   type QoderDevicePendingLogin,
-  type QoderDeviceTokenPayload,
   type QoderMachineIdIo,
 } from './qoder-device-flow.js'
 import {
   QODER,
+  QODER_DEVICE_TOKEN_REFRESH_LEAD_MS,
+  QODER_DEVICE_TOKEN_REFRESH_PATH,
   QODER_JOB_TOKEN_EXCHANGE_PATH,
   QODER_JOB_TOKEN_REFRESH_LEAD_MS,
   QODER_REQUEST_TIMEOUT_MS,
+  applyQoderDeviceRefresh,
   applyQoderRefresh,
   buildQoderCredential,
+  buildQoderDeviceCredential,
+  isQoderDeviceToken,
   isQoderPersonalToken,
   isQoderRefreshable,
   parseQoderCredential,
+  parseQoderDeviceTokenPayload,
   parseQoderJobTokenPayload,
   qoderAnonymousHeaders,
   qoderCredentialExpiresAtMs,
   serializeQoderCredential,
   type QoderCredential,
+  type QoderDeviceTokenPayload,
   type QoderJobTokenPayload,
   type QoderProduct,
 } from './qoder-product.js'
@@ -408,10 +415,17 @@ export class QoderAuth extends Service {
     return QODER_REQUEST_TIMEOUT_MS
   }
 
-  /** 标记凭据已失效：停止重试，并向 status() 暴露 refreshable: false 与重新粘贴提示。 */
+  /**
+   * 标记凭据已失效：停止重试，并向 status() 暴露 refreshable: false 与重新登录提示。
+   *
+   * ⚠️ **文案刻意是中性的「请重新登录」**（不是「请重新粘贴 PAT」）：Account Hub
+   * 的 Qoder 面板现在**只有浏览器设备流一个登录入口**（PAT 粘贴 UI 已于
+   * 2026-09-21 按用户要求移除），故「重新登录」是两代令牌下**唯一可执行**的
+   * 用户动作。说「重新粘贴」会把用户指向一个界面上不存在的入口。
+   */
   private markCredentialInvalid(): void {
     this.credentialInvalid = true
-    this.lastRefreshError = 'PAT 已失效，请重新粘贴'
+    this.lastRefreshError = '凭据已失效，请重新登录'
   }
 
   /**
@@ -548,14 +562,16 @@ export class QoderAuth extends Service {
   ): Promise<QoderLoginResult> {
     this.active = true
     const ref = options.refName ? credentialRef(options.refName) : credentialRef(this.credentialRefName)
-    // 用设备流令牌换一次 jt：既验证令牌可用（拿不到 jt 就不是有效登录），
-    // 也顺手把凭据的元数据（`user_id` 等）填上。
-    const exchangePayload = await this.exchange(payload.token)
-    const credential = buildQoderCredential(payload.token, {
-      ...exchangePayload,
-      // 设备流的 `refresh_token` 优先（见上方说明）。
-      refreshToken: payload.refreshToken.length > 0 ? payload.refreshToken : exchangePayload.refreshToken,
-    })
+    // ⚠️⚠️ **设备流令牌不做 exchange**（2026-09-21 真机报障根因）。
+    //
+    // poll 返回的 `dt-…` 就是**可用的长期令牌本体**（官方 `Veo()` 把它直接写进
+    // `security_oauth_token` / `access_token`，全程不调 `exchangePersonalToken`）。
+    // 而 `/api/v1/jobToken/exchange` 是 **PAT 专用**端点（body `personal_token`）——
+    // 把 `dt-` 提交过去，服务端回 HTTP 400 `{"errorCode":"BadRequest",…}`，
+    // 表现为「浏览器授权成功、却卡在换令牌」。
+    //
+    // 旧实现在这里调了一次 `this.exchange(payload.token)`，正是那个 400 的来源。
+    const credential = buildQoderDeviceCredential(payload.token, payload)
     await this.ctx.credentials.set(ref, serializeQoderCredential(credential))
     this.credentialInvalid = false
     this.lastRefreshError = undefined
@@ -660,22 +676,35 @@ export class QoderAuth extends Service {
   }
 
   /**
-   * 取一个可用的 job token（`jt-…`），必要时静默重打 exchange。
+   * 取一个可用的**运行时令牌**，必要时静默重换。
    *
-   * 这是**适配器（chat）与额度端点唯一该用的取令牌入口**：
+   * ## 两条令牌族，两种取法（这是本方法唯一的分派点）
    *
-   * - 缓存命中且剩余有效期 > {@link QODER_JOB_TOKEN_REFRESH_LEAD_MS}（1h）→
-   *   直接返回，**不发任何网络请求**；
-   * - 剩余不足 1h、或缓存为空 → 重打 exchange 并回填缓存。
+   * | `access_token` 形态 | 怎么取 | 出网 |
+   * |---|---|---|
+   * | `dt-…`（设备流） | **原样返回** | 零（它本身就是 Bearer） |
+   * | `pt-…`（PAT） | 缓存命中则返回 jt，否则打 exchange | 视缓存 |
    *
-   * 提前 1h 的窗口与 `src/refresh.ts` 的 `REFRESH_LEAD_MS` 同口径：卡在
+   * ⚠️⚠️ **设备令牌绝不能去打 exchange**：那是 PAT 专用端点
+   * （见 {@link exchangeQoderJobToken} 与 `QODER_JOB_TOKEN_EXCHANGE_PATH`
+   * 的说明），把 `dt-` 提交过去会回 HTTP 400 `BadRequest`。旧实现无条件走
+   * exchange 分支，于是「设备流登录」在**登录期**就被判失败。
+   *
+   * ## 为什么 PAT 分支要提前 1h 重换
+   *
+   * 剩余有效期小于 {@link QODER_JOB_TOKEN_REFRESH_LEAD_MS}（1h）→ 重打 exchange
+   * 并回填缓存。提前量与 `src/refresh.ts` 的 `REFRESH_LEAD_MS` 同口径：卡在
    * 「名义未过期、发请求时已过期」的窗口里会让用户看到一次莫名其妙的 401。
    *
-   * @param pat - PAT 本体（`QoderCredential.access_token`，**不是** jt）。
+   * @param pat - 凭据的 `access_token`（**PAT 或设备令牌**，不是 jt）。
    * @throws {RefreshTokenExpiredError} PAT 已失效（exchange 401 / `TOKEN_EXPIRE`
-   *         类）—— 适配器应把它当凭据失效处理，提示用户重新粘贴。
+   *         类）—— 适配器应把它当凭据失效处理，提示用户重新登录。
    */
   async getJobToken(pat: string): Promise<string> {
+    // 设备令牌：它自己就是 chat / quota 认的 Bearer，直接还回去。
+    // **一次网络都不出** —— 这也是「设备流登录后第一个请求不该多打一趟」的保证。
+    if (isQoderDeviceToken(pat)) return pat
+
     const cached = this.jobTokens.get(pat)
     if (cached !== undefined && cached.expiresAtMs - Date.now() > QODER_JOB_TOKEN_REFRESH_LEAD_MS) {
       return cached.token
@@ -756,7 +785,8 @@ export class QoderAuth extends Service {
     const credential = parseQoderCredential(resolved.value)
     if (!credential) throw new Error('凭据解析失败')
     if (!isQoderRefreshable(credential)) {
-      throw new RefreshTokenExpiredError('凭据缺少 PAT，请重新粘贴')
+      // ⚠️ 中性文案：设备流凭据没有 PAT，「重新粘贴 PAT」是界面上不存在的入口。
+      throw new RefreshTokenExpiredError('凭据缺少可用令牌，请重新登录')
     }
     try {
       const refreshed = await this.refreshCredential(credential)
@@ -791,7 +821,7 @@ export class QoderAuth extends Service {
     const credential = parseQoderCredential(resolved.value)
     if (!credential) throw new Error('凭据解析失败')
     if (!isQoderRefreshable(credential)) {
-      throw new RefreshTokenExpiredError('凭据缺少 PAT，请重新粘贴')
+      throw new RefreshTokenExpiredError('凭据缺少可用令牌，请重新登录')
     }
     const refreshed = await this.refreshCredential(credential)
     await this.ctx.credentials.set(ref, serializeQoderCredential(refreshed))
@@ -800,12 +830,102 @@ export class QoderAuth extends Service {
   /**
    * 对一份凭据执行一次续期并返回新凭据（不触碰凭据存储）。
    *
-   * exchange 成功时顺带回填 jt 缓存（{@link exchange} 内完成），
-   * 因此 `refreshAll` 的每一趟都是「换一张能用的 jt」。
+   * ## 按令牌族分派（两条路径，互不替代）
+   *
+   * | `access_token` | 续期方式 | 官方对应 |
+   * |---|---|---|
+   * | `pt-…` | 重打 exchange（PAT 不变，随时可重打） | `refreshStrategy: 'pat'` |
+   * | `dt-…` | `POST /api/v1/deviceToken/refresh`（body `refresh_token`） | `refreshStrategy: 'device-token'` |
+   *
+   * ⚠️ **不分派会让设备流登录「先成功后失效」**：设备令牌提交给 PAT 专用的
+   * exchange 端点必然 400，而 `refresh()` 把 4xx 之外的失败都当可重试，
+   * 用户看到的是登录明明成功、过一阵却报「凭据失效」。
+   * PAT 分支一行未动（有逐字节回归用例钉死）。
    */
   private async refreshCredential(credential: QoderCredential): Promise<QoderCredential> {
+    if (isQoderDeviceToken(credential.access_token)) {
+      const payload = await this.refreshDeviceToken(credential)
+      return applyQoderDeviceRefresh(credential, payload)
+    }
     const payload = await this.exchange(credential.access_token)
     return applyQoderRefresh(credential, payload)
+  }
+
+  /**
+   * 用设备刷新令牌（`drt-…`）换一张新的设备令牌。
+   *
+   * 官方 `refreshDeviceCredential(A,e)` @ INTL 偏移 4017721：
+   * ```js
+   * POST {openapiBase}/api/v1/deviceToken/refresh
+   * body {refresh_token: A.refresh_token, ...getMachineIdentityRequestFields(machineId)}
+   * ```
+   * 头是 `Content-Type` / `Accept` / `User-Agent`（**无 Authorization** ——
+   * 续期时手上的令牌正是要换掉的那张）。
+   *
+   * ⚠️ **`machine_id` 一并回传**（官方同款）：它是设备身份，两处漂移会让
+   * 服务端把这次续期当成另一台机器。
+   *
+   * @throws {RefreshTokenExpiredError} 401/403、或响应里没有可用令牌
+   *         （`drt-` 已失效 —— 只能重新走浏览器登录）。
+   * @throws {Error} 其余（网络失败、5xx）—— 交给调度器重试。
+   */
+  private async refreshDeviceToken(credential: QoderCredential): Promise<QoderDeviceTokenPayload> {
+    const refreshToken = credential.refresh_token
+    if (refreshToken.length === 0) {
+      // 没有 drt 就无法续期。这是**终态**（设备令牌 ≈30 天到期后必须重新登录），
+      // 与「网络抖动」区分开：重试一万次也换不出令牌。
+      throw new RefreshTokenExpiredError('凭据缺少设备刷新令牌，请重新登录')
+    }
+    const machineId = await readOrCreateQoderMachineId(this.product, {
+      ...this.options.deviceFlow?.homeDir === undefined ? {} : { homeDir: this.options.deviceFlow.homeDir },
+      ...this.options.deviceFlow?.io === undefined ? {} : { io: this.options.deviceFlow.io },
+    })
+    const signal = AbortSignal.timeout(QODER_REQUEST_TIMEOUT_MS)
+    let response: Response
+    try {
+      response = await this.fetchImpl(`${this.product.openapiBase}${QODER_DEVICE_TOKEN_REFRESH_PATH}`, {
+        method: 'POST',
+        headers: qoderAnonymousHeaders(this.product),
+        body: JSON.stringify({ refresh_token: refreshToken, machine_id: machineId }),
+        signal,
+      })
+    } catch (error) {
+      throw new Error(`Qoder 设备令牌续期网络失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+
+    let rawText: string
+    try {
+      rawText = await response.text()
+    } catch (error) {
+      throw new Error(
+        `Qoder 设备令牌续期响应读取失败（HTTP ${response.status}）：`
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+
+    if (!response.ok) {
+      const summary = summarizeQoderErrorBody(rawText)
+      if (response.status === 401 || response.status === 403) {
+        throw new RefreshTokenExpiredError(
+          `设备令牌已失效，请重新登录（HTTP ${response.status}：${summary}）`,
+        )
+      }
+      throw new Error(`Qoder 设备令牌续期失败：HTTP ${response.status} ${summary}`)
+    }
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(rawText) as unknown
+    } catch {
+      throw new Error(`Qoder 设备令牌续期响应不是 JSON（HTTP ${response.status}）：${summarizeQoderErrorBody(rawText)}`)
+    }
+    const payload = parseQoderDeviceTokenPayload(parsed)
+    if (payload === undefined) {
+      throw new RefreshTokenExpiredError(
+        `Qoder 设备令牌续期响应缺少令牌，请重新登录：${summarizeQoderErrorBody(rawText)}`,
+      )
+    }
+    return payload
   }
 
   /**
@@ -820,6 +940,12 @@ export class QoderAuth extends Service {
    * `getJobToken` 自带「剩余 >1h 即命中缓存」的判据，于是每账号每进程
    * 最多每 23 小时换一次，语义与其它 provider 的 `refreshAll` 一致
    * （都保证「下一次请求拿到的令牌是有效的」），只是不再做无用功。
+   *
+   * ⚠️ **设备令牌族例外，必须真的续期**：`getJobToken` 对 `dt-` 是
+   * **原样返回**（它本身就是 Bearer，无缓存可命中），拿它当「续期」等于
+   * 什么都没做 —— 设备令牌 ≈30 天到期后账号会静默变成不可用。故这里对
+   * 设备令牌走 {@link refreshCredential}（即 `deviceToken/refresh`），
+   * 且只在**临近过期**时才打（同样的「不做无用功」判据）。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts(this.product.id)
@@ -834,6 +960,17 @@ export class QoderAuth extends Service {
         const credential = parseQoderCredential(resolved.value)
         if (!credential || !isQoderRefreshable(credential)) {
           await pool.updateAccount(entry.id, { refreshable: false })
+          continue
+        }
+        if (isQoderDeviceToken(credential.access_token)) {
+          // 设备令牌：只在临近过期时续期（提前窗口与 PAT 侧同口径）。
+          const expiresAt = qoderCredentialExpiresAtMs(credential)
+          const lead = expiresAt === undefined
+            ? QODER_DEVICE_TOKEN_REFRESH_LEAD_MS
+            : expiresAt - Date.now()
+          if (lead > QODER_DEVICE_TOKEN_REFRESH_LEAD_MS) continue
+          const refreshed = await this.refreshCredential(credential)
+          await this.ctx.credentials.set(credentialRef(entry.credentialRef), serializeQoderCredential(refreshed))
           continue
         }
         await this.getJobToken(credential.access_token)

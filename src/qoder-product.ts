@@ -226,20 +226,73 @@ export const QODER_CN_PAT_URL = 'https://qoder.cn/account/integrations'
 // ── 端点路径 ──
 
 /**
- * 换令牌：PAT → job token（`jt-`，实测 24h）。
+ * 换令牌：**PAT** → job token（`jt-`，实测 24h）。
  *
  * ⚠️ body 键名**必须** snake_case `personal_token`（camelCase 回 400
  * `{"errorCode":"BadRequest",…}`，实测）。
+ *
+ * ⚠️⚠️ **本端点是 PAT 专用，设备流令牌绝不能打它** —— 这是「设备流授权后
+ * 换令牌 400」的根因（2026-09-21 真机报障）。两代令牌是**两个体系**：
+ *
+ * | 令牌族 | 前缀 | 怎么来 | 换不换 job token | 续期端点 |
+ * |---|---|---|---|---|
+ * | PAT | `pt-` | 用户在 Integrations 页签发 | ✅ 打本端点 | 重打本端点 |
+ * | 设备令牌 | `dt-` | 浏览器设备流 poll 返回 | ❌ **它本身就是可用 Bearer** | {@link QODER_DEVICE_TOKEN_REFRESH_PATH} |
+ *
+ * 官方把这件事写成了显式的 `refreshStrategy` 分派（`wct()` 里 PAT →
+ * `refreshStrategy:"pat"`；`Veo()` 里设备流 → `refreshStrategy:"device-token"`，
+ * 且**全程不调 `exchangePersonalToken`**）。把 `dt-` 当 `personal_token` 提交，
+ * 服务端回 400 `BadRequest`（把它当格式错）或 401 `personal token is invalid`
+ * （研究文档 L800 实测），两条都表现为「登录失败」。
  */
 export const QODER_JOB_TOKEN_EXCHANGE_PATH = '/api/v1/jobToken/exchange'
 
 /**
  * 用 `jrt-` 换新 `jt-`（CLI2API 情报，**未实测**）。
  *
- * 本 provider 的续期主路径是**重打 exchange**（PAT 不变，随时可重打），
+ * 本 provider 的 PAT 路径续期主路径是**重打 exchange**（PAT 不变，随时可重打），
  * 故这条路径只登记常量、不实现 —— 真机验收若发现 exchange 有频次限制再启用。
  */
 export const QODER_JOB_TOKEN_REFRESH_PATH = '/api/v1/jobToken/refresh'
+
+/**
+ * **设备令牌**续期：`POST {openapiBase}/api/v1/deviceToken/refresh`，
+ * body `{"refresh_token":"drt-…","machine_id":…}`。
+ *
+ * ⚠️ **这是设备流凭据唯一的续期路径，不要拿它去换 job token**。
+ * 官方把两条续期路径**按令牌族分派**（`refreshStrategy` 是 `'pat'` 还是
+ * `'device-token'`，见 {@link QODER_JOB_TOKEN_EXCHANGE_PATH} 的说明）：
+ * PAT 重打 exchange，设备令牌打本端点。用错会得到「凭据失效」的假象。
+ *
+ * 取证（官方 worker runtime，两区同构）：
+ * `refreshDeviceToken(A,e)` @ INTL 偏移 3984700
+ * ```js
+ * openApiJsonRequest({operation:"refreshDeviceToken", path:"/api/v1/deviceToken/refresh",
+ *   method:"POST", body:{refresh_token:A, ...this.getMachineIdentityRequestFields(...)}})
+ * ```
+ * 旁证：`docs/qoder-integration-research.md` §A3（`tokens.py` 的 `drt-` 分支）。
+ */
+export const QODER_DEVICE_TOKEN_REFRESH_PATH = '/api/v1/deviceToken/refresh'
+
+/**
+ * 设备令牌的**兜底有效期**（30 天）。
+ *
+ * 仅在设备流 poll 响应里 `expires_at` 与 `expires_in` **双缺**时使用 ——
+ * 实测两者都在（真机样本 `expires_in: 2591999994` ≈ 30 天，见
+ * `docs/qoder-integration-research.md` L139-147），故这是纯粹的防御分支。
+ * **不当作权威值**：权威值永远来自 poll 响应的 `expires_at`（ISO 绝对时刻）
+ * 或 `expires_in`（相对，按官方 `rIe()` 启发式解析）。
+ */
+export const QODER_DEVICE_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+/**
+ * 设备令牌的**提前续期窗口**（1 小时）。
+ *
+ * 与 {@link QODER_JOB_TOKEN_REFRESH_LEAD_MS} 同口径（也同
+ * `src/refresh.ts` 的 `REFRESH_LEAD_MS`）：卡在「名义未过期、发请求时已过期」
+ * 的窗口里会让用户看到一次莫名其妙的 401。
+ */
+export const QODER_DEVICE_TOKEN_REFRESH_LEAD_MS = 60 * 60 * 1000
 
 /** 额度用量（只认 `jt-`）。**步骤 4** 使用。 */
 export const QODER_QUOTA_USAGE_PATH = '/api/v2/quota/usage'
@@ -387,6 +440,203 @@ function readNumber(source: Record<string, unknown>, key: string): number | unde
  */
 export function isQoderPersonalToken(value: string, prefix: string = QODER_PAT_PREFIX): boolean {
   return value.startsWith(prefix) && value.length > prefix.length
+}
+
+/**
+ * 设备令牌前缀（浏览器设备流 poll 返回的 `dt-…`）。
+ *
+ * 与 `pt-` 是**两个体系**（见 {@link QODER_JOB_TOKEN_EXCHANGE_PATH} 的表）。
+ * 取值来源：`docs/qoder-integration-research.md` L141 的真机 poll 响应样本
+ * （`"token":"dt-…"`）与 L789 的方案 B 凭据形态。
+ */
+export const QODER_DEVICE_TOKEN_PREFIX = 'dt-'
+
+/**
+ * 判断一个字符串是否是**设备令牌**形态（`dt-` 开头且后面还有内容）。
+ *
+ * 判据与 {@link isQoderPersonalToken} 同形（只校验前缀，正文由服务端生成），
+ * 用途是**分派令牌族**：设备令牌直接当 Bearer 用、续期走
+ * {@link QODER_DEVICE_TOKEN_REFRESH_PATH}；PAT 才需要先换 job token。
+ */
+export function isQoderDeviceToken(value: string, prefix: string = QODER_DEVICE_TOKEN_PREFIX): boolean {
+  return value.startsWith(prefix) && value.length > prefix.length
+}
+
+/**
+ * 由设备流 poll 结果组装可持久化的凭据（**登录路径**，与 PAT 路径并列）。
+ *
+ * 与 {@link buildQoderCredential} 的区别只在**入参类型**：设备流拿到的不是
+ * job token 而是设备令牌本体，且它自带 `refresh_token` / 过期时刻。
+ *
+ * ⚠️ **`access_token` 存设备令牌本体**（`dt-…`）—— 与 PAT 存 `pt-…` 同一字段、
+ * 同一语义（都是「可当 Bearer 的长期令牌」）。字段名不动是硬约束：
+ * `AccountPool.findAccountIdByCredential` 统一取 `access_token` 作身份标识，
+ * 换字段会让限流记账**静默**失配。
+ */
+export function buildQoderDeviceCredential(
+  token: string,
+  payload: QoderDeviceTokenPayload,
+): QoderCredential {
+  return {
+    access_token: token,
+    refresh_token: payload.refreshToken,
+    ...payload.expiresAtMs === undefined ? {} : { token_expires_at: String(payload.expiresAtMs) },
+    ...payload.userId === undefined ? {} : { user_id: payload.userId },
+  }
+}
+
+/**
+ * 用设备令牌续期的结果更新旧凭据（**设备令牌族的续期路径**）。
+ *
+ * 与 {@link applyQoderRefresh} 同构：令牌本体保留（续期只换它的值，不换身份），
+ * `refresh_token` 响应没带就沿用旧值（不能覆盖成空串 —— 那等于把凭据废掉）。
+ */
+export function applyQoderDeviceRefresh(
+  previous: QoderCredential,
+  payload: QoderDeviceTokenPayload,
+): QoderCredential {
+  return {
+    ...previous,
+    access_token: payload.token,
+    refresh_token: payload.refreshToken.length > 0 ? payload.refreshToken : previous.refresh_token,
+    ...payload.expiresAtMs === undefined ? {} : { token_expires_at: String(payload.expiresAtMs) },
+    ...payload.userId === undefined ? {} : { user_id: payload.userId },
+  }
+}
+
+/**
+ * 设备流 / 设备令牌续期的令牌载荷。
+ *
+ * 字段名取自官方 `buildUserInfoFromDeviceToken(A)` @ INTL 偏移 4004781
+ * （`A.token` / `A.refresh_token` / `A.expires_at` / `A.expires_in` /
+ * `A.user_id` / `A.user_name`）与真机 poll 样本
+ * （`docs/qoder-integration-research.md` L139-147）。
+ */
+export interface QoderDeviceTokenPayload {
+  /** 设备令牌本体（`dt-…`，直接当 Bearer 用）。 */
+  token: string
+  /** 设备刷新令牌（`drt-…`）；缺失时为空串。 */
+  refreshToken: string
+  /**
+   * 令牌过期时刻（毫秒）。
+   *
+   * **缺失即 `undefined`（不编造）**：由调用方按
+   * {@link QODER_DEVICE_TOKEN_TTL_MS} 兜底。解析口径见
+   * {@link resolveQoderDeviceTokenExpiresAtMs}。
+   */
+  expiresAtMs?: number
+  /** 服务端返回的用户 id（`user_id`，有则带）。 */
+  userId?: string
+  /** 服务端返回的用户名（`user_name`，有则带）。 */
+  userName?: string
+}
+
+/**
+ * 解析设备令牌的过期时刻（毫秒）；两个字段都缺时返回 `undefined`。
+ *
+ * ## 取值优先级：绝对时刻优先，相对值按官方 `rIe()` 启发式
+ *
+ * 1. `expires_at`（ISO 8601 绝对时刻）—— 真机 poll 响应里有它，**最可靠**；
+ * 2. `expires_in`（相对值）—— 官方 `rIe()` @ INTL 偏移 3946069：
+ *    ```js
+ *    function rIe(A){ return Math.floor(Date.now()/1e3) + (A > 86400 ? Math.floor(A/1e3) : A) }
+ *    ```
+ *    即 **> 86400 视为毫秒、否则视为秒**。真机 deviceToken 的
+ *    `expires_in: 2591999994`（≈30 天，毫秒）正落在这个启发式的毫秒分支；
+ *    而 jobToken 的 `expires_in: 86400000`（24h）同样落毫秒分支。
+ *
+ * ⚠️ **与官方 `buildUserInfoFromDeviceToken` 的一处刻意偏离**：那里对
+ * `expires_in` **不加启发式**、直接当秒加（`floor(now/1e3)+A.expires_in`）——
+ * 照抄会把真机的 `2591999994` 算成 **82 年后**，于是 `token_expires_at` 变成
+ * 一个永不触发的时刻、自动续期永不武装。同一个文件里 `rIe()` 才是对的，
+ * 故这里以 `rIe()` 为准（**取同一份官方源码内更自洽的那个口径**）。
+ *
+ * `expires_at` 与 `expires_in` 都缺 ⇒ 返回 `undefined`：**不编造**，
+ * 由调用方决定兜底（`undefined` 是「未知」，不是「已过期」）。
+ */
+export function resolveQoderDeviceTokenExpiresAtMs(
+  record: Record<string, unknown>,
+  nowMs: number,
+): number | undefined {
+  const absolute = readString(record, 'expires_at')
+  if (absolute.length > 0) {
+    const parsed = Date.parse(absolute)
+    if (!Number.isNaN(parsed)) return parsed
+  }
+  const expiresIn = readNumber(record, 'expires_in')
+  if (expiresIn !== undefined && expiresIn > 0) {
+    const seconds = expiresIn > 86_400 ? Math.floor(expiresIn / 1_000) : expiresIn
+    return nowMs + seconds * 1_000
+  }
+  return undefined
+}
+
+/**
+ * 解析**设备令牌**响应（poll 与 refresh 两个端点共用这一份）。
+ *
+ * ## 成功判据：`token` 是 string（照抄官方 `nec()` 的 poll 判据）
+ *
+ * 官方 @ INTL 偏移 3940912：
+ * ```js
+ * let e=await A.json(); if(e.token && "string"==typeof e.token) return e
+ * ```
+ * ⚠️ **判据是「类型是 string」，不是「非空」**（所以 `token: ""` 也**算**成功 ——
+ * 上游回空串是上游的事，本地不做二次判断）。但 `token: 123` **不算**：
+ * 官方用的是 `typeof`，把数字强转成字符串会让我们接受一个官方拒绝的响应，
+ * 然后在下一跳以一个更难查的形态失败。故这里**不用** `readString`
+ * （它会把数字转成字符串），而是显式 `typeof === 'string'`。
+ *
+ * ## 刻意不要求 `refresh_token` 也是 string
+ *
+ * 旧实现要求两者都是 string —— 那是我们发明的额外约束，**比官方严**。
+ * 它会把「服务端只回了 token」这种**官方认为成功**的响应判成「还没好」，
+ * 于是继续轮询到 5 分钟超时，用户看到的是「授权了但登录一直不完成」。
+ * 而 `token` 本身就够用（它是可直接当 Bearer 的长期令牌，见
+ * {@link QODER_JOB_TOKEN_EXCHANGE_PATH} 的表）；缺 `refresh_token` 的后果
+ * 只是**不能静默续期**，那是降级、不是失败。
+ *
+ * ## 令牌字段三级回退
+ *
+ * `token` → `device_token` → `access_token`。poll 真机回 `token`
+ * （`docs/qoder-integration-research.md` L141），refresh 官方读 `device_token`
+ * 优先、回退 `token`。两个端点共用一份解析、三处都认，避免「续期成功但
+ * 令牌没变」这类**静默**失败（字段改名后只认一个就会命中）。
+ */
+export function parseQoderDeviceTokenPayload(
+  body: unknown,
+  nowMs: number = Date.now(),
+): QoderDeviceTokenPayload | undefined {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) return undefined
+  const record = body as Record<string, unknown>
+  const token = readDeviceTokenString(record, 'token')
+    ?? readDeviceTokenString(record, 'device_token')
+    ?? readDeviceTokenString(record, 'access_token')
+  if (token === undefined) return undefined
+  const userId = readString(record, 'user_id') || readString(record, 'userId')
+  const userName = readString(record, 'user_name') || readString(record, 'userName')
+  const expiresAtMs = resolveQoderDeviceTokenExpiresAtMs(record, nowMs)
+  return {
+    token,
+    refreshToken: readString(record, 'refresh_token'),
+    ...expiresAtMs === undefined ? {} : { expiresAtMs },
+    ...userId.length > 0 ? { userId } : {},
+    ...userName.length > 0 ? { userName } : {},
+  }
+}
+
+/**
+ * 按官方 `e.token && typeof e.token === 'string'` 口径读一个令牌字段。
+ *
+ * 与 {@link readString} 的区别有两点，都是为了**不发明**：
+ * 1. **不做数字强转** —— 官方用 `typeof`，把 `123` 强转成 `'123'` 会让我们
+ *    接受一个官方拒绝的响应，然后在下一跳以更难查的形态失败；
+ * 2. **空串视为缺失** —— 官方判据里的 `e.token &&` 就是真值性检查，
+ *    `''` 不满足它，官方会继续轮询。故这里返回 `undefined`（让调用方
+ *    继续回退到下一个候选字段名），而不是回一个空令牌。
+ */
+function readDeviceTokenString(source: Record<string, unknown>, key: string): string | undefined {
+  const value = source[key]
+  return typeof value === 'string' && value.length > 0 ? value : undefined
 }
 
 /** 从存储值解析凭据 JSON；解析失败返回 undefined。 */

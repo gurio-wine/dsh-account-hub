@@ -348,18 +348,55 @@ describe('轮询换令牌', () => {
     expect(delays).toEqual([250])
   })
 
-  it('成功判据是「token 与 refresh_token 都是 string」', () => {
-    expect(parseQoderDeviceTokenPayload({ token: 'pt-x', refresh_token: 'jrt-y' })).toEqual({
-      token: 'pt-x',
-      refreshToken: 'jrt-y',
+  it('成功判据照抄官方：`token` 是**非空 string**（`refresh_token` 不作要求）', () => {
+    expect(parseQoderDeviceTokenPayload({ token: 'dt-x', refresh_token: 'drt-y' })).toEqual({
+      token: 'dt-x',
+      refreshToken: 'drt-y',
     })
-    // 缺任一、或类型不是 string，都不算成功 —— 提前返回会让上层写下一份
-    // 半截凭据（有 token 无 refresh_token），而失败要等到很久以后才暴露。
-    expect(parseQoderDeviceTokenPayload({ token: 'pt-x' })).toBeUndefined()
-    expect(parseQoderDeviceTokenPayload({ refresh_token: 'jrt-y' })).toBeUndefined()
-    expect(parseQoderDeviceTokenPayload({ token: 123, refresh_token: 'jrt-y' })).toBeUndefined()
+    // 官方 `nec()` 判据是 `e.token && "string"==typeof e.token`：
+    // 缺 token / 空串 / 非 string 都不算成功（继续轮询）。
+    expect(parseQoderDeviceTokenPayload({ token: 'dt-x' })).toEqual({ token: 'dt-x', refreshToken: '' })
+    expect(parseQoderDeviceTokenPayload({ refresh_token: 'drt-y' })).toBeUndefined()
+    expect(parseQoderDeviceTokenPayload({ token: '' })).toBeUndefined()
+    expect(parseQoderDeviceTokenPayload({ token: 123, refresh_token: 'drt-y' })).toBeUndefined()
     expect(parseQoderDeviceTokenPayload(null)).toBeUndefined()
     expect(parseQoderDeviceTokenPayload('nope')).toBeUndefined()
+    // ⚠️ **`refresh_token` 不作要求**：旧实现要求两者都是 string，那是我们发明的
+    // 额外约束、比官方严 —— 它会把「服务端只回了 token」这种官方认为成功的响应
+    // 判成「还没好」，于是空转到 5 分钟超时（用户看到「授权了但一直不完成」）。
+  })
+
+  it('顺带解析 expires_at / expires_in / user_id（官方 buildUserInfoFromDeviceToken 的字段）', () => {
+    // 官方 `buildUserInfoFromDeviceToken` 读 `expires_at` / `expires_in` /
+    // `user_id` / `user_name` —— 设备流令牌的**真实寿命**只能从这里拿。
+    const expiresAt = new Date(Date.now() + 30 * 86_400_000).toISOString()
+    const parsed = parseQoderDeviceTokenPayload({
+      token: 'dt-x', refresh_token: 'drt-y', expires_at: expiresAt, user_id: 'u-9',
+    })
+    expect(parsed?.token).toBe('dt-x')
+    expect(parsed?.refreshToken).toBe('drt-y')
+    expect(parsed?.userId).toBe('u-9')
+    expect(parsed?.expiresAtMs).toBe(Date.parse(expiresAt))
+  })
+
+  it('expires_in 按官方 rIe() 的启发式解析（>86400 视为毫秒，否则视为秒）', () => {
+    const now = Date.now()
+    // 真机 deviceToken poll 的 `expires_in` 是 **2591999994（毫秒 ≈30 天）**：
+    // 官方 `rIe(A) = floor(now/1000) + (A > 86400 ? floor(A/1000) : A)`。
+    // 当成「秒」会算出 82 年，当成「毫秒」才对；而 jobToken 的
+    // `expires_in: 86400000` 同一个启发式也落在 24h。
+    const big = parseQoderDeviceTokenPayload({ token: 'dt-x', refresh_token: 'r', expires_in: 2_591_999_994 })
+    expect(big?.expiresAtMs).toBeGreaterThan(now + 29 * 86_400_000)
+    expect(big?.expiresAtMs).toBeLessThan(now + 31 * 86_400_000)
+
+    const small = parseQoderDeviceTokenPayload({ token: 'dt-x', refresh_token: 'r', expires_in: 3600 })
+    expect(small?.expiresAtMs).toBeGreaterThan(now + 3_500_000)
+    expect(small?.expiresAtMs).toBeLessThan(now + 3_700_000)
+  })
+
+  it('两个过期字段都缺时**不编造**（expiresAtMs 为 undefined，由上层兜底）', () => {
+    const parsed = parseQoderDeviceTokenPayload({ token: 'dt-x', refresh_token: 'r' })
+    expect(parsed?.expiresAtMs).toBeUndefined()
   })
 
   it('200 但判据不满足（用户还没点授权）→ 继续轮询，不提前失败', async () => {

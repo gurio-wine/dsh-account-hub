@@ -42,7 +42,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { QODER_CLI_CLIENT_ID, type QoderProduct } from './qoder-product.js'
+import { QODER_CLI_CLIENT_ID, parseQoderDeviceTokenPayload, type QoderDeviceTokenPayload, type QoderProduct } from './qoder-product.js'
 
 /**
  * 转出 CLI 的 `client_id`（**唯一取值来源在 `qoder-product.ts`**）。
@@ -223,30 +223,17 @@ export async function readOrCreateQoderMachineId(
 
 // ── 轮询 ────────────────────────────────────────────────────────────────────
 
-/** 设备流成功返回的令牌载荷。 */
-export interface QoderDeviceTokenPayload {
-  /** 长期令牌（进凭据的 `access_token`）。 */
-  token: string
-  /** 刷新令牌（进凭据的 `refresh_token`）。 */
-  refreshToken: string
-}
-
 /**
- * 解析轮询成功响应。
+ * 设备流成功返回的令牌载荷（**类型与解析都在 `qoder-product.ts`**）。
  *
- * 成功判据**逐字照抄官方**：`typeof token === 'string' && typeof refresh_token === 'string'`。
- * 二者缺一都返回 `undefined`（= 「还没好，继续等」）而不是抛错 —— 授权页尚未
- * 点击时上游会回 200 + 空对象，那是**正常中间态**。
- *
- * ⚠️ **刻意不要求非空串**：判据是**类型**。上游若回 `""`，那是上游的事；
- * 本函数只做「是不是 string」这一件事，与官方一致。
+ * 转出而不在本文件重新声明：poll 与 `deviceToken/refresh` 两个端点回的是
+ * **同一种载荷**，两处各写一份类型与解析必然分叉（典型后果：「续期成功但
+ * 令牌没变」这类静默失败）。协议纯函数统一住在产品层，本文件只负责流程。
  */
-export function parseQoderDeviceTokenPayload(body: unknown): QoderDeviceTokenPayload | undefined {
-  if (typeof body !== 'object' || body === null || Array.isArray(body)) return undefined
-  const record = body as Record<string, unknown>
-  if (typeof record.token !== 'string' || typeof record.refresh_token !== 'string') return undefined
-  return { token: record.token, refreshToken: record.refresh_token }
-}
+export {
+  parseQoderDeviceTokenPayload,
+  type QoderDeviceTokenPayload,
+} from './qoder-product.js'
 
 /** {@link pollQoderDeviceToken} 的选项。 */
 export interface QoderDevicePollOptions {

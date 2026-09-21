@@ -177,7 +177,7 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 ⚠️ **`machine_id` 读写用户真实 home**（`~/.qoder/.auth/machine_id` / `~/.qoder-cn/.auth/machine_id`），**与官方 CLI 同路径是刻意的**（混用时机器身份稳定，wasm 签名链才不失效）。**任何测试都必须注入 `homeDir`**，否则会污染用户环境；生产下 IO 失败退回内存态 UUID，**不抛错**。
 
-⚠️ **设备流与 PAT 写同一种凭据形态**（`access_token` = 令牌或 PAT），故 `refresh` / 额度 / 目录三条下游链路一行未改。改字段名会让 `AccountPool.findAccountIdByCredential` 的限流记账**静默**失配。
+⚠️ **设备流与 PAT 写同一种凭据形态**（`access_token` = 令牌或 PAT），故 `refresh` / 额度 / 目录三条下游链路一行未改。⚠️⚠️ **但设备流没有「换令牌」这一步**（真机 400 根因）：`dt-…` 本身就是可用 Bearer，交给 PAT 专用的 `jobToken/exchange` 恒回 400；分派与 poll 判据详见 README。
 
 ## 账号池与多账号
 

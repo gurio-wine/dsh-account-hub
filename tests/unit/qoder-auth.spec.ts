@@ -12,6 +12,7 @@ import {
 } from '../../src/qoder-auth.js'
 import {
   QODER,
+  QODER_CN,
   QODER_JOB_TOKEN_TTL_MS,
   isQoderPersonalToken,
   parseQoderJobTokenPayload,
@@ -58,6 +59,7 @@ function newService(
     fetcher?: typeof fetch
     serviceName?: string
     deviceFlow?: QoderAuthOptions['deviceFlow']
+    product?: QoderAuthOptions['product']
   } = {},
 ): QoderAuth {
   const service = new QoderAuth(ctx, options)
@@ -558,6 +560,198 @@ describe('QoderAuth getJobToken（jt 运行时缓存）', () => {
   })
 })
 
+describe('QoderAuth 设备流登录（2026-09-21 400 报障的回归锚点）', () => {
+  /** 真机设备流 poll 成功响应（字段照抄 `docs/qoder-integration-research.md` L139-147）。 */
+  function devicePollSuccess(overrides: Record<string, unknown> = {}): Response {
+    return new Response(JSON.stringify({
+      id: '01a0bb78-844d-78e2-8efc-4b0e20fe9533',
+      token: 'dt-Kq7vRt2mXp9sLd4nBc6yZg1hJf8wQa3e',
+      user_id: '01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e',
+      code_challenge: 'CHALLENGE-43',
+      challenge_method: 'S256',
+      nonce: '11111111-2222-3333-4444-555555555555',
+      expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+      refresh_token_id: 'rt-1',
+      refresh_token: 'drt-Ym3pQw8tZc5vNb2kLd7xRf4hJs9gTe6a',
+      created_at: '2026-09-21T00:00:00Z',
+      updated_at: '2026-09-21T00:00:00Z',
+      expires_in: 2_591_999_994,
+      refresh_token_expires_in: 31_103_999_996,
+      refresh_token_expires_at: new Date(Date.now() + 360 * 86_400_000).toISOString(),
+      ...overrides,
+    }), { status: 200 })
+  }
+
+  /** 一次性完成「设备流授权 → 落凭据」的完整链路。 */
+  async function completeDeviceLogin(
+    options: { fetcher: typeof fetch; homeDir: string; accountId?: string; pool?: unknown },
+  ) {
+    const { ctx, credentials } = makeContext()
+    const service = newService(ctx, {
+      fetcher: options.fetcher,
+      deviceFlow: { homeDir: options.homeDir, intervalMs: 1 },
+    })
+    const outcome = await service.prepareLogin()
+    if (!outcome.ok) throw new Error(`prepare 失败：${outcome.message}`)
+    const result = await service.persistLoginResult(outcome.session, {
+      ...options.accountId === undefined ? {} : { accountId: options.accountId },
+      ...options.pool === undefined ? {} : { pool: options.pool as never },
+      ...options.accountId === undefined ? {} : { refName: 'QODER_ACCOUNT_A1B2C3D4' },
+    })
+    return { ctx, credentials, service, result, session: outcome.session }
+  }
+
+  it('★ 设备流登录**绝不打** jobToken/exchange（400 报障的根因锚点）', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-login-'))
+    tempHomes.push(homeDir)
+    const { fetcher, calls } = stubFetcher(() => devicePollSuccess())
+
+    const { credentials } = await completeDeviceLogin({ fetcher, homeDir })
+
+    // 唯一该出网的是轮询。
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toContain('/api/v1/deviceToken/poll')
+    // ⚠️ 反向断言：exchange 端点是 **PAT 专用**。把设备令牌（`dt-…`）当
+    // `personal_token` 提交过去，服务端回 HTTP 400 `{"errorCode":"BadRequest"}` ——
+    // 那正是「浏览器授权成功、却卡在换令牌」的来路。
+    expect(calls.map((c) => c.url).join(' ')).not.toContain('/api/v1/jobToken/exchange')
+    // 凭据已落盘（登录成功），令牌本体是设备令牌、**原样**存进 access_token。
+    const stored = JSON.parse(credentials.raw('QODER_PERSONAL_TOKEN')!) as QoderCredential
+    expect(stored.access_token).toBe('dt-Kq7vRt2mXp9sLd4nBc6yZg1hJf8wQa3e')
+    expect(stored.refresh_token).toBe('drt-Ym3pQw8tZc5vNb2kLd7xRf4hJs9gTe6a')
+    expect(Number(stored.token_expires_at)).toBeGreaterThan(Date.now() + 29 * 86_400_000)
+    expect(stored.user_id).toBe('01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e')
+  })
+
+  it('设备令牌直接当 Bearer 取用：**零网络**（它自己就是可用令牌）', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-bearer-'))
+    tempHomes.push(homeDir)
+    const { fetcher, calls } = stubFetcher(() => devicePollSuccess())
+    const { service } = await completeDeviceLogin({ fetcher, homeDir })
+    const before = calls.length
+
+    const token = await service.getJobToken('dt-Kq7vRt2mXp9sLd4nBc6yZg1hJf8wQa3e')
+
+    expect(token).toBe('dt-Kq7vRt2mXp9sLd4nBc6yZg1hJf8wQa3e')
+    // 官方 `Veo()` 把设备令牌直接写进 `security_oauth_token`，全程不调
+    // `exchangePersonalToken` —— 我们同样一次网都不该出。
+    expect(calls.length).toBe(before)
+  })
+
+  it('设备令牌续期打 deviceToken/refresh（**不是** PAT 的 exchange）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('QODER_PERSONAL_TOKEN', JSON.stringify({
+      access_token: 'dt-old-token', refresh_token: 'drt-old-refresh',
+      token_expires_at: String(Date.now() + 1000),
+    } satisfies QoderCredential))
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-refresh-'))
+    tempHomes.push(homeDir)
+    const { fetcher, calls } = stubFetcher(() => new Response(JSON.stringify({
+      device_token: 'dt-new-token',
+      refresh_token: 'drt-new-refresh',
+      expires_at: new Date(Date.now() + 30 * 86_400_000).toISOString(),
+    }), { status: 200 }))
+    const service = newService(ctx, { fetcher, deviceFlow: { homeDir } })
+
+    await service.refresh()
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe('https://openapi.qoder.sh/api/v1/deviceToken/refresh')
+    expect(calls[0]!.init?.method).toBe('POST')
+    const body = JSON.parse(String(calls[0]!.init?.body)) as Record<string, unknown>
+    expect(body.refresh_token).toBe('drt-old-refresh')
+    // machine_id 一并回传（官方同款）：两处漂移会让服务端当成另一台机器。
+    expect(typeof body.machine_id).toBe('string')
+    const stored = JSON.parse(credentials.raw('QODER_PERSONAL_TOKEN')!) as QoderCredential
+    expect(stored.access_token).toBe('dt-new-token')
+    expect(stored.refresh_token).toBe('drt-new-refresh')
+  })
+
+  it('设备令牌续期 401 → 终态（重新登录），**不**落到 PAT 的 400', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('QODER_PERSONAL_TOKEN', JSON.stringify({
+      access_token: 'dt-old-token', refresh_token: 'drt-old-refresh',
+    } satisfies QoderCredential))
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-refresh-401-'))
+    tempHomes.push(homeDir)
+    const { fetcher } = stubFetcher(() => new Response('unauthorized', { status: 401 }))
+    const service = newService(ctx, { fetcher, deviceFlow: { homeDir } })
+
+    await expect(service.refresh()).rejects.toThrow(RefreshTokenExpiredError)
+    expect((await service.status()).refreshable).toBe(false)
+  })
+
+  it('设备令牌缺 refresh_token → 终态（重试一万次也换不出令牌）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('QODER_PERSONAL_TOKEN', JSON.stringify({
+      access_token: 'dt-old-token', refresh_token: '',
+    } satisfies QoderCredential))
+    const { fetcher, calls } = stubFetcher(() => devicePollSuccess())
+    const service = newService(ctx, { fetcher })
+
+    await expect(service.refresh()).rejects.toThrow(RefreshTokenExpiredError)
+    // 本地就能判定，不该白打一次网络。
+    expect(calls).toEqual([])
+  })
+
+  it('设备令牌续期按**产品配置**选 host（CN 打 CN，两区共用一份代码）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('QODER_CN_PERSONAL_TOKEN', JSON.stringify({
+      access_token: 'dt-cn-token', refresh_token: 'drt-cn-refresh',
+    } satisfies QoderCredential))
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-cn-refresh-'))
+    tempHomes.push(homeDir)
+    const { fetcher, calls } = stubFetcher(() => new Response(JSON.stringify({
+      device_token: 'dt-cn-new', refresh_token: 'drt-cn-new',
+    }), { status: 200 }))
+    const service = newService(ctx, { fetcher, product: QODER_CN, deviceFlow: { homeDir } })
+
+    await service.refresh()
+
+    // 端点路径两区相同、host 走产品配置 —— 拿国际版 host 打 CN 凭据会得到
+    // 「凭据失效」的假象（两区令牌互不承认）。
+    expect(calls[0]!.url).toBe('https://openapi.qoder.com.cn/api/v1/deviceToken/refresh')
+    const body = JSON.parse(String(calls[0]!.init?.body)) as Record<string, unknown>
+    expect(body.refresh_token).toBe('drt-cn-refresh')
+  })
+
+  it('PAT 路径**逐字节未变**：仍打 exchange、body 仍是 personal_token', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set('QODER_PERSONAL_TOKEN', JSON.stringify({
+      access_token: PAT, refresh_token: 'jrt-old',
+    } satisfies QoderCredential))
+    const { fetcher, calls } = stubFetcher(() => exchangeSuccess())
+    const service = newService(ctx, { fetcher })
+
+    await service.refresh()
+
+    // 分派是按令牌族（`dt-` vs `pt-`），PAT 分支一行未动 —— 这是红线。
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.url).toBe('https://openapi.qoder.sh/api/v1/jobToken/exchange')
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ personal_token: PAT })
+  })
+
+  it('设备流账号登记：nickname 取 user_id，且**不写** expiresAt（与 PAT 路径同口径）', async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-account-'))
+    tempHomes.push(homeDir)
+    const { fetcher } = stubFetcher(() => devicePollSuccess())
+    const added: Array<Record<string, unknown>> = []
+    const pool = {
+      async listAllAccounts() { return [] },
+      async addAccount(entry: Record<string, unknown>) { added.push(entry) },
+      async updateAccount() { /* 占位不存在，走 addAccount 分支 */ },
+    }
+
+    await completeDeviceLogin({ fetcher, homeDir, accountId: 'qoder-a1b2c3d4', pool })
+
+    expect(added).toHaveLength(1)
+    expect(added[0]!.provider).toBe('qoder')
+    expect(added[0]!.nickname).toBe('01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e')
+    expect(added[0]!.refreshable).toBe(true)
+    expect(added[0]).not.toHaveProperty('expiresAt')
+  })
+})
+
 describe('QoderAuth 续期', () => {
   it('refresh 用存储的 PAT 重打 exchange，更新 jt 元数据并保留 PAT', async () => {
     const { ctx, credentials } = makeContext()
@@ -634,7 +828,11 @@ describe('QoderAuth 续期', () => {
     const status = await service.status()
     expect(status.configured).toBe(true)
     expect(status.refreshable).toBe(false)
-    expect(status.refreshError).toMatch(/PAT 已失效/)
+    // ⚠️ 文案是**中性**的「凭据已失效，请重新登录」，**不是**「请重新粘贴 PAT」：
+    // 面板现在只有浏览器设备流一个登录入口（PAT 粘贴 UI 已按用户要求移除），
+    // 说「重新粘贴」会把用户指向一个界面上不存在的入口。
+    expect(status.refreshError).toMatch(/凭据已失效/)
+    expect(status.refreshError).not.toMatch(/重新粘贴/)
   })
 
   it('网络失败**不**判为终态（抛普通 Error，交给调度器重试）', async () => {
