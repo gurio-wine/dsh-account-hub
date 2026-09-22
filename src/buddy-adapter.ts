@@ -119,8 +119,10 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
 const IMAGE_MODELS: ReadonlySet<string> = new Set([
   'deepseek-v4-flash',
   'deepseek-v4.1-flash',
+  'deepseek-v4.1-flash-sg',
   'deepseek-v4-pro',
   'hy4-preview',
+  'hy4-preview-f',
   'hy4-preview-x',
   'hy3',
   'hy3-x',
@@ -129,7 +131,9 @@ const IMAGE_MODELS: ReadonlySet<string> = new Set([
   'glm-5.2',
   'glm-5.1',
   'glm-5v-turbo',
+  'kimi-k3',
   'kimi-k3-1',
+  'kimi-k2.8-preview',
   'kimi-k2.7',
   'kimi-k2.6',
   'minimax-m3',
@@ -189,10 +193,15 @@ export interface BuddyAdapterOptions {
   /**
    * 读取一张图片的原始字节（图片输入必需）。
    *
-   * 由调用方桥接 `ctx.attachments.readImage(ref)`；未提供时收到图片会报
-   * UNSUPPORTED_CONTENT，而不是把图片静默丢掉。
+   * 由调用方桥接 `ctx.attachments.readImage(ref)`。**失败必须抛错**：
+   * 未提供本回调时适配器会报 UNSUPPORTED_CONTENT；提供了但读不到字节时
+   * 也必须抛错（不要返回 undefined），否则图片会被静默丢弃、线上请求
+   * 退化成纯文本，而用户看不到任何原因。
+   *
+   * 返回类型刻意不含 `undefined`——早期契约允许返回 undefined 表示
+   * 「读不到」，调用方据此 `continue`，正是静默丢图的源头。
    */
-  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string }>
   fetchImpl?: typeof fetch
   /** 多账号池（用于限流时切换账号） */
   accountPool?: AccountPool
@@ -692,11 +701,38 @@ export class BuddyAdapter extends LlmAdapter {
     })
   }
 
-  /** 模型接受的输入模态：远端 supportsImages 优先，静态表兜底。 */
+  /**
+   * 远端能力字段被实测证伪、需要强制覆盖为「支持图片」的模型。
+   *
+   * 为什么需要它：上游两个模型端点对同一模型的能力声明会互相矛盾。
+   * 实测 `glm-5.1`（2026-09）：
+   * - scoped 端点 `/console/enterprises/personal/models` → `supportsImages: false`
+   * - `/v3/config` → `supportsImages: true`
+   * - 真实请求（纯红图 + 问颜色）→ 答出「红色」，**确实能看到图片**
+   *
+   * 由于 `fetchModels` 优先采用 scoped 端点，若不覆盖，`glm-5.1` 会被判成
+   * 纯文本，用户贴图时直接吃 host 的 `MODEL_DOES_NOT_SUPPORT_IMAGES` 拒绝
+   * （前端文案「当前模型不支持图片」），而图片根本到不了上游。
+   *
+   * 为什么用显式白名单而不是「兜底表 true 优先」这类通用规则：通用规则会让
+   * 兜底表永久压过远端，一旦某模型真的下线或能力变更，用户会被放行后被上游
+   * 400 拒绝 —— 错误更晚、更难懂。白名单只覆盖已实测确认的个案，新增条目
+   * 必须先有真实请求证据。
+   */
+  private static readonly IMAGE_CAPABILITY_OVERRIDES: ReadonlySet<string> = new Set([
+    // scoped 端点误报 false，实测能看图。
+    'glm-5.1',
+  ])
+
+  /**
+   * 模型接受的输入模态：远端 supportsImages 优先，静态表兜底；
+   * {@link IMAGE_CAPABILITY_OVERRIDES} 中的模型强制为支持图片。
+   */
   private inputModalitiesFor(model: string): readonly ('text' | 'image')[] {
-    const supportsImages = this.remoteMeta.get(model)?.supportsImages
-      ?? this.productFallbackMeta.get(model)?.supportsImages
-      ?? IMAGE_MODELS.has(model)
+    const supportsImages = BuddyAdapter.IMAGE_CAPABILITY_OVERRIDES.has(model)
+      || (this.remoteMeta.get(model)?.supportsImages
+        ?? this.productFallbackMeta.get(model)?.supportsImages
+        ?? IMAGE_MODELS.has(model))
     return supportsImages ? ['text', 'image'] : ['text']
   }
 
@@ -936,8 +972,28 @@ export class BuddyAdapter extends LlmAdapter {
       }
       imageUrls = new Map()
       for (const [id, ref] of imageRefs) {
-        const image = await this.options.readImage(ref)
-        if (image === undefined) continue
+        let image: { data: Uint8Array; mediaType: string } | undefined
+        try {
+          image = await this.options.readImage(ref)
+        } catch (error) {
+          // 读取抛错必须冒泡成明确的 LlmError：早先这里会把异常吞掉，
+          // 最终表现为「图片凭空消失、模型答非所问」，排查成本极高。
+          throw new LlmError(
+            `buddy: 读取图片附件失败（${id}）：${errorMessage(error)}`,
+            'UNSUPPORTED_CONTENT',
+            { cause: error as Error },
+          )
+        }
+        if (image === undefined) {
+          // 契约要求：读不到字节时报错，绝不静默丢弃整张图。
+          // 返回 undefined 的典型成因是附件服务未就绪或对象已被清理；
+          // 若此处 continue，线上请求会退化成纯文本，用户只看到模型
+          // 「看不到图」而没有任何错误提示。
+          throw new LlmError(
+            `buddy: 图片附件读取不到内容（${id}）；附件服务可能未就绪，或该对象已不存在。`,
+            'UNSUPPORTED_CONTENT',
+          )
+        }
         imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
       }
     }

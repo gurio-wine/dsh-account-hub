@@ -456,6 +456,33 @@ export function lobsteraiChatHeaders(
 }
 
 /**
+ * 构造**模型列表**请求头（`GET /api/models/available`）。
+ *
+ * 与 {@link lobsteraiChatHeaders} 同样带两个 `X-LobsterAI-Client-*` 头，
+ * 只是 `Accept` 为 JSON 而非 SSE。
+ *
+ * ⚠️ **这两个头在本端点是必需的，不是可有可无的元数据**（上游 2026-09-17 实测）：
+ * 服务端按 `X-LobsterAI-Client-Capabilities` 声明的能力**过滤模型集合** ——
+ * 不带该头时只回 25 个模型、**没有 `kimi-k3`**，带上 `kimi-k3-agentic-v1`
+ * 才回 26 个。IDE 侧走的就是同形的 capability 头构造。
+ *
+ * 早先的实现用 {@link lobsteraiAuthHeaders}（只有 4 个基础头）请求本端点，
+ * 因此即使解析正确也会**永久缺少 `kimi-k3`**。`X-LobsterAI-Client-Version`
+ * 同理用动态真值（见 {@link lobsteraiChatHeaders} 的说明）。
+ */
+export function lobsteraiModelsHeaders(
+  credential: LobsteraiCredential,
+  product: LobsteraiProduct,
+  clientVersion: string,
+): Record<string, string> {
+  return {
+    ...lobsteraiAuthHeaders(credential, product, 'application/json'),
+    'X-LobsterAI-Client-Capabilities': product.clientCapabilities,
+    'X-LobsterAI-Client-Version': clientVersion,
+  }
+}
+
+/**
  * 构造无认证请求头（exchange / refresh 用）。
  *
  * 这两个端点**不需要** `Authorization` —— 换 token 时还没有 token，

@@ -25,8 +25,8 @@ import {
   isLobsteraiExpired,
   isLobsteraiRefreshable,
   lobsteraiAnonymousHeaders,
-  lobsteraiAuthHeaders,
   lobsteraiCredentialExpiresAtMs,
+  lobsteraiModelsHeaders,
   lobsteraiRefreshBody,
   parseLobsteraiEnvelope,
   parseLobsteraiTokenPayload,
@@ -607,6 +607,11 @@ export class LobsteraiAuth extends Service {
    * 优先使用账号池中的可用账号；无账号池或池为空时回退到固定凭据 ref。
    * 两处都必须带上 `this.product` 与真实版本号 —— 该端点的 query 是
    * **身份载荷**（keyfrom），发错身份会让服务端返回错误的模型集合。
+   *
+   * ⚠️ **请求头必须用 `lobsteraiModelsHeaders`**：该端点按
+   * `X-LobsterAI-Client-Capabilities` 过滤模型集合，不带时只回 25 个、
+   * **没有 `kimi-k3`**（带上回 26 个，上游实测）。基础 4 头的
+   * `lobsteraiAuthHeaders` 不够用。
    */
   async fetchModels(pool?: AccountPool): Promise<LobsteraiRemoteModel[]> {
     let credential: LobsteraiCredential | undefined
@@ -622,7 +627,9 @@ export class LobsteraiAuth extends Service {
     try {
       const response = await this.fetchImpl(url, {
         method: 'GET',
-        headers: lobsteraiAuthHeaders(credential, this.product),
+        // 必须带 `X-LobsterAI-Client-Capabilities`：服务端按该头声明的能力
+        // 过滤模型集合，不带时 `kimi-k3` 不会返回（实测 25 vs 26 个）。
+        headers: lobsteraiModelsHeaders(credential, this.product, clientVersion),
         signal: AbortSignal.timeout(LOBSTERAI_REQUEST_TIMEOUT_MS),
       })
       if (!response.ok) return []

@@ -94,20 +94,23 @@ describe('产品配置', () => {
       product.fallbackModels?.find((m) => m.id === id)?.maxOutputTokens
 
     it('Buddy CN：逐 id 实测值', () => {
-      // ⚠️ 不能整表照搬上游：本表没有上游的 `deepseek-v4-flash`(50k) 与
-      // `kimi-k2.8-preview`(64k)，那两项不适用。
+      // 2026-09-21 移植上游 39c66ac：`deepseek-v4-flash`(50k) 与
+      // `kimi-k2.8-preview`(64k) 已补录进本表（原先缺失 ⇒ 远端正常下发的模型
+      // 被 reconcileWithFallback 丢弃）。两者按上游逐 id 抄值。
       expect(maxOut(BUDDY_CN, 'hy4-preview')).toBe(64_000)
       expect(maxOut(BUDDY_CN, 'hy3')).toBe(64_000)
       expect(maxOut(BUDDY_CN, 'hy3-x')).toBe(64_000)
       // deepseek-v4.1-flash：scoped 端点 128000、/v3/config 131072 ⇒ 取较小者。
       expect(maxOut(BUDDY_CN, 'deepseek-v4.1-flash')).toBe(128_000)
       expect(maxOut(BUDDY_CN, 'deepseek-v4-pro')).toBe(128_000)
+      expect(maxOut(BUDDY_CN, 'deepseek-v4-flash')).toBe(50_000)
       expect(maxOut(BUDDY_CN, 'glm-5.3')).toBe(64_000)
       expect(maxOut(BUDDY_CN, 'glm-5.2')).toBe(64_000)
       expect(maxOut(BUDDY_CN, 'glm-5v-turbo')).toBe(64_000)
       expect(maxOut(BUDDY_CN, 'glm-5.3-flash')).toBe(32_000)
       expect(maxOut(BUDDY_CN, 'glm-5.1')).toBe(48_000)
       expect(maxOut(BUDDY_CN, 'kimi-k3-1')).toBe(32_000)
+      expect(maxOut(BUDDY_CN, 'kimi-k2.8-preview')).toBe(64_000)
       expect(maxOut(BUDDY_CN, 'kimi-k2.7')).toBe(32_000)
       expect(maxOut(BUDDY_CN, 'kimi-k2.6')).toBe(32_000)
       expect(maxOut(BUDDY_CN, 'minimax-m3')).toBe(64_000)
@@ -131,6 +134,10 @@ describe('产品配置', () => {
       expect(maxOut(BUDDY, 'glm-5.3')).toBe(48_000)
       expect(maxOut(BUDDY, 'glm-5.2')).toBe(48_000)
       expect(maxOut(BUDDY, 'kimi-k3')).toBe(32_000)
+      // 2026-09-21 移植上游 39c66ac 补录的三条（hy4-preview / -sg / kimi-k2.8-preview）。
+      expect(maxOut(BUDDY, 'hy4-preview')).toBe(64_000)
+      expect(maxOut(BUDDY, 'deepseek-v4.1-flash-sg')).toBe(128_000)
+      expect(maxOut(BUDDY, 'kimi-k2.8-preview')).toBe(32_000)
       expect(maxOut(BUDDY, 'kimi-k2.6')).toBe(32_000)
       // ⚠️ 刻意留空（上游也没给），不编造数值 —— 缺省即交回网关默认。
       expect(maxOut(BUDDY, 'gpt-5.3-codex')).toBeUndefined()
@@ -238,7 +245,7 @@ describe('产品配置', () => {
     }
   })
 
-  it('国际版 1M 条目集合 = 无档位对的 8 项 + 带档位对的 3 项（集合相等钉死）', () => {
+  it('国际版 1M 条目集合 = 无档位对的 8 项 + 带档位对的 3 项 + 补录的 3 项（集合相等钉死）', () => {
     // 三组互斥来源，合起来必须恰好等于国际版全部 1M 条目 —— 多一个（漏改的口径）
     // 或少一个（误砍的单档模型）都会在这里炸：
     //   ① **无 `contextWindow` 字段**（单档模型）8 项 → maxInputTokens 即服务窗口，
@@ -254,12 +261,19 @@ describe('产品配置', () => {
     for (const id of withTierField) {
       expect(BUDDY.fallbackModels!.find((m) => m.id === id)?.contextWindow, `buddy/${id}`).toBe(1_000_000)
     }
+    // ③ 2026-09-21 移植上游 39c66ac 补录的三条。⚠️ 单列一组而不是塞进上面任一组：
+    // 上游只给出「远端在正常下发」这一条证据，**没有**说明它们是否带档位对，
+    // 归入 ① 或 ② 都等于替远端形态编造一个未核实的断言。三条都是 1M（上游同款）。
+    const portedWithoutTierEvidence = ['hy4-preview', 'deepseek-v4.1-flash-sg', 'kimi-k2.8-preview']
+    for (const id of portedWithoutTierEvidence) {
+      expect(BUDDY.fallbackModels!.find((m) => m.id === id)?.contextWindow, `buddy/${id}`).toBe(1_000_000)
+    }
     // 反向防线（比逐条断言更强）：集合相等，两边都不许多也不许少。
     const oneMeg = BUDDY.fallbackModels!.filter((m) => m.contextWindow === 1_000_000).map((m) => m.id).sort()
-    expect(oneMeg).toEqual([...noTierField, ...withTierField].sort())
+    expect(oneMeg).toEqual([...noTierField, ...withTierField, ...portedWithoutTierEvidence].sort())
   })
 
-  it('Buddy CN 兜底表的 1M 条目集合恰好等于带档位对的 7 项（集合相等钉死）', () => {
+  it('Buddy CN 兜底表的 1M 条目集合恰好等于带档位对的 7 项 + 补录的 2 项（集合相等钉死）', () => {
     // CN 侧同样用集合相等钉死，防止回退时漏改或误砍。
     // ⚠️ minimax-m3 **不在**其中：它的官方档位表最大档是 512K（[300K, 512K]），
     // 最大档口径取 512K 而非 1M —— 档位表是**刻意上限**，不是摆设。
@@ -267,6 +281,9 @@ describe('产品配置', () => {
     expect(oneMeg).toEqual([
       'deepseek-v4-pro', 'deepseek-v4.1-flash', 'glm-5.2',
       'glm-5.3', 'glm-5.3-flash', 'hy4-preview', 'kimi-k3-1',
+      // 2026-09-21 移植上游 39c66ac 补录（见 CN 表头注释）：漏掉任一条，远端已在
+      // 正常下发的模型就会被 reconcileWithFallback 丢弃、选择器里看不见。
+      'deepseek-v4-flash', 'kimi-k2.8-preview',
     ].sort())
     // 反向也钉一次：minimax-m3 的 512K 必须原样在表里（别被「统一成 1M」顺手改掉）。
     expect(BUDDY_CN.fallbackModels!.find((m) => m.id === 'minimax-m3')?.contextWindow).toBe(512_000)

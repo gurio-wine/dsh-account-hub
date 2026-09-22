@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands'
-import { apply } from '../../src/index.js'
+import { apply, makeReadImage } from '../../src/index.js'
 import * as pluginEntry from '../../src/index.js'
 import { runLoginFlow, runOAuthFlow } from '../../src/login.js'
 import { runBuddyLoginFlow } from '../../src/buddy-oauth.js'
@@ -762,5 +762,50 @@ describe('Qoder CN provider 注册（第二 region）', () => {
     // 漏掉 CN 这一处不会报错，只是 CN 的调度器在插件卸载后仍然存活。
     expect(intlStop).toHaveBeenCalled()
     expect(cnStop).toHaveBeenCalled()
+  })
+})
+
+/**
+ * `makeReadImage` 是「图片为什么送不出去」这条诊断链上唯一的桥接点。
+ *
+ * 旧实现在附件服务缺失或单图读取失败时一律 `return undefined`，适配器收到
+ * undefined 后 `continue` 丢图：线上请求静默退化成纯文本，用户只看到模型
+ * 「看不到图片」，拿不到任何错误原因 —— 排查成本极高。
+ * 下面三条锁住「读不到必须抛错」这一契约（移植上游 39c66ac）。
+ */
+describe('makeReadImage 图片桥接', () => {
+  it('附件服务缺失时抛错，并提示需要哪个插件', async () => {
+    const ctx = new Context()
+    const readImage = makeReadImage(ctx)
+    const error = await readImage({ attachmentId: 'att-1' }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain('attachments')
+    expect((error as Error).message).toContain('dsh-attachment-local')
+  })
+
+  it('读取成功时返回字节与 mediaType', async () => {
+    const ctx = new Context()
+    ctx.provide('attachments', {
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), ref: { mediaType: 'image/png' } }),
+    } as never)
+    const readImage = makeReadImage(ctx)
+    await expect(readImage({ attachmentId: 'att-1' })).resolves.toEqual({
+      data: new Uint8Array([1, 2, 3]),
+      mediaType: 'image/png',
+    })
+  })
+
+  it('单图读取失败时让原始异常冒泡（绝不静默返回 undefined）', async () => {
+    // 分工：桥接层不包装，保持原始错误完整；适配器层负责包成带
+    // attachmentId 的 LlmError。此处锁住「不会变成 undefined」这一点。
+    const cause = new Error('attachment object is gone')
+    const ctx = new Context()
+    ctx.provide('attachments', {
+      readImage: async () => { throw cause },
+    } as never)
+    const readImage = makeReadImage(ctx)
+    const error = await readImage({ attachmentId: 'att-1' }).catch((e: unknown) => e)
+    expect(error).toBe(cause)
+    expect(error).not.toBeUndefined()
   })
 })

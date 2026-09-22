@@ -71,6 +71,12 @@ function makeAdapter(overrides: {
   postRefreshCredential?: BuddyCredential | undefined
   fetchImpl?: typeof fetch
   fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
+  /**
+   * 刻意比生产类型宽松（允许多返回 `undefined`）：用于模拟「旧版桥接」
+   * 或版本错配时传入的 readImage —— 适配器的运行时守卫必须能挡住它，
+   * 而不是依赖类型系统保证。生产侧 `BuddyAdapterOptions.readImage`
+   * 已不含 undefined（移植上游 39c66ac）。
+   */
   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 产品配置；不传时由 BuddyAdapter 回退到 CodeBuddy。 */
   product?: BuddyProduct
@@ -123,6 +129,12 @@ describe('BuddyAdapter', () => {
     const second = await adapter.listModels('buddy-cn')
     // 产品兜底表是权威白名单：远端多出的 remote-model 被丢弃，
     // 兜底表声明的模型被补齐。重复调用不应再触发远端拉取。
+    //
+    // ⚠️ 这条「丢弃远端多出条目」是**刻意保留**的设计（服务端按认证上下文下发的
+    // 集合可能是残缺甚至错的内部别名），但它的代价正是移植上游 39c66ac 第 3 项的
+    // 动机：**兜底表漏一条 = 该模型在远端正常下发却在选择器里彻底看不见**。
+    // 故新增模型必须同步补进 `BUDDY_CN_FALLBACK_MODELS` / `BUDDY_FALLBACK_MODELS`，
+    // 而不是指望远端把它带进来。
     expect(first.map((m) => m.id)).toEqual(BUDDY_CN.fallbackModels!.map((m) => m.id))
     expect(second.map((m) => m.id)).toEqual(BUDDY_CN.fallbackModels!.map((m) => m.id))
     expect(calls).toBe(1, '远端列表只应拉取一次')
@@ -137,11 +149,14 @@ describe('BuddyAdapter', () => {
   })
 
   it('resolveModel reports the known context window', async () => {
-    // deepseek-v4-flash 不在产品兜底表里（CN 表用 deepseek-v4.1-flash /
-    // deepseek-v4-pro），走通用静态表 CONTEXT_WINDOWS；该表尚未按默认档口径
-    // 重校准（本次范围外），故此处仍是 1M。
+    // 移植上游 39c66ac 后 deepseek-v4-flash **已进产品兜底表**（CN 表 1M），
+    // 故它现在走 `productFallbackContextWindows`（1M），与通用静态表
+    // CONTEXT_WINDOWS 的取值一致 —— 三层查找的哪一层命中不再影响本断言结果，
+    // 但来源变了，注释同步更新以免读者以为它仍在走静态表。
     const resolved = await makeAdapter().resolveModel('buddy-cn', 'deepseek-v4-flash')
     expect(resolved).toMatchObject({ provider: 'buddy-cn', id: 'deepseek-v4-flash', context: { contextWindow: 1_000_000 } })
+    // 兜底表确实收录了它（而非仅靠静态表兜住）。
+    expect(BUDDY_CN.fallbackModels!.some((m) => m.id === 'deepseek-v4-flash')).toBe(true)
   })
 
   it('resolveModel matches the product fallback table (max-tier windows)', async () => {
@@ -227,6 +242,25 @@ describe('BuddyAdapter', () => {
         fetchRemoteModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'DS' }],
       })
       expect((await adapter.resolveModel('buddy-cn', 'deepseek-v4.1-flash')).inputModalities).toEqual(['text', 'image'])
+    })
+
+    // 移植上游 39c66ac：scoped 端点对 glm-5.1 误报 supportsImages=false，实测能看图。
+    it('glm-5.1 被远端误报 false 时仍声明 image 模态（白名单 override）', async () => {
+      // 远端显式 false —— 没有 override 的话这一条会是 ['text']，用户贴图会被
+      // 宿主以 MODEL_DOES_NOT_SUPPORT_IMAGES 拒绝，图片根本到不了上游。
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'glm-5.1', name: 'GLM-5.1', supportsImages: false }],
+      })
+      expect((await adapter.resolveModel('buddy-cn', 'glm-5.1')).inputModalities).toEqual(['text', 'image'])
+    })
+
+    it('白名单只覆盖实测个案，不放大到其他模型', async () => {
+      // 反向防线：override 是**逐 id 白名单**，不是「兜底表 true 优先」这类通用规则。
+      // 另一个兜底表里同样声明 supportsImages:true 的模型，远端 false 必须照样生效。
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'glm-5.2', name: 'GLM-5.2', supportsImages: false }],
+      })
+      expect((await adapter.resolveModel('buddy-cn', 'glm-5.2')).inputModalities).toEqual(['text'])
     })
   })
 
@@ -911,6 +945,53 @@ describe('BuddyAdapter credential handling', () => {
     const user = (body.messages as Array<Record<string, unknown>>).find((m) => m.role === 'user')!
     expect(user.content).toBe('hello')
   })
+
+  // ── 「静默丢图」回归护栏（移植上游 39c66ac）──
+  // 旧实现：readImage 返回 undefined 时 `continue` 丢掉整张图，线上请求退化成
+  // 纯文本，模型只能答「我看不到图片」，用户拿不到任何错误原因。
+  it('stream fails loudly when readImage reports it cannot read the bytes', async () => {
+    let body: Record<string, unknown> | undefined
+    const adapter = makeAdapter({
+      readImage: async () => undefined,
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as Record<string, unknown>
+        return sseResponse('data: [DONE]\n\n')
+      },
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'what is this?' },
+          { type: 'image', attachment: { attachmentId: 'att-missing' } },
+        ],
+      }],
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+    // 关键：请求根本没有发出，图片不可能被静默丢弃。
+    expect(body).toBeUndefined()
+  })
+
+  it('stream preserves the cause when readImage throws', async () => {
+    const cause = new Error('attachment object is gone')
+    const adapter = makeAdapter({
+      readImage: async () => { throw cause },
+      fetchImpl: async () => sseResponse('data: [DONE]\n\n'),
+    })
+    const error = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }] }],
+      signal: new AbortController().signal,
+    } as never).catch((e: unknown) => e)
+
+    expect(error).toBeInstanceOf(LlmError)
+    expect((error as LlmError).code).toBe('UNSUPPORTED_CONTENT')
+    expect((error as LlmError).message).toContain('attachment object is gone')
+  })
 })
 
 describe('BuddyAdapter stream parsing', () => {
@@ -1419,31 +1500,33 @@ describe('BuddyAdapter message serialization', () => {
     ])
   })
 
-  // 回归：`imageUrls` 为空 Map 的语义是「有图片，但每一张都读失败」，与
-  // undefined（整个请求没有图片）**不是一回事**。旧实现把空 Map 也降级成
-  // undefined，于是 `[image unavailable]` 占位符被跳过：全部失败静默消失、
-  // 部分失败才留占位符 —— 同一故障两种表现。保留空 Map 后统一产出占位符。
-  it('读图全部失败时占位符仍然出现（空 Map 不降级为 undefined）', async () => {
+  // 回归（语义在移植上游 39c66ac 后收窄，但**防线保留**）：`imageUrls` 为空的
+  // 或缺少某个 id 时，`[image unavailable]` 占位符必须照出，不能静默丢图。
+  // 旧实现把空 Map 降级成 undefined，于是占位符被跳过 —— 同一故障两种表现。
+  //
+  // ⚠️ 移植后**适配器自己不再会产生空 Map**：读图返回 undefined / 抛错现在一律
+  // 抛 `UNSUPPORTED_CONTENT`（见上面两条护栏），根本走不到序列化。故这里改走
+  // **仍然可达**的那条路径：`collectImages` 只收 `attachmentId` 是**字符串**的
+  // 附件，而 `userContentParts` 用 `String(...)` 查表 —— 非字符串 id 会被前者
+  // 跳过、却被后者查不到，正是「map 存在但缺这个 id」的真实成因。
+  it('图片 id 不在 imageUrls 里时留占位符（不静默丢图）', async () => {
     const messages = await captureSerializedMessages({
-      // 读图失败：适配器跳过该 id，imageUrls 最终是空 Map（不是 undefined）。
-      readImage: async () => undefined,
-      messages: [
-        { role: 'assistant', content: [
-          { type: 'tool-call', id: 'call_1', name: 'read_image', arguments: '{"path":"a.png"}' },
-        ] },
-        { role: 'user', content: [
-          { type: 'tool-result', toolCallId: 'call_1', content: [
-            { type: 'text', text: '<path>a.png</path>' },
-            { type: 'image', attachment: { attachmentId: 'att-1' } },
-          ] },
-        ] },
-      ],
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image', attachment: { attachmentId: 'att-ok' } },
+          // 数字 id：collectImages 不收它，故不会进 imageUrls。
+          { type: 'image', attachment: { attachmentId: 123 } },
+        ],
+      }],
     })
-
-    // 占位符必须出现（旧实现这里只剩 `<path>a.png</path>`）。
-    expect(JSON.stringify(messages)).toContain('[image unavailable]')
-    // 读失败自然不该产出任何 image_url。
-    expect(JSON.stringify(messages)).not.toContain('image_url')
+    const user = messages.find((m) => m.role === 'user' && Array.isArray(m.content))!
+    // 能读到的照常发 image_url，读不到的那张必须留占位符（不得悄悄消失）。
+    expect(user.content).toEqual([
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+      { type: 'text', text: '[image unavailable]' },
+    ])
   })
 
   it('sends tools and the system prompt', async () => {

@@ -202,8 +202,13 @@ export interface BuddyProduct {
  * 数据来源：`/v3/config` 的 `craft` agent 白名单，并**逐个用真实请求验证可用**
  * （`POST /v2/chat/completions`，stream 模式）。只收录实测返回可用的模型 ——
  * 远端 `data.models` 里另有一批 `code=11102 service info not found` 的条目
- * （glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5/k2.8-preview、hunyuan-* 等），
+ * （glm-4.6/4.7/5.0、minimax-m2.5、kimi-k2.5、hunyuan-* 等），
  * 列进选择器只会让用户选中后报错，故一律不收录。
+ *
+ * ⚠️ **`kimi-k2.8-preview` 曾被上一条理由误伤**：旧注释把它列为
+ * 「service info not found」而排除，但 2026-09 实测它**可正常调用且能看图**
+ * （纯红图问答答出「红色」），远端两端点也都在下发 —— 故已按上游 39c66ac 补录。
+ * 「不在白名单」与「实测不可用」是两件事，别再据前者推断后者。
  *
  * ⚠️ `contextWindow` 是**最大档**兜底（2026-09-21 口径）：真机单变量实测
  * `glm-5.3` 在 prompt 320K / 500K / 900K / 1.0M token **全部正常服务**，1.2M 才
@@ -214,9 +219,10 @@ export interface BuddyProduct {
  * 单档模型，`maxInputTokens` 即服务窗口，保持原值。档位数据会漂移，本表是快照
  * 而非契约；远端可用时以远端为准（见 `BuddyAdapter.reconcileWithFallback`）。
  *
- * ⚠️ `maxOutputTokens` 同样来自 2026-09-19 真机实测（`maxOutputTokens` 字段），
- * **逐 id 填值、不整表照搬上游**：本表没有上游的 `deepseek-v4-flash`(50k) 与
- * `kimi-k2.8-preview`(64k)，那两项不适用。
+ * ⚠️ `maxOutputTokens` 同样来自 2026-09-19 真机实测（`maxOutputTokens` 字段）。
+ * 2026-09-21 移植上游 39c66ac 时补录了 `deepseek-v4-flash`(50k) 与
+ * `kimi-k2.8-preview`(64k) 两条 —— 它们原先不在本表，导致远端已在正常下发的模型
+ * 被 `reconcileWithFallback` 丢弃。补录时按上游逐 id 抄值（本仓无法重跑该实测）。
  */
 const BUDDY_CN_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   {
@@ -243,6 +249,19 @@ const BUDDY_CN_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
+    // 2026-09 补录（移植上游 39c66ac）：远端 /v3/config 与 scoped 端点均返回该模型，
+    // 且实测能看图（纯红图问答答出「红色」）。它不在 craft/cli agent 白名单里，但可
+    // 正常调用，也是适配器 DEFAULT_MODEL 的取值。
+    //
+    // 档位沿用适配器静态表 REASONING_EFFORTS 的既有取值 [low,high,max]（该表有实测
+    // 依据：三档会显著改变返回的 reasoning_content 长度）。⚠️ 上游 /v3/config 声明的
+    // 是 [low,high,xhigh]，与本表不一致；实测服务端对 low/medium/high/xhigh/max 一律
+    // 返回 200（不报非法参数），无法据此判定哪一组才真实生效，故不擅自改动既有行为，
+    // 仅记录该分歧待后续验证。
+    id: 'deepseek-v4-flash', name: 'Deepseek-V4-Flash', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 50_000,
+  },
+  {
     id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
     reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
@@ -255,6 +274,11 @@ const BUDDY_CN_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
+    // supportsImages 为 true 有实测依据：纯红图问答答出「红色」。
+    // ⚠️ scoped 端点（/console/enterprises/personal/models）对它返回
+    // supportsImages=false，与 /v3/config、IDE 缓存、wb2api 清单三处矛盾；
+    // 实测以「能看到图」为准，故保留 true。只有 scoped 端点先命中时才会被它的
+    // false 覆盖 —— 那正是 `BuddyAdapter.IMAGE_CAPABILITY_OVERRIDES` 兜住的个案。
     id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'],
     maxOutputTokens: 48_000,
   },
@@ -265,6 +289,10 @@ const BUDDY_CN_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   {
     id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'],
     maxOutputTokens: 32_000,
+  },
+  {
+    id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'],
@@ -322,8 +350,9 @@ export const BUDDY_CN: BuddyProduct = {
  * 非 1M 条目（`gpt-5.4` 272K、`kimi-k2.6` 256K 等）同样不动。
  *
  * ⚠️ `maxOutputTokens` 来自 2026-09-19 对国际版 `/v3/config` 的真机实测，**逐 id
- * 填值**；本表没有上游的 `deepseek-v4.1-flash-sg` / `kimi-k2.8-preview` 两项，不适用。
- * `gpt-5.3-codex` **刻意留空**（上游同样没填，不为凑齐而编造数值）。
+ * 填值**；2026-09-21 移植上游 39c66ac 时补录 `hy4-preview` / `deepseek-v4.1-flash-sg`
+ * / `kimi-k2.8-preview` 三条（同样按上游逐 id 抄值）。`gpt-5.3-codex` **刻意留空**
+ * （上游同样没填，不为凑齐而编造数值）。
  */
 const BUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   { id: 'default-model', name: 'Auto', contextWindow: 176_000, supportsImages: true, maxOutputTokens: 24_000 },
@@ -336,10 +365,21 @@ const BUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
+    // 2026-09 补录（移植上游 39c66ac）：/v3/config 的 cli agent 白名单里有它，但兜底表
+    // 原先漏了，于是被 `reconcileWithFallback` 丢弃、模型选择器里看不到。实测能看图。
+    id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
+  },
+  {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
     reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000 },
+  {
+    // 2026-09 补录（移植上游 39c66ac）：新加坡区的同代模型（-sg 后缀），远端下发且实测能看图。
+    id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
+  },
   {
     id: 'gpt-6-astra', name: 'GPT-6-Astra', contextWindow: 1_000_000, supportsImages: true,
     reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
@@ -376,6 +416,12 @@ const BUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
     reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 48_000,
   },
   { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  {
+    // 2026-09 补录（移植上游 39c66ac）：远端 /v3/config 的 cli agent 白名单里有它，
+    // 兜底表原先漏了 ⇒ 被 `reconcileWithFallback` 丢弃、选择器里看不到。
+    id: 'kimi-k2.8-preview', name: 'Kimi-K2.8-Preview', contextWindow: 1_000_000, supportsImages: true,
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 32_000,
+  },
   { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
 ]
 

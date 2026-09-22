@@ -137,18 +137,25 @@ function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
  * 用 `ctx.get` 而非 `inject` —— 附件服务缺失时 provider 仍可正常加载，
  * 只是收到图片时报 UNSUPPORTED_CONTENT。两个 Buddy 系产品（Buddy CN /
  * Buddy）共用同一后端与协议，图片能力相同，故共用本实现。
+ *
+ * ⚠️ **失败必须抛错**：早期实现对「附件服务缺失」与「单图读取失败」一律
+ * `return undefined`，适配器据此 `continue` 丢掉整张图 —— 线上请求静默
+ * 退化成纯文本，用户只看到模型答「我没看到图片」，拿不到任何原因。
+ * 故返回类型不含 `undefined`，异常分工是：桥接层**不包装**（保留原始
+ * cause），适配器层负责包成带 attachmentId 的 `UNSUPPORTED_CONTENT`。
  */
-function makeReadImage(ctx: Context) {
-  return async (attachment: unknown): Promise<{ data: Uint8Array; mediaType: string } | undefined> => {
+export function makeReadImage(ctx: Context) {
+  return async (attachment: unknown): Promise<{ data: Uint8Array; mediaType: string }> => {
     const attachments = ctx.get('attachments') as
       { readImage?: (ref: never) => Promise<{ data: Uint8Array; ref: { mediaType: string } }> } | undefined
-    if (attachments?.readImage === undefined) return undefined
-    try {
-      const stored = await attachments.readImage(attachment as never)
-      return { data: stored.data, mediaType: stored.ref.mediaType }
-    } catch {
-      return undefined
+    if (attachments?.readImage === undefined) {
+      throw new Error(
+        'codearts-auth: 附件服务（attachments）不可用，无法把图片内联进请求；'
+        + '请确认当前 profile 已装载 @deepseek-ai/dsh-attachment-local。',
+      )
     }
+    const stored = await attachments.readImage(attachment as never)
+    return { data: stored.data, mediaType: stored.ref.mediaType }
   }
 }
 

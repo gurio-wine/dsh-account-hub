@@ -16,6 +16,7 @@ import {
   lobsteraiChatHeaders,
   lobsteraiCredentialExpiresAtMs,
   lobsteraiKeyfromBody,
+  lobsteraiModelsHeaders,
   lobsteraiRefreshBody,
   parseClientVersion,
   parseClientVersionFromUpdate,
@@ -393,6 +394,27 @@ describe('请求头构造', () => {
     expect(headers['X-LobsterAI-Client-Capabilities']).toBe('kimi-k3-agentic-v1')
     expect(headers['X-LobsterAI-Client-Version']).toBe(TEST_VERSION)
     expect(headers.Accept).toBe('text/event-stream, application/json')
+  })
+
+  /**
+   * 模型列表头必须带 Capabilities —— 该头在 `/api/models/available` 上
+   * **会改变返回的模型集合**（上游实测：不带时 25 个且无 `kimi-k3`，带上后 26 个）。
+   *
+   * 历史缺陷：早先 `fetchModels` 用的是只有 4 个基础头的 `lobsteraiAuthHeaders`，
+   * 于是即使解析正确也永久缺少 `kimi-k3`。这条断言锁死该头不得被移除。
+   */
+  it('模型列表头带 Capabilities 与版本号，Accept 为 JSON', () => {
+    const headers = lobsteraiModelsHeaders(makeCredential(), LOBSTERAI, TEST_VERSION)
+    expect(headers['X-LobsterAI-Client-Capabilities']).toBe('kimi-k3-agentic-v1')
+    expect(headers['X-LobsterAI-Client-Version']).toBe(TEST_VERSION)
+    // 与对话头刻意不同：本端点是普通 JSON，不是 SSE。
+    expect(headers.Accept).toBe('application/json')
+    expect(headers).not.toHaveProperty('Content-Type', 'text/event-stream')
+    // 仍是 Bearer 鉴权，且不夹带腾讯系归属头。
+    expect(headers.Authorization).toBe('Bearer AT')
+    for (const banned of ['X-Domain', 'X-Product', 'X-Product-Code', 'X-IDE-Name']) {
+      expect(headers, banned).not.toHaveProperty(banned)
+    }
   })
 
   it('匿名头（exchange/refresh）不带 Authorization', () => {
