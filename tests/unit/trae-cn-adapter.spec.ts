@@ -2720,6 +2720,67 @@ describe('Trae CN 目录过滤：invisible（客户端自隐项）', () => {
 })
 
 /**
+ * 官方停用开关（`config_switch`）—— 上游 `trae.ts` 的 `parseTraeBatchModelList`
+ * 硬性过滤之一，本模块此前**整条漏接**。
+ *
+ * ⚠️ 判据是**严格等于 `false`**（与 `invisible` 的三态语义同款，方向相反）：
+ * `true`（官方启用）与 `undefined`（上游没发该字段）**都必须保留**。
+ * 写成 `!entry.configSwitch` 会把整个目录清空。
+ */
+describe('Trae CN 目录过滤：config_switch（官方停用开关）', () => {
+  const entryOf = (id: string, extra: Partial<TraeCnModelEntry> = {}): TraeCnModelEntry =>
+    ({ id, name: id, function: TRAE_CN_SOLO_REMOTE_FUNCTION, ...extra })
+
+  it('**`configSwitch: false` 的停用项被剔除**（官方已停用，列出即误导）', () => {
+    const merged = mergeTraeCnDirectory([{
+      function: TRAE_CN_SOLO_REMOTE_FUNCTION,
+      entries: [
+        entryOf('glm-5.3', { usage: 'chat_completion' }),
+        entryOf('retired-model', { usage: 'chat_completion', configSwitch: false }),
+      ],
+    }], true)
+    // 反证：不能「全剔」也算通过 —— 启用项必须还在。
+    expect(merged.map((m) => m.id)).toEqual(['glm-5.3'])
+    expect(merged.map((m) => m.id)).not.toContain('retired-model')
+  })
+
+  it('**`configSwitch: true` 与 `undefined` 都必须保留**（三态，只有 false 剔除）', () => {
+    // ⚠️ 写成 `!entry.configSwitch` 会把 `undefined` 项一并误杀 ——
+    // 而真机目录里大量条目**根本不带这个字段**。
+    const merged = mergeTraeCnDirectory([{
+      function: TRAE_CN_SOLO_REMOTE_FUNCTION,
+      entries: [
+        entryOf('enabled-explicitly', { usage: 'chat_completion', configSwitch: true }),
+        entryOf('no-field-at-all', { usage: 'chat_completion' }),
+      ],
+    }], true)
+    expect(merged.map((m) => m.id)).toEqual(['enabled-explicitly', 'no-field-at-all'])
+  })
+
+  it('**解析器只把布尔 `false` 读成 configSwitch**（true / 缺字段 / 字符串都不写该属性）', () => {
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [
+        { config_name: 'off', config_switch: false, usage: 'chat_completion' },
+        { config_name: 'on', config_switch: true, usage: 'chat_completion' },
+        { config_name: 'missing', usage: 'chat_completion' },
+        // 字符串 `"false"` **不算**（只认布尔，避免上游形态漂移时误杀）。
+        { config_name: 'stringy', config_switch: 'false', usage: 'chat_completion' },
+      ],
+    }, TRAE_CN_SOLO_REMOTE_FUNCTION)
+    expect(parsed[0]!.configSwitch).toBe(false)
+    expect(parsed[1]).not.toHaveProperty('configSwitch')
+    expect(parsed[2]).not.toHaveProperty('configSwitch')
+    expect(parsed[3]).not.toHaveProperty('configSwitch')
+    // 解析侧不剔除，剔除只发生在 mergeTraeCnDirectory（保持「解析 = 忠实读取」）。
+    const merged = mergeTraeCnDirectory([{
+      function: TRAE_CN_SOLO_REMOTE_FUNCTION,
+      entries: parsed,
+    }], true)
+    expect(merged.map((m) => m.id)).toEqual(['on', 'missing', 'stringy'])
+  })
+})
+
+/**
  * 裸 id 版垃圾判定（`isTraeCnJunkModelId`）—— 服务于 `model.list` 的**黑名单
  * 并集回填**，那里的候选来自 settings 的**键名**，手上没有任何目录字段。
  *
@@ -2790,7 +2851,7 @@ describe('Trae CN 垃圾 id 判定（裸 id，供 model.list 回填侧使用）'
   })
 })
 
-describe('Trae CN 目录过滤：四道网合流（真实 roster 规模）', () => {
+describe('Trae CN 目录过滤：过滤网合流（真实 roster 规模）', () => {
   const entryOf = (id: string, extra: Partial<TraeCnModelEntry> = {}): TraeCnModelEntry =>
     ({ id, name: id, function: TRAE_CN_SOLO_REMOTE_FUNCTION, ...extra })
 

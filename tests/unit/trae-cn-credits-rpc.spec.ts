@@ -194,21 +194,45 @@ describe('credits.status 的 trae-cn 分派', () => {
 })
 
 describe('credits.claimAll 的 trae-cn 分派', () => {
-  /** A 未签到、B 已签到的响应；两个账号的设备号各不相同。 */
-  const mixed = (url: string, call: CapturedCall): Response => {
-    if (url.includes('/claim')) {
-      return new Response(JSON.stringify({ code: 0, data: { credit: 150 } }), { status: 200 })
+  /**
+   * A 未签到、B 已签到的响应；两个账号的设备号各不相同。
+   *
+   * ⚠️ **积分只在 status 里**（T8 定案）：claim 的完整响应是
+   * `{"code":0,"message":"success"}`，没有积分数，故领取成功后宿主会再查一次
+   * status 取 `credits`。补查那一次要按**账号**分别计数（每个账号各有一次
+   * 预检 + 一次补查），故 `statusCalls` 按 `deviceId` 计数 —— 用全局计数器会
+   * 让 A 的补查把 B 的预检也算成「已签到」，静默改变被测行为。
+   *
+   * `checkedInDevice` **必须显式给**：它是「这个账号本来就已签到」这一业务
+   * 状态，不同用例要的是不同状态（顺序性用例要 B 已签，凭据缺失用例要两个
+   * 账号都未签）。写死一个默认值会让后者静默变成「已领」而不是「已领取」。
+   */
+  const claimFlow = (options: { credits?: number; checkedInDevice?: string } = {}) => {
+    const statusCalls = new Map<string, number>()
+    return (url: string, call: CapturedCall): Response => {
+      if (url.includes('/claim')) {
+        return new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 })
+      }
+      const seen = statusCalls.get(call.deviceId ?? '') ?? 0
+      statusCalls.set(call.deviceId ?? '', seen + 1)
+      // 第 2 次起就是领取后的补查（与真机一致：补查时 checked_in 已翻转）。
+      const isRecheck = seen > 0
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          checked_in: isRecheck || call.deviceId === options.checkedInDevice,
+          enable: true,
+          credits: options.credits ?? 150,
+        },
+      }), { status: 200 })
     }
-    return new Response(JSON.stringify({
-      code: 0, data: { checked_in: call.deviceId === DEVICE_B, enable: true },
-    }), { status: 200 })
   }
 
   it('逐账号顺序执行：未领的领取、已领的不发领取请求', async () => {
     const h = harness({
       accounts: [entry('a'), entry('b')],
       credentials: creds(['A', credentialOf(DEVICE_A, 'A')], ['B', credentialOf(DEVICE_B, 'B')]),
-      responds: mixed,
+      responds: claimFlow({ checkedInDevice: DEVICE_B }),
     })
     const result = await h.call('credits.claimAll', { provider: 'trae-cn' })
     expect(result.ok).toBe(true)
@@ -219,34 +243,30 @@ describe('credits.claimAll 的 trae-cn 分派', () => {
     expect(value.results[0]!.outcome).toMatchObject({ kind: 'claimed', credit: 150 })
     expect(value.results[1]!.outcome).toEqual({ kind: 'already-claimed', message: '今天已签到' })
     expect(value.summary).toMatchObject({ claimed: 1, totalCredit: 150, alreadyClaimed: 1, failed: 0 })
-    // 顺序性 + 幂等短路：A 的 status/claim 各一次，B 只有 status 一次。
+    // 顺序性 + 幂等短路：A 的 status（预检）/claim/status（补查）各一次，
+    // B 只有 status 一次（已签到 ⇒ 既不发 claim、也不补查）。
     expect(h.calls.map((c) => (c.url.includes('/claim') ? 'claim' : 'status')))
-      .toEqual(['status', 'claim', 'status'])
-    expect(h.calls[0]!.deviceId).toBe(DEVICE_A)
-    expect(h.calls[1]!.deviceId).toBe(DEVICE_A)
-    expect(h.calls[2]!.deviceId).toBe(DEVICE_B)
+      .toEqual(['status', 'claim', 'status', 'status'])
+    expect(h.calls.map((c) => c.deviceId)).toEqual([DEVICE_A, DEVICE_A, DEVICE_A, DEVICE_B])
   })
 
   it('包含已停用账号（签到与账号池自动选择无关）', async () => {
     const h = harness({
       accounts: [entry('a', false)],
       credentials: creds(['A', credentialOf(DEVICE_A, 'A')]),
-      responds: (url) => url.includes('/claim')
-        ? new Response(JSON.stringify({ code: 0, data: { credit: 10 } }), { status: 200 })
-        : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }),
+      responds: claimFlow({ credits: 10 }),
     })
     const result = await h.call('credits.claimAll', { provider: 'trae-cn' })
-    const value = result.value as { summary: { claimed: number } }
-    expect(value.summary.claimed).toBe(1)
+    const value = result.value as { summary: { claimed: number; totalCredit: number } }
+    expect(value.summary).toMatchObject({ claimed: 1, totalCredit: 10 })
   })
 
   it('单账号凭据缺失记为 failed，不中断整批', async () => {
+    // 两个账号都**未**签到：缺凭据的 A 记 failed，有凭据的 B 正常领取。
     const h = harness({
       accounts: [entry('a'), entry('b')],
       credentials: creds(['B', credentialOf(DEVICE_B, 'B')]),
-      responds: (url) => url.includes('/claim')
-        ? new Response(JSON.stringify({ code: 0, data: { credit: 10 } }), { status: 200 })
-        : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }),
+      responds: claimFlow({ credits: 10 }),
     })
     const result = await h.call('credits.claimAll', { provider: 'trae-cn' })
     expect(result.ok).toBe(true)

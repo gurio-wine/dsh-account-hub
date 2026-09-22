@@ -728,9 +728,14 @@ export function apply(ctx: Context): void {
     } catch { /* 静默 */ }
   }
 
-  // 启动时如果有任何可续期账号，安排定期续期
+  // 启动时如果有任何可续期账号，安排定期续期。
+  //
+  // ⚠️ 判据只看 `refreshable`，**不看 `enabled`**：停用只影响账号池的**自动选号**，
+  // 与「凭据是否需要保持新鲜」无关。早期这里写成 `a.refreshable && a.enabled`，
+  // 于是**全部账号都被停用**时续期定时器根本不注册 —— 整个多账号续期静默失效，
+  // 所有 refresh_token 一路放到过期，用户重新启用后只能重新登录（真实缺陷）。
   pool.listAllAccounts().then(accounts => {
-    const hasRefreshable = accounts.some(a => a.refreshable && a.enabled)
+    const hasRefreshable = accounts.some(a => a.refreshable)
     if (hasRefreshable) {
       const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
       refreshTimer.unref?.()

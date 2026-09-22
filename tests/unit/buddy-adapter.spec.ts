@@ -307,6 +307,142 @@ describe('BuddyAdapter', () => {
     }
     expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
   })
+
+  // ── 单次输出上限（maxOutputTokens）──
+  //
+  // 用户报障：`deepseek-v4.1-flash` 的回答在 **32000 token** 处被截断，
+  // `turn/end` 为 `{kind:'max-tokens'}`，UI 报「已达到输出 token 上限」。根因不是
+  // 「网关固定上限」，而是适配器早期**只把 `maxOutputTokens` 当 `isChatModel` 的
+  // 过滤判据**（≤256 视为补全模型），从不下发 → 上限永久退回网关默认值，而网关
+  // 默认恰好就是 **32000**。远端对 `deepseek-v4.1-flash` 实际声明的是 **128000**。
+  // 真机日志：20 次 `turn/end max-tokens`，buddy 系 651 次请求零 `maxTokens`。
+  describe('单次输出上限', () => {
+    it('远端 maxOutputTokens 映射为 defaultMaxTokens', async () => {
+      const adapter = makeAdapter({
+        product: { ...BUDDY_CN, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'DS', maxOutputTokens: 128_000 },
+        ],
+      })
+      expect((await adapter.resolveModel('buddy-cn', 'deepseek-v4.1-flash')).defaultMaxTokens).toBe(128_000)
+    })
+
+    it('远端与兜底表都没有该值时保持 undefined（不编造）', async () => {
+      const adapter = makeAdapter({
+        product: { ...BUDDY_CN, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [{ id: 'mystery', name: 'M' }],
+      })
+      expect((await adapter.resolveModel('buddy-cn', 'mystery')).defaultMaxTokens).toBeUndefined()
+    })
+
+    it('远端缺失时用产品兜底表的实测值补位', async () => {
+      // deepseek-v4.1-flash 在 Buddy CN 兜底表中已按实测填 128000。
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [{ id: 'deepseek-v4.1-flash', name: 'DS' }],
+      })
+      expect((await adapter.resolveModel('buddy-cn', 'deepseek-v4.1-flash')).defaultMaxTokens).toBe(128_000)
+    })
+
+    it('国际版同样从兜底表取到实测值（gpt-5.3-codex 刻意留空）', async () => {
+      const adapter = makeAdapter({
+        product: BUDDY,
+        fetchRemoteModels: async () => [
+          { id: 'gpt-5.6-sol', name: 'Sol' },
+          { id: 'gpt-5.3-codex', name: 'Codex' },
+        ],
+      })
+      expect((await adapter.resolveModel('buddy', 'gpt-5.6-sol')).defaultMaxTokens).toBe(128_000)
+      expect((await adapter.resolveModel('buddy', 'gpt-5.3-codex')).defaultMaxTokens).toBeUndefined()
+    })
+
+    it('stream 把上限写进请求体的 max_tokens', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(128_000)
+    })
+
+    it('调用方显式给出的 maxTokens 优先于远端与兜底表', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        maxTokens: 4_096,
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(4_096)
+    })
+
+    it('远端下发的值优先于兜底表', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        fetchRemoteModels: async () => [
+          { id: 'deepseek-v4.1-flash', name: 'DS', maxOutputTokens: 7_000 },
+        ],
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      await collectChunks(adapter, {
+        model: 'deepseek-v4.1-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+      } as never)
+      expect(body.max_tokens).toBe(7_000)
+    })
+
+    it('非法/非正的远端值被忽略（不写 defaultMaxTokens，也不写请求体）', async () => {
+      let body: Record<string, unknown> = {}
+      const adapter = makeAdapter({
+        product: { ...BUDDY_CN, fallbackModels: undefined } as never,
+        fetchRemoteModels: async () => [
+          { id: 'zero', name: 'Z', maxOutputTokens: 0 },
+          { id: 'neg', name: 'N', maxOutputTokens: -5 },
+        ],
+        fetchImpl: async (_url, init) => {
+          body = JSON.parse(String(init?.body)) as Record<string, unknown>
+          return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        },
+      })
+      expect((await adapter.resolveModel('buddy-cn', 'zero')).defaultMaxTokens).toBeUndefined()
+      expect((await adapter.resolveModel('buddy-cn', 'neg')).defaultMaxTokens).toBeUndefined()
+      await collectChunks(adapter, {
+        model: 'zero',
+        messages: [{ role: 'user', content: 'hi' }],
+        signal: new AbortController().signal,
+      } as never)
+      expect(body).not.toHaveProperty('max_tokens')
+    })
+
+    it('**透传防线**：reconcileWithFallback 重建条目时不丢 maxOutputTokens', async () => {
+      // 该函数重建条目对象，漏字段 = 删能力（contextTiers 曾写过同款警告）。
+      // 用带兜底表的产品 + 只下发 maxOutputTokens 的远端条目，验证远端值穿过重建。
+      const adapter = makeAdapter({
+        product: {
+          ...BUDDY_CN,
+          fallbackModels: [{ id: 'glm-5.3', name: 'GLM-5.3' }],
+        } as never,
+        fetchRemoteModels: async () => [{ id: 'glm-5.3', name: 'GLM-5.3', maxOutputTokens: 12_345 }],
+      })
+      expect((await adapter.resolveModel('buddy-cn', 'glm-5.3')).defaultMaxTokens).toBe(12_345)
+    })
+  })
 })
 
 /**
@@ -1184,6 +1320,130 @@ describe('BuddyAdapter message serialization', () => {
     const assistant = payload.messages.find((m) => m.role === 'assistant')
     expect(assistant!.tool_calls).toHaveLength(2)
     expect(payload.messages.filter((m) => m.role === 'tool')).toHaveLength(2)
+  })
+
+  /**
+   * 抓取一次 stream() 序列化后的 messages 数组（结构化，未经 JSON 往返）。
+   *
+   * `overrides` 同时用于适配器构造与请求参数；`readImage` 由用例注入。
+   */
+  async function captureSerializedMessages(overrides: {
+    messages: unknown[]
+    system?: string
+    readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+  }): Promise<Array<Record<string, unknown>>> {
+    let body: { messages: Array<Record<string, unknown>> } | undefined
+    const adapter = makeAdapter({
+      ...overrides.readImage !== undefined ? { readImage: overrides.readImage } : {},
+      fetchImpl: async (_url, init) => {
+        body = JSON.parse(String(init?.body)) as { messages: Array<Record<string, unknown>> }
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      ...overrides,
+      signal: new AbortController().signal,
+    } as never)
+    return body!.messages
+  }
+
+  // 逐字节回归（红线）：无图历史的序列化结果必须与本次改动前**完全一致**。
+  // 上游有 3906 条真实会话的配对计数作证（1761 相邻 / 291 非相邻两侧相同），
+  // 本仓库用硬编码期望值钉死同一契约 —— 任何键顺序、字段增删、字符串化差异
+  // 都会破坏前缀缓存（prompt_cache_key 命中的前提是前缀逐字节稳定）。
+  it('无图历史的序列化逐字节不变（前缀缓存红线）', async () => {
+    const messages = await captureSerializedMessages({
+      system: 'You are helpful',
+      messages: [
+        { role: 'user', content: 'list the files' },
+        { role: 'assistant', content: [
+          { type: 'reasoning', text: 'let me check' },
+          { type: 'text', text: 'checking' },
+          { type: 'tool-call', id: 'call_1', name: 'read', arguments: '{"path":"a"}' },
+        ] },
+        { role: 'user', content: [
+          { type: 'tool-result', toolCallId: 'call_1', content: [{ type: 'text', text: 'file.txt' }] },
+        ] },
+        { role: 'user', content: [{ type: 'text', text: 'thanks' }] },
+      ],
+    })
+    // 该字符串是改动前实测输出的原样副本（键顺序一并锁定）。
+    expect(JSON.stringify(messages)).toBe(
+      '[{"role":"system","content":"You are helpful"},'
+      + '{"role":"user","content":"list the files"},'
+      + '{"role":"assistant","content":"checking","reasoning_content":"let me check",'
+      + '"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read","arguments":"{\\"path\\":\\"a\\"}"}}]},'
+      + '{"role":"tool","tool_call_id":"call_1","content":"file.txt"},'
+      + '{"role":"user","content":"thanks"}]',
+    )
+  })
+
+  // 回归（严重）：read_image 等工具把图片放在 tool-result 的 content 数组里。
+  // 旧实现的两个 helper 嵌套深度不对称 —— collectImages 递归进 tool-result
+  // （字节读到了），userContentParts 只看顶层（返回 undefined），于是序列化
+  // 回退到 contentToText，图片**无报错、无占位符**地消失，模型只收到
+  // `<path>…</path>` 元数据。
+  //
+  // 图片**不能**并进 `role:'tool'` 消息：OpenAI 兼容后端要求每条 tool 消息
+  // 紧跟其 assistant tool_call，中间插入内容会让整个请求 400（本文件顶部
+  // 记录的会话报废成因）。故挂起到其后的独立 user 消息发出。
+  it('工具结果内嵌图片挂起到独立 user 消息（不并进 role:tool）', async () => {
+    const messages = await captureSerializedMessages({
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'tool-call', id: 'call_1', name: 'read_image', arguments: '{"path":"a.png"}' },
+        ] },
+        { role: 'user', content: [
+          { type: 'tool-result', toolCallId: 'call_1', content: [
+            { type: 'text', text: '<path>a.png</path>' },
+            { type: 'image', attachment: { attachmentId: 'att-1' } },
+          ] },
+        ] },
+      ],
+    })
+
+    // 工具结果文本照常走 role:'tool'，且**不含**图片块。
+    const tool = messages.find((m) => m.role === 'tool')!
+    expect(tool).toEqual({ role: 'tool', tool_call_id: 'call_1', content: '<path>a.png</path>' })
+    expect(JSON.stringify(tool)).not.toContain('image_url')
+
+    // 图片以独立 user 消息发出，带载体文本标记。
+    const imageMessage = messages.find((m) => Array.isArray(m.content)
+      && (m.content as Array<Record<string, unknown>>).some((part) => part.type === 'image_url'))!
+    expect(imageMessage.role).toBe('user')
+    expect(imageMessage.content).toEqual([
+      { type: 'text', text: 'Attached image(s) from tool result:' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+    ])
+  })
+
+  // 回归：`imageUrls` 为空 Map 的语义是「有图片，但每一张都读失败」，与
+  // undefined（整个请求没有图片）**不是一回事**。旧实现把空 Map 也降级成
+  // undefined，于是 `[image unavailable]` 占位符被跳过：全部失败静默消失、
+  // 部分失败才留占位符 —— 同一故障两种表现。保留空 Map 后统一产出占位符。
+  it('读图全部失败时占位符仍然出现（空 Map 不降级为 undefined）', async () => {
+    const messages = await captureSerializedMessages({
+      // 读图失败：适配器跳过该 id，imageUrls 最终是空 Map（不是 undefined）。
+      readImage: async () => undefined,
+      messages: [
+        { role: 'assistant', content: [
+          { type: 'tool-call', id: 'call_1', name: 'read_image', arguments: '{"path":"a.png"}' },
+        ] },
+        { role: 'user', content: [
+          { type: 'tool-result', toolCallId: 'call_1', content: [
+            { type: 'text', text: '<path>a.png</path>' },
+            { type: 'image', attachment: { attachmentId: 'att-1' } },
+          ] },
+        ] },
+      ],
+    })
+
+    // 占位符必须出现（旧实现这里只剩 `<path>a.png</path>`）。
+    expect(JSON.stringify(messages)).toContain('[image unavailable]')
+    // 读失败自然不该产出任何 image_url。
+    expect(JSON.stringify(messages)).not.toContain('image_url')
   })
 
   it('sends tools and the system prompt', async () => {

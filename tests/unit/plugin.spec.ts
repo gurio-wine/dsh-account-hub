@@ -341,6 +341,73 @@ describe('WorkBuddy provider 注册', () => {
       expect(inject, required).toContain(required)
     }
   })
+
+  /**
+   * 续期调度器的**启动判据**只看 `refreshable`，**不看 `enabled`**。
+   *
+   * 真实缺陷：原判据是 `a.refreshable && a.enabled`，于是**全部账号都被停用**时
+   * 续期定时器**根本不注册** —— 整个多账号续期静默失效，所有 refresh_token
+   * 一路放到过期，用户重新启用后只能重新登录。
+   *
+   * 停用只影响账号池的**自动选号**，与「凭据是否需要保持新鲜」无关。
+   * 这条断言锁的是「定时器到底有没有被注册」，因此即便日后有人为了
+   * 「停用的账号不必刷」而把 `enabled` 加回判据，也必须先看到这里失败。
+   */
+  describe('续期调度器启动判据', () => {
+    /** 构造一个只提供「账号池内容」的最小上下文（其余服务与 makeContext 一致）。 */
+    function contextWithAccounts(accounts: Array<Record<string, unknown>>): Context {
+      const ctx = new Context()
+      ctx.provide('credentials', new FakeCredentials() as never)
+      ctx.provide('commands', new FakeCommands() as never)
+      ctx.provide('llm', new FakeLlm() as never)
+      ctx.provide('settings', {
+        register: () => ({
+          get: () => ({ accounts, disabledModels: {}, contextBudgets: {}, schemaVersion: 1 }),
+          replace: async () => {},
+        }),
+        describe: () => [],
+      } as never)
+      return ctx
+    }
+
+    const REFRESH_INTERVAL_MS = 30 * 60 * 1000
+    const account = (over: Record<string, unknown>): Record<string, unknown> => ({
+      id: 'a1',
+      provider: 'buddy-cn',
+      credentialRef: 'BUDDY_CN_ACCESS_TOKEN',
+      enabled: true,
+      refreshable: true,
+      ...over,
+    })
+
+    /** 跑一次 apply，返回「是否注册了 30 分钟续期定时器」。 */
+    async function schedulerRegistered(accounts: Array<Record<string, unknown>>): Promise<boolean> {
+      const ctx = contextWithAccounts(accounts)
+      const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+      try {
+        apply(ctx as never)
+        // `listAllAccounts().then(...)` 在微任务里落地，等一拍再看结果。
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        return setIntervalSpy.mock.calls.some((call) => call[1] === REFRESH_INTERVAL_MS)
+      } finally {
+        setIntervalSpy.mockRestore()
+        await ctx.fiber.dispose()
+      }
+    }
+
+    it('全部账号已停用时仍注册续期定时器（停用只影响自动选号）', async () => {
+      expect(
+        await schedulerRegistered([account({ enabled: false })]),
+        '全部账号停用后续期定时器未注册：判据不该按 enabled 过滤',
+      ).toBe(true)
+    })
+
+    it('全部账号不可续期时不注册续期定时器（refreshable 仍须过滤）', async () => {
+      // 与上一条互补：去掉 enabled 过滤不等于不过滤 —— 真正不可续期的
+      // （无 refresh_token 的占位账号）不该让定时器空转。
+      expect(await schedulerRegistered([account({ refreshable: false })])).toBe(false)
+    })
+  })
 })
 
 describe('LobsterAI provider 注册', () => {

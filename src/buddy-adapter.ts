@@ -230,11 +230,27 @@ function contentToText(content: unknown): string {
  *   ——与 codearts 的 deepseek-v4 校验一致；
  * - 正文为空且带 tool_calls 时 `content` 必须为 `null`（对齐 openai_chat.rs）。
  */
+/** 工具结果内嵌图片的载体文本（与官方 deepseek 适配器同名同义）。 */
+const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
+
 function serializeMessages(
   messages: readonly { role: string; content: unknown }[],
   imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
+
+  // 工具结果内嵌图片（read_image 等）不能并入 `role:'tool'` 消息：OpenAI 兼容
+  // 协议要求每条 tool 消息紧跟其 assistant tool_call，中间插入任何消息都会 400。
+  // 故与官方 deepseek 适配器一致：挂起到其后的独立 user 消息统一发出。
+  let pendingToolImages: Array<Record<string, unknown>> = []
+  const flushToolImages = (): void => {
+    if (pendingToolImages.length === 0) return
+    wire.push({
+      role: 'user',
+      content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
+    })
+    pendingToolImages = []
+  }
 
   // ── 孤儿工具调用清理（会话续命的关键）──
   // OpenAI 兼容协议要求：带 `tool_calls` 的 assistant 消息，其**每一个**
@@ -269,6 +285,9 @@ function serializeMessages(
         .map((block) => String(block.text))
         .join('')
       const text = contentToText(content)
+      // 挂起的工具结果图片必须在 assistant 之前发出（对齐官方适配器）：
+      // 否则它们会漂到这条 assistant 之后，与产生它们的工具调用脱节。
+      flushToolImages()
       wire.push({
         role: 'assistant',
         // 正文为空且有工具调用时 content 必须为 null（对齐 openai_chat.rs）。
@@ -279,6 +298,7 @@ function serializeMessages(
       continue
     }
     if (message.role === 'system') {
+      flushToolImages()
       wire.push({ role: 'system', content: contentToText(message.content) })
       continue
     }
@@ -287,23 +307,57 @@ function serializeMessages(
     const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
     const text = contentToText(message.content)
+    // 工具结果之外的常规内容（含顶层图片）。
+    const regular = content.filter((block) =>
+      !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
     // 含图片时 content 升级为 OpenAI 多模态 parts（Buddy 唯一接受的图片
     // 形态；{type:'image'} 会以 `unsupported content type ... image` 400）。
-    const parts = imageUrls === undefined || imageUrls.size === 0
+    //
+    // 注意：这里**不能**把「空 Map」也降级为 undefined。`imageUrls` 为 undefined
+    // 只发生在整个请求都没有图片时；若图片存在但全部读取失败，map 是**空的**
+    // 而非 undefined。降级成 undefined 会让 `[image unavailable]` 占位符也被跳过，
+    // 图片静默消失；只有部分失败时（map 非空）才会出现占位符 —— 同一故障两种
+    // 表现。保留空 Map 可让 `userContentParts` 统一产出占位符。
+    const parts = imageUrls === undefined
       ? undefined
-      : userContentParts(content, imageUrls)
-    if (parts !== undefined) wire.push({ role: 'user', content: parts })
-    else if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+      : userContentParts(regular, imageUrls)
+    if (parts !== undefined) {
+      flushToolImages()
+      wire.push({ role: 'user', content: parts })
+    } else if (text.length > 0 || toolResults.length === 0) {
+      flushToolImages()
+      wire.push({ role: 'user', content: text })
+    }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 其结果同样会让后端 400。
       if (!keepResultIds.has(String(result.toolCallId))) continue
+      // 工具结果内嵌的图片（read_image 等）单独收集：文本继续走 `role:'tool'`，
+      // 图片挂起到其后的 user 消息 —— 与原实现相比，这里补上了递归分支，
+      // 否则图片会被 contentToText 静默丢弃（只留元数据文本）。
+      let resultText = '(no output)'
+      if (imageUrls !== undefined && Array.isArray(result.content)) {
+        const resultParts = userContentParts(result.content, imageUrls)
+        if (resultParts !== undefined) {
+          pendingToolImages.push(...resultParts.filter((part) => part.type !== 'text'))
+          const joined = resultParts
+            .filter((part) => part.type === 'text')
+            .map((part) => String(part.text))
+            .join('')
+          if (joined.length > 0) resultText = joined
+        } else {
+          resultText = contentToText(result.content) || '(no output)'
+        }
+      } else {
+        resultText = contentToText(result.content) || '(no output)'
+      }
       wire.push({
         role: 'tool',
         tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
+        content: resultText,
       })
     }
   }
+  flushToolImages()
   return wire
 }
 
@@ -423,6 +477,12 @@ function isTransportError(error: unknown): boolean {
 /**
  * 把 user 消息内容块转为 OpenAI 多模态 parts；无图片时返回 undefined，
  * 让调用方保持原有的纯字符串路径（无图请求的线上格式不变，避免破坏前缀缓存）。
+ *
+ * `tool-result` 分支为**递归**，与 `collectImages()` 的递归深度保持一致：
+ * 二者若不对称，出现在深层工具结果里的图片会被 collectImages 收进 refs、
+ * 却因这里只走一层而在序列化阶段被静默丢弃（连 `[image unavailable]`
+ * 占位符都没有）。实测 harness 目前只产生一层嵌套，但既然收集侧已经是
+ * 任意深度，序列化侧就必须同样递归，否则是一处埋着的静默丢图。
  */
 function userContentParts(
   content: readonly unknown[],
@@ -432,7 +492,12 @@ function userContentParts(
   let hasImage = false
   for (const raw of content) {
     if (typeof raw !== 'object' || raw === null) continue
-    const block = raw as { type?: unknown; text?: unknown; attachment?: { attachmentId?: unknown } }
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
     if (block.type === 'text') {
       const text = String(block.text ?? '')
       if (text.length > 0) parts.push({ type: 'text', text })
@@ -447,6 +512,20 @@ function userContentParts(
       parts.push(url === undefined
         ? { type: 'text', text: '[image unavailable]' }
         : { type: 'image_url', image_url: { url } })
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      // 递归取内层 parts：内层只要出现图片，hasImage 即为真，
+      // 从而让整条消息升级为多模态形态。
+      const inner = userContentParts(block.content, imageUrls)
+      if (inner !== undefined) {
+        hasImage = true
+        parts.push(...inner)
+      } else {
+        // 内层无图：保留其文本，避免内容丢失。
+        const text = contentToText(block.content)
+        if (text.length > 0) parts.push({ type: 'text', text })
+      }
     }
   }
   return hasImage && parts.length > 0 ? parts : undefined
@@ -587,6 +666,13 @@ export class BuddyAdapter extends LlmAdapter {
         ...entry.contextWindow !== undefined || remote?.contextWindow !== undefined
           ? { contextWindow: remote?.contextWindow ?? entry.contextWindow }
           : {},
+        // ⚠️ 输出上限与上面同一理由：本函数重建了条目对象，漏掉哪个字段就等于
+        // 在该产品上删掉哪个能力 —— 漏了这一行，`resolveModel().defaultMaxTokens`
+        // 与请求体的 `max_tokens` 会**同时**退回网关默认 32000（远端明明有值）。
+        // 「远端优先、兜底补位」，两边都没有则留 undefined（不编造）。
+        ...entry.maxOutputTokens !== undefined || remote?.maxOutputTokens !== undefined
+          ? { maxOutputTokens: remote?.maxOutputTokens ?? entry.maxOutputTokens }
+          : {},
         // ⚠️ **档位表必须一并透传**：本函数重建了条目对象，漏掉哪个字段就等于
         // 在该产品上删掉哪个能力。**两个产品都带兜底表**（`BUDDY_CN_FALLBACK_MODELS`
         // / `BUDDY_FALLBACK_MODELS`），故两侧都走这条重建路径 —— 漏了这一行，
@@ -699,6 +785,23 @@ export class BuddyAdapter extends LlmAdapter {
       inputModalities: this.inputModalitiesFor(model),
     }
     if (contextWindow !== undefined) resolved.context = { contextWindow }
+    // 单次输出上限：远端 `maxOutputTokens` 优先，产品兜底表次之（与
+    // supportsImages / reasoningEfforts **同源**：都读 `productFallbackMeta`，
+    // **不是** `productFallbackContextWindows` —— 那个 map 只装上下文档位）。
+    //
+    // **为什么必须声明**：DSH 的 `resolveCallWithInfo` 只在调用方未显式给值时用
+    // `defaultMaxTokens` 兜底；适配器不声明就等于把上限永久交给网关默认
+    // （实测仅 32000 —— 远端 `auto` / `glm-4.6` 等声明的即为此值）。结果是长回答
+    // 与大文件写入在 32000 处被截断成 `finish_reason:'length'`，`turn/end` 报
+    // `max-tokens`，UI 显示「已达到输出 token 上限」。真机日志：20 次
+    // `turn/end max-tokens`，buddy 系 651 次请求**零** `maxTokens`。
+    //
+    // 远端与兜底表都没有该模型的值时**保持 undefined**，交回网关默认：
+    // 编造偏大的值会被服务端 400 拒绝，偏小则无谓截断用户输出。
+    const maxOutputTokens = positiveMaxTokens(
+      this.remoteMeta.get(model)?.maxOutputTokens ?? this.productFallbackMeta.get(model)?.maxOutputTokens,
+    )
+    if (maxOutputTokens !== undefined) resolved.defaultMaxTokens = maxOutputTokens
     // 思考等级：这是"思考强度"选择器出现在模型选择里的唯一入口——composer
     // 读取 resolveModel().reasoning。无等级可选的模型不声明该字段，UI 显示
     // "当前模型未提供推理等级"。
@@ -867,6 +970,25 @@ export class BuddyAdapter extends LlmAdapter {
     if (tools !== undefined && tools.length > 0) bodyObj.tools = tools
     if (options.temperature !== undefined) bodyObj.temperature = options.temperature
     if (options.stop !== undefined && options.stop.length > 0) bodyObj.stop = options.stop
+    // 单次请求输出上限。此前**完全没有**下发该字段，上限由网关默认值决定
+    // （实测仅 32000），长回答与大文件写入在中途被截断成 `finish_reason:'length'`，
+    // UI 报「已达到输出 token 上限」，且本地无从调整。
+    //
+    // 取值优先级：调用方显式给的 `options.maxTokens`（DSH 会先注入 `resolveModel`
+    // 声明的 `defaultMaxTokens`）→ 远端 `maxOutputTokens` → 产品兜底表。
+    // 三者皆无则**不发该字段**，保持网关默认（不编造，理由见 `resolveModel`）。
+    //
+    // ⚠️ 与 AGENTS.md「Buddy 系出站请求体一个字段都不动」的**红线关系**：那条红线
+    // **专属于上下文档位机制**（防「用户选的档位」漏进 body、把纯声明值切换变成
+    // 协议变更）。本修复是**正交关注点** —— 输出上限，与档位选择无关，且它本来
+    // 就是必须下发的权威字段。既有「三种档位下请求体逐字节相同」的用例仍然全绿：
+    // `max_tokens` 在三种档位下恒定，且它不在该用例的 forbidden 列表里。
+    const maxTokens = positiveMaxTokens(
+      options.maxTokens
+        ?? this.remoteMeta.get(options.model)?.maxOutputTokens
+        ?? this.productFallbackMeta.get(options.model)?.maxOutputTokens,
+    )
+    if (maxTokens !== undefined) bodyObj.max_tokens = maxTokens
     // DeepSeek 思维链开关（逆向官方 codebuddy.js，对齐 workbuddy2api-panel
     // thinking.go）。**实测关键结论（2026-09，直连三站点对照）**：
     //   - 裸请求（无 reasoning_effort、无 thinking）→ reasoning_content 恒为 0；
@@ -1245,6 +1367,19 @@ export class BuddyAdapter extends LlmAdapter {
 function isCredentialExpired(credential: BuddyCredential): boolean {
   const expiresAt = credentialExpiresAtMs(credential)
   return expiresAt === undefined ? false : Date.now() >= expiresAt
+}
+
+/**
+ * 把候选输出上限规整为「可安全下发的正整数」，否则返回 undefined。
+ *
+ * 为什么必须过滤：DSH 的 `LlmRuntime.resolveModelInfoFor` 对适配器声明的
+ * `defaultMaxTokens` 有**硬校验** —— 非安全整数或 ≤0 会直接抛
+ * `adapter returned invalid default maxTokens`（`INVALID_MODEL_MAX_TOKENS`），
+ * **整轮对话起不来**（不是降级，是崩）。远端是外部输入，`0` / 负数 / `NaN`
+ * 都可能出现，不能在适配器里假设它合法。
+ */
+function positiveMaxTokens(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
 }
 
 /**

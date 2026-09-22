@@ -83,6 +83,84 @@ describe('产品配置', () => {
     }
   })
 
+  // ── 单次输出上限兜底值（2026-09-19 真机实测）──
+  //
+  // 该字段是**必须下发**的权威额度，不是装饰：适配器把它写进请求体 `max_tokens`
+  // 并声明为 `defaultMaxTokens`。远端不可用时若兜底表也没值，上限会退回网关默认
+  // 32000，长回答被静默截断（`turn/end` 报 `max-tokens`）。
+  describe('兜底表 maxOutputTokens 实测值', () => {
+    /** 逐 id 取兜底值；id 不在表里时返回 undefined。 */
+    const maxOut = (product: { fallbackModels?: readonly { id: string; maxOutputTokens?: number }[] }, id: string) =>
+      product.fallbackModels?.find((m) => m.id === id)?.maxOutputTokens
+
+    it('Buddy CN：逐 id 实测值', () => {
+      // ⚠️ 不能整表照搬上游：本表没有上游的 `deepseek-v4-flash`(50k) 与
+      // `kimi-k2.8-preview`(64k)，那两项不适用。
+      expect(maxOut(BUDDY_CN, 'hy4-preview')).toBe(64_000)
+      expect(maxOut(BUDDY_CN, 'hy3')).toBe(64_000)
+      expect(maxOut(BUDDY_CN, 'hy3-x')).toBe(64_000)
+      // deepseek-v4.1-flash：scoped 端点 128000、/v3/config 131072 ⇒ 取较小者。
+      expect(maxOut(BUDDY_CN, 'deepseek-v4.1-flash')).toBe(128_000)
+      expect(maxOut(BUDDY_CN, 'deepseek-v4-pro')).toBe(128_000)
+      expect(maxOut(BUDDY_CN, 'glm-5.3')).toBe(64_000)
+      expect(maxOut(BUDDY_CN, 'glm-5.2')).toBe(64_000)
+      expect(maxOut(BUDDY_CN, 'glm-5v-turbo')).toBe(64_000)
+      expect(maxOut(BUDDY_CN, 'glm-5.3-flash')).toBe(32_000)
+      expect(maxOut(BUDDY_CN, 'glm-5.1')).toBe(48_000)
+      expect(maxOut(BUDDY_CN, 'kimi-k3-1')).toBe(32_000)
+      expect(maxOut(BUDDY_CN, 'kimi-k2.7')).toBe(32_000)
+      expect(maxOut(BUDDY_CN, 'kimi-k2.6')).toBe(32_000)
+      expect(maxOut(BUDDY_CN, 'minimax-m3')).toBe(64_000)
+    })
+
+    it('Buddy（国际版）：逐 id 实测值', () => {
+      expect(maxOut(BUDDY, 'default-model')).toBe(24_000)
+      expect(maxOut(BUDDY, 'deep-model')).toBe(24_000)
+      expect(maxOut(BUDDY, 'fast-model')).toBe(32_000)
+      expect(maxOut(BUDDY, 'balanced-model')).toBe(32_000)
+      expect(maxOut(BUDDY, 'primary-model')).toBe(72_000)
+      expect(maxOut(BUDDY, 'gpt-5.4')).toBe(72_000)
+      expect(maxOut(BUDDY, 'deepseek-v4.1-flash')).toBe(128_000)
+      expect(maxOut(BUDDY, 'gpt-6-astra')).toBe(128_000)
+      expect(maxOut(BUDDY, 'gpt-5.6-sol')).toBe(128_000)
+      expect(maxOut(BUDDY, 'gpt-5.6-terra')).toBe(128_000)
+      expect(maxOut(BUDDY, 'gpt-5.6-luna')).toBe(128_000)
+      expect(maxOut(BUDDY, 'gpt-5.5')).toBe(128_000)
+      // 65536 不是 64K 取整：真机就是 65536。
+      expect(maxOut(BUDDY, 'gemini-3.5-flash')).toBe(65_536)
+      expect(maxOut(BUDDY, 'glm-5.3')).toBe(48_000)
+      expect(maxOut(BUDDY, 'glm-5.2')).toBe(48_000)
+      expect(maxOut(BUDDY, 'kimi-k3')).toBe(32_000)
+      expect(maxOut(BUDDY, 'kimi-k2.6')).toBe(32_000)
+      // ⚠️ 刻意留空（上游也没给），不编造数值 —— 缺省即交回网关默认。
+      expect(maxOut(BUDDY, 'gpt-5.3-codex')).toBeUndefined()
+    })
+
+    it('凡填了的 maxOutputTokens 都是正的安全整数（DSH 硬校验防线）', () => {
+      // DSH 的 `resolveModelInfoFor` 对 `defaultMaxTokens` 有硬校验：非安全整数或
+      // ≤0 会直接抛 INVALID_MODEL_MAX_TOKENS，整轮对话起不来。兜底表是手写常量，
+      // 这条守住「有人手滑写成 0 / 负数 / 非整数」。
+      for (const product of [BUDDY_CN, BUDDY]) {
+        for (const model of product.fallbackModels!) {
+          if (model.maxOutputTokens === undefined) continue
+          expect(Number.isSafeInteger(model.maxOutputTokens), `${product.id}/${model.id}`).toBe(true)
+          expect(model.maxOutputTokens, `${product.id}/${model.id}`).toBeGreaterThan(0)
+        }
+      }
+    })
+
+    it('除 gpt-5.3-codex 外，两个产品的每个条目都填了 maxOutputTokens', () => {
+      // 反向防线：漏填会让该模型退回网关默认 32000 —— 那正是本次修复要消除的
+      // 静默截断。已知且**刻意**的唯一例外是国际版 `gpt-5.3-codex`（上游未给值）。
+      for (const product of [BUDDY_CN, BUDDY]) {
+        for (const model of product.fallbackModels!) {
+          if (product.id === 'buddy' && model.id === 'gpt-5.3-codex') continue
+          expect(model.maxOutputTokens, `${product.id}/${model.id}`).toBeDefined()
+        }
+      }
+    })
+  })
+
   it('凡声明了 reasoningEfforts 的 deepseek 系模型都必须声明 defaultReasoningEffort', () => {
     // 真实缺陷回归（会话 session-03b4d1f2 "测试思考过程显示"）：WorkBuddy 的
     // deepseek-v4.1-flash 只声明了 reasoningEfforts:['high'] 而漏了默认档，

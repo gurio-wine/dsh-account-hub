@@ -65,6 +65,17 @@ export interface BuddyFallbackModel {
    * 档位数据会漂移，本表是快照而非契约。
    */
   contextWindow?: number
+  /**
+   * 单次请求输出上限（对应远端 `maxOutputTokens`）。
+   *
+   * 远端可达时以远端为准；本字段只在远端不可用或未覆盖该模型时补位。
+   *
+   * ⚠️ **必须下发**，不是仅供展示的元数据：适配器把它写进请求体的 `max_tokens`
+   * 并声明为 `resolveModel().defaultMaxTokens`。不填的模型退回**网关默认 32000**，
+   * 长回答与大文件写入会在 32000 处被截断成 `finish_reason:'length'`
+   * （`turn/end` 报 `max-tokens`）。取值来自 2026-09-19 真机实测。
+   */
+  maxOutputTokens?: number
   /** 是否接受图片输入（对应远端 `supportsImages`）。 */
   supportsImages?: boolean
   /** 可选思考等级（对应远端 `reasoning.supportedEfforts`）。 */
@@ -202,47 +213,72 @@ export interface BuddyProduct {
  * 档位表最大档)`。未下发档位对的条目（`hy3` / `glm-5.1` / `kimi-k2.6` 等）本就是
  * 单档模型，`maxInputTokens` 即服务窗口，保持原值。档位数据会漂移，本表是快照
  * 而非契约；远端可用时以远端为准（见 `BuddyAdapter.reconcileWithFallback`）。
+ *
+ * ⚠️ `maxOutputTokens` 同样来自 2026-09-19 真机实测（`maxOutputTokens` 字段），
+ * **逐 id 填值、不整表照搬上游**：本表没有上游的 `deepseek-v4-flash`(50k) 与
+ * `kimi-k2.8-preview`(64k)，那两项不适用。
  */
 const BUDDY_CN_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
   {
     id: 'hy4-preview', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3-x', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
+    // maxOutputTokens 实测（2026-09-19）：scoped 端点 128000、/v3/config 131072。
+    // 取 **128000**（两端点的较小者）：它是服务端真正接受的额度；131072 只是
+    // /v3/config 的声明值。远端可用时仍以远端下发值为准，本字段只在远端缺失时补位。
     id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'deepseek-v4-pro', name: 'Deepseek-V4-Pro', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 32_000,
   },
   {
     id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
-  { id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  {
+    id: 'glm-5.1', name: 'GLM-5.1', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 48_000,
+  },
+  {
+    id: 'glm-5v-turbo', name: 'GLM-5V-Turbo', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 64_000,
+  },
+  {
+    id: 'kimi-k3-1', name: 'Kimi-K3-1', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
+  {
+    id: 'kimi-k2.7', name: 'Kimi-K2.7', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
+  {
+    id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 32_000,
+  },
   // ⚠️ 512K 不是笔误：官方档位表最大档就是 512K（[300K, 512K]），档位表是刻意上限。
-  { id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  {
+    id: 'minimax-m3', name: 'MiniMax-M3', contextWindow: 512_000, supportsImages: true, reasoningEfforts: ['medium'],
+    maxOutputTokens: 64_000,
+  },
 ]
 
 export const BUDDY_CN: BuddyProduct = {
@@ -284,58 +320,63 @@ export const BUDDY_CN: BuddyProduct = {
  * `gemini-3.5-flash`、`glm-5.3`、`glm-5.2`、`kimi-k3`）**不带 `contextWindow`
  * 字段**，是**单档模型** —— `maxInputTokens` 就是服务窗口，砍它等于谎报容量。
  * 非 1M 条目（`gpt-5.4` 272K、`kimi-k2.6` 256K 等）同样不动。
+ *
+ * ⚠️ `maxOutputTokens` 来自 2026-09-19 对国际版 `/v3/config` 的真机实测，**逐 id
+ * 填值**；本表没有上游的 `deepseek-v4.1-flash-sg` / `kimi-k2.8-preview` 两项，不适用。
+ * `gpt-5.3-codex` **刻意留空**（上游同样没填，不为凑齐而编造数值）。
  */
 const BUDDY_FALLBACK_MODELS: readonly BuddyFallbackModel[] = [
-  { id: 'default-model', name: 'Auto', contextWindow: 176_000, supportsImages: true },
-  { id: 'fast-model', name: 'Fast', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'balanced-model', name: 'Balanced', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'primary-model', name: 'Primary', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['high'] },
-  { id: 'deep-model', name: 'Deep', contextWindow: 176_000, supportsImages: true },
+  { id: 'default-model', name: 'Auto', contextWindow: 176_000, supportsImages: true, maxOutputTokens: 24_000 },
+  { id: 'fast-model', name: 'Fast', contextWindow: 200_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  { id: 'balanced-model', name: 'Balanced', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  { id: 'primary-model', name: 'Primary', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['high'], maxOutputTokens: 72_000 },
+  { id: 'deep-model', name: 'Deep', contextWindow: 176_000, supportsImages: true, maxOutputTokens: 24_000 },
   {
     id: 'hy4-preview-f', name: 'Hy4 preview', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
   {
     id: 'hy3', name: 'Hy3', contextWindow: 192_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high'], defaultReasoningEffort: 'high', maxOutputTokens: 64_000,
   },
-  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high' },
+  { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['high'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000 },
   {
     id: 'gpt-6-astra', name: 'GPT-6-Astra', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-terra', name: 'GPT-5.6-Terra', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.6-luna', name: 'GPT-5.6-Luna', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.5', name: 'GPT-5.5', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 128_000,
   },
   {
     id: 'gpt-5.4', name: 'GPT-5.4', contextWindow: 272_000, supportsImages: true,
-    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'medium', 'high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 72_000,
   },
+  // ⚠️ 刻意不带 maxOutputTokens：上游实测同样未给出该模型的值，不编造（缺失即交回网关默认）。
   { id: 'gpt-5.3-codex', name: 'GPT-5.3-Codex', contextWindow: 272_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'gemini-3.5-flash', name: 'Gemini-3.5-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'gemini-3.5-flash', name: 'Gemini-3.5-Flash', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 65_536 },
   {
     id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['low', 'high', 'max'], defaultReasoningEffort: 'high', maxOutputTokens: 48_000,
   },
   {
     id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, supportsImages: true,
-    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high',
+    reasoningEfforts: ['high', 'xhigh'], defaultReasoningEffort: 'high', maxOutputTokens: 48_000,
   },
-  { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'] },
-  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'] },
+  { id: 'kimi-k3', name: 'Kimi-K3', contextWindow: 1_000_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
+  { id: 'kimi-k2.6', name: 'Kimi-K2.6', contextWindow: 256_000, supportsImages: true, reasoningEfforts: ['medium'], maxOutputTokens: 32_000 },
 ]
 
 /**

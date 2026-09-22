@@ -938,8 +938,13 @@ export class QoderAuth extends Service {
   /**
    * 批量续期本产品的所有账号。
    *
-   * 遍历 pool 中 `enabled && refreshable` 的 Qoder 账号，逐一确保 jt 可用；
-   * 单账号失败不影响其他账号（与另外四个 provider 同语义）。
+   * 遍历 pool 中 **`refreshable`** 的本产品账号（**含已停用账号**），逐一确保 jt 可用；
+   * 单账号失败不影响其他账号（与另外几个 provider 同语义）。
+   *
+   * ⚠️ **停用只影响账号池的自动选号，续期仍进行**：早期实现是
+   * `if (!entry.enabled || !entry.refreshable)`，停用账号被跳过续期，凭据一路
+   * 放到失效，用户重新启用后只能重新登录（真实缺陷，详见 `BuddyAuth.refreshAll`）。
+   * 两个 region 共用本类，故一处改动同时覆盖 `qoder` 与 `qoder-cn`。
    *
    * ⚠️ **本 provider 刻意走 `getJobToken` 而不是无条件 exchange**：
    * jt 有效 24h，而 `src/index.ts` 的批量续期**每 30 分钟**跑一趟 ——
@@ -957,7 +962,8 @@ export class QoderAuth extends Service {
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts(this.product.id)
     for (const entry of accounts) {
-      if (!entry.enabled || !entry.refreshable) continue
+      // 只跳过「不可续期」的账号；enabled 与续期无关（见方法注释）。
+      if (!entry.refreshable) continue
       try {
         const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
         if (!resolved) {

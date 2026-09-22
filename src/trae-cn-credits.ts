@@ -94,11 +94,15 @@
  * ## 与 `lobsterai-credits.ts` 的签名差异（刻意）
  *
  * LobsterAI 版用 positional `fetcher` 形参；本模块改用
- * {@link TraeCnCreditsOptions} 选项包，因为**本协议有三处字段名待校准**
- * （领取积分字段、礼包数组位置、礼包余额字段），需要一个**脱敏调试出口**
+ * {@link TraeCnCreditsOptions} 选项包，因为**本协议有两处字段名待校准**
+ * （礼包数组位置、礼包余额字段），需要一个**脱敏调试出口**
  * （`onDebug`，只输出字段名不输出值）供真机一次性收敛。为了一个可选的调试
  * 出口而把 `fetcher` 挤成第三、调试挤成第四个位置参数，会让所有调用点都
  * 出现 `undefined` 占位洞，可读性更差。
+ *
+ * ⚠️ **曾经的第三处「待校准」已随 T8 定案删除**：领取响应里**没有**积分数，
+ * 故不再需要「本次获得积分字段名」的校准出口。详见
+ * {@link claimTraeCnDailyCheckin} 的「claim 成功后的补查」。
  *
  * ⚠️ **未接线项**：`onDebug` 目前只在 RPC 分发处接到 `ctx.logger.info`，
  * 由宿主日志承接；它**不**经 RPC 回传给客户端（协议里没有这个字段）。
@@ -498,6 +502,26 @@ function withLogId<T extends Record<string, unknown>>(base: T, logid: string | u
 }
 
 /**
+ * 把「响应不是 JSON」整理成可读原因。
+ *
+ * 凭据失效/过期时网关可能返回 **HTML 错误页**，直接 `response.json()` 会抛
+ * `Unexpected token '<', "<html> <h"... is not valid JSON` —— 用户既不知道
+ * 发生了什么，也看不出该重新登录。这里改为明确指向凭据问题并附状态码。
+ *
+ * 与 `credits.ts` / `lobsterai-credits.ts` 的同名函数**同款**（三条协议线各自
+ * 独立成文件，故刻意各留一份而不是跨文件共用：那两份的调用方签名与错误码
+ * 体系都不同，抽出来反而要引入一层新依赖）。
+ */
+function describeNonJsonResponse(status: number, text: string): string {
+  // 401/403 基本就是凭据失效；其余状态也一并如实给出，不做过度推断。
+  if (status === 401 || status === 403) {
+    return `凭据已失效（HTTP ${status}），请重新登录该账号`
+  }
+  const snippet = text.trim().slice(0, 80).replace(/\s+/g, ' ')
+  return `服务端返回了非 JSON 响应（HTTP ${status}）：${snippet}`
+}
+
+/**
  * 发起一次 POST 并解析业务码。
  *
  * 判定的全部依据是 **body 的 `code`**，`response.ok` 一概不看：实测无 auth 时
@@ -508,6 +532,15 @@ function withLogId<T extends Record<string, unknown>>(base: T, logid: string | u
  *
  * 失败路径**一律带上响应头里的 logid**（见 {@link TRAE_CN_LOGID_HEADER}）——
  * 传输层失败（fetch 抛错）时没有响应，故那里取不到 logid，这是如实的缺失。
+ *
+ * ⚠️ **不要用 `response.json()`**：凭据失效时网关返回 HTML 错误页，
+ * `json()` 抛出的 `Unexpected token '<'` 对用户毫无意义。故先取文本再解析，
+ * 非 JSON 时给出带状态码的可读原因（与 `credits.ts` / `lobsterai-credits.ts`
+ * 同款修复 —— 上游 `553ef21` 只改了那两个文件，本条是本仓补齐的第三处）。
+ *
+ * ⚠️ **读 logid 头必须早于读 body**：`response.text()` 之后 `headers` 仍可读，
+ * 但「先读头再读体」这个既有顺序是**刻意**的（让「logid 属于这一次响应」在
+ * 代码上显而易见），改动 body 读取方式时不要顺手把它挪到后面。
  */
 async function postJson(
   path: string,
@@ -527,10 +560,23 @@ async function postJson(
       body,
       signal: AbortSignal.timeout(TRAE_CN_REQUEST_TIMEOUT_MS),
     })
-    // 先读响应头再解析 body：`response.json()` 之后再读头同样可行，但把取数
+    // 先读响应头再解析 body：`response.text()` 之后再读头同样可行，但把取数
     // 放在紧邻响应的位置，能让「logid 属于这一次响应」这件事在代码上显而易见。
     logid = readLogId(response)
-    parsed = await response.json() as unknown
+    const text = await response.text()
+    try {
+      parsed = JSON.parse(text) as unknown
+    } catch {
+      // 非 JSON：多半是网关 HTML 错误页（凭据失效的典型表现）。
+      return withLogId(
+        {
+          ok: false as const,
+          code: CODE_TRANSPORT_FAILED,
+          message: describeNonJsonResponse(response.status, text),
+        },
+        logid,
+      )
+    }
   } catch (error) {
     // 保留原始错误消息（含 timeout / socket hang up），不吞掉诊断信息。
     return {
@@ -664,10 +710,15 @@ function parseCheckinState(body: Record<string, unknown>): TraeCnCheckinState {
  * 的凭据失效），与「服务端明确说未签到」严格区分 —— 后者返回
  * `todayCheckedIn: false` 的对象。
  *
- * 映射到共用的 {@link CheckinStatus}：只有 `active` 与 `todayCheckedIn` 有
- * 实测依据，其余字段（连续天数 / 每日积分 / 活动名…）Trae 的状态响应里
+ * 映射到共用的 {@link CheckinStatus}：`active` / `todayCheckedIn` / `dailyCredit`
+ * 三项有实测依据，其余字段（连续天数 / 今日已领 / 活动名…）Trae 的状态响应里
  * **没有已确认的对应字段**，故一律取零值，而不是臆造一份看起来丰满的状态。
  * 这与 LobsterAI 的处理同因（那份协议同样没有这些概念）。
+ *
+ * ⚠️ **`dailyCredit` 取自 `credits` 字段（T8 定案，2026-09-20）**：真机实测
+ * status 响应里 `credits: 150`，与积分余额中「签到奖励」包的 `credits_limit: 150`
+ * 完全吻合。**这是全模块唯一有实测依据的积分数来源** —— claim 响应里根本没有
+ * 积分字段（见 {@link claimTraeCnDailyCheckin}），故领取后要靠本函数补查。
  */
 export async function fetchTraeCnCheckinStatus(
   credential: TraeCnCredential,
@@ -685,13 +736,21 @@ export async function fetchTraeCnCheckinStatus(
     return null
   }
   const state = parseCheckinState(result.body)
+  const data = dataLayer(result.body)
+  // `credits` 的**字段名**有实测依据，但它落在哪一层（`data` 还是根对象）没有
+  // 取证 —— 与 `checked_in` / `enable` 同一处境，故同样两层都看（见
+  // `readBoolAnywhere` 的同款理由）。刻意**不加** `credit` 之类的候选名：
+  // 候选表正是 T8 那个「猜一个不存在的字段」的旧缺陷形态。
+  const dailyCredit = readFirstNumber(data, ['credits'])
+    ?? readFirstNumber(result.body, ['credits'])
+    ?? 0
   return {
     // 缺失视为开启：只有服务端**显式** enable:false 才判未开启，
     // 否则一旦响应里省略该字段，UI 会把正常账号显示成「活动未开启」。
     active: state.enabled !== false,
     todayCheckedIn: state.checkedIn,
     streakDays: 0,
-    dailyCredit: 0,
+    dailyCredit,
     todayCredit: 0,
     isStreakDay: false,
     totalCredits: 0,
@@ -703,30 +762,24 @@ export async function fetchTraeCnCheckinStatus(
 }
 
 // ── 签到领取 ──
-
-/**
- * 领取响应里「本次获得积分」的候选字段表。
- *
- * ⚠️ **T8 待校准**：调研报告未给出 claim 成功的响应结构。故按候选表依次尝试，
- * 全部未命中时按 0 处理并输出一条脱敏调试行（列出实际字段名），真机跑一次
- * 即可把本表收敛成唯一字段。**不发明**字段名，也不把 0 当成「服务端说 0 分」。
- */
-export const TRAE_CN_CLAIM_CREDIT_FIELDS: readonly string[] = [
-  'credit', 'credits', 'credits_granted', 'reward_credits', 'reward', 'amount', 'integral',
-]
-
-/** 从领取响应的数据层取本次积分；取不到返回 undefined。 */
-function readClaimedCredit(data: Record<string, unknown>): number | undefined {
-  for (const key of TRAE_CN_CLAIM_CREDIT_FIELDS) {
-    const value = data[key]
-    if (typeof value === 'number' && Number.isFinite(value)) return value
-    if (typeof value === 'string' && value.trim().length > 0) {
-      const parsed = Number(value.trim())
-      if (Number.isFinite(parsed)) return parsed
-    }
-  }
-  return undefined
-}
+//
+// ✅ **T8 已按真机定案（2026-09-20）——「领取响应里没有积分数」**。
+//
+// 上游真机实测：`checkin_credits/claim` 的**完整响应**就是
+// `{"code":0,"message":"success"}`，**不含任何积分字段**。
+//
+// 因此本模块曾经那张「本次获得积分」候选表
+// （`credit` / `credits` / `credits_granted` / `reward_credits` / `reward` /
+// `amount` / `integral`）**注定全部落空** —— 它不是在猜字段名，而是在猜一个
+// **根本不存在的字段**，表现为界面永远显示「领取成功 **+0** 积分」。
+//
+// 真实数值只在 **status 端点**的 `credits` 字段里（真机实测 `credits: 150`，
+// 与积分余额里「签到奖励」包的 `credits_limit: 150` 完全吻合 —— 两条独立
+// 证据互相印证，故这不是一个「猜出来的字段」）。
+//
+// 故领取成功后**补查一次 status** 取 `credits`：多一次往返，换取如实报告所得。
+// 候选表与 `readClaimedCredit` 已整体删除，理由与处置见
+// {@link claimTraeCnDailyCheckin} 的「claim 成功后的补查」一节。
 
 /** 等待指定毫秒（抽成函数是为了让测试能用假定时器接管，不必真等 4 秒）。 */
 function sleep(ms: number): Promise<void> {
@@ -773,15 +826,28 @@ async function claimTraeCnWithRetry(
 /**
  * 执行每日签到领取。
  *
- * 完整两步流程（**status → 未领则 claim**），返回与 `credits.ts` 同构的
- * {@link ClaimOutcome} 判别联合 —— `computeClaimSummary` 与结果摘要 UI 无需改动。
+ * 完整流程（**status → 未领则 claim → 补查 status**），返回与 `credits.ts`
+ * 同构的 {@link ClaimOutcome} 判别联合 —— `computeClaimSummary` 与结果摘要 UI
+ * 无需改动。
  *
  * 判定顺序（把「业务正常状态」与「真失败」严格分开）：
  * 1. 状态查询失败 → `failed`（转述底层原因；`code:1001` 译为「凭据已失效」）；
- * 2. `checked_in` 为真 → `already-claimed`（**不发领取请求**）；
+ * 2. `checked_in` 为真 → `already-claimed`（**不发领取请求**，也不补查）；
  * 3. 服务端显式 `enable:false` → `inactive`；
  * 4. 领取请求失败 → `failed`（`1001` 凭据失效 / `9004` 设备被拒各有专门文案）；
- * 5. 成功 → `claimed`。
+ * 5. 成功 → **补查一次 status 取 `credits`**（见下），然后 `claimed`。
+ *
+ * ## claim 成功后的补查（T8 定案，2026-09-20）
+ *
+ * claim 的完整响应就是 `{"code":0,"message":"success"}`，**没有积分数** ——
+ * 故第 5 步必须补查一次 status，从它的 `credits` 字段取本次所得（真机实测 150）。
+ * 补查**失败不改变 claimed 语义**：领取这件事已经由服务端的 `code:0` 确认过了，
+ * 只是数字拿不到，故 credit 落 0 并留一条调试行说明原因，而不是把整次领取
+ * 报成失败（那会让用户重试一次已经成功的领取）。
+ *
+ * 补查复用 {@link fetchTraeCnCheckinStatus}（**已有的 status 端点函数**），
+ * 不另写一份网络代码：它的字段解析、logid 透传、信封判定与预检那次必须同源，
+ * 各写一份必然漂移。
  *
  * ## 只有 claim 段重试（status 段**一次都不重试**）
  *
@@ -791,6 +857,9 @@ async function claimTraeCnWithRetry(
  * {@link TRAE_CN_CLAIM_RETRY_DELAYS_MS} 退避重试（1s → 3s，共 2 次）；
  * 重试**耗尽**后按**最后一次**尝试的 code / message / logid 返回 ——
  * 用户看到的是最近一次现场，而不是第一次的（logid 尤其如此：它标识单次请求）。
+ *
+ * ⚠️ 第 5 步的补查**不重试**：它是读接口，且它的失败不会改变 outcome 的 kind，
+ * 重试只会拖长一次已经成功的领取。它的 `onDebug` 出口与上面共用。
  *
  * 幂等是**服务端**保证的（`checked_in`），本模块只在客户端做一次预检以省掉
  * 无效请求 —— 即便预检与实际状态竞态，重复领取也只会得到服务端的幂等响应。
@@ -834,17 +903,18 @@ export async function claimTraeCnDailyCheckin(
       ...claimResult.logid === undefined ? {} : { logid: claimResult.logid },
     }
   }
-  const data = dataLayer(claimResult.body)
-  const credit = readClaimedCredit(data)
-  if (credit === undefined) {
+  // 补查一次 status 取本次积分（claim 响应里没有积分数，见函数注释）。
+  const claimedStatus = await fetchTraeCnCheckinStatus(credential, product, options)
+  if (claimedStatus === null) {
     options.onDebug?.(
-      `[trae-cn] 领取成功但未命中积分字段候选表，响应字段名: ${describeKeys(data)}`,
+      '[trae-cn] 领取成功但补查 status 失败，本次积分按 0 计'
+      + '（claim 的 code:0 已确认领取成功，故 kind 仍是 claimed）',
     )
   }
-  const delayed = readServerMessage(data)
+  const delayed = readServerMessage(dataLayer(claimResult.body))
   return {
     kind: 'claimed',
-    credit: credit ?? 0,
+    credit: claimedStatus?.dailyCredit ?? 0,
     // Trae 的签到响应不含连续签到天数概念（那是 CodeBuddy 的活动机制）。
     streakDays: 0,
     isStreakDay: false,

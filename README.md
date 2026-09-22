@@ -332,6 +332,10 @@ Tokens 福利）。
   其续期仍意味着重新运行浏览器登录流程。
 - 手动续期：`/codearts-refresh` 或 `ctx.codeartsAuth.refresh()`。
 - 续期定时器是 unref 的，在 `logout()` 和插件卸载时停止。
+- **续期不看「启用/停用」**：批量续期与调度器启动判据都**只按 `refreshable` 过滤**。
+  停用只影响账号池的**自动选号**（与积分领取同理），不该让凭据停止续期 ——
+  否则停用期间 `refresh_token` 过期，重新启用后只能重新登录；更糟的是
+  **全部账号都停用**时续期定时器根本不注册，整个多账号续期静默失效。
 - 运行时依赖新增 `jose`（用于 DPoP JWS 签发，与 CodeArts Agent 插件实现一致）。
 
 ## 开发
@@ -418,10 +422,14 @@ cordis 服务名是显式指定的 `ctx.buddyCnAuth` —— 带连字符的 id �
   **`defaultLength` 是官方客户端的 UI 默认档、不是服务端硬限** —— 2026-09-21 钳制二分
   实测（`buddy-cn` / `glm-5.3`，同一请求只改 token 数）：320,307 / 500,507 / 900,910 /
   1,000,970 token **全部 HTTP 200**，1.2M 才回 400 `code:11115`。故按最大档声明
-  （≈1M）；本插件**不发送任何档位字段**（出站请求体一个字节都不变），但 Account Hub
+  （≈1M）；本插件**不发送任何档位字段**（档位选择是纯声明值切换，出站请求体不因
+  选档而改变 —— 见下方「单次输出上限」，`max_tokens` 是**另一个正交字段**，与档位
+  无关），但 Account Hub
   的「显示列表」里**可以选择更小的档位**（`supportedLengths` 的那些值，见
   [上下文窗口档位选择](#上下文窗口档位选择)）。
   详见 [AGENTS.md](AGENTS.md) 的「Buddy 系 —— 上下文窗口取值口径」。
+- **单次输出上限（`max_tokens`）已接线** —— 见下方
+  [Buddy 系：单次输出上限](#buddy-系单次输出上限max_tokens)。
 - 请求头：除 `Authorization: Bearer` 外，还需 `X-Domain`、`X-Product`、
   `X-Product-Code` 以及伪装为 `CodeBuddyIDE/1.106.1` 的 `User-Agent`。
 - 凭据 ref：单账号 `BUDDY_CN_ACCESS_TOKEN`，多账号 `BUDDY_CN_ACCOUNT_<UUID_SHORT>`；
@@ -497,6 +505,54 @@ cordis 服务名是显式指定的 `ctx.buddyCnAuth` —— 带连字符的 id �
   远端目录可用时，**带档位对**（`contextWindow.supportedLengths`）的模型与 CN 同款
   可在「显示列表」里选档，见
   [上下文窗口档位选择](#上下文窗口档位选择)。
+
+### Buddy 系：单次输出上限（`max_tokens`）
+
+**远端下发 `maxOutputTokens`，适配器必须消费它并写进请求体。** 这是「回答被截断、
+UI 报『已达到输出 token 上限』」的根因修复。
+
+- 请求体 `max_tokens` 取值优先级：
+  **`options.maxTokens`（DSH 注入）→ 远端 `data.models[].maxOutputTokens` → 产品兜底表**。
+  三者皆无则**不发该字段**，交回网关默认值（不编造数值）。
+- `resolveModel()` 同时把该值声明为 `defaultMaxTokens`。DSH 只在调用方未显式
+  给值时用声明的默认值兜底；适配器不声明就等于把上限永久交给网关默认。
+- ⚠️ **远端非法值必须过滤**：DSH 对 `defaultMaxTokens` 有硬校验（非安全整数
+  或 ≤0 直接抛 `INVALID_MODEL_MAX_TOKENS`，整轮对话起不来），故远端是外部
+  输入，`0` / 负数 / `NaN` 一律视为未声明（见 `positiveMaxTokens`）。
+
+**真实缺陷**（用户报障）：`deepseek-v4.1-flash` 的回答在 **32000 token** 处被
+截断，`turn/end` 为 `{kind:'max-tokens'}`。根因不是「网关固定上限」，而是适配器
+早期**只把 `maxOutputTokens` 当作 `isChatModel` 的过滤判据**（≤256 视为补全
+模型），从不下发 → 上限永久退回网关默认值，而网关默认恰好就是 **32000**。
+远端对 `deepseek-v4.1-flash` 实际声明的是 **128000**。
+
+实测（2026-09-19，上游参考实现 `0611485` 的 `dump-max-output.mjs` 只读探针）：
+
+| 模型 | 中国版 scoped 端点 | 中国版 `/v3/config` | 国际版 `/v3/config` |
+|---|---|---|---|
+| `deepseek-v4.1-flash` | 128000 | 131072 | 128000 |
+| `deepseek-v4-pro` | 128000 | 131072 | — |
+| `hy4-preview` | 64000 | 64000 | 64000 |
+
+⚠️ 各端点值不完全一致（与 `maxInputTokens` 同策略）：采信**实际命中的那个端点**，
+**不做跨端点取大**。兜底表取两端点的**较小者**（`128000`）。
+
+网关**确实接受** `max_tokens` 且**精确生效**：`max_tokens: 64` 会精确截断在 64
+（`finish_reason=length`、`completion_tokens=64`），证明该字段被服务端真实消费，
+而不是被静默忽略。
+
+> **单次请求 ≠ 单轮**：每个 step 都是独立请求、各有各的预算。因此
+> 「拆多步写文件」仍是超出单次额度时最有效的手段；`max_tokens` 只是把单次
+> 额度提升到上游声明的真实值。
+>
+> **思考档位与输出预算共享同一额度**：`reasoning_tokens` 计入
+> `completion_tokens`（实测 `thinking` 内容与正文同池），故思考开到 `max`
+> 时正文更早撞上上限。
+
+⚠️ **与上下文档位红线的关系**：「档位选择不改出站请求体」那条红线**专属于上下文
+档位机制**（防用户选的档位漏进 body、把纯声明值切换变成协议变更）。`max_tokens`
+是**正交关注点** —— 输出上限，与档位选择无关，且它本来就是必须下发的权威字段。
+既有「三种档位下请求体逐字节相同」的用例仍然全绿（`max_tokens` 在三种档位下恒定）。
 
 ### 与 Account Hub 设置页的关系
 
@@ -742,7 +798,8 @@ PAT」），而「三池全为 0」是一个**成功的查询结果**（`total: 
 2. `checked_in` 为真则跳过领取（幂等短路），服务端显式 `enable:false`
    则报 `inactive`；
 3. 否则调领取端点（`POST …/checkin_credits/claim`，同样 body
-   `{"req_source":1}`）；命中可重试码时**退避重试**（见下）。
+   `{"req_source":1}`）；命中可重试码时**退避重试**（见下）；
+4. 领取成功（`code:0`）后**补查一次 status** 取本次积分（见下）。
 
 > **Trae 的签到必须带设备头**（与腾讯系、LobsterAI 都不同）：`x-device-id`
 > 取自凭据里的 `checkin_device_id`（= **登录时生成并上报的 16 位设备号**），
@@ -838,6 +895,48 @@ chat 侧（`traeCnSoloHeaders`）**继续用它，一行未动**。
 
 `3003`（`MODEL_FAIL`）虽然在共享退避表里，但它是 **chat 通道**的基础设施码，
 签到端点没有对应观测，**刻意不放进** `TRAE_CN_CLAIM_RETRY_CODES`。
+
+#### ✅ T8 已按真机定案（2026-09-20）——「领取成功 **+0** 积分」的两个根因
+
+**claim 响应里根本没有积分数。** 真机实测它的**完整响应**就是
+`{"code":0,"message":"success"}`。旧实现按一张候选字段表
+（`credit` / `credits` / `credits_granted` / `reward_credits` / `reward` /
+`amount` / `integral`）去 claim 响应里找积分 ⇒ **注定全部落空** ⇒ 界面永远显示
+「领取成功 **+0** 积分」，而 IDE 里明明写着 150（用户报障）。
+
+真实数值只在 **status 端点**的 `credits` 字段里（真机实测 `credits: 150`，
+与积分余额里「签到奖励」包的 `credits_limit: 150` **完全吻合** —— 两条独立
+证据互相印证，故这不是一个「猜出来的字段」）。
+
+**修法**：`code===0` 后**补查一次 status**（复用已有的
+`fetchTraeCnCheckinStatus`，不新写网络代码），取它的 `credits` 作为本次所得。
+候选表与 `readClaimedCredit` **已整体删除** —— 候选表不是「宽容」，而是
+「猜一个不存在的字段」，正是这个缺陷的本体。
+
+**补查失败不改变 `claimed` 语义**：领取这件事已由服务端的 `code:0` 确认过，
+只是数字拿不到 ⇒ `credit` 落 0 + 一条 `onDebug` 调试行，**不是**把整次领取报成
+失败（那会让用户重试一次已经成功的领取）。补查**不重试**（读接口，且失败不影响
+kind）。
+
+代价是每次领取多一次往返（两步变三步），换取如实报告所得。
+`tests/unit/trae-cn-credits.spec.ts` 的夹具里 claim 响应**一个积分字段都没有**，
+故任何「回 claim 里读积分」的实现都会立刻掉到 0 —— 那条用例就是这件事的钉子。
+
+#### HTML 错误页不再报 `Unexpected token '<'`（补齐上游漏掉的第三处）
+
+上游 `553ef21` 修了 `credits.ts` / `lobsterai-credits.ts` 两处：凭据失效时网关
+返回的是 **HTML 错误页**而不是 JSON，直接 `await response.json()` 会抛
+`Unexpected token '<', "<html> <h"... is not valid JSON` —— 用户既看不出
+「凭据失效」，也想不到要重新登录。
+
+**它漏了 `src/trae-cn-credits.ts`，本仓一并补齐**（全仓最后一处裸
+`response.json()`）。三处同款修法：先 `await response.text()` 再 try
+`JSON.parse`；解析失败时给出可读原因 —— `401`/`403` → 「凭据已失效
+（HTTP xxx），请重新登录该账号」，其余 → 状态码 + 前 80 字符片段（压缩空白）。
+
+⚠️ **trae-cn 的既有顺序必须保持**：`postJson` 里是**先读 logid 头、再读 body**，
+改成 `text()` 后这个顺序一行未动（有专门的用例把「HTML 错误页仍透传 logid」
+钉死）。网络异常仍原样透传（`fetch` 抛错时没有响应，也就没有 logid，如实缺失）。
 
 `9074` **不记冷却徽章**（`recordsTraeCnCooldown(9074) === false`）：徽章语义是
 「这个模型限流 N 分钟，等一会儿自动解除」，而设备身份**与模型无关、等多久都不会
@@ -1376,7 +1475,7 @@ IDE 通道对我方新池请求的恒定回复。归**可重试**（退避）而
 > 真正可用的是 `get_detail_param`，且**必须按 `function` 分别拉取后取并集**：
 > roster 被 Trae 摊在多个 SOLO function 下（`glm-5.3` 只在 `solo_work_remote`）。
 
-**目录过滤规则**（`src/trae-cn-models.ts` 的 `mergeTraeCnDirectory`，**四道网**）：
+**目录过滤规则**（`src/trae-cn-models.ts` 的 `mergeTraeCnDirectory`，**五道网**）：
 
 1. **remote 优先**：同名 id 以先到的 function 为准（顺序即优先级）；
 2. **remote 成功时剔除 lite 独有项** —— 实测「用户可调的项要么两个 function
@@ -1385,7 +1484,13 @@ IDE 通道对我方新池请求的恒定回复。归**可重试**（退避）而
    `explore_sub_agent_v2` / `browser_use_subagent` / `computer_use_subagent`）
    + 形态（id 里含 `agent` / `subagent`）。现存 11 项**一个都不命中**该形态，
    故不会误杀用户可调的模型；
-4. **账号私有 BYOK 项过滤**（`isCustomTraeCnModel`）：14 项 `custom_model_*`
+4. **官方停用项过滤**（`configSwitch === false`）：上游把条目留在表里、只翻
+   `config_switch` 开关表示**已停用**（上游 `trae.ts` 的 `parseTraeBatchModelList`
+   把它列为硬性过滤之一，本模块此前**整条漏接**）。不剔的话用户选中即回 `4001`。
+   ⚠️ **三态语义，不能写成 `!entry.configSwitch`**：只有严格 `false` 才剔除，
+   `true`（官方启用）与 **`undefined`（上游没发该字段）都必须保留** ——
+   写成取反会把整个目录清空成静态回退表；
+5. **账号私有 BYOK 项过滤**（`isCustomTraeCnModel`）：14 项 `custom_model_*`
    是**某个账号私有的三方来源**（`custom_models:["deepseek//deepseek-chat"]` 这种，
    key 存在该账号服务端），列进选择器只会让别的账号选中即失败，且用户无法从名字
    看出它是私有的。判据 = **主判据 `usage === 'custom_model'`** + **兜底 id 前缀
@@ -1394,7 +1499,7 @@ IDE 通道对我方新池请求的恒定回复。归**可重试**（退避）而
    `display_config.is_custom_model` **恒为 `false`**（连 `custom_model_gemini` 也是
    false）；`Array.isArray(custom_models)` 会**漏掉 `custom_model_placeholder`**
    （它的 `custom_models` 是 `null`），故只作兜底不作主判据；
-5. **客户端自隐项过滤**（`invisible === true`）：8 项 `is_invisible_to_user:true`
+6. **客户端自隐项过滤**（`invisible === true`）：8 项 `is_invisible_to_user:true`
    —— 客户端自己隐藏它们。其中 `seed-code-pro-0430` / `Doubao-Seed-2.0-Code` 的
    展示名分别是 **`Doubao-Seed-2.1-Pro` / `Doubao-Seed-2.1-Turbo`**（**旧代际重名
    别名**，不剔会与真身重名出现在选择器里，用户无从分辨），`sagitta` / `aquila`
@@ -1403,14 +1508,14 @@ IDE 通道对我方新池请求的恒定回复。归**可重试**（退避）而
    14 项**，其中 `qwen3.8-max` / `qwen-3.7-plus` 是**正常项**）。反向陷阱：
    `kimi-k2.7-code` / `kimi-k2.6` 是 `is_invisible_to_user:false` 的**正常项，
    必须保留**；
-6. **刻意不接 remote 骨架合并**：把远端独有项也列出来会引入 `join` 不到的不可调项
+7. **刻意不接 remote 骨架合并**：把远端独有项也列出来会引入 `join` 不到的不可调项
    （如旧表里的 `Doubao-Seed-Code`），选中即路由失败；
-7. **多模态标记与思考档位由静态表补齐**（目录端点两个都不提供，见下）：只对
+8. **多模态标记与思考档位由静态表补齐**（目录端点两个都不提供，见下）：只对
    **静态表已有的 id** 补值、**不新增条目**。不补的话，同一模型在「目录成功」与
    「目录失败」两条路径下会报出不同模态、且档位**整行消失**，是自相矛盾；
-8. **档位（dev/Max）来自 agent 池目录**（2026-09-21 换轨）：`GET https://solo.trae.cn/api/remote/v1/models?functions=solo_agent_remote`
+9. **档位（dev/Max）来自 agent 池目录**（2026-09-21 换轨）：`GET https://solo.trae.cn/api/remote/v1/models?functions=solo_agent_remote`
    的 `max_mode` + `context_window_tokens.max`。⚠️ IDE 目录端点**已对可调模型停发
-   max**（只剩 `custom_model_*` BYOK 项带，而那些项在第 4 条就出局）⇒ 档位列原本
+   max**（只剩 `custom_model_*` BYOK 项带，而那些项在第 5 条就出局）⇒ 档位列原本
    在真机上**没有数据可渲染**。规则同样是**只补不增**：只给本目录**已有**的条目补
    `maxContextWindow`，agent 组独有的 id（如 `Doubao-Seed-Code`）**一律忽略**；
    该端点失败/超时/无本组 ⇒ 本次刷新**没有档位**，目录本身照常返回。
@@ -1420,6 +1525,10 @@ IDE 通道对我方新池请求的恒定回复。归**可重试**（退避）而
 > `40（并集）− 5（内部）− 14（custom）− 8（invisible）= 13 项`。
 > ⚠️ 内部项是 **5** 项而非 4：`computer_use_subagent` 是 **lite 独有**项，在第 2 条
 > 规则里就已出局，容易被漏算。
+> ⚠️ 第 4 条（官方停用开关）在**该次取证的 roster 上零命中** —— 40 项里没有任何
+> 一项 `config_switch === false`，故上面的规模算式**不因它改变**。它是一条
+> **防将来**的网：上游下架模型时只翻这个开关、条目仍留在表里，漏接它就会让用户
+> 选中一个必然回 `4001` 的模型。
 > 动态目录的 13 项与静态回退表（11 项）的差集**只有两项**：
 > `kimi-k2.7-code` / `kimi-k2.6`（它们不在旧 IDE 通道的 16 项里，只在 SOLO roster）。
 
@@ -1525,9 +1634,11 @@ agent 池目录，见下文「上下文窗口档位选择」。
   `['text','image']`，其余 `['text']`。
   `listModels` 与 `resolveModel` 读的是同一个 `supportsImages` 字段，两处口径强制
   同源（不一致会让选择器与请求路径自相矛盾）；
-- `maxTokens` **只记录不 materialize**：DSH 的 `defaultMaxTokens` 会在调用方未给
-  上限时自动填进请求体，而本仓库另外六个 provider 一个都没设该字段 ——
-  由适配器替用户决定输出上限是行为变更，不在本次范围内。
+- `maxTokens` **本 provider 只记录不 materialize**：DSH 的 `defaultMaxTokens` 会在
+  调用方未给上限时自动填进请求体，而 trae-cn / qoder / lobsterai 仍不设该字段 ——
+  由适配器替用户决定输出上限是行为变更，不在本 provider 范围内。
+  ⚠️ **buddy 系已不适用这条**：它已接线该机制（见下文「Buddy 系：单次输出上限」），
+  因为 buddy 系的真实缺陷正是「不下发就退回网关默认 32000、长回答被静默截断」。
 - **消耗倍率不再解析**：旧实现会从 `display_contact_config.consumption_rate.data.rate`
   读出倍率但不展示（DSH 的 `LlmModelInfo` 没有放自定义元数据的位置，塞进
   `description` 会污染选择器文案）。新的目录解析器**不读它** —— 读出来没有任何
@@ -1894,9 +2005,12 @@ x-app-version: 3.3.102
 > limit 2000 / consumed 2000 → 通用池 **0**；endpoint=1 包 limit 2000 /
 > `usage:{}` → Work 池 **2000**。
 >
-> ⚠️ **T8 仍待校准**：领取响应里「本次获得积分」的字段名
-> （`TRAE_CN_CLAIM_CREDIT_FIELDS`），未命中时按 0 计并输出一行**只含字段名、
-> 不含值**的日志。status / claim 的其它逻辑真机全通，未动。
+> ⚠️ **T8 已定案（2026-09-20），不再是待校准项**：`claim` 的完整响应就是
+> `{"code":0,"message":"success"}`，**没有积分字段** —— 旧候选表
+> （`TRAE_CN_CLAIM_CREDIT_FIELDS`）因此注定落空，表现为「领取成功 **+0** 积分」。
+> 积分数只在 status 的 `credits` 字段（真机 150），故 `code:0` 后**补查一次
+> status** 取它；候选表与 `readClaimedCredit` 已整体删除。详见上文
+> 「Trae CN 签到」的 T8 小节。
 >
 > 两处的调试出口是 `TraeCnCreditsOptions.onDebug`，在 RPC 分发处接到
 > `ctx.logger.info`（**看宿主日志，面板上看不到**），输出一律只有键名与结构判定。
@@ -2175,7 +2289,8 @@ plugin are supported`（`kmodel`）、`tools[0].type: unknown variant ..., expec
 能送达（`serializeQoderMessages` 只搬运文本块）。把 `is_vl` 报成「支持图片」会让
 DSH 把图片路由过来、然后在序列化时静默丢掉。
 
-`maxTokens` 只记录不 materialize（与 Trae CN 同则）；目录的
+`maxTokens` 只记录不 materialize（与 Trae CN 同则；⚠️ buddy 系**已不适用** —— 它已
+接线该机制，见「Buddy 系：单次输出上限」）；目录的
 `default_context_window` 有 `272000` 这类非整值，**不当常量**。
 
 **上下文窗口档位**：目录的 `available_context_windows`（真机 `[200000, 400000, 1000000]`）

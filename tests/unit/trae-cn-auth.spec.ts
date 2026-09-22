@@ -354,14 +354,21 @@ describe('TraeCnAuth 批量续期', () => {
     }
   }
 
-  it('只续期 provider 匹配且 enabled + refreshable 的账号', async () => {
+  /**
+   * ⚠️ 本用例的语义已修正（原断言「停用账号不续期」是**缺陷**，不是规格）。
+   *
+   * 停用只应影响账号池的**自动选号**，与「凭据是否需要保持新鲜」无关；
+   * 跳过停用账号的续期会让 refresh_token 一路放到失效，用户重新启用后
+   * 只能重新登录。契约是**只按 `refreshable` 过滤**，而 **provider 必须匹配**。
+   */
+  it('续期 provider 匹配且 refreshable 的账号（含已停用）', async () => {
     const { ctx, credentials } = makeContext()
     await credentials.set('TRAE_CN_ACCOUNT_A', JSON.stringify(makeCredential({ access_token: 'A' })))
     await credentials.set('TRAE_CN_ACCOUNT_B', JSON.stringify(makeCredential({ access_token: 'B' })))
     await credentials.set('TRAE_CN_ACCOUNT_C', JSON.stringify(makeCredential({ access_token: 'C' })))
     const pool = makePool([
       { id: 'a', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_A', enabled: true, refreshable: true },
-      // 停用：不续期
+      // 停用但可续期 → 必须同样续期（见上方说明）
       { id: 'b', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_B', enabled: false, refreshable: true },
       // 其他 provider：绝不串用
       { id: 'c', provider: 'lobsterai', credentialRef: 'TRAE_CN_ACCOUNT_C', enabled: true, refreshable: true },
@@ -374,7 +381,8 @@ describe('TraeCnAuth 批量续期', () => {
     expect(a.refresh_token).toBe('RT-2')
     const b = JSON.parse(credentials.raw('TRAE_CN_ACCOUNT_B')!) as TraeCnCredential
     const c = JSON.parse(credentials.raw('TRAE_CN_ACCOUNT_C')!) as TraeCnCredential
-    expect(b.refresh_token).toBe('RT-1')
+    // 停用的 B **也**应被续期；异 provider 的 C 不得被改动。
+    expect(b.refresh_token, '停用账号未被续期：refreshAll 不该按 enabled 过滤').toBe('RT-2')
     expect(c.refresh_token).toBe('RT-1')
   })
 

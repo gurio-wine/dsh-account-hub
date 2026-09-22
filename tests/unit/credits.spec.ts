@@ -109,6 +109,49 @@ describe('积分签到模块', () => {
     expect(outcome).toMatchObject({ message: expect.stringContaining('socket hang up') })
   })
 
+  /**
+   * 真实缺陷（上游 `553ef21` 修复）：凭据失效后腾讯网关返回的是 **HTML 错误页**
+   * 而不是 JSON，而实现直接 `await response.json()`，于是抛出
+   * `Unexpected token '<', "<html> <h"... is not valid JSON` —— 用户既看不出
+   * 「凭据失效」，也想不到要重新登录。
+   *
+   * 修法：先取文本再解析，非 JSON 时给出带状态码的可读原因。
+   */
+  it('HTML 错误页（凭据失效）不抛 Unexpected token，而是可读的凭据提示', async () => {
+    const fetcher = stubFetch(() => new Response(
+      '<html><head><title>401 Unauthorized</title></head><body>...</body></html>',
+      { status: 401 },
+    ))
+    const outcome = await claimDailyCheckin(makeCredential(), BUDDY, fetcher)
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') {
+      expect(outcome.message).not.toContain('Unexpected token')
+      expect(outcome.message).toContain('凭据已失效')
+      expect(outcome.message).toContain('401')
+      expect(outcome.message).toContain('重新登录')
+    }
+  })
+
+  it('非 JSON 且非鉴权类状态码 → 带状态码与响应片段', async () => {
+    const fetcher = stubFetch(() => new Response('<html>Bad Gateway</html>', { status: 502 }))
+    const outcome = await claimDailyCheckin(makeCredential(), BUDDY, fetcher)
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') {
+      expect(outcome.message).not.toContain('Unexpected token')
+      expect(outcome.message).toContain('502')
+      expect(outcome.message).toContain('非 JSON')
+    }
+  })
+
+  it('状态查询与余额查询遇 HTML 错误页返回 null（不抛异常）', async () => {
+    // 两者的契约都是「查不到返回 null」，不能因为服务端返回 HTML 就让异常
+    // 冒泡到批量领取/批量查余额的循环里。
+    const forbidden = stubFetch(() => new Response('<html>403</html>', { status: 403 }))
+    await expect(fetchCheckinStatus(makeCredential(), BUDDY, forbidden)).resolves.toBeNull()
+    const broken = stubFetch(() => new Response('<html>500</html>', { status: 500 }))
+    await expect(fetchCreditBalance(makeCredential(), BUDDY, broken)).resolves.toBeNull()
+  })
+
   it('请求携带产品码与 bearer 凭据，且不携带 X-Device-Token', async () => {
     let seen: Headers | undefined
     const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {

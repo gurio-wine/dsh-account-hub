@@ -82,6 +82,11 @@ const UNPARSABLE_RESPONSE_MESSAGE = '请求失败或响应无法解析'
  *
  * 网络失败时**保留原始错误消息**（含 timeout / socket hang up），
  * 不吞掉诊断信息 —— 这是 `credits.ts` 里已验证的做法。
+ *
+ * ⚠️ 与 `credits.ts` 的 `postJson` 同款：**不用 `response.json()`**。
+ * 凭据失效时服务端可能返回 HTML 错误页，`json()` 抛出的
+ * `Unexpected token '<' ...` 对用户毫无意义；先取文本再解析，
+ * 非 JSON 时给出带状态码的可读原因。
  */
 async function requestJson(
   url: string,
@@ -97,7 +102,13 @@ async function requestJson(
       ...init.body === undefined ? {} : { body: init.body },
       signal: AbortSignal.timeout(LOBSTERAI_REQUEST_TIMEOUT_MS),
     })
-    const parsed = await response.json() as unknown
+    const text = await response.text()
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      return { ok: false, message: describeNonJsonResponse(response.status, text) }
+    }
     if (typeof parsed !== 'object' || parsed === null) {
       return { ok: false, message: UNPARSABLE_RESPONSE_MESSAGE }
     }
@@ -105,6 +116,15 @@ async function requestJson(
   } catch (error) {
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
+}
+
+/** 把「响应不是 JSON」整理成可读原因（与 `credits.ts` 同款）。 */
+function describeNonJsonResponse(status: number, text: string): string {
+  if (status === 401 || status === 403) {
+    return `凭据已失效（HTTP ${status}），请重新登录该账号`
+  }
+  const snippet = text.trim().slice(0, 80).replace(/\s+/g, ' ')
+  return `服务端返回了非 JSON 响应（HTTP ${status}）：${snippet}`
 }
 
 /** 从 JSON 安全读取布尔值。 */

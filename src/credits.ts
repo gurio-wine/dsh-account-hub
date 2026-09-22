@@ -251,6 +251,12 @@ const UNPARSABLE_RESPONSE_MESSAGE = '请求失败或响应无法解析'
 /**
  * 发起一次签到请求并解析 JSON 响应体。
  * 网络失败或响应无法解析为对象时返回失败原因（由调用方决定如何呈现）。
+ *
+ * ⚠️ **不要用 `response.json()`**：凭据过期/失效时，腾讯网关返回的是
+ * **HTML 错误页**而不是 JSON，`json()` 会抛
+ * `Unexpected token '<', "<html> <h"... is not valid JSON` —— 这条消息对
+ * 用户毫无意义，也看不出真正原因是「凭据过期」。故先取文本、再尝试解析，
+ * 非 JSON 时带上 HTTP 状态码与响应片段（真实缺陷：用户看到的就是上面那句）。
  */
 async function postJson(
   path: string,
@@ -265,7 +271,15 @@ async function postJson(
       body: '{}',
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
-    const parsed = await response.json() as unknown
+    const text = await response.text()
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      // 非 JSON：多半是网关 HTML 错误页（凭据失效的典型表现）。
+      // 如实带上状态码，让「HTTP 401/403 → 凭据问题」这条线索浮出来。
+      return { ok: false, message: describeNonJsonResponse(response.status, text) }
+    }
     if (typeof parsed !== 'object' || parsed === null) {
       return { ok: false, message: UNPARSABLE_RESPONSE_MESSAGE }
     }
@@ -274,6 +288,22 @@ async function postJson(
     // 保留原始错误消息（含超时/连接被重置等信号），不吞掉诊断信息。
     return { ok: false, message: error instanceof Error ? error.message : String(error) }
   }
+}
+
+/**
+ * 把「响应不是 JSON」整理成可读原因。
+ *
+ * 凭据过期时腾讯网关返回 HTML 错误页，原始报错是
+ * `Unexpected token '<', "<html> <h"... is not valid JSON` —— 用户既不知道
+ * 发生了什么，也看不出该重新登录。这里改为明确指向凭据问题并附状态码。
+ */
+function describeNonJsonResponse(status: number, text: string): string {
+  // 401/403 基本就是凭据失效；其余状态也一并如实给出，不做过度推断。
+  if (status === 401 || status === 403) {
+    return `凭据已失效（HTTP ${status}），请重新登录该账号`
+  }
+  const snippet = text.trim().slice(0, 80).replace(/\s+/g, ' ')
+  return `服务端返回了非 JSON 响应（HTTP ${status}）：${snippet}`
 }
 
 /**

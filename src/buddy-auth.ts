@@ -293,13 +293,19 @@ export class BuddyAuth extends Service {
 
   /**
    * 批量续期本产品的所有账号。
-   * 遍历 pool 中 enabled + refreshable 的本产品账号，逐一续期。
+   *
+   * **包含已停用账号**（只按 `refreshable` 过滤）：停用只影响账号池的
+   * **自动选号**，不该让凭据烂掉。早期实现是 `if (!entry.enabled || !entry.refreshable)`，
+   * 停用账号被跳过续期，refresh_token 一路放到失效 —— 用户重新启用后拿到的是
+   * 一个死凭据，**无法自动恢复**，只能重新登录（真实缺陷）。
+   *
    * 单账号失败不影响其他账号。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts(this.product.id)
     for (const entry of accounts) {
-      if (!entry.enabled || !entry.refreshable) continue
+      // 只跳过「不可续期」的账号；enabled 与续期无关（见方法注释）。
+      if (!entry.refreshable) continue
       try {
         const ref = credentialRef(entry.credentialRef)
         const resolved = await this.ctx.credentials.resolve(ref)

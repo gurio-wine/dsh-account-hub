@@ -300,12 +300,15 @@ export interface TraeCnFallbackModel {
   /**
    * 该模型的最大输出 token 数（真机目录的 `max_tokens`：`64000` 或 `32000`）。
    *
-   * **刻意只记录、不落进 `defaultMaxTokens`**：DSH 的
+   * **本 provider 刻意只记录、不落进 `defaultMaxTokens`**：DSH 的
    * `LlmResolvedModelInfo.defaultMaxTokens` 会在调用方未给 `maxTokens` 时自动
-   * 填进请求体，而本仓库另外四个 provider 一个都没设该字段
-   * （`grep defaultMaxTokens src/` 零命中）—— 由适配器替用户决定输出上限是
-   * 行为变更。保留字段是为了让目录与真机逐列对齐（否则后来者会以为目录里本来
-   * 就没有它）。
+   * 填进请求体，而 trae-cn / qoder / lobsterai **仍不设该字段** —— 由适配器替用户
+   * 决定输出上限是行为变更，不在本 provider 范围内。
+   *
+   * ⚠️ **buddy 系已不再适用这条**：`0611485` 起 `src/buddy-adapter.ts` 已移植该机制
+   * （远端 `maxOutputTokens` → 请求体 `max_tokens` + `resolveModel().defaultMaxTokens`），
+   * 因为 buddy 系的真实缺陷正是「不下发就退回网关默认 32000、长回答被静默截断」。
+   * 保留字段是为了让目录与真机逐列对齐（否则后来者会以为目录里本来就没有它）。
    */
   maxTokens: number
   /**
@@ -480,6 +483,20 @@ export interface TraeCnModelEntry {
    * 静态回退表条目**没有**该字段（它们全是云端可调模型）。
    */
   usage?: string
+  /**
+   * 目录的 `config_switch` 字段 —— **官方停用开关**（`false` = 上游已停用该条目）。
+   *
+   * ⚠️ 三态语义，与 {@link TraeCnModelEntry.invisible} 同款：**只有严格 `false`
+   * 才剔除**，`true`（官方启用）与 `undefined`（上游没发这个字段）**都必须保留**。
+   * 写成 `!entry.configSwitch` 会把所有未表态的条目一并误杀 —— 那等于把整个目录
+   * 清空成静态回退表。
+   *
+   * 上游 `trae.ts` 的 `parseTraeBatchModelList` 把它列为**硬性过滤之一**
+   * （`usage` / `config_switch` / `is_invisible_to_user` / 内部项），本模块此前
+   * **整条漏接** —— 上游若把某个模型下架（保留条目、只翻这个开关），我们会继续
+   * 把它列进选择器，用户选中即回 `4001`。
+   */
+  configSwitch?: boolean
   /**
    * 目录的 `is_invisible_to_user` 字段 —— **客户端自己会隐藏**的项。
    *
@@ -681,8 +698,11 @@ export function parseTraeCnDirectory(body: unknown, functionName: string): TraeC
       ...maxTokens === undefined ? {} : { maxTokens },
       ...reasoning,
       // 过滤线索：`usage` 用于识别账号私有 BYOK 项；`is_invisible_to_user`
-      // **只认布尔 true**（缺字段与 false 都不剔除，见 TraeCnModelEntry.invisible）。
+      // **只认布尔 true**（缺字段与 false 都不剔除，见 TraeCnModelEntry.invisible）；
+      // `config_switch` 反向**只认布尔 false**（官方停用开关，见
+      // TraeCnModelEntry.configSwitch）—— 两者都是三态，都**不能**写成取反。
       ...usage === undefined ? {} : { usage },
+      ...record.config_switch === false ? { configSwitch: false } : {},
       ...record.is_invisible_to_user === true ? { invisible: true } : {},
       function: functionName,
     })
@@ -759,7 +779,7 @@ export interface TraeCnDirectoryGroup {
 /**
  * 合并多个 function 的目录（**first wins，调用方按优先级给顺序**）。
  *
- * ## 四道过滤网（在**同一个循环**里逐项判定，与内部项过滤并列）
+ * ## 五道过滤网（在**同一个循环**里逐项判定，与内部项过滤并列）
  *
  * 1. **remote 优先**：先到的 function 拥有该 id（{@link TRAE_CN_SOLO_FUNCTIONS}
  *    的顺序即优先级）。同名 id 在两条 function 下**可能不是同一个可调项**
@@ -771,6 +791,11 @@ export interface TraeCnDirectoryGroup {
  *    与 `Doubao-Seed-2.0-Code` 的展示名分别是 **`Doubao-Seed-2.1-Pro` /
  *    `Doubao-Seed-2.1-Turbo`**（旧代际重名别名，不剔会与真身**重名**出现在
  *    选择器里），`sagitta` / `aquila` 的展示名是 **`"-"`**。客户端自己隐藏它们。
+ * 5. **官方停用项**（`configSwitch === false`，即上游 `config_switch`）：上游把
+ *    条目留在表里、只翻这个开关表示**已停用**（上游 `trae.ts` 的
+ *    `parseTraeBatchModelList` 把它列为硬性过滤之一）。它此前**整条漏接**，
+ *    是本次补上的第五道网。⚠️ **三态、方向与第 4 条相反**：只有严格 `false`
+ *    才剔除，`true` 与 `undefined` 都必须保留。
  *
  * ## remote 成功时剔除 lite 独有项
  *
@@ -784,6 +809,8 @@ export interface TraeCnDirectoryGroup {
  * `40（并集）− 5（内部）− 14（custom）− 8（invisible）= 13 项`。
  * ⚠️ 内部项是 **5** 项而非 4：`computer_use_subagent` 是 **lite 独有**项，它在
  * 第 1 条规则（remote 成功时剔除 lite 独有）里就已经出局，故容易被漏算。
+ * ⚠️ 第 5 条在**该次取证的 roster 上零命中**（40 项里没有任何一项
+ * `config_switch === false`），故上面的算式**不因它改变** —— 它是**防将来**的网。
  * 13 项与静态回退表（11 项）的差集是 `kimi-k2.7-code` / `kimi-k2.6` 两项 ——
  * 它们是 `is_invisible_to_user:false` 的**正常项**，必须保留。
  */
@@ -796,6 +823,10 @@ export function mergeTraeCnDirectory(
     for (const entry of group.entries) {
       if (isInternalTraeCnConfig(entry.id)) continue
       if (isCustomTraeCnModel(entry)) continue
+      // 官方停用开关：**只有严格 `false` 才剔除**（`undefined` = 上游没发该字段、
+      // `true` = 官方启用，两者都必须保留）。三态语义与下一行的 `invisible` 同款，
+      // 都**不能**写成 `!entry.xxx`。
+      if (entry.configSwitch === false) continue
       if (entry.invisible === true) continue
       if (byId.has(entry.id)) continue
       byId.set(entry.id, entry)

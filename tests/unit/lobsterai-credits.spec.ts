@@ -293,6 +293,51 @@ describe('claimLobsteraiDailyCheckin', () => {
     expect(await claimLobsteraiDailyCheckin(makeCredential(), LOBSTERAI, CLIENT_VERSION, fetcher))
       .toEqual({ kind: 'failed', code: 40001, message: '活动已结束' })
   })
+
+  /**
+   * 与 `credits.ts` 同款缺陷（上游 `553ef21` 同批修复）：凭据失效时服务端返回
+   * **HTML 错误页**，直接 `response.json()` 会抛出
+   * `Unexpected token '<' ...` —— 看不出真正原因是凭据过期。
+   *
+   * 打在**领取步**（`check_in`）上：前两步的失败会被 `claimLobsteraiDailyCheckin`
+   * 折成「活动槽位/上下文查询失败」的固定文案，只有领取步的 `result.message`
+   * 会原样透出，故只有它能验证「可读原因」这件事。
+   */
+  it('HTML 错误页（凭据失效）不出现 Unexpected token，而是可读的凭据提示', async () => {
+    const { fetcher } = stubFetch((url) => {
+      if (url.includes('/slot')) {
+        return new Response(JSON.stringify({
+          code: 0, data: { slotState: 'available', activity: { activityCode: 'a', configRevision: 1 } },
+        }), { status: 200 })
+      }
+      if (url.includes('/actions/check_in')) {
+        return new Response(
+          '<html><head><title>401 Unauthorized</title></head><body>...</body></html>',
+          { status: 401 },
+        )
+      }
+      return new Response(JSON.stringify({
+        code: 0, data: { state: { claimedToday: false }, actions: ['check_in'] },
+      }), { status: 200 })
+    })
+    const outcome = await claimLobsteraiDailyCheckin(makeCredential(), LOBSTERAI, CLIENT_VERSION, fetcher)
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') {
+      expect(outcome.message).not.toContain('Unexpected token')
+      expect(outcome.message).toContain('凭据已失效')
+      expect(outcome.message).toContain('401')
+      expect(outcome.message).toContain('重新登录')
+    }
+  })
+
+  it('HTML 错误页在槽位步也不会抛出解析异常（折成固定文案，但绝不冒泡）', async () => {
+    // 前两步的失败会被折成固定文案（既有契约，本次不改），但**必须**是
+    // 「失败」而不是抛异常 —— 后者会中断整批领取。
+    const { fetcher } = stubFetch(() => new Response('<html>502</html>', { status: 502 }))
+    const outcome = await claimLobsteraiDailyCheckin(makeCredential(), LOBSTERAI, CLIENT_VERSION, fetcher)
+    expect(outcome.kind).toBe('failed')
+    expect((outcome as { message: string }).message).not.toContain('Unexpected token')
+  })
 })
 
 describe('fetchLobsteraiCreditBalance', () => {

@@ -497,13 +497,17 @@ export class LobsteraiAuth extends Service {
   /**
    * 批量续期本产品的所有账号。
    *
-   * 遍历 pool 中 `enabled && refreshable` 的 LobsterAI 账号，逐一续期；
+   * **包含已停用账号**（只按 `refreshable` 过滤）：停用只影响账号池的
+   * **自动选号**，不该让凭据烂掉 —— 否则用户重新启用时只能重新登录。
+   * 详见 `BuddyAuth.refreshAll` 的注释（同一缺陷）。
+   *
    * 单账号失败不影响其他账号（与 `BuddyAuth.refreshAll` 同语义）。
    */
   async refreshAll(pool: AccountPool): Promise<void> {
     const accounts = await pool.listAccounts(this.product.id)
     for (const entry of accounts) {
-      if (!entry.enabled || !entry.refreshable) continue
+      // 只跳过「不可续期」的账号；enabled 与续期无关（见方法注释）。
+      if (!entry.refreshable) continue
       try {
         const ref = credentialRef(entry.credentialRef)
         const resolved = await this.ctx.credentials.resolve(ref)

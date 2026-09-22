@@ -1000,14 +1000,22 @@ describe('QoderAuth 批量续期', () => {
     }
   }
 
-  it('只续期 provider 匹配且 enabled + refreshable 的账号', async () => {
+  /**
+   * ⚠️ 本用例的语义已修正（原断言「停用账号不续期」是**缺陷**，不是规格）。
+   *
+   * 停用只应影响账号池的**自动选号**，与「凭据是否需要保持新鲜」无关；
+   * 跳过停用账号的续期会让凭据一路放到失效，用户重新启用后只能重新登录。
+   * 契约是**只按 `refreshable` 过滤**，而 **provider 必须匹配**。
+   * 两个 region 共用本类，故这一条同时覆盖 `qoder` 与 `qoder-cn`。
+   */
+  it('续期 provider 匹配且 refreshable 的账号（含已停用）', async () => {
     const { ctx, credentials } = makeContext()
     await credentials.set('QODER_ACCOUNT_A', JSON.stringify({ access_token: `${PAT}-A`, refresh_token: 'r' }))
     await credentials.set('QODER_ACCOUNT_B', JSON.stringify({ access_token: `${PAT}-B`, refresh_token: 'r' }))
     await credentials.set('QODER_ACCOUNT_C', JSON.stringify({ access_token: `${PAT}-C`, refresh_token: 'r' }))
     const pool = makePool([
       { id: 'a', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_A', enabled: true, refreshable: true },
-      // 停用：不续期
+      // 停用但可续期 → 必须同样续期（见上方说明）
       { id: 'b', provider: 'qoder', credentialRef: 'QODER_ACCOUNT_B', enabled: false, refreshable: true },
       // 其他 provider：绝不串用
       { id: 'c', provider: 'buddy', credentialRef: 'QODER_ACCOUNT_C', enabled: true, refreshable: true },
@@ -1017,8 +1025,10 @@ describe('QoderAuth 批量续期', () => {
 
     await service.refreshAll(pool as never)
 
-    expect(calls).toHaveLength(1)
+    // A 与停用的 B 各换一次 jt；异 provider 的 C 一次都不该被换。
+    expect(calls, '停用账号未被续期：refreshAll 不该按 enabled 过滤').toHaveLength(2)
     expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ personal_token: `${PAT}-A` })
+    expect(JSON.parse(String(calls[1]!.init?.body))).toEqual({ personal_token: `${PAT}-B` })
     // 没有终态失败 → 不该写任何 refreshable: false
     expect(pool.updates).toEqual([])
   })

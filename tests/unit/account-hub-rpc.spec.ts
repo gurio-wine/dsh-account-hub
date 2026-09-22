@@ -544,6 +544,139 @@ describe('credits.balances 逐账号余额收集', () => {
 })
 
 /**
+ * ⚠️ **真实缺陷回归：`as unknown as` 签名谎言 ⇒ `fetcher is not a function`。**
+ *
+ * `fetchCheckinStatus` / `claimDailyCheckin` / `fetchCreditBalance` 的真实签名是
+ * `(credential, product, fetcher)`，而 `CreditsEndpointDeps` 把它们声明为两参。
+ * 历史写法 `deps.claim ?? (claimDailyCheckin as unknown as …)` 用双重断言把签名
+ * 不匹配「压」了过去 —— TypeScript 不再报错，但**一旦调用点按声明多传一个实参**
+ * （`claim(credential, product, entry)`），那个 `entry` 就落进 `fetcher` 的位置，
+ * 运行时抛 `TypeError: fetcher is not a function`。
+ *
+ * ⚠️ **为什么长期零覆盖**：`makeDeps()` **总是注入** `fetchStatus` / `claim`，
+ * 于是真实的默认实现路径**从未被任何用例走到**。本组用例刻意**只给
+ * `resolve` + `fetcher`**，把三条默认实现全部拉进执行路径。
+ */
+describe('credits 默认实现（未注入 deps 时）—— as unknown as 签名谎言回归', () => {
+  /** 只记录请求、按端点返回真实形态响应的 fetcher 替身。 */
+  function makeFetcher(): { fetcher: typeof fetch; calls: string[] } {
+    const calls: string[] = []
+    const fetcher = (async (input: string | URL | Request) => {
+      const url = String(input)
+      calls.push(url)
+      if (url.includes('/checkin-activity-status')) {
+        // ⚠️ 字段名必须是真实的 `active` / `today_checked_in`（见 fetchCheckinStatus），
+        // 名字写错会被 readBool 读成 false → 流程落到「活动未开启」短路。
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { active: true, today_checked_in: false, streak_days: 3 },
+        }), { status: 200 })
+      }
+      if (url.includes('/daily-checkin')) {
+        return new Response(JSON.stringify({
+          code: 0,
+          data: { credit: 100, streak_days: 3, is_streak_day: false },
+        }), { status: 200 })
+      }
+      // 余额端点是**双层嵌套** `data.Response.Data.Accounts[]`（见 fetchCreditBalance）。
+      return new Response(JSON.stringify({
+        code: 0,
+        data: {
+          Response: {
+            Data: {
+              Accounts: [{
+                PackageName: 'Bonus Pack',
+                Status: 1,
+                CycleCapacityRemainPrecise: '347.87',
+                CapacityRemainPrecise: '347.87',
+              }],
+            },
+          },
+        },
+      }), { status: 200 })
+    }) as unknown as typeof fetch
+    return { fetcher, calls }
+  }
+
+  it('collectCreditsStatus 走真实默认实现，fetcher 被当成函数调用', async () => {
+    const { fetcher, calls } = makeFetcher()
+    // ⚠️ 关键：**不传** fetchStatus。
+    const results = await collectCreditsStatus([makeEntry({ id: 'cb-1' })], BUDDY, {
+      resolve: async () => ({ value: VALID_CREDENTIAL_JSON }),
+      fetcher,
+    })
+
+    expect(results[0]!.status).toMatchObject({ active: true, todayCheckedIn: false, streakDays: 3 })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toContain('/checkin-activity-status')
+  })
+
+  it('collectClaimResults 走真实默认实现，第三参必须是 fetcher 而不是 entry（真实缺陷回归）', async () => {
+    const { fetcher, calls } = makeFetcher()
+    // ⚠️ 关键：**不传** claim / fetchStatus，只注入 fetcher。
+    const response = await collectClaimResults([makeEntry({ id: 'cb-1' })], BUDDY, {
+      resolve: async () => ({ value: VALID_CREDENTIAL_JSON }),
+      fetcher,
+    })
+
+    const outcome = response.results[0]?.outcome
+    // 缺陷形态：`entry` 被当成 fetcher 调用 ⇒ 这条消息出现，且下面两条断言同时失败。
+    if (outcome?.kind === 'failed') {
+      expect(outcome.message).not.toContain('fetcher is not a function')
+    }
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 100 })
+    // 预检 + 领取两次真实请求（顺序固定）。
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toContain('/checkin-activity-status')
+    expect(calls[1]).toContain('/daily-checkin')
+  })
+
+  it('collectClaimResults 未注入 claim 且 precheckStatus=false 时同样走默认实现', async () => {
+    // LobsterAI 形态：跳过预检、直接领取。默认实现仍必须把 fetcher 送进第三参。
+    const { fetcher, calls } = makeFetcher()
+    const response = await collectClaimResults([makeEntry({ id: 'cb-1' })], BUDDY, {
+      resolve: async () => ({ value: VALID_CREDENTIAL_JSON }),
+      precheckStatus: false,
+      fetcher,
+    })
+
+    expect(response.results[0]!.outcome).toMatchObject({ kind: 'claimed', credit: 100 })
+    // 跳过预检 ⇒ 只发领取那一次。
+    expect(calls).toEqual([expect.stringContaining('/daily-checkin')])
+  })
+
+  it('collectCreditBalances 走真实默认实现，fetcher 被当成函数调用', async () => {
+    const { fetcher, calls } = makeFetcher()
+    // ⚠️ 关键：**不传** fetchBalance。
+    const results = await collectCreditBalances([makeEntry({ id: 'cb-1' })], BUDDY, {
+      resolve: async () => ({ value: VALID_CREDENTIAL_JSON }),
+      fetcher,
+    })
+
+    expect(results[0]!.balance?.total).toBe(347.87)
+    expect(results[0]!.error).toBeUndefined()
+    expect(calls).toEqual([expect.stringContaining('/get-user-resource')])
+  })
+
+  it('未提供 fetcher 时回退全局 fetch（不抛 fetcher is not a function）', async () => {
+    // 默认实现必须能在**完全没有 fetcher 注入**时也正常降级到全局 fetch ——
+    // 生产路径（src/account-hub-rpc.ts 的三处默认分支）就是这个形态。
+    const original = globalThis.fetch
+    const { fetcher, calls } = makeFetcher()
+    globalThis.fetch = fetcher
+    try {
+      const results = await collectCreditsStatus([makeEntry({ id: 'cb-1' })], BUDDY, {
+        resolve: async () => ({ value: VALID_CREDENTIAL_JSON }),
+      })
+      expect(results[0]!.status).toMatchObject({ active: true })
+      expect(calls).toHaveLength(1)
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+})
+
+/**
  * model.list / model.setDisabled 端点。
  *
  * 这两个端点是 Account Hub「显示列表」按钮的唯一数据通道，同时串起三件必须

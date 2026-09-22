@@ -705,6 +705,12 @@ in response — re-login required`（134-136 行）。**没有** CodeBuddy 那�
    遍历 pool 中 `enabled && refreshable` 的**本产品**账号，逐个续期，
    单账号失败不中断循环；凭据缺失或不可刷新时把 `refreshable` 置 false。
 
+   > ⚠️ **订正（后续修复）**：上面这段是当时实现的描述，其中 `enabled` 这一半
+   > **是缺陷而非规格** —— 停用只影响账号池的**自动选号**，不该让凭据停止续期。
+   > 现在的契约是**只按 `refreshable` 过滤**；同理 `src/index.ts` 的续期调度器
+   > 启动判据也不再带 `enabled`（否则全部账号停用时定时器根本不注册）。
+   > 详见 `BuddyAuth.refreshAll` 的方法注释。
+
 #### C. 推荐做法
 
 新建 `src/lobsterai-auth.ts`，`LobsteraiAuth extends Service`，**完整照抄

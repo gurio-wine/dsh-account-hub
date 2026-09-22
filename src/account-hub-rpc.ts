@@ -382,6 +382,20 @@ export interface CreditsEndpointDeps<
   claim?: (credential: TCredential, product: TProduct) => Promise<ClaimOutcome>
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
+  /**
+   * 默认实现（`fetchCheckinStatus` / `claimDailyCheckin` / `fetchCreditBalance`）
+   * 使用的 fetch。
+   *
+   * ⚠️ **必须经此注入，不要在调用点直接 `fetch(...)`**：这些默认实现的真实签名是
+   * `(credential, product, fetcher)`，而本模块的历史写法用**双重类型断言**
+   * （`deps.claim ?? (claimDailyCheckin as …)`）把三参函数硬转成「只传两个参数」
+   * 的类型 —— 于是调用点写 `claim(credential, product, entry)` 时，`entry` 落进了
+   * **`fetcher` 的位置**，运行时抛 **`TypeError: fetcher is not a function`**。
+   *
+   * 现改为**显式包装**默认实现（见 `collectCreditsStatus` / `collectClaimResults` /
+   * `collectCreditBalances`），把 fetcher 正确送进第三参。未提供时用全局 `fetch`。
+   */
+  fetcher?: typeof fetch
   /** 单账号异常时的告警出口（不参与控制流）。 */
   warn?: (message: string) => void
   /**
@@ -396,6 +410,46 @@ export interface CreditsEndpointDeps<
    * 故它传 `false` 跳过预检，直接交给 `claim`。
    */
   precheckStatus?: boolean
+}
+
+/**
+ * 把注入的依赖与**默认实现**（Buddy 系三兄弟）合流成一组可直接调用的函数。
+ *
+ * ⚠️ **默认实现必须显式适配，不能靠双重类型断言硬转。**
+ *
+ * 真实签名是 `(credential, product, fetcher)`，而 {@link CreditsEndpointDeps} 把它们
+ * 声明为两参 `(credential, product)`。历史写法用 `as` 双重断言把这个不匹配
+ * 「压」了过去 —— TypeScript 于是不再报错，但调用点一旦按**声明**多传一个实参
+ * （`claim(credential, product, entry)`），`entry` 就落进 **`fetcher` 的位置**，
+ * 运行时抛 **`TypeError: fetcher is not a function`**（上游真实缺陷：一键领取的
+ * 账号全部失败，而报错信息与「第三参错位」毫无字面关联，极难定位）。
+ *
+ * 这里把 `deps.fetcher`（或全局 `fetch`）显式送进第三参，从此不存在「谁多传一个
+ * 实参就炸」的窗口。**集中成一处而不是三个收集器各写一遍**：三份包装一旦漂移
+ * （例如只改了 `claim` 忘了 `fetchBalance`），缺陷会以「某个面板的积分突然查不到」
+ * 的形态复现，而这里只有一个落点。
+ *
+ * 非 Buddy 系的 provider（LobsterAI / Trae CN / Qoder）**全部显式注入**这三个函数，
+ * 因此不会走到下面的默认实现；泛型实参在此断言成 Buddy 系类型是刻意的 ——
+ * 默认实现本身就是 Buddy 系的，而 `CreditsEndpointDeps` 的泛型参数只为
+ * 「注入路径」服务。
+ */
+function resolveCreditsDeps<TCredential, TProduct>(
+  deps: CreditsEndpointDeps<TCredential, TProduct>,
+): {
+  fetchStatus: NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchStatus']>
+  claim: NonNullable<CreditsEndpointDeps<TCredential, TProduct>['claim']>
+  fetchBalance: NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchBalance']>
+} {
+  const fetcher = deps.fetcher ?? fetch
+  return {
+    fetchStatus: deps.fetchStatus
+      ?? ((credential, product) => fetchCheckinStatus(credential as BuddyCredential, product as BuddyProduct, fetcher)),
+    claim: deps.claim
+      ?? ((credential, product) => claimDailyCheckin(credential as BuddyCredential, product as BuddyProduct, fetcher)),
+    fetchBalance: deps.fetchBalance
+      ?? ((credential, product) => fetchCreditBalance(credential as BuddyCredential, product as BuddyProduct, fetcher)),
+  }
 }
 
 /**
@@ -414,7 +468,7 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsStatusResponse['accounts']> {
-  const fetchStatus = deps.fetchStatus ?? (fetchCheckinStatus as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchStatus']>)
+  const { fetchStatus } = resolveCreditsDeps(deps)
   const results: RpcCreditsStatusResponse['accounts'] = []
   // 顺序查询，避免并发触发风控
   for (const entry of accounts) {
@@ -450,8 +504,7 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsClaimAllResponse> {
-  const fetchStatus = deps.fetchStatus ?? (fetchCheckinStatus as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchStatus']>)
-  const claim = deps.claim ?? (claimDailyCheckin as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['claim']>)
+  const { fetchStatus, claim } = resolveCreditsDeps(deps)
   // 默认保留预检（Buddy 系需要）；LobsterAI 显式传 false 跳过。
   const precheck = deps.precheckStatus !== false
   const results: RpcCreditsClaimAllResponse['results'] = []
@@ -512,7 +565,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsBalancesResponse['accounts']> {
-  const fetchBalance = deps.fetchBalance ?? (fetchCreditBalance as unknown as NonNullable<CreditsEndpointDeps<TCredential, TProduct>['fetchBalance']>)
+  const { fetchBalance } = resolveCreditsDeps(deps)
   const results: RpcCreditsBalancesResponse['accounts'] = []
   // 顺序查询，避免并发触发风控
   for (const entry of accounts) {

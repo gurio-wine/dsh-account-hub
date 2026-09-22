@@ -296,14 +296,24 @@ describe('LobsteraiAuth 批量续期', () => {
     }
   }
 
-  it('只续期 provider 匹配且 enabled + refreshable 的账号', async () => {
+  /**
+   * ⚠️ 本用例的语义已修正（原断言「停用账号不续期」是**缺陷**，不是规格）。
+   *
+   * 停用只应影响账号池的**自动选号**，与「凭据是否需要保持新鲜」无关 ——
+   * 停用账号同样会出现在 Account Hub 里并参与积分领取。跳过它们的续期会让
+   * refresh_token 一路放到失效，用户重新启用后只能重新登录。
+   *
+   * 因此现在的契约是：**只按 `refreshable` 过滤，不看 `enabled`**；
+   * 而 **provider 必须匹配**（绝不串用其他 provider 的凭据）。
+   */
+  it('续期 provider 匹配且 refreshable 的账号（含已停用）', async () => {
     const { ctx, credentials } = makeContext()
     await credentials.set('LOBSTERAI_ACCOUNT_A', JSON.stringify(makeCredential({ access_token: 'A' })))
     await credentials.set('LOBSTERAI_ACCOUNT_B', JSON.stringify(makeCredential({ access_token: 'B' })))
     await credentials.set('LOBSTERAI_ACCOUNT_C', JSON.stringify(makeCredential({ access_token: 'C' })))
     const pool = makePool([
       { id: 'a', provider: 'lobsterai', credentialRef: 'LOBSTERAI_ACCOUNT_A', enabled: true, refreshable: true },
-      // 停用：不续期（停用只影响自动选择，但续期也无意义）
+      // 停用但可续期 → 必须同样续期（见上方说明）
       { id: 'b', provider: 'lobsterai', credentialRef: 'LOBSTERAI_ACCOUNT_B', enabled: false, refreshable: true },
       // 其他 provider：绝不串用
       { id: 'c', provider: 'buddy', credentialRef: 'LOBSTERAI_ACCOUNT_C', enabled: true, refreshable: true },
@@ -314,10 +324,10 @@ describe('LobsteraiAuth 批量续期', () => {
 
     const a = JSON.parse(credentials.raw('LOBSTERAI_ACCOUNT_A')!) as LobsteraiCredential
     expect(a.access_token).toBe('AT2')
-    // 停用的 B 与异 provider 的 C 都不应被改动
+    // 停用的 B **也**应被续期；异 provider 的 C 不得被改动。
     const b = JSON.parse(credentials.raw('LOBSTERAI_ACCOUNT_B')!) as LobsteraiCredential
     const c = JSON.parse(credentials.raw('LOBSTERAI_ACCOUNT_C')!) as LobsteraiCredential
-    expect(b.access_token).toBe('B')
+    expect(b.access_token, '停用账号未被续期：refreshAll 不该按 enabled 过滤').toBe('AT2')
     expect(c.access_token).toBe('C')
   })
 

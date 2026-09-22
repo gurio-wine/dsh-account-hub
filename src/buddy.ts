@@ -442,6 +442,19 @@ export interface BuddyRemoteModel {
    * 缺省 = 该模型**没有档位可选**（无 `supportedLengths`，或表里只有一个值）。
    */
   contextTiers?: number[]
+  /**
+   * 单次请求输出上限（`data.models[].maxOutputTokens`）。
+   *
+   * ⚠️ 这是**必须消费**的权威字段，不是仅供参考的元数据：适配器早期把它只当
+   * 「过滤补全模型」的判据（见 {@link isChatModel}），却从不下发到请求体，导致
+   * 所有 buddy / buddy-cn 模型都退化成网关默认输出上限（实测 32000），大文件
+   * 写入与长回答被截断成 `finish_reason: 'length'`、`turn/end` 报 `max-tokens`。
+   *
+   * 实测（2026-09-19）各端点取值不完全一致：`deepseek-v4.1-flash` 在中国版
+   * scoped 端点为 128000、`/v3/config` 为 131072、国际版 `/v3/config` 为 128000。
+   * 与 `maxInputTokens` 同策略：采信实际命中的那个端点，**不做跨端点取大**。
+   */
+  maxOutputTokens?: number
   /** 是否接受图片输入（data.models[].supportsImages）。 */
   supportsImages?: boolean
   /** 可选思考等级（data.models[].reasoning.supportedEfforts）；无等级可选的模型缺省。 */
@@ -469,7 +482,8 @@ export interface BuddyRemoteModel {
  *    hy4-preview：它既不在 craft 列表也不在 data.models，仅由试用横幅下发，
  *    但实测可正常调用，故一并加入。
  *
- * 过滤规则：跳过 `auto`（自动选择，非真实模型）、非对话用途的模型
+ * 过滤规则：跳过 `auto` / `default`（自动选择占位，非真实模型 —— 企业端点会同时
+ * 下发这两个内部别名）、非对话用途的模型
  * （`text-to-image` 标签）与补全/NES 等专用模型（id 前缀 nes- / completion-）。
  * 解析失败时返回空数组，调用方回退内置列表。
  */
@@ -492,7 +506,7 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
   const parsed: BuddyRemoteModel[] = []
   const seen = new Set<string>()
   const push = (id: string): void => {
-    if (id === 'auto' || seen.has(id) || !isChatModel(id, metaById.get(id))) return
+    if (id === 'auto' || id === 'default' || seen.has(id) || !isChatModel(id, metaById.get(id))) return
     seen.add(id)
     const meta = metaById.get(id)
     // 显示名优先用服务端下发的 name（如 `GPT-5.6-Sol`、`GLM-5.3`）；
@@ -532,7 +546,7 @@ export function parseModelsFromConfig(body: unknown): BuddyRemoteModel[] {
 
   // 3. 追加试用模型（试用横幅下发的 targetModelId）
   for (const id of trialModelIds(record)) {
-    if (id === 'auto' || seen.has(id)) continue
+    if (id === 'auto' || id === 'default' || seen.has(id)) continue
     seen.add(id)
     parsed.push({ id, name: displayNameForModel(id), ...parseModelMeta(metaById.get(id)) })
   }
@@ -627,6 +641,12 @@ function parseModelMeta(record: Record<string, unknown> | undefined): Omit<Buddy
   // 档位表：只在**两个及以上**档位时记（单档模型没有可选项，UI 不该渲染档位列）。
   const tiers = readSupportedLengthTiers(record)
   if (tiers !== undefined) meta.contextTiers = tiers
+  // 单次输出上限：与上下文窗口同样「只保留正的有限数」，缺失即 undefined
+  // （不猜默认值 —— 猜大了被上游 400 拒绝，猜小了无谓截断用户输出）。
+  const maxOutput = record.maxOutputTokens
+  if (typeof maxOutput === 'number' && Number.isFinite(maxOutput) && maxOutput > 0) {
+    meta.maxOutputTokens = maxOutput
+  }
   if (typeof record.supportsImages === 'boolean') meta.supportsImages = record.supportsImages
   const reasoning = record.reasoning
   if (typeof reasoning === 'object' && reasoning !== null) {

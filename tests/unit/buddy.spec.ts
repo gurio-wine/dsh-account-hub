@@ -567,6 +567,83 @@ describe('buddy model config parsing', () => {
     expect(models[1]).toEqual({ id: 'bare', name: 'bare' })
   })
 
+  // ── 单次输出上限（maxOutputTokens）──
+  //
+  // 用户报障：长回答在 32000 token 处被截断，`turn/end` 为 `{kind:'max-tokens'}`。
+  // 根因是适配器**从未下发 max_tokens**，上限完全由网关默认值决定（实测网关对
+  // auto / glm-4.6 等模型正是 32000）；而远端早已下发权威的 maxOutputTokens。
+  describe('单次输出上限解析', () => {
+    it('远端 maxOutputTokens 被收进目录项', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['deepseek-v4.1-flash'] }],
+          models: [{ id: 'deepseek-v4.1-flash', maxOutputTokens: 128_000 }],
+        },
+      })
+      expect(models[0]!.maxOutputTokens).toBe(128_000)
+    })
+
+    it('非法值一律视为未声明（0 / 负数 / NaN / 字符串 / Infinity）', () => {
+      // 与上下文窗口同一口径：只保留正的**有限**数。DSH 对 defaultMaxTokens 有
+      // 硬校验（非安全整数或 ≤0 直接抛 INVALID_MODEL_MAX_TOKENS，整轮起不来），
+      // 故远端作为外部输入必须逐项过滤。
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['zero', 'neg', 'nan', 'str', 'inf'] }],
+          models: [
+            { id: 'zero', maxOutputTokens: 0 },
+            { id: 'neg', maxOutputTokens: -5 },
+            { id: 'nan', maxOutputTokens: Number.NaN },
+            { id: 'str', maxOutputTokens: '32000' },
+            { id: 'inf', maxOutputTokens: Number.POSITIVE_INFINITY },
+          ],
+        },
+      })
+      for (const model of models) {
+        expect(model.maxOutputTokens, model.id).toBeUndefined()
+        expect(model).not.toHaveProperty('maxOutputTokens')
+      }
+    })
+
+    it('远端未下发该字段时不声明（不猜默认值）', () => {
+      const models = parseModelsFromConfig({
+        data: {
+          agents: [{ name: 'craft', models: ['bare'] }],
+          models: [{ id: 'bare' }],
+        },
+      })
+      expect(models[0]).not.toHaveProperty('maxOutputTokens')
+    })
+  })
+
+  // ── `default` 内部别名过滤 ──
+  //
+  // 企业端点实测会下发**两个**自动选择占位别名：`auto` 与 `default`。二者都不是
+  // 真实可路由模型（选中后服务端无法解析），必须与 `auto` 同样过滤掉。
+  it('excludes the `default` alias alongside `auto`', () => {
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'cli', models: ['auto', 'default', 'glm-5.3'] }],
+        models: [{ id: 'auto' }, { id: 'default' }, { id: 'glm-5.3' }],
+      },
+    })
+    expect(models.map((m) => m.id)).toEqual(['glm-5.3'])
+  })
+
+  it('excludes the `default` alias coming from the trial banner', () => {
+    // 试用横幅是第二条 push 路径（不经 `push` 闭包），必须同样过滤。
+    const models = parseModelsFromConfig({
+      data: {
+        agents: [{ name: 'craft', models: ['glm-5.3'] }],
+        models: [{ id: 'glm-5.3' }],
+        productFeaturesConfig: {
+          ModelTrialBanner: { banners: [{ targetModelId: 'default' }, { targetModelId: 'hy4-preview' }] },
+        },
+      },
+    })
+    expect(models.map((m) => m.id)).toEqual(['glm-5.3', 'hy4-preview'])
+  })
+
   it('returns an empty list for malformed payloads', () => {
     expect(parseModelsFromConfig(null)).toEqual([])
     expect(parseModelsFromConfig({})).toEqual([])

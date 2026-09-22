@@ -101,19 +101,40 @@ async function claimWithFakeTimers(
   }
 }
 
-/** 未签到 + 领取成功的标准响应集。 */
+/**
+ * 未签到 + 领取成功的标准响应集。
+ *
+ * ⚠️ **夹具按 T8 真机定案的形态**（2026-09-20）：
+ * - `claim` 的完整响应就是 `{"code":0,"message":"success"}`，**没有积分数** ——
+ *   夹具刻意**不带** `credits`，任何「回 claim 里读积分」的实现都会立刻掉到 0；
+ * - 积分数只在 **status** 的 `credits` 字段（真机 150），且领取成功后的补查里
+ *   `checked_in` 已翻转为 true。
+ */
 function happyPath(overrides: {
   status?: Record<string, unknown>
   claim?: Record<string, unknown>
+  /** 领取成功后那次补查 status 的覆盖项。 */
+  recheck?: Record<string, unknown>
 } = {}) {
+  let statusCalls = 0
   return (url: string) => {
     if (url.includes('/claim')) {
       return new Response(JSON.stringify({
-        code: 0, msg: 'OK', data: { credit: 100, ...overrides.claim },
+        code: 0, message: 'success', ...overrides.claim,
       }), { status: 200 })
     }
+    statusCalls += 1
+    // 第 1 次是领取前的预检（未签到），第 2 次是领取后的补查（已签到）。
+    const isRecheck = statusCalls > 1
     return new Response(JSON.stringify({
-      code: 0, msg: 'OK', data: { checked_in: false, enable: true, ...overrides.status },
+      code: 0, msg: 'OK',
+      data: {
+        checked_in: isRecheck,
+        enable: true,
+        credits: 150,
+        ...overrides.status,
+        ...isRecheck ? overrides.recheck : {},
+      },
     }), { status: 200 })
   }
 }
@@ -284,12 +305,48 @@ describe('fetchTraeCnCheckinStatus', () => {
   })
 
   it('无实测依据的字段一律取零值（不臆造状态）', async () => {
+    // 除 dailyCredit 外全部取零值：Trae 的状态响应里没有那些概念的已确认字段。
     const { fetcher } = stubFetch(happyPath())
     const status = await fetchTraeCnCheckinStatus(makeCredential(), TRAE_CN, { fetcher })
     expect(status).toMatchObject({
-      streakDays: 0, dailyCredit: 0, todayCredit: 0, isStreakDay: false,
+      streakDays: 0, todayCredit: 0, isStreakDay: false,
       totalCredits: 0, checkinDates: [], activityName: '', themeName: '', endTime: '',
     })
+  })
+
+  it('dailyCredit 取自 `credits` 字段（T8 定案，2026-09-20 真机 150）', async () => {
+    // 真机实测：status 响应里 `credits: 150`，与积分余额中「签到奖励」包的
+    // `credits_limit: 150` 吻合。这是全模块唯一有实测依据的积分数来源。
+    const { fetcher } = stubFetch(happyPath())
+    const status = await fetchTraeCnCheckinStatus(makeCredential(), TRAE_CN, { fetcher })
+    expect(status!.dailyCredit).toBe(150)
+  })
+
+  it('credits 缺失时 dailyCredit 落 0（不编造数字）', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { checked_in: false, enable: true },
+    }), { status: 200 }))
+    const status = await fetchTraeCnCheckinStatus(makeCredential(), TRAE_CN, { fetcher })
+    expect(status!.dailyCredit).toBe(0)
+  })
+
+  it('credits 在根对象上也认（与 checked_in 同款的两层容错）', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, credits: 150, data: { checked_in: false, enable: true },
+    }), { status: 200 }))
+    const status = await fetchTraeCnCheckinStatus(makeCredential(), TRAE_CN, { fetcher })
+    expect(status!.dailyCredit).toBe(150)
+  })
+
+  it('刻意**不**认 `credit` 等旧候选名（T8 缺陷形态：猜一个不存在的字段）', async () => {
+    // 旧实现按候选表 `credit` / `credits_granted` / `reward` … 依次尝试。
+    // T8 定案后只认实测存在的 `credits`：候选表是那个「永远落空」缺陷的本体，
+    // 不能因为「多认几个名字更宽容」而把它放回来。
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { checked_in: false, enable: true, credit: 999, reward: 888 },
+    }), { status: 200 }))
+    const status = await fetchTraeCnCheckinStatus(makeCredential(), TRAE_CN, { fetcher })
+    expect(status!.dailyCredit).toBe(0)
   })
 
   it('code:1001（无 auth 的失效形态）返回 null —— 与「未签到」区分', async () => {
@@ -321,17 +378,83 @@ describe('fetchTraeCnCheckinStatus', () => {
   })
 })
 
-describe('claimTraeCnDailyCheckin', () => {
-  it('未签到时走 status → claim 两步并返回 claimed', async () => {
-    const { fetcher, calls } = stubFetch(happyPath())
+/**
+ * HTML 错误页（上游 `553ef21` 修了 `credits.ts` / `lobsterai-credits.ts`
+ * 两处，**漏了本文件** —— 这里补齐第三处）。
+ *
+ * 缺陷形态：凭据失效时网关返回 HTML 而不是 JSON，直接 `response.json()` 抛
+ * `Unexpected token '<', "<html> <h"... is not valid JSON` —— 用户既看不出
+ * 「凭据失效」，也想不到要重新登录。
+ */
+describe('HTML 错误页不出现 Unexpected token（三处 postJson 的第三处）', () => {
+  it('claim 遇 HTML 错误页 → failed，文案是可读的凭据提示', async () => {
+    const { fetcher } = stubFetch((url) => url.includes('/claim')
+      ? new Response('<html><head><title>401 Unauthorized</title></head><body>...</body></html>', { status: 401 })
+      : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true, credits: 150 } }), { status: 200 }))
     const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
-    expect(outcome).toMatchObject({ kind: 'claimed', credit: 100, streakDays: 0, isStreakDay: false })
-    expect(calls).toHaveLength(2)
-    expect(calls[0]!.url).toContain('/status')
-    expect(calls[1]!.url).toContain('/claim')
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') {
+      expect(outcome.message).not.toContain('Unexpected token')
+      expect(outcome.message).toContain('凭据已失效')
+      expect(outcome.message).toContain('401')
+      expect(outcome.message).toContain('重新登录')
+    }
   })
 
-  it('两个请求都是 POST 且带 req_source:1', async () => {
+  it('status 遇 HTML 错误页返回 null（不抛异常冒泡到批量领取循环）', async () => {
+    const { fetcher } = stubFetch(() => new Response('<html>403 Forbidden</html>', { status: 403 }))
+    await expect(fetchTraeCnCheckinStatus(makeCredential(), TRAE_CN, { fetcher })).resolves.toBeNull()
+  })
+
+  it('余额端点遇 HTML 错误页返回 null', async () => {
+    const { fetcher } = stubFetch(() => new Response('<html>502</html>', { status: 502 }))
+    await expect(fetchTraeCnCreditBalance(
+      makeCredential(), TRAE_CN, TRAE_CN_POOL_UNIVERSAL, { fetcher },
+    )).resolves.toBeNull()
+  })
+
+  it('非 JSON 且非鉴权类状态码 → 带状态码与响应片段', async () => {
+    const { fetcher } = stubFetch((url) => url.includes('/claim')
+      ? new Response('<html>Bad Gateway</html>', { status: 502 })
+      : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }))
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome.kind).toBe('failed')
+    if (outcome.kind === 'failed') {
+      expect(outcome.message).not.toContain('Unexpected token')
+      expect(outcome.message).toContain('502')
+      expect(outcome.message).toContain('非 JSON')
+    }
+  })
+
+  it('HTML 错误页仍透传响应头里的 logid（改读 body 方式不影响读头顺序）', async () => {
+    // ⚠️ 本模块的既有顺序是「先读 logid 头、再读 body」；改成 text() 后必须保持。
+    const { fetcher } = stubFetch((url) => {
+      if (!url.includes('/claim')) {
+        return new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 })
+      }
+      const headers = new Headers({ 'Content-Type': 'text/html' })
+      headers.set('x-tt-logid', REAL_LOGID)
+      return new Response('<html>401</html>', { status: 401, headers })
+    })
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome).toMatchObject({ kind: 'failed', logid: REAL_LOGID })
+    expect((outcome as { message: string }).message).toContain('凭据已失效')
+  })
+})
+
+describe('claimTraeCnDailyCheckin', () => {
+  it('未签到时走 status → claim → 补查 status 三步并返回 claimed', async () => {
+    const { fetcher, calls } = stubFetch(happyPath())
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 150, streakDays: 0, isStreakDay: false })
+    // T8 定案：claim 响应不含积分数 ⇒ 成功后再查一次 status 取 `credits`。
+    expect(calls).toHaveLength(3)
+    expect(calls[0]!.url).toContain('/status')
+    expect(calls[1]!.url).toContain('/claim')
+    expect(calls[2]!.url).toContain('/status')
+  })
+
+  it('三个请求都是 POST 且带 req_source:1', async () => {
     const { fetcher, calls } = stubFetch(happyPath())
     await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
     for (const call of calls) {
@@ -389,26 +512,91 @@ describe('claimTraeCnDailyCheckin', () => {
     expect(calls.filter((call) => call.url.includes('/claim'))).toHaveLength(1)
   })
 
-  it('领取响应缺积分字段时按 0 计并留调试行（不发明字段名）', async () => {
+  /**
+   * T8 的核心用例（2026-09-20 上游真机定案）。
+   *
+   * 缺陷形态：claim 的完整响应就是 `{"code":0,"message":"success"}`，**没有
+   * 积分数**，而旧实现去 claim 响应里按候选字段表找积分 ⇒ 永远落空 ⇒
+   * 界面显示「领取成功 **+0** 积分」（用户报障），而 IDE 里明明写着 150。
+   *
+   * 修法：`code===0` 后**补查一次 status**，取它的 `credits` 字段。
+   * 这条用例的夹具里 claim 响应**一个积分字段都没有**（`happyPath` 刻意如此），
+   * 故任何「回 claim 里读积分」的实现都会立刻掉到 0。
+   */
+  it('积分取自 claim 后补查的 status.credits（claim 响应里没有积分数）', async () => {
+    const { fetcher, calls } = stubFetch(happyPath())
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 150 })
+    // 反向护栏：claim 响应里确实没有积分数 —— 若夹具将来被加上，
+    // 这条用例就不再证明「积分来自补查」了。
+    expect(calls.filter((call) => call.url.includes('/claim'))).toHaveLength(1)
+    const recheck = calls[2]!
+    expect(recheck.url).toContain('/status')
+  })
+
+  it('补查失败（网络错）不改变 claimed 语义，credit 落 0 并留调试行', async () => {
     const debug: string[] = []
-    const { fetcher } = stubFetch(happyPath({ claim: { credit: undefined, mystery_field: 7 } }))
+    // 第 1 次 status 正常（未签到）→ claim 成功 → 第 2 次 status 抛错。
+    let statusCalls = 0
+    const { fetcher } = stubFetch((url) => {
+      if (url.includes('/claim')) {
+        return new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 })
+      }
+      statusCalls += 1
+      if (statusCalls > 1) throw new Error('socket hang up')
+      return new Response(JSON.stringify({
+        code: 0, data: { checked_in: false, enable: true, credits: 150 },
+      }), { status: 200 })
+    })
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, {
+      fetcher, onDebug: (message) => debug.push(message),
+    })
+    // 领取已被服务端的 code:0 确认，故 kind 仍是 claimed（不是 failed）。
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 0 })
+    expect(debug.join('\n')).toContain('补查 status 失败')
+  })
+
+  it('补查失败（响应信封异常）同样不改变 claimed 语义', async () => {
+    const debug: string[] = []
+    let statusCalls = 0
+    const { fetcher } = stubFetch((url) => {
+      if (url.includes('/claim')) {
+        return new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 })
+      }
+      statusCalls += 1
+      if (statusCalls > 1) {
+        return new Response(JSON.stringify({ code: 1001 }), { status: 200 })
+      }
+      return new Response(JSON.stringify({
+        code: 0, data: { checked_in: false, enable: true, credits: 150 },
+      }), { status: 200 })
+    })
     const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, {
       fetcher, onDebug: (message) => debug.push(message),
     })
     expect(outcome).toMatchObject({ kind: 'claimed', credit: 0 })
-    expect(debug.some((line) => line.includes('未命中积分字段候选表'))).toBe(true)
-    // 脱敏：只报字段名，不报值。
-    expect(debug.join('\n')).not.toContain('7')
+    expect(debug.join('\n')).toContain('补查 status 失败')
+  })
+
+  it('补查的 status 里没有 credits 字段时按 0 计（不发明字段名）', async () => {
+    const debug: string[] = []
+    const { fetcher } = stubFetch(happyPath({ recheck: { credits: undefined } }))
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, {
+      fetcher, onDebug: (message) => debug.push(message),
+    })
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 0 })
+    // 这条路径**不是**补查失败，故不应出现「补查 status 失败」的调试行。
+    expect(debug.join('\n')).not.toContain('补查 status 失败')
   })
 
   it('领取响应带 msg 时作为 delayedMessage 透出', async () => {
-    const { fetcher } = stubFetch(happyPath({ claim: { credit: 50, msg: '明天再来' } }))
+    const { fetcher } = stubFetch(happyPath({ claim: { msg: '明天再来' } }))
     const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
-    expect(outcome).toMatchObject({ kind: 'claimed', credit: 50, delayedMessage: '明天再来' })
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 150, delayedMessage: '明天再来' })
   })
 
   it('字符串形态的积分也能解析', async () => {
-    const { fetcher } = stubFetch(happyPath({ claim: { credit: '88.5' } }))
+    const { fetcher } = stubFetch(happyPath({ recheck: { credits: '88.5' } }))
     const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
     expect(outcome).toMatchObject({ kind: 'claimed', credit: 88.5 })
   })
@@ -532,9 +720,16 @@ describe('logid 透传（失败诊断的关键线索）', () => {
 // claim 段有界重试（2026-09-20）
 // ─────────────────────────────────────────────────────────────
 
-/** 成功 / 未签到的 status 响应（重试用例里恒定不变）。 */
+/**
+ * 成功 / 未签到的 status 响应（重试用例里恒定不变）。
+ *
+ * 带 `credits: 150`：T8 定案后积分**只**来自 status，故重试用例里
+ * 「claimed 的 credit 是 150」这件事由本函数提供，claim 响应里不再放积分数。
+ */
 function statusOk(): Response {
-  return new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 })
+  return new Response(JSON.stringify({
+    code: 0, data: { checked_in: false, enable: true, credits: 150 },
+  }), { status: 200 })
 }
 
 /**
