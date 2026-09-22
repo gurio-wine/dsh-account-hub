@@ -703,12 +703,36 @@ export async function* consumeTraeCnStream(
  *   而这条坏历史会被每次请求原样重放 —— 表现为「会话突然报废，此后所有消息
  *   都无回复」。发出前剔除可让会话自愈；
  * - assistant 正文为空且有 `tool_calls` 时 `content` 必须为 `null`（OpenAI 规范）。
+ *
+ * ## 图片（`imageUrls`）
+ *
+ * `imageUrls` 为 `undefined` 表示整个请求没有图片；非 undefined（**含空 Map**）
+ * 时把带图的 user 消息升级为多模态 parts（`{type:'image_url',image_url:{url}}`）。
+ * 空 Map **不能**降级为 undefined —— 那会让「图片存在但字节读取失败」的
+ * `[image unavailable]` 占位符也被跳过，图片静默消失。
+ *
+ * ⚠️ 图片形态沿用 SOLO 对数组 content 的**原样透传**（实测上游直接接受），
+ * 无需额外协议转换 —— 见 {@link userContentParts}。
  */
 export function serializeTraeCnMessages(
   messages: readonly { role: string; content: unknown }[],
+  imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
   const { keepCallIds, keepResultIds } = resolveToolPairing(messages)
+
+  // 工具结果内嵌图片（`read_image` 等）不能并入 `role:'tool'` 消息：该角色的
+  // content 只能是字符串，且必须紧跟其 assistant tool_call，中间插消息会 400。
+  // 故挂起到其后的独立 user 消息统一发出（与 buddy / lobsterai 同款处理）。
+  let pendingToolImages: Array<Record<string, unknown>> = []
+  const flushToolImages = (): void => {
+    if (pendingToolImages.length === 0) return
+    wire.push({
+      role: 'user',
+      content: [{ type: 'text', text: TOOL_RESULT_IMAGE_TEXT }, ...pendingToolImages],
+    })
+    pendingToolImages = []
+  }
 
   for (const message of messages) {
     if (message.role === 'assistant') {
@@ -745,18 +769,112 @@ export function serializeTraeCnMessages(
     const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
     const text = contentToText(message.content)
-    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+    // 图片：仅当本请求带图（imageUrls 非 undefined）时升级为多模态 parts。
+    const parts = imageUrls === undefined ? undefined : userContentParts(content, imageUrls)
+    if (parts !== undefined) {
+      // 有图：正文与图片合并为一条多模态 user 消息（parts 里已含文本块）。
+      flushToolImages()
+      wire.push({ role: 'user', content: parts })
+    } else if (text.length > 0 || toolResults.length === 0) {
+      wire.push({ role: 'user', content: text })
+    }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 的结果同样会让后端 400。
       if (!keepResultIds.has(String(result.toolCallId))) continue
+      const innerParts = imageUrls === undefined
+        ? undefined
+        : (Array.isArray(result.content) ? userContentParts(result.content, imageUrls) : undefined)
+      if (innerParts !== undefined) {
+        // 工具结果内嵌图片：该消息的 content 只能是字符串，图片挂到后续独立
+        // user 消息里（不能就地展开，否则违反 role:'tool' 的协议约束）。
+        pendingToolImages.push(...innerParts.filter((part) => part.type === 'image_url'))
+      }
       wire.push({
         role: 'tool',
         tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
+        content: contentToText(result.content) || (innerParts !== undefined ? TOOL_RESULT_IMAGE_TEXT : '(no output)'),
       })
     }
+    flushToolImages()
   }
   return wire
+}
+
+/** 工具结果内嵌图片的载体文本（与 buddy / lobsterai 适配器同名同义）。 */
+const TOOL_RESULT_IMAGE_TEXT = 'Attached image(s) from tool result:'
+
+/**
+ * 把 harness 内容块转成 OpenAI 多模态 parts（含图片）。
+ *
+ * 图片必须转成 `{type:'image_url', image_url:{url}}` —— **实测上游唯一接受的
+ * 形态**：SOLO 对数组 content 原样透传，这种 parts 形状直发即可被模型读到
+ * （纯红图答「红色」、纯蓝图答「蓝色」，不带图则答「无法确定」）。故无需任何
+ * 额外的协议转换。
+ *
+ * 返回 `undefined` 表示「无图」；只要出现过图片块就一定返回数组（即便字节
+ * 解析失败也留 `[image unavailable]` 占位符），以免图片被静默吞掉。
+ *
+ * 与 `collectImages` **对称地递归**处理 `tool-result` 内层：收集侧是任意深度，
+ * 序列化侧若只走一层，深层图片会被收进 refs 却在序列化时静默丢弃。
+ */
+function userContentParts(
+  content: readonly unknown[],
+  imageUrls: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> | undefined {
+  const parts: Array<Record<string, unknown>> = []
+  let hasImage = false
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
+    if (block.type === 'text') {
+      const text = String(block.text ?? '')
+      if (text.length > 0) parts.push({ type: 'text', text })
+      continue
+    }
+    if (block.type === 'image') {
+      hasImage = true
+      const url = block.attachment?.attachmentId === undefined
+        ? undefined
+        : imageUrls.get(String(block.attachment.attachmentId))
+      // 解析不到字节时留占位文本，而不是静默吞掉整张图。
+      parts.push(url === undefined
+        ? { type: 'text', text: '[image unavailable]' }
+        : { type: 'image_url', image_url: { url } })
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      // 递归取内层 parts：内层只要出现图片，hasImage 即为真，
+      // 从而让整条消息升级为多模态形态。
+      const inner = userContentParts(block.content, imageUrls)
+      if (inner !== undefined) {
+        hasImage = true
+        parts.push(...inner)
+      } else {
+        // 内层无图：保留其文本，避免内容丢失。
+        const text = contentToText(block.content)
+        if (text.length > 0) parts.push({ type: 'text', text })
+      }
+    }
+  }
+  return hasImage && parts.length > 0 ? parts : undefined
+}
+
+/** 收集 user 消息中的图片附件引用（含工具结果内嵌图片），按 attachmentId 去重。 */
+export function collectImages(content: readonly unknown[], refs: Map<string, unknown>): void {
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as { type?: unknown; attachment?: { attachmentId?: unknown }; content?: unknown }
+    if (block.type === 'image' && typeof block.attachment?.attachmentId === 'string') {
+      refs.set(block.attachment.attachmentId, block.attachment)
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) collectImages(block.content, refs)
+  }
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */

@@ -437,8 +437,42 @@ export interface TraeCnModelEntry {
    *
    * **缺省 = 未知**（目录端点不带该字段）→ 适配器按**纯文本**声明。
    * 静态表条目一律有值（真机 vscdb 的多模态标记）。
+   *
+   * ⚠️ 与 {@link TraeCnModelEntry.multimodal} 的关系：`multimodal`（目录
+   * `display_config.multimodal`，**实时权威**）优先，本静态值仅作兜底回退，
+   * 见 `TraeCnAdapter.inputModalitiesFor` 的口径。
    */
   supportsImages?: boolean
+  /**
+   * `display_config.multimodal` —— 该模型是否接受**用户图片**输入。
+   *
+   * ## 为什么必须按模型读，而不是依赖静态表快照
+   *
+   * 目录条目里 `display_config` 一直**在实时下发**该字段（真机 2026-09-21：52 个
+   * 可调用条目里 27 个为 `true`），而早期解析器只读了同层级的 `max_mode` /
+   * `display_name`，漏了相邻的 `multimodal` —— 于是图片准入只能退回静态表（==
+   * 一次性快照），目录一刷新就与真机脱节。本字段是**权威准入判据**：
+   *
+   * - `true` → `['text','image']`；
+   * - `false` / **未声明** → `['text']`（保守：远没说 ≠ 远支持）。
+   *
+   * 反向对照实证（真机）：`multimodal:false` 的模型（`DeepSeek-V4-Pro-Official`）
+   * 收到图后答「无法确定」、思考链明说「但没有图片」—— **与不带图的回答一致**，
+   * 证明该标志逐模型可信。
+   *
+   * ⚠️ 与 {@link TraeCnModelEntry.toolResponseMultimodal} 是**两种独立能力**，
+   * 不可合并判断（实测 `deepseek-v4.1-flash` 为 multimodal:true 而
+   * tool_response_multimodal:false）。
+   */
+  multimodal?: boolean
+  /**
+   * `display_config.tool_response_multimodal` —— **工具结果**内嵌图片能否回传。
+   *
+   * ⚠️ 与 {@link TraeCnModelEntry.multimodal} 是**两种独立能力**，不可合并。
+   * 当前实现只消费 `multimodal`；单独保存该字段是为了保留远端权威信息、
+   * 便于将来细化（本插件自身不发 `read_image` 的工具图，实际影响面有限）。
+   */
+  toolResponseMultimodal?: boolean
   /**
    * 上下文窗口（目录给的 dev 档：`context_window_tokens.dev`，回退 `prompt_max_tokens`）。
    * 缺省 = 未提供。
@@ -687,6 +721,17 @@ export function parseTraeCnDirectory(body: unknown, functionName: string): TraeC
     const maxTokens = readPositive(detail?.max_tokens)
     const reasoning = readReasoningConfig(record)
     const usage = readString(record.usage)
+    // 图片能力（逐模型权威判据，见 `TraeCnModelEntry.multimodal` 的实测记录）。
+    // `multimodal` 与 `tool_response_multimodal` 是**两个独立字段**，不可合并。
+    // 兼容 PascalCase（`Multimodal` / `ToolResponseMultimodal`）形态。
+    const multimodal = display === undefined
+      ? undefined
+      : readBooleanField(display, 'multimodal')
+        ?? readBooleanField(display, 'Multimodal')
+    const toolResponseMultimodal = display === undefined
+      ? undefined
+      : readBooleanField(display, 'tool_response_multimodal')
+        ?? readBooleanField(display, 'ToolResponseMultimodal')
     entries.push({
       id,
       name: readString(display?.display_name) ?? id,
@@ -697,6 +742,8 @@ export function parseTraeCnDirectory(body: unknown, functionName: string): TraeC
         : {},
       ...maxTokens === undefined ? {} : { maxTokens },
       ...reasoning,
+      ...multimodal === undefined ? {} : { multimodal },
+      ...toolResponseMultimodal === undefined ? {} : { toolResponseMultimodal },
       // 过滤线索：`usage` 用于识别账号私有 BYOK 项；`is_invisible_to_user`
       // **只认布尔 true**（缺字段与 false 都不剔除，见 TraeCnModelEntry.invisible）；
       // `config_switch` 反向**只认布尔 false**（官方停用开关，见
@@ -751,6 +798,16 @@ function readString(value: unknown): string | undefined {
 /** 读正有限数，否则 undefined（**不把 0 当成有效窗口**）。 */
 function readPositive(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+/**
+ * 读布尔字段：**只认严格 true / false**，其余（缺失 / 字符串 `"true"` / 数字）一律
+ * 返回 undefined —— 三态语义（`false` 是「远说不支持」、`undefined` 是「远没说」）
+ * 必须保留，写成取反或字符串解析会把「不支持」与「未声明」混为一谈。
+ */
+function readBooleanField(source: Record<string, unknown>, key: string): boolean | undefined {
+  const value = source[key]
+  return typeof value === 'boolean' ? value : undefined
 }
 
 /** 严格判对象（非对象/数组返回 undefined）。 */

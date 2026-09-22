@@ -1022,6 +1022,28 @@ describe('TraeCnAdapter 模型目录', () => {
     expect(byId.get('glm-5.3')!.inputModalities).toEqual(['text'])
   })
 
+  it('**目录实时 multimodal 优先于静态表 supportsImages**（远端说 true 才 true）', async () => {
+    // 远端条目自带 multimodal（目录实时权威），即便静态表说 supportsImages:false
+    // 也应如实声明 image —— 早期只认静态快照会与真机脱节（Issue #IKHDKC）。
+    const { adapter } = makeAdapter(() => sseResponse(''), {
+      fetchRemoteModels: async () => [
+        // 远端说 multimodal:true，静态表（glm-5.3 supportsImages:false）不得覆盖。
+        { id: 'glm-5.3', name: 'GLM-5.3', multimodal: true, function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+        // 远端说 multimodal:false，静态表（kimi-k3 supportsImages:true）不得覆盖。
+        { id: 'kimi-k3', name: 'Kimi-K3', multimodal: false, function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+        // 远端未声明 → 回退静态表（kimi-k3 支持图片）。
+        { id: 'qwen3.8-max', name: 'Qwen3.8-Max', function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+        // 远端未声明 + 未知 id → 纯文本。
+        { id: 'remote-only', name: 'Remote Only', function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+      ],
+    })
+    const byId = new Map((await adapter.listModels('trae-cn')).map((m) => [m.id, m.inputModalities]))
+    expect(byId.get('glm-5.3')).toEqual(['text', 'image'])
+    expect(byId.get('kimi-k3')).toEqual(['text'])
+    expect(byId.get('qwen3.8-max')).toEqual(['text', 'image'])
+    expect(byId.get('remote-only')).toEqual(['text'])
+  })
+
   it('远端可用时以远端为准（不做「以兜底表为准」的裁剪）', async () => {
     const { adapter } = makeAdapter(() => sseResponse(''), {
       fetchRemoteModels: async () => [
@@ -1122,12 +1144,13 @@ describe('TraeCnAdapter resolveModel', () => {
   /**
    * dev / Max 档位选择（Account Hub 的档位单选列）。
    *
-   * 机制是**纯声明值切换**：只改我们向 DSH 声明的窗口（它决定宿主压缩阈值
-   * `0.8 × 窗口` 与压缩后的保留预算），出站请求体一个字段都不动 —— 这是红线，
-   * 由下面那条「逐字节比对两次请求体」的用例钉死。
+   * 机制是**双重生效**：选 Max 档时既把我们向 DSH 声明的窗口换成 Max（它决定宿主
+   * 压缩阈值 `0.8 × 窗口`），也让出站请求体成套携带 Max 字段集（对齐上游
+   * `traeMaxModeFields`）—— 否则上游按 200K 校验、1M 输入被 4022 拒绝后再靠压缩
+   * 兜底。
    *
    * 判据是「预算值必须**精确命中**目录公布的 Max 档」：未设置、等于 dev、
-   * 编造值、目录漂移后旧值失效，四种情况一律静默退回 dev 档。
+   * 编造值、目录漂移后旧值失效，四种情况一律静默退回 dev 档，出站一个字段都不加。
    */
   describe('上下文窗口档位（dev / Max）', () => {
     /** 目录形态：一个两档模型 + 一个单档模型。 */
@@ -1195,16 +1218,58 @@ describe('TraeCnAdapter resolveModel', () => {
     })
 
     it('**出站请求体与档位无关**（红线：切换档位不改请求体一个字节）', async () => {
+      // 这条基线仍在钉「非 Max 档」场景：未选 max 档（默认/显式 dev）时，
+      // body 必须逐字节不变。Max 档的成套出站由下一条用例单独验证。
       const options = generateOptions({ model: 'glm-5.3' })
       const dev = withBudget({})
       await collect(dev.adapter, options)
-      const max = withBudget({ 'glm-5.3': 1_048_576 })
-      await collect(max.adapter, options)
+      // 显式 dev 预算（等于 dev 档）同样不触发 Max 出站。
+      const devExplicit = withBudget({ 'glm-5.3': 119_040 })
+      await collect(devExplicit.adapter, options)
       expect(dev.calls).toHaveLength(1)
-      expect(max.calls).toHaveLength(1)
-      expect(String(max.calls[0]!.init?.body)).toBe(String(dev.calls[0]!.init?.body))
+      expect(devExplicit.calls).toHaveLength(1)
+      expect(String(devExplicit.calls[0]!.init?.body)).toBe(String(dev.calls[0]!.init?.body))
       // 反证：两条路径确实各自发了请求（不是「都没发」而恒等）。
       expect(String(dev.calls[0]!.init?.body)).toContain('"config_name":"glm-5.3"')
+    })
+
+    it('**预算 = Max 档 → 出站 body 成套携带 Max 六字段**（不再只是声明值切换）', async () => {
+      const options = generateOptions({ model: 'glm-5.3' })
+      const max = withBudget({ 'glm-5.3': 1_048_576 })
+      await collect(max.adapter, options)
+      expect(max.calls).toHaveLength(1)
+      const body = JSON.parse(String(max.calls[0]!.init?.body)) as Record<string, unknown>
+      expect(body.model_auto_selection).toEqual({
+        strategy: 'max',
+        fallback_to_advance_model: null,
+        entitlement_id: null,
+      })
+      expect(body.model_selection_strategy).toBe('max')
+      expect(body.mode_type).toBe(1)
+      // 用该模型公布的 Max 档值（glm-5.3 在此目录里是 1_048_576）。
+      expect(body.context_window_size).toBe(1_048_576)
+      expect(body.prompt_max_tokens).toBe(936_000)
+      expect(body.max_tokens).toBe(64_000)
+    })
+
+    it('**无 Max 档 / 编造预算 / 目录漂移 → 出站不带任何 Max 字段**', async () => {
+      // 反证：只有精确命中 Max 档才触发成套出站。
+      const options = generateOptions({ model: 'glm-5.3' })
+      for (const budgets of [{}, { 'glm-5.3': 999_999_999 }, { 'glm-5.3': 524_288 }]) {
+        const { adapter, calls } = withBudget(budgets)
+        await collect(adapter, options)
+        const body = JSON.parse(String(calls[0]!.init?.body)) as Record<string, unknown>
+        expect(body, JSON.stringify(budgets)).not.toHaveProperty('model_auto_selection')
+        expect(body).not.toHaveProperty('model_selection_strategy')
+        expect(body).not.toHaveProperty('context_window_size')
+        expect(body).not.toHaveProperty('prompt_max_tokens')
+      }
+      // 无 Max 档的模型带 max 预算也只是 dev：不出站字段，测试它的 resolveModel
+      // 已由「无 Max 档的模型带任何预算都只声明 dev」覆盖，这里验证出站侧一致。
+      const single = withBudget({ 'kimi-k2.6': 1_048_576 })
+      await collect(single.adapter, generateOptions({ model: 'kimi-k2.6' }))
+      const body = JSON.parse(String(single.calls[0]!.init?.body)) as Record<string, unknown>
+      expect(body).not.toHaveProperty('model_selection_strategy')
     })
   })
 
@@ -1611,7 +1676,7 @@ describe('TraeCnAdapter 请求构造', () => {
     const { adapter, calls } = makeAdapter(() => sseResponse(textStream('ok')))
     const options = generateOptions({
       messages: [createUserMessage({
-        content: [{ type: 'image', ref: { id: 'x' } } as never],
+        content: [{ type: 'image', attachment: { attachmentId: 'att-x' } } as never],
         source: { kind: 'user' },
       })],
     })
@@ -1619,6 +1684,105 @@ describe('TraeCnAdapter 请求构造', () => {
     expect(error?.code).toBe('UNSUPPORTED_CONTENT')
     // 在取凭据/发请求之前就拒绝。
     expect(calls).toHaveLength(0)
+  })
+
+  /**
+   * 图片能力**按模型**判定（对齐上游 3979729 真机定案，Issue #IKHDKC）。
+   *
+   * 实测：远端 `display_config.multimodal` 一直在目录里下发该能力；直发图片后
+   * 模型真的读到了像素（纯红图答「红色」、纯蓝图答「蓝色」、无图答「无法确定」）；
+   * 反向对照 `multimodal:false` 的模型收到图后答「无法确定」、思考链说「但没有
+   * 图片」—— 与不带图一致 ⇒ 该标志是**权威准入判据**，必须逐模型判断。
+   */
+  describe('Trae CN 图片按模型判定（支持/拒绝分流）', () => {
+    it('`multimodal===true` 的模型：图片转 data URL 发出（image_url 形态）', async () => {
+      const { adapter, calls } = makeAdapter(() => sseResponse(textStream('ok')), {
+        fetchRemoteModels: async () => [
+          { id: 'kimi-k3', name: 'Kimi-K3', supportsImages: true, function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+        ],
+        readImage: async () => ({ data: new Uint8Array([137, 80, 78, 71]), mediaType: 'image/png' }),
+      })
+      await collect(adapter, generateOptions({
+        model: 'kimi-k3',
+        messages: [createUserMessage({
+          content: [
+            { type: 'image', attachment: { attachmentId: 'att-1' } } as never,
+            { type: 'text', text: '什么颜色' },
+          ],
+          source: { kind: 'user' },
+        })],
+      }))
+      expect(calls, '必须真的发出请求').toHaveLength(1)
+      const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: Array<{ content: unknown[] }> }
+      const parts = body.messages[0]!.content
+      const image = parts.find((p) => (p as { type: string }).type === 'image_url') as { image_url?: { url?: string } }
+      // 图片必须是 image_url + data URL（实测上游唯一接受的形态）。
+      expect(image.image_url?.url).toBe('data:image/png;base64,iVBORw==')
+      // 文本块必须保留。
+      expect(parts.some((p) => (p as { type: string }).type === 'text'
+        && (p as { text: string }).text === '什么颜色')).toBe(true)
+    })
+
+    it('`multimodal===false` / 未声明的模型收到图片仍拒绝且不发请求', async () => {
+      // 默认模型 glm-5.2 是 supportsImages:false —— 图片依旧被拒。
+      const { adapter, calls } = makeAdapter(() => sseResponse(textStream('ok')), {
+        readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+      })
+      const { error } = await collect(adapter, generateOptions({
+        messages: [createUserMessage({
+          content: [{ type: 'image', attachment: { attachmentId: 'att-1' } } as never],
+          source: { kind: 'user' },
+        })],
+      }))
+      expect(error?.code).toBe('UNSUPPORTED_CONTENT')
+      expect(calls).toHaveLength(0)
+      // 提示指向「该模型不收图」，而不是 attachment 服务。
+      expect(String(error?.message)).toContain('does not accept image')
+    })
+
+    it('读取图片字节失败时留 `[image unavailable]` 占位符（不静默丢图）', async () => {
+      const { adapter, calls } = makeAdapter(() => sseResponse(textStream('ok')), {
+        fetchRemoteModels: async () => [
+          { id: 'kimi-k3', name: 'Kimi-K3', supportsImages: true, function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+        ],
+        // readImage 回 undefined（附件已被清理等）→ 字节映射为空，序列化层留占位符
+        // （空 Map 不能降级为 undefined —— 否则占位符也会被跳过）。
+        readImage: async () => undefined,
+      })
+      const { chunks, error } = await collect(adapter, generateOptions({
+        model: 'kimi-k3',
+        messages: [createUserMessage({
+          content: [{ type: 'image', attachment: { attachmentId: 'att-1' } } as never],
+          source: { kind: 'user' },
+        })],
+      }))
+      expect(error).toBeUndefined()
+      expect(calls, '必须真的发出请求').toHaveLength(1)
+      const body = JSON.parse(String(calls[0]!.init?.body)) as { messages: unknown[] }
+      const json = JSON.stringify(body)
+      expect(json, '不得静默丢弃').toContain('image unavailable')
+      // 占位符是输出块产物（虽然模型侧收到的是占位文本，但适配器不吞图、发了请求）。
+      expect(chunks).toBeDefined()
+    })
+
+    it('声明支持图片但未提供 readImage 时明确报错（需要附件服务，不静默丢图）', async () => {
+      const { adapter, calls } = makeAdapter(() => sseResponse(textStream('ok')), {
+        fetchRemoteModels: async () => [
+          { id: 'kimi-k3', name: 'Kimi-K3', supportsImages: true, function: TRAE_CN_SOLO_REMOTE_FUNCTION },
+        ],
+        // 刻意不传 readImage
+      })
+      const { error } = await collect(adapter, generateOptions({
+        model: 'kimi-k3',
+        messages: [createUserMessage({
+          content: [{ type: 'image', attachment: { attachmentId: 'att-1' } } as never],
+          source: { kind: 'user' },
+        })],
+      }))
+      expect(error?.code).toBe('UNSUPPORTED_CONTENT')
+      expect(String(error?.message)).toContain('attachment service')
+      expect(calls).toHaveLength(0)
+    })
   })
 })
 
@@ -1671,6 +1835,85 @@ describe('buildTraeCnSoloBody（纯函数，逐字段锁死出站形态）', () 
     expect(body.config_name).toBe('glm-5.3')
     expect(body.model).toBe('glm-5.3')
     expect(body.stream).toBe(true)
+  })
+
+  it('**无图请求的 body 逐字节不变**（传 undefined imageUrls 与不传等价）', () => {
+    // 红线：图片支持只在该请求**带图**时才改变 body；无图请求的出站形态必须
+    // 与改动前**完全一致**（前缀缓存命中的前提是前缀逐字节稳定，见
+    // `buddy-adapter.spec.ts` 的「逐字节红线」同类约定）。
+    const baseline = buildTraeCnSoloBody(generateOptions(), 'solo_work_remote')
+    const withUndefined = buildTraeCnSoloBody(generateOptions(), 'solo_work_remote', undefined)
+    expect(withUndefined).toBe(baseline)
+    // 即便给一个「空 Map」（相当于读了但没读到字节），也不该改变无图消息的形态
+    // —— userContentParts 只在出现图片块时才升级为多模态 parts。
+    const withEmptyMap = buildTraeCnSoloBody(generateOptions(), 'solo_work_remote', new Map())
+    expect(withEmptyMap).toBe(baseline)
+    // 反证：带图时必须真的改变 body（否则「图片支持」形同虚设）。
+    const withImage = buildTraeCnSoloBody(generateOptions({
+      messages: [createUserMessage({
+        content: [
+          { type: 'image', attachment: { attachmentId: 'att-1' } } as never,
+          { type: 'text', text: '你好' },
+        ],
+        source: { kind: 'user' },
+      })],
+    }), 'solo_work_remote', new Map([['att-1', 'data:image/png;base64,eA==']]))
+    expect(withImage).not.toBe(baseline)
+    expect(withImage).toContain('image_url')
+  })
+
+  // ── Max 档（1M 上下文）成套出站 ──
+
+  it('**选 max 档 → body 含 Max 六字段且值正确**（对齐上游 traeMaxModeFields）', () => {
+    const body = JSON.parse(buildTraeCnSoloBody(generateOptions(), 'solo_work_remote', undefined, {
+      maxContextWindow: 1_048_576,
+    })) as Record<string, unknown>
+    expect(body.model_auto_selection).toEqual({
+      strategy: 'max',
+      fallback_to_advance_model: null,
+      entitlement_id: null,
+    })
+    expect(body.model_selection_strategy).toBe('max')
+    expect(body.mode_type).toBe(1)
+    // Max 窗口：用该模型自己公布的 maxContextWindow（远端值，非臆造的固定 1M）。
+    expect(body.context_window_size).toBe(1_048_576)
+    expect(body.prompt_max_tokens).toBe(936_000)
+    // 未显式给 maxTokens 时用 64K 兜底。
+    expect(body.max_tokens).toBe(64_000)
+  })
+
+  it('**未选 max 档 → body 与基线逐字节一致**（红线：切换档位只影响 max 档命中）', () => {
+    const baseline = buildTraeCnSoloBody(generateOptions(), 'solo_work_remote')
+    // 显式传 undefined maxMode（非 max 档）不得改变任何字节。
+    const withUndefined = buildTraeCnSoloBody(generateOptions(), 'solo_work_remote', undefined, undefined)
+    expect(withUndefined).toBe(baseline)
+    // 反证：六个档位字段在非 max 档下都不该存在。
+    const parsed = JSON.parse(withUndefined) as Record<string, unknown>
+    expect(parsed).not.toHaveProperty('model_auto_selection')
+    expect(parsed).not.toHaveProperty('model_selection_strategy')
+    expect(parsed).not.toHaveProperty('mode_type')
+    expect(parsed).not.toHaveProperty('context_window_size')
+    expect(parsed).not.toHaveProperty('prompt_max_tokens')
+  })
+
+  it('**max 档 + temperature → temperature 正常写入且不与 Max 字段冲突', () => {
+    const body = JSON.parse(buildTraeCnSoloBody(generateOptions({ temperature: 0.3 }), 'solo_work_remote', undefined, {
+      maxContextWindow: 1_000_000,
+    })) as Record<string, unknown>
+    // temperature 独立驱动，不属于 Max 字段集，两者共存。
+    expect(body.temperature).toBe(0.3)
+    expect(body.model_selection_strategy).toBe('max')
+    expect(body.context_window_size).toBe(1_000_000)
+  })
+
+  it('**max 档 + 显式 maxTokens → 尊重显式值**（两者是同一个字段，不写两处）', () => {
+    const body = JSON.parse(buildTraeCnSoloBody(generateOptions({ maxTokens: 128_000 }), 'solo_work_remote', undefined, {
+      maxContextWindow: 1_000_000,
+    })) as Record<string, unknown>
+    expect(body.max_tokens).toBe(128_000)
+    // Max 其余字段不受影响。
+    expect(body.prompt_max_tokens).toBe(936_000)
+    expect(body.model_selection_strategy).toBe('max')
   })
 })
 
@@ -2160,6 +2403,67 @@ describe('Trae CN 目录解析（parseTraeCnDirectory）', () => {
       maxTokens: 64_000,
       function: 'solo_work_remote',
     }])
+  })
+
+  // ── 图片能力（对齐上游 3979729 真机定案，Issue #IKHDKC）──
+
+  it('读出 `display_config.multimodal`（逐模型，不是按 provider 一刀切）', () => {
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [{
+        config_name: 'kimi-k3',
+        display_config: { display_name: 'Kimi-K3', multimodal: true },
+      }],
+    }, 'solo_work_remote')
+    expect(parsed[0]!.multimodal).toBe(true)
+  })
+
+  it('`multimodal:false` 如实读出（不能当成「未声明」）', () => {
+    // 「远端说不支持」与「远端没说」是两回事：前者可用于拒绝，后者只能保守处理。
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [{
+        config_name: 'glm-5.3',
+        display_config: { display_name: 'GLM-5.3', multimodal: false },
+      }],
+    }, 'solo_work_remote')
+    expect(parsed[0]!.multimodal).toBe(false)
+  })
+
+  it('未声明 multimodal 的条目该字段为 undefined（不臆造能力）', () => {
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [{
+        config_name: 'x',
+        display_config: { display_name: 'X' },
+      }],
+    }, 'solo_work_remote')
+    expect(parsed[0]).not.toHaveProperty('multimodal')
+  })
+
+  it('⚠️ 用户贴图与工具结果图是**两个独立字段**，不可合并', () => {
+    // 实测 deepseek-v4.1-flash: multimodal=true 而 tool_response_multimodal=false
+    // （用户能贴图，但工具读到的图回传不了）；Doubao/Kimi 系列则两者皆 true。
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [{
+        config_name: 'deepseek-v4.1-flash',
+        display_config: {
+          display_name: 'DeepSeek-V4.1-Flash',
+          multimodal: true,
+          tool_response_multimodal: false,
+        },
+      }],
+    }, 'solo_work_remote')
+    expect(parsed[0]!.multimodal).toBe(true)
+    expect(parsed[0]!.toolResponseMultimodal).toBe(false)
+  })
+
+  it('兼容 PascalCase 形态（`Multimodal` / `ToolResponseMultimodal`）', () => {
+    const parsed = parseTraeCnDirectory({
+      config_info_list: [{
+        config_name: 'x',
+        display_config: { display_name: 'X', Multimodal: true, ToolResponseMultimodal: true },
+      }],
+    }, 'solo_work_remote')
+    expect(parsed[0]!.multimodal).toBe(true)
+    expect(parsed[0]!.toolResponseMultimodal).toBe(true)
   })
 
   /**

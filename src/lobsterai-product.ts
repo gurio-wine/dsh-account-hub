@@ -50,22 +50,28 @@ export interface LobsteraiFallbackModel {
    */
   contextWindow?: number
   /**
-   * 可选思考档位（真机 `thinkingConfig.options[].level`，逐字符照抄）。
+   * 可选思考档位（**发给服务端的 wire 值** `thinkingConfig.options[].openclawLevel`，
+   * 逐字符照抄）。
+   *
+   * ⚠️ **wire 值是 `openclawLevel`，不是 `level`**（上游 commit 9669ee4 真机定案）：
+   * 远端 `options[]` 每项同时含 `level`（产品侧档位名，有 `max`）与
+   * `openclawLevel`（发给服务端的 `reasoning_effort` 取值，**无 `max`**）；
+   * 远端把 `level:'max'` 映射到 `openclawLevel:'xhigh'`。实测直接发
+   * `reasoning_effort:'max'`（level 值）与不带参数**无差异**（走服务端默认），
+   * 发 `'xhigh'` 才真正触发最高档 —— 因此本表存的是 `openclawLevel`。
+   *
+   * ⚠️ **`off` 保留在列表、不过滤**：关掉思考（`reasoning_effort:'off'`）要求
+   * `X-LobsterAI-Client-Capabilities` 头含 `thinking-level-control-v1`
+   * （见 {@link LOBSTERAI_CLIENT_CAPABILITIES}），带上即正常；只发
+   * `kimi-k3-agentic-v1` 时才 HTTP 500。本仓已同步该头，off 档可用。
    *
    * 空/缺省 = **不暴露选择器**：DSH 的模型选择器只读 `resolveModel().reasoning`，
    * 不声明时该行不渲染（与 `src/trae-cn-adapter.ts` 同约定）。
-   *
-   * ⚠️ **刻意剔除 `off`**：真机 `options` 里确有 `off`，但实测在
-   * `deepseek-flash` / `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`
-   * 三个模型上发 `reasoning_effort: "off"` 会返回 **HTTP 500**
-   * （`{"code":500,"message":"服务器内部错误"}`，3/3 复现），
-   * 而 `none` 才等价于「关闭思考」。给用户一个必然 500 的档位是纯粹的陷阱，
-   * 故只暴露真机实测可用的档位。关闭思考仍可通过选择不带档位的模型实现。
    */
   reasoningEfforts?: readonly string[]
   /**
-   * 默认档位（真机 `thinkingConfig.defaultLevel`），**必须**在
-   * {@link reasoningEfforts} 内。
+   * 默认档位（**wire 值** `openclawLevel`，由真机 `thinkingConfig.defaultLevel`
+   * 经 `options` 映射得到），**必须**在 {@link reasoningEfforts} 内。
    *
    * DSH 的 `resolveCallInfo` 会在调用方省略 `reasoningEffort` 时把它
    * materialize 进请求 —— 与真机网页版「默认档」语义一致。
@@ -121,11 +127,22 @@ export const LOBSTERAI_FALLBACK_CLIENT_VERSION = '2026.9.4'
 /**
  * 客户端能力声明（`X-LobsterAI-Client-Capabilities` 头）。
  *
- * 实测值来自 `internal/upstream/client.go:99`（硬编码）。
- * 该头看起来是在声明「本客户端支持 kimi-k3 的 agentic 协议」，
- * 换掉可能影响工具调用行为，故原样保留。
+ * 两个能力**都必须声明**，各自解决一个具体问题（2026-09-17 真实凭据实测，
+ * 上游 commit 9669ee4 真机定案）：
+ *
+ * - `kimi-k3-agentic-v1`：**模型列表的准入条件**。不带该能力时
+ *   `/api/models/available` 只返回 25 个模型且**没有 `kimi-k3`**；带上才 26 个。
+ *   该值来自 `internal/upstream/client.go:99` 的硬编码。
+ * - `thinking-level-control-v1`：**思考档位协议的前提**。`reasoning_effort`
+ *   的常规档位（low/high/max/xhigh）不需要它，但 `"off"`（关闭思考）
+ *   在**不带**该能力时服务端直接 HTTP 500（`{"code":500,"message":"服务器内部错误"}`），
+ *   带上则正常返回。也就是说「关掉思考」这条协议要先声明支持它。
+ *
+ * 顺序无关（两种顺序都实测通过），但保持与 IDE 的
+ * `LOBSTERAI_CLIENT_CAPABILITIES`（`modelRuntimeProfiles.js`）一致的排列。
  */
-export const LOBSTERAI_CLIENT_CAPABILITIES = 'kimi-k3-agentic-v1'
+export const LOBSTERAI_CLIENT_CAPABILITIES
+  = 'kimi-k3-agentic-v1,thinking-level-control-v1'
 
 /**
  * User-Agent。
@@ -172,8 +189,10 @@ export interface LobsteraiProduct {
  *
  * **来源：2026-09-19 真机 `GET /api/models/available` 实测拉取**（用账号池凭据
  * 直连上游），逐字段照抄：`modelId` → `id`、`modelName` → `name`、
- * `contextWindow` → `contextWindow`、`thinkingConfig` → `reasoningEfforts` /
- * `defaultReasoningEffort`。
+ * `contextWindow` → `contextWindow`、`thinkingConfig.options[].openclawLevel`
+ * → `reasoningEfforts`、`defaultLevel` 经 options 映射成 wire 值 →
+ * `defaultReasoningEffort`。**思考档位一律存 wire 值 `openclawLevel`**（含保留
+ * `off`），`level:'max'` 映射为 `'xhigh'`（上游 commit 9669ee4 真机定案）。
  *
  * 早期版本照抄的是 `lobsterai2api/internal/server/handler.go:94-114` 的
  * `staticModels`（注释标明 2026-08-06 拉取），那份表**已过时**：19 项里
@@ -189,19 +208,19 @@ export interface LobsteraiProduct {
  * 「与上游对比」这类排查工作失去可比性。
  */
 const LOBSTERAI_FALLBACK_MODELS: readonly LobsteraiFallbackModel[] = [
-  { id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 1_000_000, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'high' },
-  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'high' },
-  { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', contextWindow: 1_000_000, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'max' },
-  { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'max' },
-  { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'max' },
+  { id: 'deepseek-flash', name: 'DeepSeek-V4.1-Flash', contextWindow: 1_000_000, reasoningEfforts: ['off', 'high', 'xhigh'], defaultReasoningEffort: 'high' },
+  { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: 1_000_000, reasoningEfforts: ['off', 'high', 'xhigh'], defaultReasoningEffort: 'high' },
+  { id: 'glm-5.3-flashx', name: 'GLM-5.3-FlashX', contextWindow: 1_000_000, reasoningEfforts: ['off', 'high', 'xhigh'], defaultReasoningEffort: 'xhigh' },
+  { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash', contextWindow: 1_000_000, reasoningEfforts: ['off', 'high', 'xhigh'], defaultReasoningEffort: 'xhigh' },
+  { id: 'glm-5.3', name: 'GLM-5.3', contextWindow: 1_000_000, reasoningEfforts: ['off', 'high', 'xhigh'], defaultReasoningEffort: 'xhigh' },
   { id: 'MiniMax-M3', name: 'MiniMax-M3', contextWindow: 1_000_000 },
   { id: 'qwen3.8-max', name: 'Qwen3.8-Max', contextWindow: 1_000_000 },
   { id: 'qwen3.8-flash', name: 'Qwen3.8-Flash', contextWindow: 1_000_000 },
   { id: 'qwen3.8-omni-flash', name: 'Qwen3.8-Omni-Flash', contextWindow: 1_000_000 },
   { id: 'kimi-k2.7-code', name: 'Kimi-K2.7-Code', contextWindow: 262_144 },
   { id: 'doubao-seed-2-1-pro-260915', name: 'Doubao-Seed-2.1-Pro', contextWindow: 256_000 },
-  { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek-V4-Flash-Vision-Exp', contextWindow: 1_000_000, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'high' },
-  { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: 1_000_000, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'high' },
+  { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek-V4-Flash-Vision-Exp', contextWindow: 1_000_000, reasoningEfforts: ['off', 'high', 'xhigh'], defaultReasoningEffort: 'high' },
+  { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: 1_000_000, reasoningEfforts: ['off', 'high', 'xhigh'], defaultReasoningEffort: 'high' },
   { id: 'MiniMax-M2.7', name: 'MiniMax-M2.7' },
   { id: 'qwen3.7-max', name: 'Qwen3.7-Max', contextWindow: 1_000_000 },
   { id: 'qwen3.7-plus', name: 'Qwen3.7-Plus', contextWindow: 1_000_000 },
@@ -210,7 +229,7 @@ const LOBSTERAI_FALLBACK_MODELS: readonly LobsteraiFallbackModel[] = [
   { id: 'kimi-k2.7-code-highspeed', name: 'Kimi-K2.7-Code-Highspeed', contextWindow: 262_144 },
   { id: 'kimi-k2.6', name: 'Kimi-K2.6' },
   { id: 'kimi-k2.5', name: 'Kimi-K2.5' },
-  { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, reasoningEfforts: ['high', 'max'], defaultReasoningEffort: 'max' },
+  { id: 'glm-5.2', name: 'GLM-5.2', contextWindow: 1_000_000, reasoningEfforts: ['off', 'high', 'xhigh'], defaultReasoningEffort: 'xhigh' },
   { id: 'glm-5.1', name: 'GLM-5.1' },
   { id: 'glm-5v-turbo', name: 'GLM-5V-Turbo' },
   { id: 'glm-5', name: 'GLM-5' },

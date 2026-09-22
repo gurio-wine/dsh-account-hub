@@ -508,6 +508,7 @@ export function apply(ctx: Context): void {
       else await traeCn.refresh()
     },
     accountPool: pool,
+    readImage: makeReadImage(ctx),
     product: TRAE_CN,
   })
 

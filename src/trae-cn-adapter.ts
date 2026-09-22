@@ -60,7 +60,7 @@ import {
   traeCnCreditsExhaustedHint,
 } from './trae-cn-errors.js'
 import type { TraeCnErrorAction, TraeCnTerminalScope } from './trae-cn-errors.js'
-import { consumeTraeCnStream, serializeTraeCnMessages, traeCnErrorCodeForAction } from './trae-cn-sse.js'
+import { consumeTraeCnStream, serializeTraeCnMessages, collectImages, traeCnErrorCodeForAction } from './trae-cn-sse.js'
 import type { TraeCnStreamOutcome } from './trae-cn-sse.js'
 
 /** 本适配器注册的 provider 路由名（等价于 `TRAE_CN.id`）。 */
@@ -76,6 +76,37 @@ const TRAE_CN_MAX_ROTATE = 3
 
 /** 限流/额度/风控类冷却时长（毫秒，1 小时）。 */
 const TRAE_CN_COOLDOWN_MS = 3_600_000
+
+// ── Max 档（1M 上下文）成套出站常量 ──
+//
+// 与上游 `trae.ts` 的 `traeMaxModeFields` / 各 `TRAE_MAX_*` 常量对齐
+// （值以 upstream/master 为准，见 `git show upstream/master:src/trae.ts`）：
+// 选 Max 档时不再只是本地压缩阈值切换，而是真正携带 Max 字段集出站，
+// 否则上游按 200K 校验、1M 输入被 4022 拒绝后再靠压缩兜底。
+
+/** Max 档的上下文窗口兜底值（1M），仅在某模型未声明 Max 窗口时使用。 */
+const TRAE_CN_MAX_CONTEXT_TOKENS = 1_000_000
+/** Max 档的提示词预算（936K）—— 1M 总窗口里留给补全的部分，刻意小于总窗口。 */
+const TRAE_CN_MAX_PROMPT_TOKENS = 936_000
+/** Max 档的输出上限兜底（64K）。 */
+const TRAE_CN_MAX_OUTPUT_TOKENS = 64_000
+/** Max 档的 `mode_type` 取值。 */
+const TRAE_CN_MAX_MODE_TYPE = 1
+
+/**
+ * Max 档出站所需的窗口明细（由调用方逐模型解析后实参下发）。
+ *
+ * 只携带「该模型自己的 Max 档窗口」：输出上限**不在**这里 —— 本仓没有与
+ * upstream/master 的 `__max` 明细对应的独立输出声明（`TraeCnModelEntry.maxTokens`
+ * 是 dev 明细的 `max_tokens`，多为 32000/64000，不是 Max 会话的输出上限），
+ * 臆造会违反「值以 upstream/master 为准」。故 Max 档的 `max_tokens` 走
+ * {@link TRAE_CN_MAX_OUTPUT_TOKENS}（64K）兜底，或由调用方显式 `options.maxTokens`
+ * 覆盖。
+ */
+interface TraeCnMaxModeOutbound {
+  /** 该模型声明的 Max 窗口（远端 `maxContextWindow`）。 */
+  maxContextWindow: number
+}
 
 /**
  * 思考档位 id → 展示名。
@@ -249,6 +280,14 @@ export interface TraeCnAdapterOptions {
    */
   fetchRemoteModels?: (credential: TraeCnCredential) => Promise<TraeCnModelEntry[]>
   fetchImpl?: typeof fetch
+  /**
+   * 读取图片附件的原始字节（内联为 `data:` URL 用）。
+   *
+   * 由调用方桥接 `ctx.attachments.readImage(ref)`（见 `src/index.ts` 的
+   * `makeReadImage(ctx)`）。未提供时收到图片会报 `UNSUPPORTED_CONTENT`（而
+   * 不是静默丢弃）—— 见 `stream()` 的图片分支。
+   */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   /** 多账号池（用于限流时切换账号）。 */
   accountPool?: AccountPool
   /** 产品配置；默认 `TRAE_CN`。 */
@@ -327,16 +366,26 @@ export class TraeCnAdapter extends LlmAdapter {
   }
 
   /**
-   * 模型接受的输入模态。
+   * 模型接受的输入模态 —— **逐模型**判定，判据优先级：
    *
-   * 真机目录（2026-09-18）逐项标了多模态：原 16 项里 **12 项支持图片**；剔除 5 项
-   * SOLO 不可调 id 后现存 11 项里 6 项（`minimax-m3` 按 SOLO 目录实测改为 false）。
-   * 动态目录条目由 `applyTraeCnStaticMetadata` 从静态表补齐该标记；仍缺省的
-   * （远端独有 id）**保守判为纯文本** —— 目录里没有的能力不该被假定存在（与
-   * `stream()` 的图片拦截同向：宁可报 UNSUPPORTED_CONTENT，也不静默丢图）。
+   * 1. 目录条目的 `multimodal`（`display_config.multimodal`，**实时权威**，
+   *    见 {@link TraeCnModelEntry.multimodal} 的实测记录）；
+   * 2. 否则回退条目的 `supportsImages`（静态表兜底 / 解析重塑的现场值）。
+   *
+   * 三条结论：
+   * - `multimodal === true` → `['text','image']`；
+   * - `multimodal === false` → `['text']`（远端**明确声明不支持**，权威拒绝）；
+   * - `multimodal` **未声明** → 回退 `supportsImages`；两者皆非 true 则保守
+   *   判 `['text']`（远端没说 ≠ 远端支持）。
+   *
+   * ⚠️ **这里返回的 `image` 是 DSH 的准入闸门**：不声明 `image` 时，图片会在
+   * **附件入库阶段**就被拒（`session/attachment-invalid`），用户看到「当前模型
+   * 不支持图片」—— 而图根本没发到上游。因此漏报 `image` 不只是「少个功能」，
+   * 而是「连降级成文本占位符的机会都没有」。
    */
-  private inputModalitiesFor(supportsImages: boolean | undefined): readonly ['text'] | readonly ['text', 'image'] {
-    return supportsImages === true ? ['text', 'image'] : ['text']
+  private inputModalitiesFor(entry: TraeCnModelEntry | undefined): readonly ('text' | 'image')[] {
+    const supports = entry?.multimodal ?? entry?.supportsImages
+    return supports === true ? ['text', 'image'] : ['text']
   }
 
   /**
@@ -390,8 +439,9 @@ export class TraeCnAdapter extends LlmAdapter {
       provider: this.product.id,
       id: model.id,
       name: model.name,
-      // 模态按目录条目给（静态表 11 项里 6 项多模态）；远端条目无该字段时判纯文本。
-      inputModalities: this.inputModalitiesFor(model.supportsImages),
+      // 模态按目录条目给：`multimodal` 优先，回退 `supportsImages`（见
+      // `inputModalitiesFor` 的口径）；静态表 11 项里 6 项多模态。
+      inputModalities: this.inputModalitiesFor(model),
     }))
   }
 
@@ -416,9 +466,10 @@ export class TraeCnAdapter extends LlmAdapter {
       provider,
       id: model,
       name: entry?.name ?? model,
-      // 模态与 `listModels` **同源同口径**：两处都读同一条目的 supportsImages，
-      // 否则选择器显示「支持图片」而请求路径按纯文本处理（或反之），是自相矛盾。
-      inputModalities: this.inputModalitiesFor(entry?.supportsImages),
+      // 模态与 `listModels` **同源同口径**：两处都读同一条目的能力字段
+      // （`multimodal` 优先，回退 `supportsImages`），否则选择器显示「支持图片」
+      // 而请求路径按纯文本处理（或反之），是自相矛盾。
+      inputModalities: this.inputModalitiesFor(entry),
     }
     // 上下文窗口：动态目录给 `context_window_tokens.dev`（回退 `prompt_max_tokens`，
     // 与官方客户端显示的 200K 同口径），静态表给真机 dev 档 —— 两者同口径
@@ -477,14 +528,15 @@ export class TraeCnAdapter extends LlmAdapter {
   /**
    * 该模型**本次应当声明的上下文窗口**（dev 档，或用户选中的 Max 档）。
    *
-   * ## 机制：只有声明值会变，出站请求体一个字段都不动
+   * ## 机制：声明值与出站字段集**同源**联动（2026-09-19 起不再只是声明值切换）
    *
-   * Trae 的 chat 请求体里**没有**任何档位字段（`buildTraeCnSoloBody` 的字段全集是
-   * `messages` / `model` / `config_name` / `function` / `stream` / `tools` /
-   * `temperature` / `max_tokens` / `stop` / `reasoning_effort_level`）。所谓「选 Max 档」
-   * 只是把**我们向 DSH 声明的窗口**从 dev 换成该模型自己公布的 Max ——
-   * 上游本来就按请求实际长度服务，声明值决定的是**宿主何时压缩**（阈值 `0.8 × 窗口`）
-   * 与压缩后的保留预算。因此本函数绝不产生任何出站差异。
+   * 选择档位**双重生效**：
+   * - **声明值**：我们向 DSH 声明的窗口从 dev 换成该模型自己公布的 Max ——
+   *   决定宿主何时压缩（阈值 `0.8 × 窗口`）与压缩后的保留预算；
+   * - **出站字段**：当命中 Max 档时，`buildTraeCnSoloBody` 会成套携带 Max 字段集
+   *   （`model_auto_selection` / `model_selection_strategy` / `mode_type` /
+   *   `context_window_size` / `prompt_max_tokens` / `max_tokens`，见
+   *   {@link TraeCnAdapter.maxModeOutboundFor}），否则上游按 200K 校验并拒绝 1M 输入。
    *
    * ## 判据：预算值必须**精确命中**目录公布的档位（两条缺一不可）
    *
@@ -508,6 +560,27 @@ export class TraeCnAdapter extends LlmAdapter {
   }
 
   /**
+   * 当前请求目标模型**本次是否命中 Max 档**，命中则给出出站所需的 Max 窗口/输出明细。
+   *
+   * 与 {@link effectiveContextWindow} **同源同口径**（读同一条目、同一个预算判据），
+   * 保证「选中的档位」在声明值（DSH 压缩阈值）与出站字段集（上游准入校验）两处
+   * **永远一致**。返回 `undefined` = 非 Max 档（dev / 编造值 / 无 Max 档模型），
+   * 此时出站请求体保持现状、一个字段都不注入。
+   */
+  private maxModeOutboundFor(model: string): TraeCnMaxModeOutbound | undefined {
+    const entry = this.catalogEntries().find((candidate) => candidate.id === model)
+      ?? this.fallbackIndex.get(model)
+    if (entry === undefined) return undefined
+    const dev = entry.contextWindow
+    if (dev === undefined) return undefined
+    const max = entry.maxContextWindow
+    if (max === undefined || max <= dev) return undefined
+    const budget = this.options.accountPool?.contextBudget(this.product.id, model)
+    if (budget !== max) return undefined
+    return { maxContextWindow: max }
+  }
+
+  /**
    * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
    * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本基类尚未
    * 提供该方法，缺少时会在每轮请求开始时抛
@@ -526,21 +599,57 @@ export class TraeCnAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    // 图片：静态表 11 项里 6 项标了多模态，但**本适配器的图片通路未实测**
-    // （`serializeTraeCnMessages` 只展平文本块，没有把 image 块编码成上游要的
-    // 形态）。故这里明确报错而不是静默丢弃 —— 静默丢弃会让用户以为模型看到了
-    // 图片，那比报错更糟。
+    // 图片：按**模型**判定是否接受，并把字节读成 data URL 随请求发出。
     //
-    // ⚠️ 与 `inputModalities` 的关系（**有意的不一致**，不要「顺手」改掉）：
-    // 目录照实报 `['text','image']`（那是模型的能力），而请求路径仍拒绝图片
-    // （那是本适配器的能力）。DSH 会在路由层按 `inputModalities` 把图片投影成
-    // 文本占位（`projectImagesForTextModel`），所以正常调用到不了这里；
-    // 这条抛错是**最后一道防线**，防的是绕过路由层直接调 `stream()` 的路径。
+    // ⚠️ **不能无条件拒绝**：实测（上游 3979729 真机定案）TRAE 上游真的支持图片 ——
+    // `inputModalities` 是 DSH 的**准入闸门**，不声明 `image` 时图片在附件入库
+    // 阶段就被拒（图根本没发到上游）；而目录 `display_config.multimodal` 一直在
+    // 实时下发该能力。故这里按模型分流：`multimodal !== true` 明确报错且**不发
+    // 请求**（实测反向对照：`multimodal:false` 的模型收到图后答「无法确定」、
+    // 思考链说「但没有图片」，与不带图一致 ⇒ 该标志是权威准入判据）；
+    // `multimodal === true` 的模型读字节、转 data URL 发出。
+    //
+    // 与 `inputModalities` 保持一致（不再「有意不一致」）：两处都读同一条目的
+    // 能力字段，否则会出现「业务声明支持、路由层却按纯文本投影」的自相矛盾。
+    const imageRefs = new Map<string, unknown>()
     for (const message of options.messages) {
-      if (!Array.isArray(message.content)) continue
-      const hasImage = message.content.some((block) =>
-        typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image')
-      if (hasImage) throw new LlmError('trae-cn: 当前 provider 不支持图片输入', 'UNSUPPORTED_CONTENT')
+      if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+    }
+    // `imageUrls` 为 undefined 表示「本请求没有图片」；非 undefined（**含空 Map**）
+    // 时序列化层会把带图的 user 消息升级为多模态 parts。空 Map 不能降级为
+    // undefined —— 那会让「图片存在但字节读取失败」的 `[image unavailable]`
+    // 占位符也被跳过，图片静默消失。
+    let imageUrls: Map<string, string> | undefined
+    if (imageRefs.size > 0) {
+      // 该模型的目录条目（`multimodal` 优先，回退 `supportsImages`）。与
+      // `inputModalitiesFor` 同源：`stream()` 这里的拒绝与 `listModels` /
+      // `resolveModel` 的声明必须一致，否则「业务声明支持、请求却拒图」自相矛盾。
+      const modelEntry = this.catalogEntries().find((candidate) => candidate.id === options.model)
+        ?? this.fallbackIndex.get(options.model)
+      if (!this.inputModalitiesFor(modelEntry).includes('image')) {
+        throw new LlmError(
+          `trae-cn: model "${options.model}" does not accept image input.`,
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+      if (this.options.readImage === undefined) {
+        throw new LlmError(
+          'trae-cn: image input requires the attachment service; '
+          + 'confirm the profile loads @deepseek-ai/dsh-attachment-local.',
+          'UNSUPPORTED_CONTENT',
+        )
+      }
+      imageUrls = new Map()
+      for (const [id, ref] of imageRefs) {
+        const image = await this.options.readImage(ref)
+        if (image === undefined) {
+          // 读不到字节（附件被清理等）：**不设置 URL、让该图在序列化层留
+          // `[image unavailable]` 占位符**（见 `userContentParts`）—— 绝不静默
+          // 吞掉这张图，但也不必抛错令整条请求失败。
+          continue
+        }
+        imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
+      }
     }
 
     // 1. 获取凭据（过期则先静默续期）
@@ -571,7 +680,7 @@ export class TraeCnAdapter extends LlmAdapter {
     }
 
     await this.ensureRemoteModels()
-    const body = this.buildBody(options)
+    const body = this.buildBody(options, imageUrls)
 
     // 3. 发送首个请求（401/403 时先续期一次再重试）
     let response = await this.send(credential, body, options)
@@ -819,8 +928,13 @@ export class TraeCnAdapter extends LlmAdapter {
   }
 
   /** 构造 chat 请求体（SOLO 通道形态）。 */
-  private buildBody(options: GenerateOptions): string {
-    return buildTraeCnSoloBody(options, this.functionForModel(options.model))
+  private buildBody(options: GenerateOptions, imageUrls?: ReadonlyMap<string, string>): string {
+    return buildTraeCnSoloBody(
+      options,
+      this.functionForModel(options.model),
+      imageUrls,
+      this.maxModeOutboundFor(options.model),
+    )
   }
 
   /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
@@ -890,9 +1004,20 @@ export class TraeCnAdapter extends LlmAdapter {
  *
  * @param options - harness 的生成选项。
  * @param functionName - 目标模型的来源 function（见 `TraeCnAdapter.functionForModel`）。
+ * @param imageUrls - 本请求图片附件 → data URL 的映射（见 `serializeTraeCnMessages` 的
+ *   `imageUrls` 参数）；`undefined` 表示整个请求**无图**（无图请求的出站形态保持不变）。
+ * @param maxMode - 目标模型**本次命中 Max 档**时的出站明细（见
+ *   `TraeCnAdapter.maxModeOutboundFor`）。`undefined` = 非 Max 档，此时本函数
+ *   不注入任何档位字段、出站形态与历史基线**逐字节一致**（既有逐字节锁死用例
+ *   据此保持绿）。
  */
-export function buildTraeCnSoloBody(options: GenerateOptions, functionName: string): string {
-  const messages = serializeTraeCnMessages(normalizeSoloRoles(options.messages))
+export function buildTraeCnSoloBody(
+  options: GenerateOptions,
+  functionName: string,
+  imageUrls?: ReadonlyMap<string, string>,
+  maxMode?: TraeCnMaxModeOutbound,
+): string {
+  const messages = serializeTraeCnMessages(normalizeSoloRoles(options.messages), imageUrls)
   if (options.system !== undefined && options.system.length > 0) {
     messages.unshift({ role: 'system', content: options.system })
   }
@@ -924,6 +1049,31 @@ export function buildTraeCnSoloBody(options: GenerateOptions, functionName: stri
   // `reasoning.defaultEffort` 在调用方省略时补好，适配器再补一次会与 DSH
   // 的口径分叉）。字段名的证据链见函数头注释。
   if (options.reasoningEffort !== undefined) body.reasoning_effort_level = options.reasoningEffort
+  if (maxMode !== undefined) {
+    // Max 档（1M 上下文）出站字段集 —— 对齐上游 `traeMaxModeFields`。
+    //
+    // ⚠️ 必须**成套**下发，缺一个都会被上游当普通会话按 200K 校验：
+    // - `strategy=max` + `model_auto_selection.strategy=max`：判定「这是 Max 会话」；
+    // - `context_window_size` / `prompt_max_tokens` / `max_tokens`：远端准入校验三件套。
+    //
+    // `max_tokens` 与上方 `options.maxTokens` 是**同一个 body 字段**，本函数只写
+    // 一处：显式 `options.maxTokens` 优先（尊重调用方显式预算），否则用 Max 档的
+    // 输出默认 64K（{@link TRAE_CN_MAX_OUTPUT_TOKENS}，对齐上游 `TRAE_MAX_OUTPUT_TOKENS`）。
+    // 绝不写两处互相覆盖。
+    const output = options.maxTokens !== undefined
+      ? options.maxTokens
+      : TRAE_CN_MAX_OUTPUT_TOKENS
+    body.model_auto_selection = {
+      strategy: 'max',
+      fallback_to_advance_model: null,
+      entitlement_id: null,
+    }
+    body.model_selection_strategy = 'max'
+    body.mode_type = TRAE_CN_MAX_MODE_TYPE
+    body.context_window_size = maxMode.maxContextWindow
+    body.prompt_max_tokens = TRAE_CN_MAX_PROMPT_TOKENS
+    body.max_tokens = output
+  }
   return JSON.stringify(body)
 }
 

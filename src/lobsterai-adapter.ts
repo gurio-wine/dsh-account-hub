@@ -124,18 +124,19 @@ const LOBSTERAI_RATE_LIMIT_FALLBACK_MS = 3_600_000
 const LOBSTERAI_MAX_ROTATE = 3
 
 /**
- * 思考档位的展示名。
+ * 思考档位 wire 值 → 展示名。
  *
- * 与 `src/trae-cn-adapter.ts` 的 `effortDisplayName` 同约定（中英并列，
- * 让选择器在中文界面下也可读）；未登记的 id 回退为 id 本身，
- * 这样真机将来加档位时不会显示成空白。
- *
- * 真机当前只会出现 `high` / `max`（`max` 在出站时被上游映射成 `xhigh`，
- * 但**请求体里发的就是 `max`** —— 映射发生在服务端，插件照抄 `level`）。
+ * 键用 `openclawLevel`（发给服务端的 `reasoning_effort` 取值），**不是**
+ * 产品侧的 `level` —— 两者在 `max`/`xhigh` 上不同名（上游 commit 9669ee4
+ * 真机定案）。命名风格对齐 buddy 适配器。
  */
 const LOBSTERAI_EFFORT_NAMES: Readonly<Record<string, string>> = {
+  off: '关闭 Off',
+  minimal: '极低 Minimal',
+  low: '低 Low',
+  medium: '中 Medium',
   high: '高 High',
-  max: '最高 Max',
+  xhigh: '最高 XHigh',
 }
 
 /** 档位 id 的展示名；未登记的 id 回退为 id 本身。 */
@@ -181,32 +182,91 @@ interface LobsteraiCatalogEntry {
  *   {level:'high',openclawLevel:'high'},{level:'max',openclawLevel:'xhigh'}],
  *   defaultLevel:'high'}, requestCapabilities:['lobsterai-options-v1'], ...}`
  */
+/**
+ * 远端 `thinkingConfig.options[]` 中的一档。
+ *
+ * **两个字段语义不同，不可混用**（上游 commit 9669ee4 真机定案）：
+ * - `level`：**产品侧档位名**（`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`），
+ *   用于 UI 展示与 `defaultLevel` 引用；
+ * - `openclawLevel`：**发给服务端的 wire 值**（`off`/`minimal`/`low`/`medium`/`high`/`xhigh`
+ *   —— **没有 `max`**），即 `reasoning_effort` 的取值。
+ *
+ * 实测：远端把 `level: 'max'` 映射到 `openclawLevel: 'xhigh'`。直接发
+ * `reasoning_effort: 'max'`（level 值）与不带参数无差异（走服务端默认），
+ * 发 `'xhigh'` 才真正触发最高档 —— 因此**线路上必须用 `openclawLevel`**。
+ */
+export interface LobsteraiThinkingOption {
+  /** 产品侧档位名（`defaultLevel` 引用的是这个值）。 */
+  level: string
+  /** 发给服务端的 `reasoning_effort` 取值。 */
+  openclawLevel: string
+}
+
+/** 远端 `thinkingConfig`：可选档位与默认档位。 */
+export interface LobsteraiThinkingConfig {
+  options: readonly LobsteraiThinkingOption[]
+  /** 默认档位（产品侧 `level` 值，需再经 `options` 映射成 wire 值）。 */
+  defaultLevel: string
+}
+
+/** 产品侧思考档位名的合法取值（远端 `level` 字段）。 */
+const THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+/** wire 侧思考档位的合法取值（远端 `openclawLevel`，**无 `max`**）。 */
+const OPENCLAW_THINKING_LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+
+/**
+ * 解析 `thinkingConfig`；结构不符时返回 `undefined`（丢弃而非解析出半截数据）。
+ *
+ * 严格性对齐 IDE 的 `parseModelThinkingConfig`（`modelThinking.js`）：
+ * - `options` 必须是非空数组，每项都要有合法的 `level` 与 `openclawLevel`；
+ * - 两者的「是否 off」必须一致（避免 `off` 配一个非 off 的 wire 值）；
+ * - 不允许重复档位；
+ * - `defaultLevel` 必须存在且落在 `options` 里 —— 否则 DSH 会拿一个
+ *   不存在的档位去请求，比不声明更糟。
+ *
+ * 只有 `off` 一档时视为无档位可选（等价于不支持配置思考），返回 `undefined`。
+ */
+export function parseLobsteraiThinkingConfig(value: unknown): LobsteraiThinkingConfig | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const record = value as Record<string, unknown>
+  const rawOptions = record.options
+  if (!Array.isArray(rawOptions) || rawOptions.length === 0) return undefined
+
+  const options: LobsteraiThinkingOption[] = []
+  const seenLevels = new Set<string>()
+  const seenWireLevels = new Set<string>()
+  for (const raw of rawOptions) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+    const entry = raw as Record<string, unknown>
+    const level = typeof entry.level === 'string' ? entry.level : ''
+    const openclawLevel = typeof entry.openclawLevel === 'string' ? entry.openclawLevel : ''
+    if (!THINKING_LEVELS.has(level) || !OPENCLAW_THINKING_LEVELS.has(openclawLevel)) return undefined
+    if (seenLevels.has(level) || seenWireLevels.has(openclawLevel)) return undefined
+    if ((level === 'off') !== (openclawLevel === 'off')) return undefined
+    seenLevels.add(level)
+    seenWireLevels.add(openclawLevel)
+    options.push({ level, openclawLevel })
+  }
+  if (options.length === 1 && options[0]!.level === 'off') return undefined
+
+  const defaultLevel = typeof record.defaultLevel === 'string' ? record.defaultLevel : ''
+  if (!seenLevels.has(defaultLevel)) return undefined
+  return { options, defaultLevel }
+}
+
 export interface LobsteraiRemoteModel {
   id: string
   name: string
   /** 上下文窗口；真机为 `null` 或缺失时**不声明**（不编造）。 */
   contextWindow?: number
-  /** 可选思考档位（真机 `thinkingConfig.options[].level`，已剔除不可用的 `off`）。 */
+  /**
+   * 可选思考档位（**发给服务端的 wire 值**，由真机
+   * `thinkingConfig.options[].openclawLevel` 解析得到，`off` 保留）。
+   */
   reasoningEfforts?: readonly string[]
-  /** 默认档位（真机 `thinkingConfig.defaultLevel`）。 */
+  /** 默认档位（wire 值，由真机 `thinkingConfig.defaultLevel` 经 options 映射）。 */
   defaultReasoningEffort?: string
 }
-
-/**
- * 真机实测**会导致 HTTP 500** 的思考档位，解析时剔除。
- *
- * 真机 `thinkingConfig.options` 里含 `off`，但发 `reasoning_effort: "off"` 时：
- * `deepseek-flash` / `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp`
- * 返回 `HTTP 500 {"code":500,"message":"服务器内部错误"}`（3/3 复现），
- * 而 `glm-5.x` 系返回 200。**同一档位在不同模型上行为不一致**，且失败的三个
- * 恰好是默认档模型，用户一旦选择就必然拿到 500。
- *
- * 等价语义的关闭开关是 `none`（实测 200 且 `reasoningChars: 0`），
- * 但真机 `options` 里没有 `none`，故**不自行发明档位**（见任务约束「没观察到
- * 的东西不猜」）—— 只剔除已证实会炸的 `off`，把「关闭思考」留给
- * 不带档位的模型。这个白名单是**实测黑名单**，不是猜测。
- */
-export const LOBSTERAI_UNSAFE_REASONING_EFFORTS: readonly string[] = ['off']
 
 /**
  * 解析 `GET /api/models/available` 的响应。
@@ -240,10 +300,12 @@ export function parseLobsteraiModels(body: unknown): LobsteraiRemoteModel[] {
     if (contextWindow !== undefined && contextWindow > 0) model.contextWindow = contextWindow
     // 思考档位：真机权威来源。`supportsThinking:false` 时不声明。
     if (record.supportsThinking !== false) {
-      const { efforts, defaultEffort } = parseLobsteraiThinkingConfig(record.thinkingConfig)
-      if (efforts.length > 0) {
-        model.reasoningEfforts = efforts
-        if (defaultEffort !== undefined) model.defaultReasoningEffort = defaultEffort
+      const config = parseLobsteraiThinkingConfig(record.thinkingConfig)
+      if (config !== undefined) {
+        model.reasoningEfforts = config.options.map((o) => o.openclawLevel)
+        // 默认档位经 options 映射成 wire 值后才声明（必须落在 efforts 内）。
+        const defaultWire = config.options.find((o) => o.level === config.defaultLevel)?.openclawLevel
+        if (defaultWire !== undefined) model.defaultReasoningEffort = defaultWire
       }
     }
     models.push(model)
@@ -270,33 +332,6 @@ function readLobsteraiModelsArray(body: unknown): unknown[] | undefined {
     if (Array.isArray(nested)) return nested
   }
   return undefined
-}
-
-/**
- * 解析真机 `thinkingConfig` → 可用档位 + 默认档位。
- *
- * 档位 id **逐字符照抄**真机 `level`（它会原样进请求体，规整化会让上游认不出）。
- * 剔除 {@link LOBSTERAI_UNSAFE_REASONING_EFFORTS}；默认档若被剔除或不在可用集合内，
- * **不下发默认档**（否则 DSH 会把一个必然失败的档位 materialize 进每次请求）。
- */
-function parseLobsteraiThinkingConfig(
-  value: unknown,
-): { efforts: string[], defaultEffort?: string } {
-  if (typeof value !== 'object' || value === null) return { efforts: [] }
-  const record = value as Record<string, unknown>
-  const options = record.options
-  if (!Array.isArray(options)) return { efforts: [] }
-  const efforts: string[] = []
-  for (const option of options) {
-    if (typeof option !== 'object' || option === null) continue
-    const level = readStringField(option as Record<string, unknown>, 'level')
-    if (level.length === 0) continue
-    if (LOBSTERAI_UNSAFE_REASONING_EFFORTS.includes(level)) continue
-    if (!efforts.includes(level)) efforts.push(level)
-  }
-  const declaredDefault = readStringField(record, 'defaultLevel')
-  const defaultEffort = efforts.includes(declaredDefault) ? declaredDefault : undefined
-  return { efforts, defaultEffort }
 }
 
 /**
@@ -647,12 +682,15 @@ export class LobsteraiAdapter extends LlmAdapter {
     //
     // 早期版本注释写「刻意不声明，因为未实测」——**该结论已于 2026-09-19 被真机推翻**：
     // 远端 `thinkingConfig` 就是权威档位表，且实测 `reasoning_effort` 被服务端
-    // 真实消费（见 `LOBSTERAI_UNSAFE_REASONING_EFFORTS` 的说明）。
+    // 真实消费。档位 id 存的是 **wire 值 `openclawLevel`**（`off` 保留，`max`→
+    // `xhigh`，见 {@link parseLobsteraiThinkingConfig} 的说明 —— 上游 commit
+    // 9669ee4 真机定案）。
     // 无档位的模型（真机 19/27 项）保持不声明 —— 那是诚实的。
     const efforts = entry?.reasoningEfforts ?? []
     if (efforts.length > 0) {
       resolved.reasoning = {
-        // id **逐字符照抄**真机 level：它会原样进请求体，规整化会让上游认不出档位。
+        // id 就是发给服务端的 wire 值：DSH 会把它直接写进 `reasoning_effort`，
+        // 因此必须用 `openclawLevel` 而不是产品侧 `level`（规整化会让上游认不出）。
         efforts: efforts.map((id) => ({ id: ReasoningEffortId(id), name: effortDisplayName(id) })),
         ...entry?.defaultReasoningEffort !== undefined && efforts.includes(entry.defaultReasoningEffort)
           ? { defaultEffort: ReasoningEffortId(entry.defaultReasoningEffort) }
@@ -771,15 +809,22 @@ export class LobsteraiAdapter extends LlmAdapter {
     // 思考档位下发：字段名 `reasoning_effort`（**2026-09-19 真机定案**）。
     //
     // 证据链（三条独立互证）：
-    //   1. **服务端行为**：同一请求只改该字段的值，`bogus-xyz` 与 `off` 返回
-    //      HTTP 500、`none` 返回 200 且思考内容为空、`high`/`max` 返回 200 并
-    //      带 `reasoning_content` —— 若服务端不解析该字段，未知值不可能 500。
+    //   1. **服务端行为**：同一请求只改该字段的值，`bogus-xyz` 返回 HTTP 500、
+    //      `none` 返回 200 且思考内容为空、`high`/`xhigh` 返回 200 并带
+    //      `reasoning_content` —— 若服务端不解析该字段，未知值不可能 500。
+    //      **`off` 需要 Capabilities 头含 `thinking-level-control-v1`**（适配器
+    //      已发，见 {@link LOBSTERAI_CLIENT_CAPABILITIES}），只发
+    //      `kimi-k3-agentic-v1` 时 `off` 才是 500。
     //   2. **产品自身实现**：LobsterAI 桌面端 `app.asar` 内 openclaw 的
     //      `openai-completions` 传输层在 `supportsReasoningEffort` 时写
     //      `params.reasoning_effort = reasoningEffort`，取值经
     //      `reasoningEffortMap[level] ?? thinkingLevelMap[level] ?? level` 映射。
     //   3. **契约字段**：模型目录 `requestCapabilities: ['lobsterai-options-v1']`
     //      对应的 `lobsterai_options`（version 1）是另一套能力协商，**不**承载档位。
+    //
+    // **本适配器下发的是 wire 值 `openclawLevel`**（`off`/`high`/`xhigh` 等）：
+    // resolveModel() 已把档位 id 定为 wire 值，这里 `options.reasoningEffort`
+    // 就是 wire 值，直接原样透传。
     //
     // 只透传、**不补档**：buddy 那套「deepseek 系必须补档否则不思考」是针对腾讯
     // 后端的实测，LobsterAI 实测不带该字段时照样返回 `reasoning_content`

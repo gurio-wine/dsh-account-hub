@@ -391,7 +391,7 @@ describe('请求头构造', () => {
 
   it('对话头额外带 Capabilities 与动态版本号，Accept 为 SSE', () => {
     const headers = lobsteraiChatHeaders(makeCredential(), LOBSTERAI, TEST_VERSION)
-    expect(headers['X-LobsterAI-Client-Capabilities']).toBe('kimi-k3-agentic-v1')
+    expect(headers['X-LobsterAI-Client-Capabilities']).toBe(LOBSTERAI.clientCapabilities)
     expect(headers['X-LobsterAI-Client-Version']).toBe(TEST_VERSION)
     expect(headers.Accept).toBe('text/event-stream, application/json')
   })
@@ -405,7 +405,7 @@ describe('请求头构造', () => {
    */
   it('模型列表头带 Capabilities 与版本号，Accept 为 JSON', () => {
     const headers = lobsteraiModelsHeaders(makeCredential(), LOBSTERAI, TEST_VERSION)
-    expect(headers['X-LobsterAI-Client-Capabilities']).toBe('kimi-k3-agentic-v1')
+    expect(headers['X-LobsterAI-Client-Capabilities']).toBe(LOBSTERAI.clientCapabilities)
     expect(headers['X-LobsterAI-Client-Version']).toBe(TEST_VERSION)
     // 与对话头刻意不同：本端点是普通 JSON，不是 SSE。
     expect(headers.Accept).toBe('application/json')

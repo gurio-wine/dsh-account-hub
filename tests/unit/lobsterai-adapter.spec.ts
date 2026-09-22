@@ -101,7 +101,7 @@ describe('LobsterAI 模型列表解析', () => {
     })).toEqual([{ id: 'glm-5.2', name: 'GLM-5.2' }])
   })
 
-  it('解析 contextWindow 与 thinkingConfig（思考档的权威来源）', () => {
+  it('解析 contextWindow 与 thinkingConfig（思考档的权威来源，wire 值 openclawLevel）', () => {
     expect(parseLobsteraiModels({
       code: 0,
       data: [{
@@ -122,8 +122,10 @@ describe('LobsterAI 模型列表解析', () => {
       id: 'deepseek-flash',
       name: 'DeepSeek-V4.1-Flash',
       contextWindow: 1_000_000,
-      // `off` 被剔除：真机实测它在 3 个模型上返回 HTTP 500（见常量说明）。
-      reasoningEfforts: ['high', 'max'],
+      // wire 值：`level:'max'` → `openclawLevel:'xhigh'`；off 保留（Capabilities
+      // 头已含 thinking-level-control-v1，off 可用）。defaultLevel 经 options
+      // 映射成 wire 值 `high`。
+      reasoningEfforts: ['off', 'high', 'xhigh'],
       defaultReasoningEffort: 'high',
     }])
   })
@@ -141,24 +143,30 @@ describe('LobsterAI 模型列表解析', () => {
       code: 0,
       data: [
         { modelId: 'qwen3.8-max', modelName: 'Qwen3.8-Max' },
-        { modelId: 'x', modelName: 'X', supportsThinking: false, thinkingConfig: { options: [{ level: 'high' }], defaultLevel: 'high' } },
+        { modelId: 'x', modelName: 'X', supportsThinking: false, thinkingConfig: { options: [{ level: 'high', openclawLevel: 'high' }], defaultLevel: 'high' } },
       ],
     })
     expect(models[0]).not.toHaveProperty('reasoningEfforts')
     expect(models[1]).not.toHaveProperty('reasoningEfforts')
   })
 
-  it('默认档不在可用档位内时**不下发**默认档（避免 materialize 一个必然失败的档）', () => {
-    // 真机 glm 系 defaultLevel 若为被剔除的 off，必须整体丢掉默认档。
+  it('默认档不在可用档位内时**整体丢弃档位**（避免 materialize 一个必然失败的档）', () => {
+    // 新版解析是「全合法才收」：defaultLevel 不在 options 里时整包丢弃。
     const [model] = parseLobsteraiModels({
       code: 0,
       data: [{
         modelId: 'm', modelName: 'M',
-        thinkingConfig: { options: [{ level: 'off' }, { level: 'high' }], defaultLevel: 'off' },
+        thinkingConfig: {
+          options: [
+            { level: 'off', openclawLevel: 'off' },
+            { level: 'high', openclawLevel: 'high' },
+          ],
+          defaultLevel: 'ghost', // 不在 options 里的默认档 → 整体丢弃
+        },
       }],
     })
-    expect(model!.reasoningEfforts).toEqual(['high'])
-    expect(model).not.toHaveProperty('defaultReasoningEffort')
+    expect(model).toEqual({ id: 'm', name: 'M' })
+    expect(model).not.toHaveProperty('reasoningEfforts')
   })
 
   it('缺 modelName 时以 id 兜底', () => {
@@ -294,13 +302,14 @@ describe('LobsteraiAdapter resolveModel', () => {
     expect(resolved.context).toBeUndefined()
   })
 
-  it('**声明** reasoning（档位逐字符照抄真机 thinkingConfig.level）', async () => {
-    // 2026-09-19 真机取证推翻了早期「刻意不声明」的结论：
-    // 远端 thinkingConfig 就是权威档位表，且 reasoning_effort 被服务端真实消费。
+  it('**声明** reasoning（档位 id 是 wire 值 openclawLevel：off 保留、max→xhigh）', async () => {
+    // 2026-09-19 真机取证推翻了早期「刻意不声明」的结论：远端 thinkingConfig
+    // 就是权威档位表，且 reasoning_effort 被服务端真实消费。档位 id 为
+    // 发给服务端的 wire 值，`level:'max'` 映射成 `'xhigh'`（上游 commit 9669ee4）。
     const { adapter } = makeAdapter(() => textSse('x'))
     const resolved = await adapter.resolveModel('lobsterai', 'glm-5.2')
-    expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['high', 'max'])
-    expect(resolved.reasoning?.defaultEffort).toBe('max')
+    expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['off', 'high', 'xhigh'])
+    expect(resolved.reasoning?.defaultEffort).toBe('xhigh')
   })
 
   it('无档位模型不声明 reasoning（真机 19/27 项如此）', async () => {
@@ -329,7 +338,7 @@ describe('LobsteraiAdapter resolveModel', () => {
     const resolved = await adapter.resolveModel('lobsterai', 'glm-5.2')
     expect(resolved.name).toBe('远端名')
     expect(resolved.context).toEqual({ contextWindow: 1_000_000 })
-    expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['high', 'max'])
+    expect(resolved.reasoning?.efforts.map((e) => e.id)).toEqual(['off', 'high', 'xhigh'])
   })
 
   it('未知模型回退为 id 作展示名且不报错', async () => {
@@ -361,7 +370,8 @@ describe('LobsteraiAdapter 请求构造', () => {
     await collect(generateOptions(), adapter)
     const headers = calls[0]!.init?.headers as Headers
     expect(headers.get('Authorization')).toBe('Bearer AT')
-    expect(headers.get('X-LobsterAI-Client-Capabilities')).toBe('kimi-k3-agentic-v1')
+    expect(headers.get('X-LobsterAI-Client-Capabilities')).toBe(LOBSTERAI.clientCapabilities)
+    expect(headers.get('X-LobsterAI-Client-Capabilities')).toBe('kimi-k3-agentic-v1,thinking-level-control-v1')
     expect(headers.get('X-LobsterAI-Client-Version')).toBe(CLIENT_VERSION)
     expect(headers.get('User-Agent')).toBe('LobsterAI/0.1.0')
     for (const banned of ['X-Domain', 'X-Product', 'X-Product-Code', 'X-IDE-Name']) {
@@ -395,13 +405,14 @@ describe('LobsteraiAdapter 请求构造', () => {
     expect(body.reasoning_effort).toBe('high')
   })
 
-  it('档位 id 原样下发（`max` 不被改写成 openclaw 的 xhigh）', async () => {
-    // 真机目录的 level 是 `max`；映射成 xhigh 是**服务端**的事，
-    // 插件照抄 level，规整化会让上游认不出档位。
+  it('档位 id 原样下发，不做任何改写（wire 值由 resolveModel 提供）', async () => {
+    // `stream()` 只透传 `options.reasoningEffort` 到 `reasoning_effort`，
+    // 不做映射。wire 值（off/high/xhigh）已在 resolveModel() 阶段用
+    // openclawLevel 定好；这里锁死「stream 不越权改写」。
     const { adapter, calls } = makeAdapter(() => textSse('hi'))
-    await collect(generateOptions({ reasoningEffort: 'max' as never }), adapter)
+    await collect(generateOptions({ reasoningEffort: 'xhigh' as never }), adapter)
     const body = JSON.parse(String(calls[0]!.init?.body)) as Record<string, unknown>
-    expect(body.reasoning_effort).toBe('max')
+    expect(body.reasoning_effort).toBe('xhigh')
   })
 
   it('透传 temperature / maxTokens / stop', async () => {
