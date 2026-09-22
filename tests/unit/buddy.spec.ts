@@ -47,7 +47,7 @@ describe('buddy credential parsing', () => {
   it('parseTokenData 用 expiresIn 相对秒数换算绝对过期时间（e2e 实证格式）', () => {
     // 真实响应不含 expiresAt/refreshExpiresAt，只有 expiresIn/refreshExpiresIn。
     // JWT 的 iat=1789132433 / exp=1794316433 作为换算基准。
-    const accessToken = makeJwt({ iat: 1789132433, exp: 1794316433, nickname: 'Jet' })
+    const accessToken = makeJwt({ iat: 1789132433, exp: 1794316433, nickname: 'Hub' })
     const token = parseTokenData({
       accessToken,
       refreshToken: 'RT',
@@ -75,12 +75,12 @@ describe('buddy credential parsing', () => {
   })
 
   it('buildCredential 从 JWT 回填 nickname 与 user_id（login/account 常为空）', () => {
-    const accessToken = makeJwt({ sub: 'uid-from-jwt', nickname: 'Jet', preferred_username: '186' })
+    const accessToken = makeJwt({ sub: 'uid-from-jwt', nickname: 'Hub', preferred_username: '186' })
     const credential = buildCredential(
       parseTokenData({ accessToken, refreshToken: 'RT', expiresIn: 3600 }),
       parseAccountData({ uid: '', nickname: '', type: 'personal' }),
     )
-    expect(credential.nickname).toBe('Jet')
+    expect(credential.nickname).toBe('Hub')
     expect(credential.user_id).toBe('uid-from-jwt')
     // 落盘安全性：JSON 必须是单行（多行会被 YAML 当块标量破坏结构）
     expect(/[\r\n]/.test(JSON.stringify(credential))).toBe(false)

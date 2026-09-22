@@ -34,7 +34,7 @@ import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { registerAccountHubRpc } from '../../src/account-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { QoderAuth } from '../../src/qoder-auth.js'
 import { QODER, QODER_CN, type QoderCredential } from '../../src/qoder-product.js'
@@ -214,7 +214,7 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
     get: () => undefined,
   }
 
-  registerJetHubRpc(
+  registerAccountHubRpc(
     rpcCtx as never,
     pool,
     {} as never,
@@ -228,13 +228,13 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
   if (handler === undefined) throw new Error('Account Hub 端点未注册')
 
   const call = async <T>(method: string, payload: unknown): Promise<RpcResult<T>> => {
-    const response = await handler!(new Request('http://127.0.0.1/api/jet-hub', {
+    const response = await handler!(new Request('http://127.0.0.1/api/account-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         type: 'client-request',
         rpcId: 'rpc-1',
-        method: 'jet-hub',
+        method: 'account-hub',
         payload: { method, payload },
       }),
     }))
@@ -423,7 +423,7 @@ describe('两个 region 的账号池**互相看不见**（两批账号，不是�
     // 两个 region 是**两批账号**，故必须**不**映射。若有人照抄「共享账号池」的
     // 写法把 qoder-cn 映射过去，CN 面板会列出国际版的账号，而适配器会拿 CN 的
     // 池键去查 —— 两个方向都不报错。
-    const { poolProviderFor } = await import('../../src/jet-hub-rpc.js')
+    const { poolProviderFor } = await import('../../src/account-hub-rpc.js')
     expect(poolProviderFor('qoder-cn')).toBe('qoder-cn')
     expect(poolProviderFor('qoder')).toBe('qoder')
   })
@@ -730,7 +730,7 @@ describe('model.list / model.setDisabled / retestAll / resetAll 用 qoder-cn 键
         setModelDisabledCalls.push({ provider, modelId, disabled })
       },
     }
-    registerJetHubRpc(
+    registerAccountHubRpc(
       ctx as never, pool as never, {} as never, {} as never, {} as never,
       {} as never, {} as never, {} as never, {} as never,
     )
@@ -741,11 +741,11 @@ describe('model.list / model.setDisabled / retestAll / resetAll 用 qoder-cn 键
       listByProviderCalls,
       setModelDisabledCalls,
       call: async (method: string, payload: unknown) => {
-        const response = await handler!(new Request('http://127.0.0.1/api/jet-hub', {
+        const response = await handler!(new Request('http://127.0.0.1/api/account-hub', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
-            type: 'client-request', rpcId: 'r1', method: 'jet-hub', payload: { method, payload },
+            type: 'client-request', rpcId: 'r1', method: 'account-hub', payload: { method, payload },
           }),
         }))
         const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { message: string } } }
@@ -791,7 +791,7 @@ describe('model.list / model.setDisabled / retestAll / resetAll 用 qoder-cn 键
 
 describe('CN 的产品常量与账号 ref 前缀', () => {
   it('账号凭据 ref 前缀与 accountCredentialRefName 的机械派生一致', async () => {
-    const { accountCredentialRefName } = await import('../../src/jet-hub-rpc.js')
+    const { accountCredentialRefName } = await import('../../src/account-hub-rpc.js')
     // 带连字符的 provider id 会被 `toUpperCase().replace(/-/g,'_')` 归一化 ——
     // 两处漂移的后果是「凭据写到一个名字、读的时候找另一个名字」：账号建得出来，
     // 但下一次请求就报「请先登录」。

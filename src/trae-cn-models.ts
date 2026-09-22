@@ -235,7 +235,7 @@ export const TRAE_CN_INVISIBLE_MODEL_IDS: readonly string[] = [
  *
  * {@link isCustomTraeCnModel} 的接口是**目录条目**：它的主判据 `usage` 只有目录
  * 端点才发。而本函数服务于另一条链路 —— `model.list` 的**黑名单并集回填**
- * （见 `src/jet-hub-rpc.ts`）：那里的候选来自 `jet-hub.disabledModels` 的**键名**，
+ * （见 `src/account-hub-rpc.ts`）：那里的候选来自 `dsh_account_hub.disabledModels` 的**键名**，
  * 手上只有 id 字符串，没有任何目录字段。若照抄 entry 版本，`usage` 判据必然落空，
  * 只剩前缀兜底（对 custom 项尚可），而 invisible 项**根本没有形态判据可用**。
  *

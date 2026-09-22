@@ -71,7 +71,7 @@
 | 2 | LLM 适配器 | `src/qoder-adapter.ts`、`src/qoder-errors.ts` | OpenAI 同构透传 + 流式解析器（[DONE] 判据、流内 error、usage LF 兜底、tool_calls 聚合）+ 错误分类表 |
 | 3 | 模型目录 | `src/qoder-models.ts` | 动态目录（PAT 直连）+ 静态兜底（含 lite）+ efforts 档位接线 |
 | 4 | 额度余额 | `src/qoder-credits.ts` | 三池容缺解析（userQuota 必有；addOnQuota/orgResourcePackage 可选；主池尽但包有余=未耗尽）；`roundCredits` |
-| 5 | Hub 面板 | `plugin-src/client/jet-hub.js`、`credits-capabilities.js` | PROVIDERS 第七条 + 能力矩阵 `balance:true, dailyCheckin:false` + **PAT 粘贴表单**（新形态，替代浏览器登录按钮） |
+| 5 | Hub 面板 | `plugin-src/client/account-hub.js`、`credits-capabilities.js` | PROVIDERS 第七条 + 能力矩阵 `balance:true, dailyCheckin:false` + **PAT 粘贴表单**（新形态，替代浏览器登录按钮） |
 | 6 | 测试接线 + 收尾 | `src/index.ts`、`tests/unit/*`、`README.md` | `ctx.llm.registerProvider` 注册、`makeCredentialResolver`/`makeAccountPicker` 接线、单测全绿、`pnpm build:all`、README 章节 |
 
 ## 2. 关键设计决策
@@ -217,7 +217,7 @@ provider（同一批 `TRAE_CN_ACCOUNT_*`、同一份凭据、`poolProviderFor()`
 | 段 | 范围 | 提交 |
 |---|---|---|
 | A | 产品配置 + 协议字段参数化（`QODER_CN`、`clientType` / `cosyVersion`） | `221d309` |
-| B | 宿主接线（`src/index.ts` 注册第二个 `QoderAuth` 实例与适配器；`jet-hub-rpc.ts` 的 `account.create` / `credits.balances` / `account.refresh` 三分支 + `qoderRegionFor()`；`credits.status` / `claimAll` 结构性拒绝） | `88ad3d2` |
+| B | 宿主接线（`src/index.ts` 注册第二个 `QoderAuth` 实例与适配器；`account-hub-rpc.ts` 的 `account.create` / `credits.balances` / `account.refresh` 三分支 + `qoderRegionFor()`；`credits.status` / `claimAll` 结构性拒绝） | `88ad3d2` |
 | C | 客户端面板 + 文档收尾（`PROVIDERS` 第八条 —— 当时 TraeWork 路径尚在、共 8 条，现为 7 条；能力矩阵行、测试与 README/AGENTS 同步） | `本次提交` |
 
 ### 验收状态（按 region 分开看，不要合并叙述）

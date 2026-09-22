@@ -19,10 +19,10 @@
  * react 不在本仓库依赖里，`ProviderPanel` 用了 hooks 渲染不了。但本次要证明的
  * 恰好是**条件分支的输出差异**（有失败明细 / 没有），正则断言只能证明「提到过
  * 某个名字」，证明不了分支正确。故沿用
- * `tests/unit/jet-hub-credit-balance-row.spec.ts` 的办法：把 `react` 换成把参数
+ * `tests/unit/account-hub-credit-balance-row.spec.ts` 的办法：把 `react` 换成把参数
  * 收成普通对象的占位模块后加载插件源码，直接调用纯函数组件。
  *
- * 为此 `jet-hub.js` 里把提示抽成了 `ClaimNotice` 组件与 `buildClaimNotice`
+ * 为此 `account-hub.js` 里把提示抽成了 `ClaimNotice` 组件与 `buildClaimNotice`
  * 纯函数（原先是内联在 `ProviderPanel` 的 setState 里），两个都不消费 hook。
  */
 
@@ -53,7 +53,7 @@ exports.supportsDailyCheckin = function () { return true };
 
 /**
  * 插件源码是纯 ESM；这里把它的两条 import 与 export 改写成 CJS 形态后加载。
- * 改写逐条断言命中 —— 若 `jet-hub.js` 的 import 形态变了要**立刻报错**，
+ * 改写逐条断言命中 —— 若 `account-hub.js` 的 import 形态变了要**立刻报错**，
  * 而不是静默加载出一个缺模块的半成品（那种失败会伪装成「组件返回 undefined」）。
  */
 const IMPORT_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
@@ -68,7 +68,7 @@ function toCjs(source: string): string {
   let out = source
   for (const [pattern, replacement] of IMPORT_REWRITES) {
     if (!pattern.test(out)) {
-      throw new Error(`jet-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
+      throw new Error(`account-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
     }
     out = out.replace(pattern, replacement)
   }
@@ -81,18 +81,18 @@ function toCjs(source: string): string {
 }
 
 function loadClientModule(): Record<string, unknown> {
-  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8'))
+  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8'))
 
-  const dir = mkdtempSync(join(tmpdir(), 'jet-hub-claim-'))
+  const dir = mkdtempSync(join(tmpdir(), 'account-hub-claim-'))
   mkdirSync(join(dir, 'node_modules', 'react'), { recursive: true })
   writeFileSync(join(dir, 'node_modules', 'react', 'package.json'),
     JSON.stringify({ name: 'react', version: '0.0.0-stub', main: 'index.js' }))
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
-  writeFileSync(join(dir, 'jet-hub.js'), cjs)
+  writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
-  const loaded = requireFromTemp(join(dir, 'jet-hub.js')) as { __testExports: Record<string, unknown> }
+  const loaded = requireFromTemp(join(dir, 'account-hub.js')) as { __testExports: Record<string, unknown> }
   tempDir = dir
   return loaded.__testExports
 }
@@ -209,7 +209,7 @@ describe('失败账号的服务端原文必须出现在渲染树里（本次修�
       summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 2 },
     })
 
-    expect(tree.children[1]).toMatchObject({ type: 'ul', props: { className: 'dim-jh-probeDetails' } })
+    expect(tree.children[1]).toMatchObject({ type: 'ul', props: { className: 'dim-ah-probeDetails' } })
     const items = childrenOf(tree.children[1] as TreeNode)
     expect(items).toHaveLength(2)
     expect(textOf(items[0]!)).toEqual(['账号一：当前参与用户太多，请稍后再试（code 9074）'])
@@ -345,7 +345,7 @@ describe('成功路径的渲染逐元素不变（纯增量护栏）', () => {
     // 任何意外新增的节点、类名或 role 变化都会让这条断言失败。
     expect(snapshot(render(allClaimedResponse()))).toEqual({
       type: 'div',
-      className: 'dim-jh-probeNotice',
+      className: 'dim-ah-probeNotice',
       tone: 'ok',
       role: 'status',
       children: [
@@ -375,7 +375,7 @@ describe('成功路径的渲染逐元素不变（纯增量护栏）', () => {
       summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0 },
     }))).toEqual({
       type: 'div',
-      className: 'dim-jh-probeNotice',
+      className: 'dim-ah-probeNotice',
       tone: 'ok',
       role: 'status',
       children: [

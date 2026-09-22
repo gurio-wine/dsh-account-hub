@@ -2898,7 +2898,7 @@ describe('registerTraeCnLlm', () => {
     }])
     expect(adapters).toEqual(['trae-cn'])
     // 返回值是**刚注册的那个适配器实例**：`src/index.ts` 把它转交给
-    // `registerJetHubRpc`（Account Hub 的窗口档位只能由目录持有者回答）。
+    // `registerAccountHubRpc`（Account Hub 的窗口档位只能由目录持有者回答）。
     // 返回 undefined 会让 `model.list` 永远没有档位列、`model.setContextBudget` 恒拒绝。
     expect(adapter).toBeInstanceOf(TraeCnAdapter)
     expect(typeof adapter.contextTiers).toBe('function')

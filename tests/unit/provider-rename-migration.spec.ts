@@ -23,7 +23,7 @@
 
 import { describe, expect, it, beforeEach } from 'vitest'
 import type { Context } from '@deepseek-ai/cordis'
-import { AccountPool, JET_HUB_SCHEMA_VERSION } from '../../src/account-pool.js'
+import { AccountPool, ACCOUNT_HUB_SCHEMA_VERSION } from '../../src/account-pool.js'
 import {
   PROVIDER_RENAME_MAP,
   migrateProviderNames,
@@ -205,7 +205,7 @@ describe('migrateProviderNames —— 完整迁移', () => {
     expect(h.credentials.get('BUDDY_CN_ACCOUNT_7B0C71B1')).toBe('{"access_token":"CN"}')
     expect(h.credentials.get('BUDDY_ACCOUNT_208D9DB2')).toBe('{"access_token":"INTL"}')
     // 版本号已落盘。
-    expect(h.stored().schemaVersion).toBe(JET_HUB_SCHEMA_VERSION)
+    expect(h.stored().schemaVersion).toBe(ACCOUNT_HUB_SCHEMA_VERSION)
   })
 
   it('单凭据 ref 一起迁移（BUDDY_ACCESS_TOKEN→BUDDY_CN_ACCESS_TOKEN、WORKBUDDY_ACCESS_TOKEN→BUDDY_ACCESS_TOKEN）', async () => {
@@ -396,7 +396,7 @@ describe('migrateProviderNames —— 幂等与 short-circuit', () => {
     const h = makeHarness({
       accounts: [makeEntry({ id: 'buddy-cn-a', provider: 'buddy', credentialRef: 'BUDDY_ACCOUNT_X' })],
       credentials: { BUDDY_ACCOUNT_X: 'CN' },
-      schemaVersion: JET_HUB_SCHEMA_VERSION,
+      schemaVersion: ACCOUNT_HUB_SCHEMA_VERSION,
     })
     const pool = makePool(h.ctx)
 
@@ -442,7 +442,7 @@ describe('migrateProviderNames —— 幂等与 short-circuit', () => {
     expect(report.shortCircuited).toBe(false)
     expect(report.wrote).toBe(true)
     expect(report.accountsRenamed).toBe(0)
-    expect(h.stored().schemaVersion).toBe(JET_HUB_SCHEMA_VERSION)
+    expect(h.stored().schemaVersion).toBe(ACCOUNT_HUB_SCHEMA_VERSION)
   })
 
   it('中断重入：只搬完中国版就中断，重跑能补完国际版且数据无损', async () => {
@@ -599,31 +599,31 @@ describe('迁移与存储契约', () => {
     // `contextBudgets`（Trae CN 的 dev / Max 档位）**不是迁移对象**，但同属这个
     // namespace，故必须原样随写带上 —— 漏带会让改名迁移顺手清空用户的档位选择。
     expect(Object.keys(payload).sort()).toEqual(['accounts', 'contextBudgets', 'disabledModels', 'schemaVersion'])
-    expect(payload.schemaVersion).toBe(JET_HUB_SCHEMA_VERSION)
+    expect(payload.schemaVersion).toBe(ACCOUNT_HUB_SCHEMA_VERSION)
   })
 
   it('写账号不会把版本号重置为 0（否则迁移每次启动都重跑）', async () => {
     const h = makeHarness({
       accounts: [],
       credentials: {},
-      schemaVersion: JET_HUB_SCHEMA_VERSION,
+      schemaVersion: ACCOUNT_HUB_SCHEMA_VERSION,
     })
     const pool = makePool(h.ctx)
 
     await pool.addAccount(makeEntry({ id: 'buddy-cn-new', provider: 'buddy-cn' }))
 
-    expect(h.stored().schemaVersion).toBe(JET_HUB_SCHEMA_VERSION)
+    expect(h.stored().schemaVersion).toBe(ACCOUNT_HUB_SCHEMA_VERSION)
     expect((h.stored().accounts as ProviderAccountEntry[])).toHaveLength(1)
   })
 
   it('写黑名单不会把版本号重置为 0', async () => {
-    const h = makeHarness({ accounts: [], schemaVersion: JET_HUB_SCHEMA_VERSION })
+    const h = makeHarness({ accounts: [], schemaVersion: ACCOUNT_HUB_SCHEMA_VERSION })
     const pool = makePool(h.ctx)
 
     await pool.setModelDisabled('buddy-cn', 'glm-5.2', true)
 
-    expect(h.stored().schemaVersion).toBe(JET_HUB_SCHEMA_VERSION)
-    expect(pool.schemaVersion).toBe(JET_HUB_SCHEMA_VERSION)
+    expect(h.stored().schemaVersion).toBe(ACCOUNT_HUB_SCHEMA_VERSION)
+    expect(pool.schemaVersion).toBe(ACCOUNT_HUB_SCHEMA_VERSION)
   })
 
   it('pool.allDisabledModels() 返回浅拷贝（改它不影响池内副本）', async () => {

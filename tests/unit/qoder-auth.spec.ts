@@ -144,7 +144,7 @@ describe('QoderAuth 注册与基本信息', () => {
     expect(QODER.defaultCredentialRef).toBe('QODER_PERSONAL_TOKEN')
   })
 
-  it('账号池 ref 前缀为 QODER_ACCOUNT（与 jet-hub-rpc 的机械派生同值）', () => {
+  it('账号池 ref 前缀为 QODER_ACCOUNT（与 account-hub-rpc 的机械派生同值）', () => {
     // 无连字符的 provider：`provider.toUpperCase() + '_ACCOUNT_'` 与本前缀
     // 必须逐字符一致，否则账号卡片的凭据会落在另一个前缀下。
     expect(QODER.accountCredentialRefPrefix).toBe('QODER_ACCOUNT')

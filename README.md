@@ -79,7 +79,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 > `prepare` 脚本，因此必须先手动执行 `pnpm build:all` 生成 `lib/`，否则 dsh 启动时
 > 报 `ERR_MODULE_NOT_FOUND: ... dsh-account-hub/lib/index.js`。
 > 注意必须用 `build:all` 而非 `build`：后者只编译宿主侧，不产出
-> `lib/client/jet-hub.js`。
+> `lib/client/account-hub.js`。
 
 每次修改 `src/` 或 `plugin-src/` 后都需要重新执行 `pnpm build:all`——dsh 启动时
 不会自动重建。
@@ -152,7 +152,7 @@ settings 写入目标是 profile 的 `cordis.patch.yml`（配置）。storage �
 的极简子集解析器只取目标一节（其余 section 连碰都不碰）；不支持的构造（锚点、别名、
 块标量）**显式抛错而不是猜** —— 迁移面对的是用户唯一的账号数据。
 
-> ⚠️ `'jet-hub'` 这个字面量仍然存在（`AccountPool.JET_HUB_NS`），但它的角色**只剩两件**：
+> ⚠️ `'jet-hub'` 这个字面量仍然存在（`AccountPool.ACCOUNT_HUB_NS`），但它的角色**只剩两件**：
 > ① 回退路径继续读写它；② 迁移模块用它定位旧数据。**新写入一律走 storage**，
 > 别按旧 namespace 命名新存储位置。
 
@@ -173,7 +173,8 @@ settings 写入目标是 profile 的 `cordis.patch.yml`（配置）。storage �
 **两个腾讯系产品的 id 互换**，所以升级时数据必须跟着搬。插件启动时自动执行
 一次性迁移（`src/provider-rename-migration.ts`），覆盖三处持久化数据：
 
-- 账号条目的 `provider` / `credentialRef` / `id`（`settings.yaml` 的 `jet-hub` 命名空间）；
+- 账号条目的 `provider` / `credentialRef` / `id`（账号池持久层：storage 域 `dsh_account_hub`
+  为主，旧 `settings.yaml` 的 `jet-hub` 命名空间仅作回退路径）；
 - `disabledModels` 模型开关的 provider 键；
 - 凭据 ref 名（`.credentials.yaml`）：`BUDDY_*` → `BUDDY_CN_*`，
   `WORKBUDDY_*` → `BUDDY_*`。
@@ -235,7 +236,7 @@ CodeBuddy 系（现 Buddy 系）、LobsterAI 完全一致（见 [AGENTS.md](AGEN
    避免留下无凭据的幽灵账号。
 3. **轮询结算**：客户端每秒调 `login.poll`，宿主按 `accountId` 回
    `{done, error?}`。**失败是终态**：第二段失败时先登记失败原因、再删占位
-   （`jet-hub-rpc.ts` 的 `loginFailures` 表），poll 回 `{done:true, error}`
+   （`account-hub-rpc.ts` 的 `loginFailures` 表），poll 回 `{done:true, error}`
    并**读到即清**；成功仍是 `{done:true, success:true}`，未完成是
    `{done:false}`。三者严格区分 —— 否则「失败」会退化成「永远未完成」，
    客户端白等 5 分钟且窗口不收（用户报障的残留标签页）。
@@ -250,13 +251,13 @@ CodeBuddy 系（现 Buddy 系）、LobsterAI 完全一致（见 [AGENTS.md](AGEN
 
 - **provider 级互斥**：同一时间只允许一个进行中的 Codearts 登录会话，重复点击返回
   `{ok:false, error:'login-in-progress'}`（判别联合，**不抛异常** —— 抛异常会被 RPC
-  统一包装成 `jet-hub/handler-failed`，客户端就拿不到可判别的错误码）。
+  统一包装成 `account-hub/handler-failed`，客户端就拿不到可判别的错误码）。
   不复用旧会话（会让一份凭据被多个占位 accountId 共享），也不静默新建
   （每次点击都会堆一个 loopback 端口到 180 秒超时）。互斥采用**同步占位**
   （`'preparing'` 槽位）：判空与 listen 之间隔着 `generateDpopKeyPair()` 等 await，
   若只在 listen 成功后才登记，并发连发会全部通过判空、各起一个监听；
   listen 失败会**归还槽位**，否则此后所有登录都会被永久挡住。
-- **`account.delete` 会 cancel 对应会话**（`jet-hub-rpc.ts` 的
+- **`account.delete` 会 cancel 对应会话**（`account-hub-rpc.ts` 的
   `pendingCodeartsLogins` 登记表）：否则旧会话会一直占着回调端口到超时，
   用户删掉占位账号后重新登录会一直拿到 `login-in-progress`。
 - `login()` 保留为**阻塞式便捷封装**（`prepare` + `awaitCredential` 的串联），
@@ -345,7 +346,7 @@ Tokens 福利）。
 - `pnpm build` — 用 tsc 将 `src/` 编译到 `lib/`（生成 `.js`、`.d.ts` 和 source
   map）。插件**宿主侧**入口是 `lib/index.js`。
 - `pnpm build:client` — 用 esbuild 将 `plugin-src/client/` 打包为
-  `lib/client/jet-hub.js`（Account Hub 设置页的客户端 bundle，由 `exports["./client"]`
+  `lib/client/account-hub.js`（Account Hub 设置页的客户端 bundle，由 `exports["./client"]`
   引用）。它**不在** `tsc` 的编译范围内，必须单独构建。
 - `pnpm build:all` — 依次执行上面两步（`build` + `build:client`），是完整的构建。
 - `pnpm typecheck` — 只做类型检查（`tsc --noEmit`），不产出文件，可在构建前快速
@@ -506,10 +507,10 @@ Account Hub（设置页）的账号面板按 provider 分组展示，Buddy 是�
   只操作 `provider: 'buddy'` 的账号。
 - 账号卡片展示 credentialRef、有效期（含「自动续期」标记）、限流状态与**积分
   余额**（见下节）。「一键领取积分」按钮**仅 Buddy CN 面板提供**，结果来自
-  RPC 端点 `credits.claimAll`（实现见 `src/jet-hub-rpc.ts`，签到客户端见
+  RPC 端点 `credits.claimAll`（实现见 `src/account-hub-rpc.ts`，签到客户端见
   `src/credits.ts`）。
 - 后端另实现了 `credits.status`（查询某 provider 下全部启用账号的签到状态），
-  但**前端尚无消费者**：`plugin-src/client/jet-hub.js` 只调用 `credits.claimAll`，
+  但**前端尚无消费者**：`plugin-src/client/account-hub.js` 只调用 `credits.claimAll`，
   `credits.status` 目前仅供外部脚本或直接 RPC 调用使用。
 - 对应 LLM provider 的设置命名空间为 `llm-buddy`（Buddy CN 是 `llm-buddy-cn`，
   两者由 `llm-${product.id}` 派生）。
@@ -523,8 +524,9 @@ Account Hub 面板标题栏的「**显示列表**」按钮展开该 provider 的
 模型）一律默认显示。这与白名单制的关键差别在于——新模型上线时无需任何配置就会
 自动出现在选择器里，不会被静默挡在门外。
 
-- 开关状态持久化在 `jet-hub` settings 命名空间的 `disabledModels` 字段
-  （形如 `{ 'buddy-cn': { 'glm-5.2': true } }`），与账号池同处一个 namespace。
+- 开关状态持久化在同一份账号池文档的 `disabledModels` 字段（storage 域
+  `dsh_account_hub`；旧 settings 的 `jet-hub` namespace 仅作回退路径）
+  （形如 `{ 'buddy-cn': { 'glm-5.2': true } }`），与账号池同处一个文档。
 - 模型列表来自 `ctx.llm.listModels()`，**即对话框模型选择器读取的同一份目录**
   （会话控制器的 `buildModelCatalog`），因此设置页展示的模型与实际可选集合始终
   一致，不会出现「设置里有、选择器里没有」的错位。
@@ -539,13 +541,13 @@ Account Hub 面板标题栏的「**显示列表**」按钮展开该 provider 的
   Qoder / Qoder CN **七份黑名单互不影响**。改名迁移会把这七份的 provider 键
   一并搬到新命名，见「provider 改名与数据迁移」。
 - 相关 RPC 端点：`model.list`（列出模型并回填 `disabled`）、`model.setDisabled`
-  （打开/关闭单个模型），实现见 `src/jet-hub-rpc.ts`。
+  （打开/关闭单个模型），实现见 `src/account-hub-rpc.ts`。
 
 #### 显示列表的回填机制与过滤
 
 「显示列表」弹窗的模型集合**不只是**适配器播报的那份目录，而是
 `llm.listModels()` **并上**黑名单里的历史键 —— 由 `model.list` 端点完成（见
-`src/jet-hub-rpc.ts`）。这套「并集回填」有两个方向都必须正确：
+`src/account-hub-rpc.ts`）。这套「并集回填」有两个方向都必须正确：
 
 **为什么要回填。** 适配器的 `listModels` 会实时剔除黑名单命中的模型，因此
 `llm.listModels()` 的结果里**没有**被关闭的模型。若设置页直接用它渲染，被关掉的
@@ -586,12 +588,12 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
 也正是那份目录，所以关闭状态下改档本就该生效。早前只在 `models.map(...)` 那一支加
 窗口字段，回填行（恰恰就是被关闭的那些）一条都不带 ⇒ 用户报障「**为什么只有开启后
 才能选上下文**」：关掉模型想顺手改档时，档位列整个消失。**两个方向都不报错**，
-只能靠断言钉死 —— 见 `tests/unit/jet-hub-rpc.spec.ts` 的「被关闭的模型（回填行）
+只能靠断言钉死 —— 见 `tests/unit/account-hub-rpc.spec.ts` 的「被关闭的模型（回填行）
 照样带窗口档位」与「关闭状态下设置档位照常生效」两条。
 
 相关常量与判据集中在 `src/trae-cn-models.ts`
 （`TRAE_CN_INVISIBLE_MODEL_IDS` / `isTraeCnJunkModelId`），测试见
-`tests/unit/jet-hub-rpc.spec.ts` 的「黑名单并集：垃圾键不回填」与
+`tests/unit/account-hub-rpc.spec.ts` 的「黑名单并集：垃圾键不回填」与
 `tests/unit/trae-cn-adapter.spec.ts` 的「垃圾 id 判定」两组。
 
 ### 积分余额（Credits Balance）
@@ -628,7 +630,7 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
   而**Trae CN 面板只显示通用池**（本插件走的 IDE 对话消耗的就是它，
   也就是该 provider 实际能花的钱；Work 池只有 TraeWork 网页/桌面版能花，本插件已无那条路径）
   —— 显示的是**单数字**，界面上不出现「通用」「Work」字样，资源包列表也
-  只含本池的包。选池在 `src/jet-hub-rpc.ts` 的 `credits.balances` trae-cn 分支里
+  只含本池的包。选池在 `src/account-hub-rpc.ts` 的 `credits.balances` trae-cn 分支里
   **内联 `TRAE_CN_POOL_UNIVERSAL`**（历史上有过一层「面板 → 显示池」的映射函数，
   已随 TraeWork 路径一并删除；`TRAE_CN_POOL_WORK` 常量本身仍保留）。
   **不要**用 `ug/activity/info` 的活动口径：实测它写「200 work 积分」而实际到账
@@ -666,17 +668,17 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
 PAT」），而「三池全为 0」是一个**成功的查询结果**（`total: 0`），不是失败。
 
 > **Trae CN 的前端已登记。** 三个积分端点的 provider 分发在
-> `src/trae-cn-credits.ts` + `src/jet-hub-rpc.ts`，客户端一侧两件事都已落地：
+> `src/trae-cn-credits.ts` + `src/account-hub-rpc.ts`，客户端一侧两件事都已落地：
 > 1. `plugin-src/client/credits-capabilities.js` 登记了 `trae-cn`（`balance` ✓、
 >    `dailyCheckin` ✓），`PROVIDERS` 同步加入该 tab —— 面板因此显示「积分」行、
 >    「刷新积分」与「一键领取积分」按钮；
 > 2. `CreditBalanceRow` 只渲染**一个数字**加本池的资源包明细。它不做任何池判断
 >    —— 「显示哪个池」的决定全在宿主侧，组件的输入与其余 provider 逐字段同构，
->    由 `tests/unit/jet-hub-credit-balance-row.spec.ts` 用整树深比较守住（含
+>    由 `tests/unit/account-hub-credit-balance-row.spec.ts` 用整树深比较守住（含
 >    「喂进旧的双池字段也不多渲染一段」）。
 >
 > ✅ 宿主侧接线已完成（`47f253f`）：`account.create` / `account.refresh` /
-> `account-probe.ts` 三处的 `trae-cn` 分支与 `registerJetHubRpc` 的 `traeCn`
+> `account-probe.ts` 三处的 `trae-cn` 分支与 `registerAccountHubRpc` 的 `traeCn`
 > 实例均已就位，Trae CN 面板可以新建账号、刷新凭据与重测限流标记。
 
 **CodeArts 不支持**：它是华为云账号体系，没有上述任何一条计费接口。因此 CodeArts
@@ -891,7 +893,7 @@ chat 侧（`traeCnSoloHeaders`）**继续用它，一行未动**。
 |---|---|---|
 | 1. 类型 | `src/credits.ts` | `ClaimOutcome` 失败分支新增**可选**字段 `logid?: string` |
 | 2. 宿主 | `src/trae-cn-credits.ts` | `postJson` 读响应头 `x-tt-logid`（大小写不敏感、trim、空白视为没有），失败路径一路带到 `outcome.logid` |
-| 3. 前端 | `plugin-src/client/jet-hub.js` | `formatClaimFailureLine` 在 logid 非空时追加 ` · logid <值>` |
+| 3. 前端 | `plugin-src/client/account-hub.js` | `formatClaimFailureLine` 在 logid 非空时追加 ` · logid <值>` |
 
 几个刻意的取舍：
 
@@ -1747,7 +1749,7 @@ Trae 客户端自己的 `168K` 都这么写），用 1024 进制缩写反而会�
 ### 签到与积分余额
 
 实现是独立一套 `src/trae-cn-credits.ts`（协议与 Buddy 系、LobsterAI 都不同），
-三个 RPC 端点在同一处按 provider 分发（`src/jet-hub-rpc.ts`）。
+三个 RPC 端点在同一处按 provider 分发（`src/account-hub-rpc.ts`）。
 
 **端点与请求体**（host `https://api.trae.cn`，鉴权 `Cloud-IDE-JWT`）：
 
@@ -1872,7 +1874,7 @@ x-app-version: 3.3.102
 > provider 逐字段同构）。历史上那套「双池超集 + `workTotal` 两段渲染」已随分池
 > 一并删除 —— 同一处显示两个池时，永远有一段是那个面板花不掉的；合并的前提
 > 消失后，「绝不把两池相加」这条提醒也就不再有对象。
-> `tests/unit/jet-hub-credit-balance-row.spec.ts` 用整树深比较守住，含「喂进旧的
+> `tests/unit/account-hub-credit-balance-row.spec.ts` 用整树深比较守住，含「喂进旧的
 > 双池字段也不多渲染一段」。改动前端后必须 `pnpm build:all` 重建客户端 bundle。
 
 **判定一律以 body `code` 为准，不看 HTTP 状态**（对齐 Buddy 系既有约定）：
@@ -1923,7 +1925,7 @@ CN 的地方外，两个 region 行为一致。
   实现（**同一套流程、零分叉**，只有域名与 `machine_id` 目录不同）。
   > ⚠️ **PAT 粘贴形态已于 2026-09-21 从 UI 移除**（用户要求「不要 pat 登录，
   > 只要浏览器登录」）：客户端不再有 PAT 表单与形态选择器。**库层与协议层保留** ——
-  > `src/qoder-auth.ts` 的 `loginWithPat`、`src/jet-hub-rpc.ts` 对
+  > `src/qoder-auth.ts` 的 `loginWithPat`、`src/account-hub-rpc.ts` 对
   > `account.create` 载荷里 `pat` 的分派一行未动，服务 headless / 测试 / 未来形态。
 - **凭据只有一件长效物**（令牌），PAT 路径换来的 job token 是**进程内运行时
   缓存**、**不落盘**；设备流路径连 job token 都不需要（`dt-` 直接当 Bearer）。

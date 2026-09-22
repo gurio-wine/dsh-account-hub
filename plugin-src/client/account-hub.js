@@ -2,7 +2,7 @@ import * as React from 'react';
 
 import { supportsCreditBalance, supportsDailyCheckin } from './credits-capabilities.js';
 
-export const JET_HUB_RPC_CHANNEL = '/jet-hub';
+export const ACCOUNT_HUB_RPC_CHANNEL = '/account-hub';
 
 // 内联图标 base64
 const CODEARTS_ICON = 'data:image/png;base64,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'
@@ -14,7 +14,7 @@ const BUDDY_ICON = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEgAAABICAYAAA
  *
  * 用 SVG 而非 base64 PNG：现有三个图标是逆向客户端资源得到的 PNG，
  * 而 LobsterAI 没有可取的官方小图标 —— 内联 SVG 体积小、无色差，
- * 且在 `jet-hub-styles.js` 的 `.dim-jh-providerIcon` 白底容器里显示清晰。
+ * 且在 `account-hub-styles.js` 的 `.dim-ah-providerIcon` 白底容器里显示清晰。
  *
  * 内容是**预先算好的 base64 字面量**，不用 `btoa()` 运行时拼接：
  * 该 bundle 由 esbuild 打包，目标环境未必提供 `btoa`（Node 有、但
@@ -95,10 +95,10 @@ const PROVIDERS = Object.freeze([
  *
  * ⚠️ **删的是 UI 入口，不是能力**：`src/qoder-auth.ts` 的 `login({ pat })` /
  * `loginWithPat` 一行未动（库层能力，与设备流共用写凭据逻辑），宿主
- * `src/jet-hub-rpc.ts` 对 `account.create` 的 `hasPat` 分派也保留 ——
+ * `src/account-hub-rpc.ts` 对 `account.create` 的 `hasPat` 分派也保留 ——
  * 那两处服务的是 headless / 测试 / 未来形态，不是本文件的死代码。
  *
- * 样式表里只服务这个表单的 `.dim-jh-pat*` 规则一并删除（留着就是死类）。
+ * 样式表里只服务这个表单的 `.dim-ah-pat*` 规则一并删除（留着就是死类）。
  */
 /**
  * 积分能力判定见 `./credits-capabilities.js`。
@@ -136,7 +136,7 @@ const LOGIN_WINDOW_FEATURES = 'width=800,height=600,resizable=yes,scrollbars=yes
 function ProviderLogo({ provider }) {
   const p = PROVIDERS.find(p => p.id === provider);
   if (!p) return null;
-  return React.createElement('span', { className: `dim-jh-providerIcon ${p.logoClass}` },
+  return React.createElement('span', { className: `dim-ah-providerIcon ${p.logoClass}` },
     React.createElement('img', { src: p.icon, alt: '', width: 20, height: 20 })
   );
 }
@@ -298,18 +298,18 @@ function buildClaimNotice(res) {
 /**
  * 领取结果的提示块：摘要行（`text`）+ 失败账号明细列表（`details`）。
  *
- * 形状与上方「重测 / 重置」的 `probeNotice` 完全一致（同 `.dim-jh-probeNotice`
- * + `.dim-jh-probeDetails`，同一个 `tone` 取值域），两处提示在界面上是同一种
+ * 形状与上方「重测 / 重置」的 `probeNotice` 完全一致（同 `.dim-ah-probeNotice`
+ * + `.dim-ah-probeDetails`，同一个 `tone` 取值域），两处提示在界面上是同一种
  * 东西，不该长成两个样。
  *
  * **刻意抽成组件而不是在 ProviderPanel 里内联**：`ProviderPanel` 用了 hooks，
- * 单元测试加载不了它（react 不在依赖里，见 `tests/unit/jet-hub-credit-balance-row.spec.ts`
+ * 单元测试加载不了它（react 不在依赖里，见 `tests/unit/account-hub-credit-balance-row.spec.ts`
  * 的说明）；抽出来才能对这棵树做**整树深比较**，把「成功路径一个字符都不变」
  * 变成可执行的断言，而不是靠肉眼看源码。
  */
 function ClaimNotice({ tone, text, details }) {
   return React.createElement('div', {
-    className: 'dim-jh-probeNotice',
+    className: 'dim-ah-probeNotice',
     'data-tone': tone,
     role: tone === 'error' ? 'alert' : 'status',
   },
@@ -317,7 +317,7 @@ function ClaimNotice({ tone, text, details }) {
   // 每个失败账号一行：账号名 + 服务端 message + code。文案已由
   // formatClaimFailureLine 兜底（message 缺失时给固定文案），这里只判有无。
   (details?.length ?? 0) > 0
-    ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+    ? React.createElement('ul', { className: 'dim-ah-probeDetails' },
         details.map((line, i) => React.createElement('li', { key: i }, line)))
     : null);
 }
@@ -331,7 +331,7 @@ function ClaimNotice({ tone, text, details }) {
  * - 还没有结果 → 显示"读取中"
  *
  * **单数字**：Trae CN 面板只查它自己那条路径能花的池（宿主按 provider 选池，
- * 见 `src/jet-hub-rpc.ts` 的 `credits.balances` 分支），返回的 `total` 与
+ * 见 `src/account-hub-rpc.ts` 的 `credits.balances` 分支），返回的 `total` 与
  * `packages` 都**只含该池**，故这里就是普通的一个数字，与其他 provider
  * 走的是同一条渲染路径。
  *
@@ -342,12 +342,12 @@ function ClaimNotice({ tone, text, details }) {
  */
 function CreditBalanceRow({ balance, error, loading }) {
   if (loading) {
-    return React.createElement('div', { className: 'dim-jh-metaRow' },
+    return React.createElement('div', { className: 'dim-ah-metaRow' },
       React.createElement('dt', null, '积分'),
       React.createElement('dd', { 'data-tone': 'muted' }, '读取中…'));
   }
   if (error || !balance) {
-    return React.createElement('div', { className: 'dim-jh-metaRow' },
+    return React.createElement('div', { className: 'dim-ah-metaRow' },
       React.createElement('dt', null, '积分'),
       React.createElement('dd', { 'data-tone': 'warn', title: error || '查询失败' },
         error || '查询失败'));
@@ -357,20 +357,20 @@ function CreditBalanceRow({ balance, error, loading }) {
   const detail = (balance.packages || []).map(formatPackageLine).join('\n');
   const all = balance.packages || [];
   const activeCount = all.filter(p => p.active).length;
-  return React.createElement('div', { className: 'dim-jh-metaRow' },
+  return React.createElement('div', { className: 'dim-ah-metaRow' },
     React.createElement('dt', null, '积分'),
     React.createElement('dd', {
-      className: 'dim-jh-creditValue',
+      className: 'dim-ah-creditValue',
       title: detail || undefined,
     },
-    React.createElement('strong', { className: 'dim-jh-creditTotal' }, total),
+    React.createElement('strong', { className: 'dim-ah-creditTotal' }, total),
     all.length > 1
-      ? React.createElement('span', { className: 'dim-jh-creditPackages' },
+      ? React.createElement('span', { className: 'dim-ah-creditPackages' },
           `${activeCount}/${all.length} 个资源包有效`)
       : null,
     // 失效额度单独提示：它们仍在服务端响应里，但不计入上面的数字
     balance.expiredTotal > 0
-      ? React.createElement('span', { className: 'dim-jh-creditExpired' },
+      ? React.createElement('span', { className: 'dim-ah-creditExpired' },
           `另有 ${formatCredits(balance.expiredTotal)} 已失效`)
       : null));
 }
@@ -385,27 +385,27 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, cre
   const hasAnyLimit = Boolean(account.modelRateLimits && Object.keys(account.modelRateLimits).length > 0);
 
   return React.createElement('div', {
-    className: 'dim-jh-accountCard',
+    className: 'dim-ah-accountCard',
     'data-enabled': account.enabled,
   },
-    React.createElement('div', { className: 'dim-jh-accountTop' },
+    React.createElement('div', { className: 'dim-ah-accountTop' },
       React.createElement('span', {
-        className: 'dim-jh-accountStatus',
+        className: 'dim-ah-accountStatus',
         'data-on': account.enabled ? 'true' : 'false',
         title: account.enabled ? '已启用' : '已停用',
         'aria-hidden': 'true',
       }),
-      React.createElement('span', { className: 'dim-jh-accountName' },
+      React.createElement('span', { className: 'dim-ah-accountName' },
         account.nickname || account.id),
       React.createElement('span', {
-        className: 'dim-jh-accountTag',
+        className: 'dim-ah-accountTag',
         'data-tone': account.enabled ? 'on' : 'off',
       }, account.enabled ? '已启用' : '已停用')),
-    React.createElement('dl', { className: 'dim-jh-accountMeta' },
-      React.createElement('div', { className: 'dim-jh-metaRow' },
+    React.createElement('dl', { className: 'dim-ah-accountMeta' },
+      React.createElement('div', { className: 'dim-ah-metaRow' },
         React.createElement('dt', null, '凭据'),
         React.createElement('dd', null, React.createElement('code', null, account.credentialRef))),
-      React.createElement('div', { className: 'dim-jh-metaRow' },
+      React.createElement('div', { className: 'dim-ah-metaRow' },
         React.createElement('dt', null, '有效期'),
         React.createElement('dd', { 'data-tone': expired ? 'warn' : undefined },
           account.expiresAt
@@ -422,34 +422,34 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, cre
           })
         : null),
     rateLimits.length > 0
-      ? React.createElement('div', { className: 'dim-jh-rateLimits' },
-          React.createElement('span', { className: 'dim-jh-rateLimitsLabel' }, '限额重置'),
+      ? React.createElement('div', { className: 'dim-ah-rateLimits' },
+          React.createElement('span', { className: 'dim-ah-rateLimitsLabel' }, '限额重置'),
           rateLimits.map(([modelId, resetAt]) =>
             React.createElement('span', {
               key: modelId,
-              className: 'dim-jh-ttlBadge',
+              className: 'dim-ah-ttlBadge',
               title: `模型 ${modelId}`,
             }, `${modelId} · ${formatTime(resetAt)}`)))
       : null,
-    React.createElement('div', { className: 'dim-jh-accountActions' },
+    React.createElement('div', { className: 'dim-ah-accountActions' },
       React.createElement('button', {
-        className: 'dim-jh-btn',
+        className: 'dim-ah-btn',
         title: RETEST_HELP,
         disabled: busy || !hasAnyLimit,
         onClick: () => onRetest(account.id),
       }, '重测'),
       React.createElement('button', {
-        className: 'dim-jh-btn',
+        className: 'dim-ah-btn',
         title: RESET_HELP,
         disabled: busy || !hasAnyLimit,
         onClick: () => onReset(account.id),
       }, '重置'),
       React.createElement('button', {
-        className: 'dim-jh-btn',
+        className: 'dim-ah-btn',
         onClick: () => onToggle(account.id, !account.enabled),
       }, account.enabled ? '停用' : '启用'),
       React.createElement('button', {
-        className: 'dim-jh-btn',
+        className: 'dim-ah-btn',
         'data-kind': 'danger',
         onClick: () => onDelete(account.id),
       }, '删除')));
@@ -572,14 +572,14 @@ function ModelTierPicker({ model, busy, onSelect }) {
     // 的容量本身就是它的名字，重复一遍会渲染成 `400K 400K`。
     const text = label === capacity ? capacity : `${label} ${capacity}`;
     return React.createElement('label', {
-      className: 'dim-jh-tierOption',
-      key: `dim-jh-tier-${model.id}-${window}`,
+      className: 'dim-ah-tierOption',
+      key: `dim-ah-tier-${model.id}-${window}`,
       // 精确值放 title：缩写是给一眼扫过的，tooltip 是给要核对数字的人的。
       title: `${label}档 · ${window} token`,
     },
       React.createElement('input', {
         type: 'radio',
-        name: `dim-jh-tier-${model.id}`,
+        name: `dim-ah-tier-${model.id}`,
         checked: selected === window,
         disabled: busy,
         onChange: () => onSelect(model.id, window),
@@ -587,7 +587,7 @@ function ModelTierPicker({ model, busy, onSelect }) {
       React.createElement('span', null, text));
   };
   return React.createElement('div', {
-    className: 'dim-jh-modelTier',
+    className: 'dim-ah-modelTier',
     role: 'radiogroup',
     'aria-label': `${name} 上下文窗口档位`,
   }, ...tiers.map(option));
@@ -602,18 +602,18 @@ function ModelTierPicker({ model, busy, onSelect }) {
  */
 function ModelToggle({ model, busy, onToggle, tierBusy, onSelectTier }) {
   return React.createElement('div', {
-    className: 'dim-jh-modelRow',
+    className: 'dim-ah-modelRow',
     'data-disabled': model.disabled ? 'true' : 'false',
   },
     // label 只包住「名字 + 显示开关」：两者的点击语义都属于「开关模型可见性」。
     // 档位 radio 在它之外，避免点档位时连带翻转显示开关。
-    React.createElement('label', { className: 'dim-jh-modelMain', title: model.id },
-      React.createElement('span', { className: 'dim-jh-modelInfo' },
-        React.createElement('strong', { className: 'dim-jh-modelName' }, model.name || model.id),
-        React.createElement('code', { className: 'dim-jh-modelId' }, model.id)),
+    React.createElement('label', { className: 'dim-ah-modelMain', title: model.id },
+      React.createElement('span', { className: 'dim-ah-modelInfo' },
+        React.createElement('strong', { className: 'dim-ah-modelName' }, model.name || model.id),
+        React.createElement('code', { className: 'dim-ah-modelId' }, model.id)),
       React.createElement('input', {
         type: 'checkbox',
-        className: 'dim-jh-switch',
+        className: 'dim-ah-switch',
         role: 'switch',
         checked: !model.disabled,
         disabled: busy,
@@ -694,7 +694,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
       if (!mounted.current) return;
       setModels(prev => (prev || []).map(m => (m.id === modelId ? { ...m, disabled } : m)));
     } catch (caught) {
-      console.error('[jet-hub] toggle model failed:', caught);
+      console.error('[account-hub] toggle model failed:', caught);
       if (!mounted.current) return;
       // 开关切换失败不能把整张表替换成错误页——用户会以为模型列表没了。
       // 保留列表，只在顶部提示这次操作失败。
@@ -733,7 +733,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
         ? { ...m, contextBudget: res?.contextBudget }
         : m)));
     } catch (caught) {
-      console.error('[jet-hub] set context budget failed:', caught);
+      console.error('[account-hub] set context budget failed:', caught);
       if (!mounted.current) return;
       setToggleError(caught?.message || '设置上下文窗口档位失败');
     } finally {
@@ -756,67 +756,67 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     : null;
 
   const dialog = React.createElement('div', {
-    className: 'dim-jh-modalOverlay',
+    className: 'dim-ah-modalOverlay',
     // 点击遮罩关闭；点击弹窗内部不关闭（stopPropagation 由内层容器负责）。
     onClick: (event) => { if (event.target === event.currentTarget) onClose(); },
   },
     React.createElement('div', {
-      className: 'dim-jh-modal',
+      className: 'dim-ah-modal',
       role: 'dialog',
       'aria-modal': 'true',
       'aria-label': `${providerLabel} 模型列表`,
     },
-      React.createElement('div', { className: 'dim-jh-modalHead' },
-        React.createElement('div', { className: 'dim-jh-modalTitle' },
+      React.createElement('div', { className: 'dim-ah-modalHead' },
+        React.createElement('div', { className: 'dim-ah-modalTitle' },
           React.createElement('strong', null, '模型列表'),
-          React.createElement('span', { className: 'dim-jh-modalSubtitle' }, providerLabel),
+          React.createElement('span', { className: 'dim-ah-modalSubtitle' }, providerLabel),
           phase === 'ready'
-            ? React.createElement('span', { className: 'dim-jh-modelPanelCount' },
+            ? React.createElement('span', { className: 'dim-ah-modelPanelCount' },
                 `${all.length} 个模型${hiddenCount > 0 ? `，已隐藏 ${hiddenCount} 个` : ''}`)
             : null),
-        React.createElement('div', { className: 'dim-jh-modelPanelActions' },
+        React.createElement('div', { className: 'dim-ah-modelPanelActions' },
           React.createElement('button', {
-            className: 'dim-jh-btn',
+            className: 'dim-ah-btn',
             disabled: phase === 'loading',
             onClick: () => void load(),
           }, phase === 'loading' ? '读取中…' : '刷新'),
           React.createElement('button', {
-            className: 'dim-jh-btn',
+            className: 'dim-ah-btn',
             'data-kind': 'primary',
             onClick: onClose,
           }, '完成'))),
-      React.createElement('p', { className: 'dim-jh-modalHint' },
+      React.createElement('p', { className: 'dim-ah-modalHint' },
         '关闭开关后该模型不再出现在对话框的模型选择里；其余模型（含服务端新增的）默认显示。'),
       // 目录来源提示（C3）：仅当 Host 明确播报 fallback 时显示 —— 措辞与
       // 「当前为兜底清单」风格一致，说清「为什么列表这么短」与「它是可用的」。
       catalogSource === 'fallback'
-        ? React.createElement('p', { className: 'dim-jh-modalHint' },
+        ? React.createElement('p', { className: 'dim-ah-modalHint' },
           '当前为兜底清单（远端目录不可达），仅含少量实测可用模型；远端恢复后将自动回到完整目录。')
         : null,
       tierHint
-        ? React.createElement('p', { className: 'dim-jh-modalHint' }, tierHint)
+        ? React.createElement('p', { className: 'dim-ah-modalHint' }, tierHint)
         : null,
       toggleError
         ? React.createElement('div', {
-            className: 'dim-jh-probeNotice',
+            className: 'dim-ah-probeNotice',
             'data-tone': 'error',
             role: 'alert',
           }, React.createElement('div', null, toggleError))
         : null,
       phase === 'error'
-        ? React.createElement('div', { className: 'dim-jh-modalBody' },
-            React.createElement('div', { className: 'dim-jh-empty' },
+        ? React.createElement('div', { className: 'dim-ah-modalBody' },
+            React.createElement('div', { className: 'dim-ah-empty' },
               React.createElement('p', null, error),
-              React.createElement('button', { className: 'dim-jh-btn', onClick: () => void load() }, '重新读取')))
+              React.createElement('button', { className: 'dim-ah-btn', onClick: () => void load() }, '重新读取')))
         : phase === 'loading'
-          ? React.createElement('div', { className: 'dim-jh-modalBody' },
-              React.createElement('div', { className: 'dim-jh-empty' }, '正在读取模型列表…'))
+          ? React.createElement('div', { className: 'dim-ah-modalBody' },
+              React.createElement('div', { className: 'dim-ah-empty' }, '正在读取模型列表…'))
           : all.length === 0
-            ? React.createElement('div', { className: 'dim-jh-modalBody' },
-                React.createElement('div', { className: 'dim-jh-empty' },
+            ? React.createElement('div', { className: 'dim-ah-modalBody' },
+                React.createElement('div', { className: 'dim-ah-empty' },
                   React.createElement('p', null, '该 Provider 当前没有可用的模型。')))
-            : React.createElement('div', { className: 'dim-jh-modalBody' },
-                React.createElement('div', { className: 'dim-jh-modelList' },
+            : React.createElement('div', { className: 'dim-ah-modalBody' },
+                React.createElement('div', { className: 'dim-ah-modelList' },
                   all.map(model => React.createElement(ModelToggle, {
                     key: model.id,
                     model,
@@ -826,7 +826,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
                     onSelectTier: (id, window) => void selectTier(id, window),
                   }))))));
 
-  // 与登录弹窗（.dim-jh-loginOverlay）同款做法：直接渲染在组件树内，靠
+  // 与登录弹窗（.dim-ah-loginOverlay）同款做法：直接渲染在组件树内，靠
   // position: fixed 覆盖全屏。**刻意不用 createPortal** —— 客户端模块表由
   // 宿主注入（staticModules 种子表），本仓库无法离线确认 `react-dom` 是否在
   // 其中；一旦不在，require 会抛「missed the module table」，弹窗直接白屏。
@@ -868,7 +868,7 @@ function ProviderPanel({ provider, rpcCall }) {
     setError(null);
     try {
       // 这里**发的是面板 id**，不是它背后的账号池键。
-      // 「面板 id → 池键」的映射收敛在宿主（`src/jet-hub-rpc.ts` 的
+      // 「面板 id → 池键」的映射收敛在宿主（`src/account-hub-rpc.ts` 的
       // `poolProviderFor()`）：客户端若也映射一次，
       // 宿主那几个按池过滤的分支就必须跟着改，同一件事写两遍。
       // 客户端只管把面板 id 原样送出去。
@@ -945,7 +945,7 @@ function ProviderPanel({ provider, rpcCall }) {
       }
       setCredits(next);
     } catch (caught) {
-      console.error('[jet-hub] load credits failed:', caught);
+      console.error('[account-hub] load credits failed:', caught);
       if (!mounted.current) return;
       // 整批失败（如 provider 不支持、RPC 未注册）：给当前每个账号都留下失败
       // 原因，避免卡片永远停在"读取中"。
@@ -1010,7 +1010,7 @@ function ProviderPanel({ provider, rpcCall }) {
       // 领取会改变余额，顺带刷新一次，免得卡片还显示领取前的数字
       await loadCredits();
     } catch (caught) {
-      console.error('[jet-hub] claim credits failed:', caught);
+      console.error('[account-hub] claim credits failed:', caught);
       if (!mounted.current) return;
       setClaimNotice({ tone: 'error', text: caught?.message || '领取积分失败' });
     } finally {
@@ -1032,7 +1032,7 @@ function ProviderPanel({ provider, rpcCall }) {
      * 因此这里先开一个 `about:blank` 空窗占住手势，RPC 返回后再填 URL。
      */
     const loginWindow = window.open('', LOGIN_WINDOW_NAME, LOGIN_WINDOW_FEATURES);
-    console.log('[jet-hub] account.create request, provider =', provider, '/ popup =', loginWindow);
+    console.log('[account-hub] account.create request, provider =', provider, '/ popup =', loginWindow);
 
     /** 关闭手势内开的空窗（幂等；已被拦截时为 no-op）。 */
     const closeLoginWindow = () => {
@@ -1043,7 +1043,7 @@ function ProviderPanel({ provider, rpcCall }) {
 
     try {
       const res = await rpcCall('account.create', { provider });
-      console.log('[jet-hub] account.create response =', res);
+      console.log('[account-hub] account.create response =', res);
       const accountId = res?.accountId;
       const loginUrl = res?.loginUrl;
       if (!accountId) {
@@ -1065,7 +1065,7 @@ function ProviderPanel({ provider, rpcCall }) {
         // 用 location.replace 而不是 href —— 空窗的 about:blank 不留在历史里，
         // 用户点「后退」不会退到一张白页。
         loginWindow.location.replace(loginUrl);
-        console.log('[jet-hub] login window navigated to', loginUrl);
+        console.log('[account-hub] login window navigated to', loginUrl);
       } else {
         // 空窗被激进拦截器挡下了。这里**不再**退化成 location.href：
         // 那会把 DSH 页面整个顶掉（用户丢失当前工作界面，且登录完成后
@@ -1100,7 +1100,7 @@ function ProviderPanel({ provider, rpcCall }) {
           // 必须与成功一样收窗 + 刷新，否则窗口会停在 127.0.0.1 上，
           // 用户既看不出登录已失败、也无法从面板得知原因。
           if (pollRes.error) {
-            console.warn('[jet-hub] login failed:', pollRes.error);
+            console.warn('[account-hub] login failed:', pollRes.error);
             if (mounted.current) {
               // 复用面板既有的通知行（probeNotice 的渲染块）而不是新造 UI：
               // 面板的 `error` + `phase='error'` 是整页替换，会把刚刷新的
@@ -1115,7 +1115,7 @@ function ProviderPanel({ provider, rpcCall }) {
       // 只清定时器会留下一张永远挂着的窗口。
       setTimeout(() => { void finishPolling(); }, 300000);
     } catch (caught) {
-      console.error('[jet-hub] create account failed:', caught);
+      console.error('[account-hub] create account failed:', caught);
       // 所有错误路径都要收掉空窗，否则就是一张永远白屏的孤儿窗。
       closeLoginWindow();
       if (caught?.code === 'login-in-progress') {
@@ -1137,7 +1137,7 @@ function ProviderPanel({ provider, rpcCall }) {
       await rpcCall('account.update', { accountId, patch: { enabled } });
       await loadAccounts();
     } catch (caught) {
-      console.error('[jet-hub] toggle failed:', caught);
+      console.error('[account-hub] toggle failed:', caught);
     }
   };
 
@@ -1147,7 +1147,7 @@ function ProviderPanel({ provider, rpcCall }) {
       await rpcCall('account.delete', { accountId });
       await loadAccounts();
     } catch (caught) {
-      console.error('[jet-hub] delete failed:', caught);
+      console.error('[account-hub] delete failed:', caught);
     }
   };
 
@@ -1183,7 +1183,7 @@ function ProviderPanel({ provider, rpcCall }) {
       setProbeNotice({ tone: details.length > 0 ? 'warn' : 'ok', text: summary, details });
       await loadAccounts();
     } catch (caught) {
-      console.error('[jet-hub] limit action failed:', caught);
+      console.error('[account-hub] limit action failed:', caught);
       if (!mounted.current) return;
       setProbeNotice({ tone: 'error', text: `操作失败：${caught?.message || '未知错误'}`, details: [] });
     } finally {
@@ -1195,18 +1195,18 @@ function ProviderPanel({ provider, rpcCall }) {
     // 标题与按钮分开成两块（而不是同一行的 space-between）：操作按钮多达 5 个，
     // 与面板标题挤在一行时既会被压缩又会溢出。标题独占一行、按钮组另起一行
     // 并允许换行，窄面板下也能完整显示。
-    React.createElement('div', { className: 'dim-jh-panelHead' },
-      React.createElement('h2', { className: 'dim-jh-panelTitle' },
+    React.createElement('div', { className: 'dim-ah-panelHead' },
+      React.createElement('h2', { className: 'dim-ah-panelTitle' },
         `${providerLabel} 账号管理`),
-      React.createElement('div', { className: 'dim-jh-headerActions' },
+      React.createElement('div', { className: 'dim-ah-headerActions' },
         React.createElement('button', {
-          className: 'dim-jh-btn',
+          className: 'dim-ah-btn',
           title: MODEL_LIST_HELP,
           onClick: () => setShowModels(true),
         }, '显示列表'),
         canLoadCredits
           ? React.createElement('button', {
-              className: 'dim-jh-btn',
+              className: 'dim-ah-btn',
               title: '重新查询本页全部账号的剩余积分（Credits Balance）。余额由服务端实时计算，点此可刷新。',
               disabled: creditsLoading,
               onClick: () => void loadCredits(),
@@ -1214,20 +1214,20 @@ function ProviderPanel({ provider, rpcCall }) {
           : null,
         supportsCredits
           ? React.createElement('button', {
-              className: 'dim-jh-btn',
+              className: 'dim-ah-btn',
               title: `领取全部 ${providerLabel} 账号（含已停用）的每日签到积分`,
               disabled: claiming || accounts.length === 0,
               onClick: () => void claimCredits(),
             }, claiming ? '领取中…' : '一键领取积分')
           : null,
         React.createElement('button', {
-          className: 'dim-jh-btn',
+          className: 'dim-ah-btn',
           title: RETEST_ALL_HELP,
           disabled: probeBusy !== null || accounts.length === 0,
           onClick: () => void runLimitAction('retestAll'),
         }, probeBusy === 'all' ? '重测中…' : '重测所有'),
         React.createElement('button', {
-          className: 'dim-jh-btn',
+          className: 'dim-ah-btn',
           title: RESET_ALL_HELP,
           disabled: probeBusy !== null || accounts.length === 0,
           onClick: () => void runLimitAction('resetAll'),
@@ -1236,7 +1236,7 @@ function ProviderPanel({ provider, rpcCall }) {
         // 2026-09-21 按用户要求移除），故这里直接接 `createAccount()`，
         // 不再有选择器、也没有「点了做什么」的分支。
         React.createElement('button', {
-          className: 'dim-jh-btn',
+          className: 'dim-ah-btn',
           'data-kind': 'primary',
           title: '通过浏览器登录一个新的账号并加入账号池。',
           onClick: () => void createAccount(),
@@ -1244,13 +1244,13 @@ function ProviderPanel({ provider, rpcCall }) {
         }, creating ? '正在登录…' : '+ 新建账号'))),
     probeNotice
       ? React.createElement('div', {
-          className: 'dim-jh-probeNotice',
+          className: 'dim-ah-probeNotice',
           'data-tone': probeNotice.tone,
           role: 'status',
         },
         React.createElement('div', null, probeNotice.text),
         probeNotice.details.length > 0
-          ? React.createElement('ul', { className: 'dim-jh-probeDetails' },
+          ? React.createElement('ul', { className: 'dim-ah-probeDetails' },
               probeNotice.details.map((d, i) => React.createElement('li', { key: i }, d)))
           : null)
       : null,
@@ -1266,7 +1266,7 @@ function ProviderPanel({ provider, rpcCall }) {
     // 用手势内空窗的方案已经试过一次并失败了（拦截器策略），再失败一次用户
     // 就彻底没有入口。原生 <a href> 由浏览器自己处理导航，不受脚本开窗策略影响。
     manualLogin
-      ? React.createElement('div', { className: 'dim-jh-manualLogin', role: 'status' },
+      ? React.createElement('div', { className: 'dim-ah-manualLogin', role: 'status' },
           React.createElement('p', null, '登录窗口被浏览器拦截了。请点击下面的链接在浏览器中完成登录：'),
           React.createElement('a', {
             href: manualLogin.url,
@@ -1275,13 +1275,13 @@ function ProviderPanel({ provider, rpcCall }) {
           }, '打开登录页面'))
       : null,
     phase === 'loading'
-      ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
+      ? React.createElement('div', { className: 'dim-ah-empty' }, '正在读取账号列表…')
       : phase === 'error'
-        ? React.createElement('div', { className: 'dim-jh-empty', role: 'alert' },
+        ? React.createElement('div', { className: 'dim-ah-empty', role: 'alert' },
             React.createElement('p', null, error),
-            React.createElement('button', { className: 'dim-jh-btn', onClick: loadAccounts }, '重新读取'))
+            React.createElement('button', { className: 'dim-ah-btn', onClick: loadAccounts }, '重新读取'))
         : accounts.length === 0
-          ? React.createElement('div', { className: 'dim-jh-empty' },
+          ? React.createElement('div', { className: 'dim-ah-empty' },
               React.createElement('p', null, '尚未配置账号'),
               // 每个 provider（含 Qoder 两区）都是**在本面板浏览器登录**：
               // PAT 形态移除后文案只剩这一种，不再按登录形态分支。
@@ -1310,7 +1310,7 @@ function ProviderPanel({ provider, rpcCall }) {
       : null);
 }
 
-export function JetHubPage({ close, rpcCall }) {
+export function AccountHubPage({ close, rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
   const [version, setVersion] = React.useState(0);
@@ -1320,22 +1320,22 @@ export function JetHubPage({ close, rpcCall }) {
     setVersion(v => v + 1);
   };
 
-  return React.createElement('section', { className: 'dim-jh-page', 'aria-label': 'Account Hub 账号管理' },
-    React.createElement('header', { className: 'dim-jh-header' },
-      React.createElement('div', { className: 'dim-jh-brand' },
-        React.createElement('strong', { className: 'dim-jh-brandName' }, 'Account Hub'),
-        React.createElement('p', { className: 'dim-jh-brandDesc' }, 'Provider 凭据管理与多账号支持')),
+  return React.createElement('section', { className: 'dim-ah-page', 'aria-label': 'Account Hub 账号管理' },
+    React.createElement('header', { className: 'dim-ah-header' },
+      React.createElement('div', { className: 'dim-ah-brand' },
+        React.createElement('strong', { className: 'dim-ah-brandName' }, 'Account Hub'),
+        React.createElement('p', { className: 'dim-ah-brandDesc' }, 'Provider 凭据管理与多账号支持')),
       close ? React.createElement('button', {
-        className: 'dim-jh-btn',
+        className: 'dim-ah-btn',
         onClick: close,
       }, '关闭') : null),
-    React.createElement('div', { className: 'dim-jh-layout' },
-      React.createElement('nav', { className: 'dim-jh-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
+    React.createElement('div', { className: 'dim-ah-layout' },
+      React.createElement('nav', { className: 'dim-ah-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
         PROVIDERS.map(p => React.createElement('button', {
           key: p.id,
           type: 'button',
           role: 'tab',
-          className: 'dim-jh-provider',
+          className: 'dim-ah-provider',
           'aria-selected': p.id === selected,
           onClick: () => selectProvider(p.id),
         },
@@ -1343,7 +1343,7 @@ export function JetHubPage({ close, rpcCall }) {
         React.createElement('span', null,
           React.createElement('strong', null, p.label))))),
       React.createElement('main', {
-        className: 'dim-jh-panel',
+        className: 'dim-ah-panel',
         role: 'tabpanel',
       },
       PROVIDERS.map(p => p.id === selected

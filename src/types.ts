@@ -69,7 +69,7 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
 }
 
 /** Account Hub 在 ctx.settings 中的 schema */
-export interface JetHubConfig {
+export interface AccountHubConfig {
   accounts: ProviderAccountEntry[]
   /**
    * 模型黑名单：provider id → 模型 id → true。

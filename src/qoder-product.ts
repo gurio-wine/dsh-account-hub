@@ -423,7 +423,7 @@ export const QODER_DEFAULT_CREDENTIAL_REF = 'QODER_PERSONAL_TOKEN'
 /**
  * 账号池凭据 ref 前缀（`{前缀}_{SHORTID}` → `QODER_ACCOUNT_A1B2C3D4`）。
  *
- * 必须与 `src/jet-hub-rpc.ts` 的 `accountCredentialRefName('qoder', id)` 同值
+ * 必须与 `src/account-hub-rpc.ts` 的 `accountCredentialRefName('qoder', id)` 同值
  * （它按 `${provider.toUpperCase()}_ACCOUNT_${suffix}` 机械派生；`qoder`
  * 无连字符，两者天然一致，有单测钉死）。
  */
@@ -1105,7 +1105,7 @@ export const QODER: QoderProduct = {
  * ## 凭据隔离
  *
  * `QODER_CN_ACCOUNT` / `QODER_CN_PERSONAL_TOKEN` 与其它 provider 完全隔离。
- * 带连字符的 provider id 在 `src/jet-hub-rpc.ts` 的 `accountCredentialRefName`
+ * 带连字符的 provider id 在 `src/account-hub-rpc.ts` 的 `accountCredentialRefName`
  * 里会被 `toUpperCase().replace(/-/g, '_')` 转成 `QODER_CN_ACCOUNT_*`——
  * 与本配置的前缀**逐字符一致**（该转换机制已存在，本段无需改动）。
  */

@@ -51,7 +51,7 @@
 
 **红线与判据**：机制是**纯声明值切换，出站请求体一个字段都不动** —— 变的只有 `resolveModel().context.contextWindow`（宿主压缩阈值 `0.8×窗口` + 压缩后保留预算），有逐字节比对两次请求体的用例钉死。三条判据缺一不可：① 写入只有一个落点 —— `max` 严格大于**实际生效的默认档**才写（`max<=dev` / `0` / 缺失都不收）；② RPC `model.setContextBudget` 只接受**精确等于**该模型当前目录条目的某个档位（省略 / 等于默认档 = 清除预算），错误信息必须带实际可用档位值；③ 读取时 `effectiveContextWindow` 再判一次。⚠️ **编造值静默退回默认档是设计**。⚠️ **静态回退表 11 项一律不带 `maxContextWindow`**，故静态路径下模型自动无档位 UI。
 
-**档位来源与注册表**：`src/context-tiers.ts` 是档位通用机制（`availableContextTiers` / `effectiveContextWindow` / `createContextTierRegistry`），`src/index.ts` 用 `createContextTierRegistry({ [TRAE_CN.id]: …, [BUDDY_CN.id]: …, [BUDDY.id]: …, [QODER.id]: …, [QODER_CN.id]: … })` 作为 `registerJetHubRpc` 的**第 10 个实参**注入（键取 `*.id`，别写字面量）。**只有 buddy 系（`supportedLengths`）与 qoder 两区（`available_context_windows`）有档位数据源**，trae-cn 走上面那套；**lobsterai 没有档位源 ⇒ 不显示档位 UI**（不是遗漏）。
+**档位来源与注册表**：`src/context-tiers.ts` 是档位通用机制（`availableContextTiers` / `effectiveContextWindow` / `createContextTierRegistry`），`src/index.ts` 用 `createContextTierRegistry({ [TRAE_CN.id]: …, [BUDDY_CN.id]: …, [BUDDY.id]: …, [QODER.id]: …, [QODER_CN.id]: … })` 作为 `registerAccountHubRpc` 的**第 10 个实参**注入（键取 `*.id`，别写字面量）。**只有 buddy 系（`supportedLengths`）与 qoder 两区（`available_context_windows`）有档位数据源**，trae-cn 走上面那套；**lobsterai 没有档位源 ⇒ 不显示档位 UI**（不是遗漏）。
 
 **存储与通路**：账号池持久层是 **`ctx.storage` 的 storage 域**（`dsh_account_hub` → `$DSH_HOME/storages/dsh_account_hub.json`，single 布局 + 一个 global 单例文档，四件套 `accounts` / `disabledModels` / `contextBudgets` / `schemaVersion`）。`contextBudget` / `writeContextBudget` 读写第四件；`writeAccounts` / `writeModels` / `writeBudgets` / `replaceAll` **四件套互带**、都汇入唯一写落点 `persist()`，后三者都**先 `ensureLoaded()`**（它们不过读路径，漏了就整体写空账号 / 黑名单 / 版本号）。**降级矩阵** = storage 为主 → 旧 settings（`jet-hub` namespace，**历史兼容读取，勿改**）回退 → 纯内存兜底；`apply()` 里 `await pool.openStorage()` **必须早于改名迁移**（它内部重置载入标记，切换点不留数据分叉）。**一次性迁移**（`account-hub-migration.ts`）：storage 无账号数据且能读到旧来源时把 `jet-hub` 段原样搬入，来源优先级 `settings.yaml.imported` → `settings.yaml` → 旧 scope；只读来源 / 幂等 / 空表不落 / 失败不半途覆盖。⚠️ **storage 域名只接受 `^[a-z][a-z0-9_]*$`（连字符不合法）**，故是 `dsh_account_hub` 而非插件 id；⚠️ 域打开后**必须 `ctx.effect` 登记 `domain.close`**（facility 按域名单开，不登记就永久占住）；⚠️ **不引 YAML 依赖**：`simple-yaml.ts` 只取目标一节，不支持的构造（锚点/别名/块标量）显式抛错。⚠️ `LlmRuntime.listModels` 会重建条目、丢掉额外字段，`ctx` 也没有「按 provider 取适配器」的入口 ⇒ 由 `register*Llm` **返回适配器实例**经上述参数注入；省略时 `model.list` 不带窗口字段、`setContextBudget` 一律拒绝（headless / 测试的既定降级）。⚠️ **回填行（被关闭的模型）与目录行必须带同一组窗口字段**。⚠️ 客户端 `ModelToggle` 根节点是 `div`、`label` 只包「名称 + 显示开关」，**档位 radio 必须在 label 之外**（放进去会连带翻转显示开关）。
 
@@ -67,7 +67,7 @@
 
 ⚠️ **安全网（不改分类器）**：1.2M 报文被**现有**分类器命中 `CONTEXT_WINDOW_EXCEEDED`（`httpErrorCode` 靠**完整 body**）。⚠️ 承重点是 `displayMsg.en` 那句英文措辞：新报文 `extError.code` 是纯数字、`msg` 无 `for this model` 后缀，结构化正则都认不出，**摘掉 `displayMsg` 即落回 `INVALID_REQUEST`（不触发压缩）**。判据复用宿主 `isContextWindowExceededError`、**不自建关键词表**（同 lobsterai / qoder 先例）；`buddy-adapter.spec.ts` 有钉死用例。
 
-Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Qoder 与 Qoder CN 都不提供（详见下文「积分能力」）。**七个 provider 都有 Account Hub 面板**（Qoder 两区见 README）。
+Account Hub 设置页（`plugin-src/client/account-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Qoder 与 Qoder CN 都不提供（详见下文「积分能力」）。**七个 provider 都有 Account Hub 面板**（Qoder 两区见 README）。
 
 ### Qoder 国际版（`qoder`）—— chat 250 的三条硬事实
 
@@ -115,23 +115,23 @@ Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理�
 
 **移除它留下两条结构性事实仍然成立**，见下两段。
 
-**面板 id → 账号池键的收敛点仍是 `src/jet-hub-rpc.ts` 的 `poolProviderFor()`**（客户端不做映射，发的就是面板 id）：移除 Work 后它是**恒等函数**，但**刻意保留** —— 六个入口（`account.list` / `account.retestAll` / `account.resetAll` / `credits.status` / `credits.claimAll` / `credits.balances`）仍经它把「面板 id」翻成「池键」，将来若再出现复用别人账号的 provider，加一行即可，不必把 if 撒进六处调用点。
+**面板 id → 账号池键的收敛点仍是 `src/account-hub-rpc.ts` 的 `poolProviderFor()`**（客户端不做映射，发的就是面板 id）：移除 Work 后它是**恒等函数**，但**刻意保留** —— 六个入口（`account.list` / `account.retestAll` / `account.resetAll` / `credits.status` / `credits.claimAll` / `credits.balances`）仍经它把「面板 id」翻成「池键」，将来若再出现复用别人账号的 provider，加一行即可，不必把 if 撒进六处调用点。
 
 ⚠️ **「选显示哪个积分池」是另一件事，不走 `poolProviderFor()`**：`traeCnPoolFor()` 已随 Work 路径删除，`credits.balances` 的 trae-cn 分支**内联 `TRAE_CN_POOL_UNIVERSAL`** 作为 `fetchTraeCnCreditBalance` 的第三个实参（Trae CN 面板显示的就是它实际能花的池）。账号映射与选池**不可合并**：用池键查账号会让面板空白；`TRAE_CN_POOL_WORK` 与 `TraeCnPoolId` **仍保留**（服务上游 `available_endpoint` 分池字段与礼包归类，非 provider 专属）。
 
 ⚠️ **刻意不经过映射的两个入口**：**`account.create`**（它按 provider 解析产品配置决定「登录怎么做」，对未知 provider 一律回 `unknown provider` —— 映射会给同一份凭据建出第二个占位账号，等于把一个账号建两遍）；**`model.list` / `model.setDisabled`**（黑名单按 provider id 存，映射会把一个 provider 的开关写进另一个的黑名单）。`credits-capabilities.spec.ts` 的「集合相等」断言已同步到七条，并断言**没有条目声明 `loginHint`**（每个面板都自带「+ 新建账号」入口）。
 
-- **包名** `dsh-account-hub`；**入口** `lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）；**构建** `pnpm build:all`（`tsc` + `esbuild`）；**语言** TypeScript；**许可** MIT
+- **包名** `dsh-account-hub`；**入口** `lib/index.js`（宿主侧）、`lib/client/account-hub.js`（客户端 bundle）；**构建** `pnpm build:all`（`tsc` + `esbuild`）；**语言** TypeScript；**许可** MIT
 
 ## 技术栈与约束
 
 - **Node.js** `^22.19.0 || >=24.0.0`；**依赖管理** pnpm workspace（作为 DSH 插件安装）；**代码风格**与 `@deepseek-ai/dsh` 主仓库保持一致。
-- **构建**：宿主侧 TypeScript `tsc` → `lib/`；客户端 bundle `esbuild`（`plugin-src/client/build.mjs`）→ `lib/client/jet-hub.js`。两者都产出到已 gitignore 的 `lib/`，`prepare` 执行 `pnpm build:all` 保证 git 安装时两侧产物齐全。⚠️ **`build:client` 末尾含产物顶层求值冒烟（stub require）** —— 模板字符串求值类错误构建即炸，而 `plugin-src/` 不在 typecheck/test 视野内，**这道闸是客户端 bundle 的唯一语义防线，勿删**。
+- **构建**：宿主侧 TypeScript `tsc` → `lib/`；客户端 bundle `esbuild`（`plugin-src/client/build.mjs`）→ `lib/client/account-hub.js`。两者都产出到已 gitignore 的 `lib/`，`prepare` 执行 `pnpm build:all` 保证 git 安装时两侧产物齐全。⚠️ **`build:client` 末尾含产物顶层求值冒烟（stub require）** —— 模板字符串求值类错误构建即炸，而 `plugin-src/` 不在 typecheck/test 视野内，**这道闸是客户端 bundle 的唯一语义防线，勿删**。
 - **测试**：Vitest。`pnpm test` 为单元测试（快速、无网络、全部 mock）；`pnpm test:e2e:*` 按 provider 分列（如 `test:e2e:codearts` / `buddy-cn` / `buddy-claim`），**均有闸门、默认全部跳过**，哪些会消耗模型积分见 `tests/e2e/README.md`。测试文件按约定放 `tests/unit/` 与 `tests/e2e/`。
 
 ## 项目结构
 
-`src/` 宿主侧 TS 源码；`plugin-src/client/` Account Hub 客户端源码（esbuild 打包）；`lib/` 编译产物（已 gitignore，含 `lib/client/jet-hub.js`）；`tests/unit/` 单元测试；`cordis.patch.yml` DSH bundle 补丁；`tsconfig.json` / `vitest.config.ts` 配置。
+`src/` 宿主侧 TS 源码；`plugin-src/client/` Account Hub 客户端源码（esbuild 打包）；`lib/` 编译产物（已 gitignore，含 `lib/client/account-hub.js`）；`tests/unit/` 单元测试；`cordis.patch.yml` DSH bundle 补丁；`tsconfig.json` / `vitest.config.ts` 配置。
 
 ## DSH 插件契约
 
@@ -146,7 +146,7 @@ Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理�
 
 ### 登录必须两段式：RPC 立即返回 loginUrl
 
-`account.create` **不得**在 RPC 里等待用户完成浏览器登录：浏览器登录最长 10 分钟，等它返回时用户手势早已过期 —— 客户端拿到 URL 再开窗会被弹窗拦截，兜底逻辑于是自行开窗，把 DSH 页面顶掉。正确形态（`src/jet-hub-rpc.ts`）：
+`account.create` **不得**在 RPC 里等待用户完成浏览器登录：浏览器登录最长 10 分钟，等它返回时用户手势早已过期 —— 客户端拿到 URL 再开窗会被弹窗拦截，兜底逻辑于是自行开窗，把 DSH 页面顶掉。正确形态（`src/account-hub-rpc.ts`）：
 
 1. **第一段（同步返回）**：先拿到 `loginUrl`（buddy 系 `fetchAuthState`、lobsterai 的 `prepareLogin`），`pool.addAccount` 写入**占位条目**（`refreshable: false`、无 `expiresAt`），立即 `return { ok: true, value: { accountId, loginUrl } }`；
 2. **宿主 opener 置空**（`openBrowser: () => {}`）—— 打开动作归客户端，宿主再开一次会变成两个标签页；
@@ -182,7 +182,7 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 - **只影响模型目录播报，不影响路由**：被关闭的模型仍可 `resolveModel` / 正常收发请求（DSH 约定：`listModels` 结果仅供参考）
 - `AccountPool` 的 `writeAccounts` / `writeModels` 都是**整体 replace**，两者必须互相携带对方的字段，否则一次账号操作会把模型开关清空（反之亦然）；改名迁移会搬运 `disabledModels` 的 provider 键（`buddy`→`buddy-cn`、`workbuddy`→`buddy`），属**对调式搬运**，有测试钉死（`src/provider-rename-migration.ts`）
 - `CodeArtsAdapter.listModels` 必须 `await this.ensureRemoteModels()`：早期用 `void` 丢弃 Promise，冷缓存时会误用静态兜底表
-- RPC：`model.list` / `model.setDisabled`（`src/jet-hub-rpc.ts`），前端在 `plugin-src/client/jet-hub.js` 的 `ModelListPanel`
+- RPC：`model.list` / `model.setDisabled`（`src/account-hub-rpc.ts`），前端在 `plugin-src/client/account-hub.js` 的 `ModelListPanel`
 
 ## Codearts 上下文窗口（`contextWindow`）声明 —— 远端优先，静态表兜底（2026-09-21 接线）
 

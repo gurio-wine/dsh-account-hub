@@ -5,7 +5,7 @@
  *
  * `account.create` / `credits.balances` / `account.refresh` 三处**宿主分发分支**
  * 不在任何纯函数上：`collect*` 那类测试走的是注入替身路径，覆盖不到
- * `registerJetHubRpc` 里的 provider 分发。而「新增 provider 漏接一个分支」
+ * `registerAccountHubRpc` 里的 provider 分发。而「新增 provider 漏接一个分支」
  * 正是本仓库被记录过两次的缺陷形态（LobsterAI 漏了 `account.refresh` 的
  * workbuddy 分支；Trae CN 漏了整条积分线，见 `47f253f`）。故这里直接驱动注册
  * 出来的**真实 HTTP 处理器**，只把出网换成替身。
@@ -40,7 +40,7 @@ import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { registerAccountHubRpc } from '../../src/account-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { QoderAuth } from '../../src/qoder-auth.js'
 import { QODER, QODER_CN, QODER_PAT_URL, type QoderCredential } from '../../src/qoder-product.js'
@@ -219,7 +219,7 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
     get: () => undefined,
   }
 
-  registerJetHubRpc(
+  registerAccountHubRpc(
     rpcCtx as never,
     pool,
     {} as never,
@@ -233,13 +233,13 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
   if (handler === undefined) throw new Error('Account Hub 端点未注册')
 
   const call = async <T>(method: string, payload: unknown): Promise<RpcResult<T>> => {
-    const response = await handler!(new Request('http://127.0.0.1/api/jet-hub', {
+    const response = await handler!(new Request('http://127.0.0.1/api/account-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         type: 'client-request',
         rpcId: 'rpc-1',
-        method: 'jet-hub',
+        method: 'account-hub',
         payload: { method, payload },
       }),
     }))

@@ -6,9 +6,9 @@ import {
   collectCreditBalances,
   collectCreditsStatus,
   computeClaimSummary,
-  registerJetHubRpc,
-} from '../../src/jet-hub-rpc.js'
-import type { CreditsEndpointDeps } from '../../src/jet-hub-rpc.js'
+  registerAccountHubRpc,
+} from '../../src/account-hub-rpc.js'
+import type { CreditsEndpointDeps } from '../../src/account-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { createContextTierRegistry } from '../../src/context-tiers.js'
 import type { ClaimOutcome, CheckinStatus, CreditBalance } from '../../src/credits.js'
@@ -595,7 +595,7 @@ describe('model.list / model.setDisabled 端点', () => {
     /** 预置上下文窗口预算（按 provider → 模型存）。 */
     contextBudgets?: Record<string, Record<string, number>>
     /**
-     * 窗口档位来源（`registerJetHubRpc` 的第 10 个参数）—— **按 provider id 分键**
+     * 窗口档位来源（`registerAccountHubRpc` 的第 10 个参数）—— **按 provider id 分键**
      * 的注册表，缺省的键就是「该 provider 不参与档位机制」。
      *
      * 省略即「未接线」：`model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝
@@ -663,7 +663,7 @@ describe('model.list / model.setDisabled 端点', () => {
       },
       // `connection` 由生产代码用**惰性注入**（`ctx.inject`）挂载，而非插件级
       // 静态 `inject`：它只存在于 Web bundle，静态声明会让 headless/CLI profile
-      // 永久 pending 而启动失败。替身必须复刻这一机制，否则 registerJetHubRpc
+      // 永久 pending 而启动失败。替身必须复刻这一机制，否则 registerAccountHubRpc
       // 会以 `ctx.inject is not a function` 直接抛错。
       //
       // 语义对齐真实 cordis：回调以**同一 ctx** 立即调用（本替身里 connection
@@ -672,7 +672,7 @@ describe('model.list / model.setDisabled 端点', () => {
       logger: { warn: () => {}, info: () => {} },
     }
 
-    registerJetHubRpc(
+    registerAccountHubRpc(
       ctx as never, pool, {} as never, {} as never, {} as never,
       {} as never, {} as never, {} as never, {} as never,
       // 生产路径传的是 `createContextTierRegistry(...)` 的产物；这里**走同一个
@@ -684,13 +684,13 @@ describe('model.list / model.setDisabled 端点', () => {
 
     /** 调用一个端点方法，返回解包后的 result。 */
     const call = async (method: string, payload: unknown) => {
-      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+      const response = await handler!(new Request('http://localhost/api/account-hub', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           type: 'client-request',
           rpcId: 'rpc-1',
-          method: 'jet-hub',
+          method: 'account-hub',
           payload: { method, payload },
         }),
       }))
@@ -1438,7 +1438,7 @@ describe('model.list / model.setDisabled 端点', () => {
  *
  * 此用例锁住后端这一侧，防止两种「好心改坏」：
  * - 把拒绝改成「返回空结果」→ 前端会以为 CodeArts 真没有积分可查，永远查不出问题；
- * - 让它抛异常 → 退化成 `jet-hub/handler-failed`，丢失「provider 不支持」这一原因。
+ * - 让它抛异常 → 退化成 `account-hub/handler-failed`，丢失「provider 不支持」这一原因。
  * 同时也验证拒绝是**按 provider 精确生效**的，没有连 Buddy 系一起误拒。
  */
 describe('积分端点的 provider 能力边界', () => {
@@ -1452,7 +1452,7 @@ describe('积分端点的 provider 能力边界', () => {
       get: (key: string) => key === 'connection'
         ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
         : undefined,
-      // 生产代码用惰性注入挂载 connection 端点（见 registerJetHubRpc 的说明）：
+      // 生产代码用惰性注入挂载 connection 端点（见 registerAccountHubRpc 的说明）：
       // 替身必须提供 inject，否则会以 `ctx.inject is not a function` 抛错。
       inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
       logger: { warn: () => {}, info: () => {} },
@@ -1462,20 +1462,20 @@ describe('积分端点的 provider 能力边界', () => {
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
     const pool = { listAccounts: async () => [] }
 
-    registerJetHubRpc(
+    registerAccountHubRpc(
       ctx as never, pool as never, {} as never, {} as never, {} as never,
       {} as never, {} as never, {} as never, {} as never,
     )
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {
-      const response = await handler!(new Request('http://localhost/api/jet-hub', {
+      const response = await handler!(new Request('http://localhost/api/account-hub', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           type: 'client-request',
           rpcId: 'rpc-1',
-          method: 'jet-hub',
+          method: 'account-hub',
           payload: { method, payload },
         }),
       }))

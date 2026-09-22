@@ -4,7 +4,7 @@
  * 用真实的 ~/.dsh/settings.yaml 与 .credentials.yaml 构造最小 ctx，
  * 验证：findAccountIdByCredential → updateModelRateLimit → 落盘 这条链路。
  *
- * 默认跳过（会写真实 settings.yaml）。用 DSH_JETHUB_POOL_CHECK=1 启用。
+ * 默认跳过（会写真实 settings.yaml）。用 DSH_ACCOUNT_HUB_POOL_CHECK=1 启用。
  */
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -12,11 +12,11 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { AccountPool } from '../../src/account-pool.js'
 
-const RUN = process.env.DSH_JETHUB_POOL_CHECK === '1'
+const RUN = process.env.DSH_ACCOUNT_HUB_POOL_CHECK === '1'
 const suite = RUN ? describe : describe.skip
 
 /** 从磁盘读取现有账号列表（模拟 settings scope 的 get）。 */
-function readJetHubAccounts(): Array<Record<string, unknown>> {
+function readAccountHubAccounts(): Array<Record<string, unknown>> {
   const text = readFileSync(join(homedir(), '.dsh', 'settings.yaml'), 'utf8')
   const idx = text.indexOf('jet-hub:')
   if (idx < 0) return []
@@ -61,7 +61,7 @@ function readCredential(refName: string): Record<string, unknown> | undefined {
 
 suite('AccountPool 限流记录闭环', () => {
   it('findAccountIdByCredential 能按 access_token 反查到账号', async () => {
-    const accounts = readJetHubAccounts()
+    const accounts = readAccountHubAccounts()
     console.log('\n=== 磁盘上的账号 ===')
     for (const a of accounts) {
       console.log(`  ${String(a.id)}  ref=${String(a.credentialRef)}  nickname=${String(a.nickname)}`)
@@ -72,7 +72,7 @@ suite('AccountPool 限流记录闭环', () => {
     // 拿它的 id 反查会因 provider 过滤而恒为空串。
     const PROVIDER = 'buddy-cn'
     // 反查只遍历「已启用的同 provider 账号」（见 account-pool.findAccountIdByCredential），
-    // 故只对这类账号断言。enabled 由 readJetHubAccounts 按文本解析，是字符串 'true'/'false'。
+    // 故只对这类账号断言。enabled 由 readAccountHubAccounts 按文本解析，是字符串 'true'/'false'。
     const candidates = accounts.filter((a) => a.provider === PROVIDER && String(a.enabled) !== 'false')
     console.log(`\n=== ${PROVIDER} 已启用账号 ${candidates.length} / 共 ${accounts.length} ===`)
     expect(candidates.length, `未找到已启用的 ${PROVIDER} 账号`).toBeGreaterThan(0)

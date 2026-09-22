@@ -10,7 +10,7 @@
       "types": "./lib/types/index.d.ts",
       "default": "./lib/index.js"
     },
-    "./client": "./lib/client/jet-hub.js",
+    "./client": "./lib/client/account-hub.js",
     "./package.json": "./package.json"
   },
   "files": [

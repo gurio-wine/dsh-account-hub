@@ -728,7 +728,7 @@ export class BuddyAdapter extends LlmAdapter {
    * 帮不上忙 —— `LlmRuntime` 会把适配器返回的条目重建成
    * `{provider, id, name, description?, inputModalities?}`，`contextTiers` 这类
    * 额外字段在那一层被丢掉。故由 `src/index.ts` 把本实例交给
-   * `registerJetHubRpc`（见 `ContextTierRegistry`）。
+   * `registerAccountHubRpc`（见 `ContextTierRegistry`）。
    *
    * ## 数据源与 `resolveModel` **同源同口径**
    *
@@ -1256,7 +1256,7 @@ function isCredentialExpired(credential: BuddyCredential): boolean {
  * 注意 settingsNs 必须与 `src/index.ts` 的 registerProviderSettings 注册的
  * namespace 保持一致，否则模型设置页会因未注册 namespace 崩溃。
  *
- * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerJetHubRpc`，
+ * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerAccountHubRpc`，
  *          供 Account Hub 读取逐模型的窗口档位（`contextTiers`）与校验用户选择。
  *          适配器是**模型目录的唯一持有者**，RPC 层拿不到目录就只能靠猜
  *          （与 `registerTraeCnLlm` / `registerQoderLlm` 同一约定）。

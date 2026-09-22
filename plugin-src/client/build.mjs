@@ -6,7 +6,7 @@ import { build } from 'esbuild';
 
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(sourceDirectory, '../..');
-const outputPath = resolve(packageRoot, 'lib/client/jet-hub.js');
+const outputPath = resolve(packageRoot, 'lib/client/account-hub.js');
 const loaderId = 'dsh-account-hub';
 
 /**
@@ -84,7 +84,7 @@ function smokeTestBundleTopLevel(code, filename) {
     loaded.factory(() => lazyStub('require'));
   } catch (error) {
     const lines = code.split('\n');
-    const frame = /jet-hub\.js:(\d+):(\d+)/.exec(String(error?.stack ?? ''));
+    const frame = /account-hub\.js:(\d+):(\d+)/.exec(String(error?.stack ?? ''));
     console.error('\n✗ 客户端产物冒烟失败：bundle 顶层求值抛错。');
     console.error(`  ${error?.name ?? 'Error'}: ${error?.message ?? error}`);
     if (frame) {

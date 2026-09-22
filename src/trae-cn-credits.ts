@@ -6,7 +6,7 @@
  * 某一个文件出现大量 `if (provider === …)` 分支。但**复用 `credits.ts` 的类型**，
  * 让 `computeClaimSummary`、`collectCreditsStatus` / `collectClaimResults` /
  * `collectCreditBalances` 三个收集器与前端的结果摘要 UI 都不必各写一份 ——
- * Trae 只需注入自己的下钻函数（见 `src/jet-hub-rpc.ts` 的三处分发），
+ * Trae 只需注入自己的下钻函数（见 `src/account-hub-rpc.ts` 的三处分发），
  * 唯一的类型改动是补上显式类型参数（因为 Trae 的凭据不是 `BuddyCredential`）。
  *
  * ## 协议（调研实测）
@@ -321,7 +321,7 @@ export interface TraeCnCreditsOptions {
    * 脱敏调试出口（**只输出字段名与结构判定，不输出值**）。
    *
    * 用途是在真机校准时一次性看清「礼包数组在哪、余额字段叫什么、领取积分字段
-   * 叫什么」。生产接线把它接到 `ctx.logger.info`（见 `src/jet-hub-rpc.ts` 的
+   * 叫什么」。生产接线把它接到 `ctx.logger.info`（见 `src/account-hub-rpc.ts` 的
    * 三处分发）；它**不**回传客户端，故校准看宿主日志。
    */
   onDebug?: (message: string) => void

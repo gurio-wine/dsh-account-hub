@@ -15,7 +15,7 @@ import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
 import { createContextTierRegistry } from './context-tiers.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
-import { registerJetHubRpc } from './jet-hub-rpc.js'
+import { registerAccountHubRpc } from './account-hub-rpc.js'
 import { BUDDY_CN, BUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE_CN } from './trae-cn-product.js'
@@ -296,18 +296,18 @@ export function apply(ctx: Context): void {
         void pool.pruneAccountsWithForeignDomain(product).then((removed) => {
           if (removed.length > 0) {
             ctx.logger.info(
-              `[jet-hub] 已清理 ${removed.length} 个 ${product.displayName} 域名失配账号，请重新登录：${removed.join(', ')}`,
+              `[account-hub] 已清理 ${removed.length} 个 ${product.displayName} 域名失配账号，请重新登录：${removed.join(', ')}`,
             )
           }
         }).catch((error: unknown) => {
-          ctx.logger.warn(`[jet-hub] 清理 ${product.displayName} 域名失配账号失败：${String(error)}`)
+          ctx.logger.warn(`[account-hub] 清理 ${product.displayName} 域名失配账号失败：${String(error)}`)
         })
       }
     })
   }).catch((error: unknown) => {
     // openStorage 自身已把可预期的失败吞掉并降级；这里只兜住意外异常，
     // 绝不让持久层的问题阻断插件加载。
-    ctx.logger.warn(`[jet-hub] storage 接管失败，账号池以当前通路继续：${String(error)}`)
+    ctx.logger.warn(`[account-hub] storage 接管失败，账号池以当前通路继续：${String(error)}`)
   })
 
   ctx.commands.register({
@@ -617,7 +617,7 @@ export function apply(ctx: Context): void {
   // `QODER_CN.id`（`'qoder-cn'`），**不做任何 poolProviderId 映射**。
   // 账号条目的 `provider` 字段 = `'qoder-cn'`，凭据 ref 前缀
   // `QODER_CN_ACCOUNT_*`（连字符转下划线的机制已有，见
-  // `src/jet-hub-rpc.ts` 的 `accountCredentialRefName`）。
+  // `src/account-hub-rpc.ts` 的 `accountCredentialRefName`）。
   //
   // 服务名由产品配置显式给出 `qoderCnAuth`：id 带连字符，机械派生的
   // `qoder-cnAuth` 不是合法标识符风格 —— 这正是 `QoderProduct.serviceName`
@@ -743,7 +743,7 @@ export function apply(ctx: Context): void {
         traeCn.stop()
         qoder.stop()
         qoderCn.stop()
-      }, 'jet-hub: multi-account refresh scheduler')
+      }, 'account-hub: multi-account refresh scheduler')
     }
   })
 
@@ -779,6 +779,6 @@ export function apply(ctx: Context): void {
     [QODER.id]: qoderAdapter,
     [QODER_CN.id]: qoderCnAdapter,
   })
-  registerJetHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTierRegistry)
+  registerAccountHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTierRegistry)
   ctx.provide('accountPool', pool)
 }

@@ -223,7 +223,7 @@ export async function openAccountHubStorage(ctx: Context): Promise<AccountHubSto
   const facility = ctx.get('storageDomain') as DomainFacilityLike | undefined
   if (!facility || typeof facility.open !== 'function') {
     ctx.logger?.warn?.(
-      '[jet-hub] storage 服务不可用，账号池回退旧 settings 路径',
+      '[account-hub] storage 服务不可用，账号池回退旧 settings 路径',
     )
     return undefined
   }
@@ -237,7 +237,7 @@ export async function openAccountHubStorage(ctx: Context): Promise<AccountHubSto
       tables: {},
     })
   } catch (error) {
-    ctx.logger?.warn?.(`[jet-hub] storage 域打开失败，账号池回退旧 settings 路径: ${String(error)}`)
+    ctx.logger?.warn?.(`[account-hub] storage 域打开失败，账号池回退旧 settings 路径: ${String(error)}`)
     return undefined
   }
 

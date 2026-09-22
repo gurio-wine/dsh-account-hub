@@ -10,11 +10,11 @@
  *    `BUDDY_CN_ACCOUNT_XXX` —— 于是「刷新这个账号」实际刷的是另一个凭据。
  *
  * 这两个缺陷都无法靠 `collect*` 那类纯函数测试发现（它们不在那条代码路径上），
- * 因此这里直接驱动 `registerJetHubRpc` 注册的 HTTP 处理器，断言真实分派行为。
+ * 因此这里直接驱动 `registerAccountHubRpc` 注册的 HTTP 处理器，断言真实分派行为。
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { registerAccountHubRpc } from '../../src/account-hub-rpc.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 /** 采集到的「某服务被要求刷新的 credentialRef」。 */
@@ -39,7 +39,7 @@ function makeCtx(accounts: ProviderAccountEntry[]) {
     // 生产代码用**惰性注入**（`ctx.inject(['connection'], …)`）挂载端点，而非
     // 插件级静态 `inject`：`connection` 只存在于 Web bundle，静态声明会让
     // headless/CLI profile 永久 pending 而启动失败。替身必须复刻这一机制，
-    // 否则 registerJetHubRpc 会以 `ctx.inject is not a function` 直接抛错。
+    // 否则 registerAccountHubRpc 会以 `ctx.inject is not a function` 直接抛错。
     // 语义对齐真实 cordis：回调以**同一 ctx** 立即调用。
     inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
     logger: { warn: () => {}, info: () => {}, error: () => {} },
@@ -78,7 +78,7 @@ async function callRefresh(
 ): Promise<{ calls: RefreshCall[]; value: { success: boolean; error?: string } }> {
   const calls: RefreshCall[] = []
   const { ctx, getHandler } = makeCtx(accounts)
-  registerJetHubRpc(
+  registerAccountHubRpc(
     ctx as never,
     makePool(accounts) as never,
     makeServiceStub('codearts', calls) as never,
@@ -91,13 +91,13 @@ async function callRefresh(
     makeServiceStub('qoder', calls) as never,
     makeServiceStub('qoder-cn', calls) as never,
   )
-  const response = await getHandler()(new Request('http://127.0.0.1/api/jet-hub', {
+  const response = await getHandler()(new Request('http://127.0.0.1/api/account-hub', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       type: 'client-request',
       rpcId: 'r1',
-      method: 'jet-hub',
+      method: 'account-hub',
       payload: { method: 'account.refresh', payload: { accountId } },
     }),
   }))

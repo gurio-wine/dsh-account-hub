@@ -5,17 +5,17 @@
  * Client 侧通过 connection.rpc.call() 调用。
  *
  * 路径格式：
- *   Host 注册：/api/jet-hub
- *   Client 调用：connection.rpc.call('/api', 'jet-hub', { method, payload }, signal)
+ *   Host 注册：/api/account-hub
+ *   Client 调用：connection.rpc.call('/api', 'account-hub', { method, payload }, signal)
  */
 
-const ENDPOINT = 'jet-hub'
+const ENDPOINT = 'account-hub'
 
 /**
  * 调用 Account Hub 管理 API。
  *
  * @param {import('@deepseek-ai/dsh-connection').Connection} connection
- * @param {string} channel  通道名（如 '/jet-hub'，用于识别）
+ * @param {string} channel  通道名（如 '/account-hub'，用于识别）
  * @param {string} method  端点方法名（如 'account.list'）
  * @param {unknown} payload  请求载荷
  * @param {AbortSignal} [signal]  可选的取消信号
@@ -24,7 +24,7 @@ const ENDPOINT = 'jet-hub'
 export function callManagementRpc(connection, channel, method, payload, signal) {
   // 使用 DSH 的标准 RPC 模式：
   // connection.rpc.call(mountPoint, endpoint, payload, signal)
-  // mountPoint = '/api', endpoint = 'jet-hub'
+  // mountPoint = '/api', endpoint = 'account-hub'
   // payload = { method: 'account.list', payload: { provider: 'buddy-cn' } }
   return connection.rpc.call('/api', ENDPOINT, { method, payload }, signal)
 }

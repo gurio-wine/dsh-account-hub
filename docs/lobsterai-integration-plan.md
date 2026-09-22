@@ -424,7 +424,7 @@ POST {serverBase}/api/auth/exchange
 | `/tmp/lb2api-login-state.json`（跨进程状态） | 进程内 `Promise`（`src/login.ts:165-168` 的 `result`） | ❌ |
 | `python3` 解析 JSON | JS 原生 `JSON.parse` | ❌ |
 | `docker restart` 加载账号 | `ctx.credentials.set()` 即时生效，账号池读的是进程内副本 | ❌ |
-| `read -rp` 人工确认「按 y」 | Account Hub 弹窗轮询 `login.poll`（`jet-hub-rpc.ts:478-488`） | ❌ |
+| `read -rp` 人工确认「按 y」 | Account Hub 弹窗轮询 `login.poll`（`account-hub-rpc.ts:478-488`） | ❌ |
 | `LB2A_LOGIN_PORTAL` / `LB2A_UPSTREAM_BASE` env | 写进 `LobsteraiProduct` 常量（§3.1-C） | ❌ |
 
 → 这正是 §0.3「不需要跑那个反代」在**具体依赖**层面的体现：
@@ -469,7 +469,7 @@ return listenOnCallbackPort(server).then((port) => ({ port, server, result }))
 `src/buddy-oauth.ts:468-508` `runBuddyLoginFlow`：
 `fetchAuthState` → 打开浏览器 → `loopGetToken`（1 秒间隔轮询）→ `getAccount`。
 
-**Account Hub 的两步式封装**（`src/jet-hub-rpc.ts:376-438` `account.create`）：
+**Account Hub 的两步式封装**（`src/account-hub-rpc.ts:376-438` `account.create`）：
 - 第一步：同步取 `state` + `loginUrl` 返回给前端弹窗；
 - 第二步：用**同一个 state** 后台异步跑完 `runBuddyLoginFlow`，
   成功写 `ctx.credentials`、失败则删除占位账号。
@@ -528,7 +528,7 @@ export interface LobsteraiLoginFlowResult {
    }
    ```
 
-   缺点：前端要等用户完成登录（CodeArts 现在就是这样，`jet-hub-rpc.ts:430-434`）。
+   缺点：前端要等用户完成登录（CodeArts 现在就是这样，`account-hub-rpc.ts:430-434`）。
    照它做，改动最小、语义最直白。
 
    > **2026-09 更新：已改为两段式非阻塞**，本条的「缺点」正是当时的痛点 ——
@@ -601,7 +601,7 @@ const info = await this.ctx.credentials.describe(ref)
 
 - **ref 命名**：单账号用固定名（`CODEARTS_ACCESS_TOKEN` / `BUDDY_ACCESS_TOKEN` /
   `WORKBUDDY_ACCESS_TOKEN`）；多账号用 `{PROVIDER}_ACCOUNT_{UUID_SHORT}`
-  （`jet-hub-rpc.ts:380-381`）。
+  （`account-hub-rpc.ts:380-381`）。
   > 这两个 buddy 系 ref 是**改正名之前**的取值：改名后中国版让位到
   > `BUDDY_CN_ACCESS_TOKEN`，国际版接管 `BUDDY_ACCESS_TOKEN`，
   > 而 `WORKBUDDY_ACCESS_TOKEN` 已作废（升级时自动搬迁）。
@@ -1167,7 +1167,7 @@ Body: { "configRevision": rev,
    逐字段安全读取，**绝不抛错**；
 5. `REQUEST_TIMEOUT_MS = 30_000` + `AbortSignal.timeout`。
 
-**RPC 层**（`src/jet-hub-rpc.ts`）：
+**RPC 层**（`src/account-hub-rpc.ts`）：
 - `collectCreditsStatus`（163-187 行）/ `collectClaimResults`（199-239 行）；
 - **逐账号顺序执行**（避免并发触发风控）；
 - **凭据解析在 try 之内**（158-162 行注释说明了原因：`credentialRef()` 会对
@@ -1390,7 +1390,7 @@ pool.listAllAccounts().then(accounts => {
 
 #### B. 当前项目怎么做的
 
-**宿主侧**：`src/jet-hub-rpc.ts`（654 行）注册 `POST /api/jet-hub`，
+**宿主侧**：`src/account-hub-rpc.ts`（654 行）注册 `POST /api/account-hub`，
 方法分发在 `handleMethod`（368-645 行）：
 
 | 方法 | 要点 |
@@ -1405,7 +1405,7 @@ pool.listAllAccounts().then(accounts => {
 | `model.list` | `ctx.llm.listModels(provider)` + **黑名单并集补回**（595-620 行，注释解释了「关掉后彻底找不到」的根因） |
 | `model.setDisabled` | `pool.setModelDisabled` |
 
-**客户端**：`plugin-src/client/jet-hub.js`（769 行，React）：
+**客户端**：`plugin-src/client/account-hub.js`（769 行，React）：
 - `PROVIDERS`（10-14 行）驱动 tab 列表，每项 `{id, label, icon, logoClass}`；
 - `CREDITS_PROVIDERS = ['buddy']`（24 行）决定是否渲染「一键领取积分」；
 - `ProviderLogo`（26-32 行）按 `logoClass` 上 CSS class；
@@ -1420,10 +1420,10 @@ pool.listAllAccounts().then(accounts => {
 > 每次打开都报 unsupported provider」的根因。`PROVIDERS` 现在是五项：
 > `codearts` / `buddy-cn` / `buddy` / `lobsterai` / `trae-cn`。
 
-**样式**：`plugin-src/client/jet-hub-styles.js:25-29` 为每个 provider 定义
-`.dim-jh-providerIcon.{logoClass} { background: white; }`。
+**样式**：`plugin-src/client/account-hub-styles.js:25-29` 为每个 provider 定义
+`.dim-ah-providerIcon.{logoClass} { background: white; }`。
 
-> ⚠️ **发现的既有 bug 1**（`jet-hub-rpc.ts:452-476`）：`account.refresh` 的分支
+> ⚠️ **发现的既有 bug 1**（`account-hub-rpc.ts:452-476`）：`account.refresh` 的分支
 > 只处理 `codearts` 与 `buddy`，**`workbuddy` 会落到 `else` 抛
 > `Unknown provider: workbuddy`**。即当前 WorkBuddy 账号卡片的「刷新」按钮是坏的。
 >
@@ -1443,7 +1443,7 @@ pool.listAllAccounts().then(accounts => {
 
 #### C. 推荐做法
 
-**宿主侧**（`src/jet-hub-rpc.ts`）：
+**宿主侧**（`src/account-hub-rpc.ts`）：
 
 1. `account.create` 加 `lobsterai` 分支 —— 照 CodeArts 那样**同步**执行：
    ```ts
@@ -1474,7 +1474,7 @@ pool.listAllAccounts().then(accounts => {
    （它们只用 `credentialRef` 和 `deps`，而 `deps.fetchStatus` / `deps.claim` /
    `deps.fetchBalance` **已经是注入的**，见 `CreditsEndpointDeps` 135-150 行）。
 
-**客户端**（`plugin-src/client/jet-hub.js`）：
+**客户端**（`plugin-src/client/account-hub.js`）：
 
 1. `PROVIDERS` 加一项：
    ```js
@@ -1490,8 +1490,8 @@ pool.listAllAccounts().then(accounts => {
 3. 新增 `LOBSTERAI_ICON`（base64 PNG，尺寸对齐现有：AI 图标 64x64、
    CodeBuddy 70x70、WorkBuddy 72x72 —— 显示时统一缩到 20x20）。
    （这两份图标即今日的 Buddy CN 与 Buddy；改名时**没有**换过图标本体。）
-4. `plugin-src/client/jet-hub-styles.js` 加
-   `.dim-jh-providerIcon.lobsterai { background: white; }`。
+4. `plugin-src/client/account-hub-styles.js` 加
+   `.dim-ah-providerIcon.lobsterai { background: white; }`。
 
 ---
 
@@ -1507,7 +1507,7 @@ curl 命令（55-71 行）。
 - **单元测试**：`tests/unit/**/*.spec.ts`（21 个文件），`pnpm test`，
   全 mock 无网络。`vitest.config.ts` 只 include `tests/unit/`。
   现有覆盖：`credits.spec.ts`（22.6 KB）、`buddy-adapter.spec.ts`（71.7 KB）、
-  `account-pool.spec.ts`（30 KB）、`jet-hub-rpc.spec.ts`（32.4 KB）等。
+  `account-pool.spec.ts`（30 KB）、`account-hub-rpc.spec.ts`（32.4 KB）等。
 - **E2E**：`tests/e2e/**`，`pnpm test:e2e:*`，**全部有闸门且默认 skip**
   （`describe.skip`），说明见 `tests/e2e/README.md`。
   README 里明确分了「消耗模型积分」与「不消耗」两张表，
@@ -1629,13 +1629,13 @@ curl 命令（55-71 行）。
 | `src/lobsterai-adapter.ts` | **新建**（`LobsteraiAdapter extends LlmAdapter`） | **高**（SSE/工具调用最易出错） |
 | `src/lobsterai-credits.ts` | **新建**（签到 + 余额） | 中 |
 | `src/lobsterai-errors.ts` | **新建**（错误分类） | 低 |
-| `src/index.ts` | 注册 `llm-lobsterai` settings namespace；实例化 `lobsteraiAuth`；注册 LLM；加入 `refreshAllCredentials`；`registerJetHubRpc` 传参 | 低 |
-| `src/jet-hub-rpc.ts` | `account.create` 加 lobsterai 分支；`account.refresh` 加分支（**并顺带修 2 个既有 bug**）；`registerJetHubRpc` 签名加 `lobsterai` 参数 | 中 |
+| `src/index.ts` | 注册 `llm-lobsterai` settings namespace；实例化 `lobsteraiAuth`；注册 LLM；加入 `refreshAllCredentials`；`registerAccountHubRpc` 传参 | 低 |
+| `src/account-hub-rpc.ts` | `account.create` 加 lobsterai 分支；`account.refresh` 加分支（**并顺带修 2 个既有 bug**）；`registerAccountHubRpc` 签名加 `lobsterai` 参数 | 中 |
 | `src/types.ts` | `resolveCredentialForAccount` 返回类型加 `LobsteraiCredential`；`CreditsEndpointDeps` / `collect*` 的 product 参数放宽 | 低 |
 | `src/account-pool.ts` | **几乎不用改**（provider 已是 `string`）。仅 `resolveCredentialForAccount` 的返回类型联合需要放宽 | 低 |
 | `src/account-probe.ts` | **必须改**：`probeWithAdapter` 现在是 `productById(...) ? BuddyAdapter : CodeArtsAdapter`（122-134 行）—— lobsterai 会落进 **CodeArtsAdapter** 分支，用华为云 HMAC 签名去发 LobsterAI 请求，**必然失败**。加第三个分支 | **高**（正是 `account-probe.ts:118-121` 注释里记录过的同一类 bug） |
-| `plugin-src/client/jet-hub.js` | `PROVIDERS` 加项 + 图标；`CREDITS_PROVIDERS` 加 `'lobsterai'`（**实际改为能力矩阵登记**，见 §3.11 补记） | 低 |
-| `plugin-src/client/jet-hub-styles.js` | 加 `.dim-jh-providerIcon.lobsterai` | 低 |
+| `plugin-src/client/account-hub.js` | `PROVIDERS` 加项 + 图标；`CREDITS_PROVIDERS` 加 `'lobsterai'`（**实际改为能力矩阵登记**，见 §3.11 补记） | 低 |
+| `plugin-src/client/account-hub-styles.js` | 加 `.dim-ah-providerIcon.lobsterai` | 低 |
 | `package.json` | 加 `test:e2e:lobsterai*` 脚本 | 低 |
 | `tests/e2e/README.md` | 加 LobsterAI 用例的消耗标注 | 低 |
 | `README.md` / `AGENTS.md` | 补 LobsterAI provider 章节 | 低 |
@@ -1675,7 +1675,7 @@ curl 命令（55-71 行）。
    产出：Account Hub 面板的「一键领取积分」与积分余额行。
 
 6. **T6 — Account Hub UI**
-   `plugin-src/client/jet-hub.js` + `jet-hub-styles.js`
+   `plugin-src/client/account-hub.js` + `account-hub-styles.js`
    产出：第四个 provider tab。
 
 7. **T7 — 收尾**
@@ -1826,8 +1826,8 @@ DNS 解析与 HTTP 实测（portal / API / 更新接口，见 §0.2、§0.2b、�
 **本插件**
 `src/index.ts` / `src/product.ts` / `src/buddy.ts` / `src/buddy-auth.ts` /
 `src/buddy-oauth.ts` / `src/buddy-adapter.ts` / `src/credits.ts` /
-`src/account-pool.ts` / `src/account-probe.ts` / `src/jet-hub-rpc.ts` /
+`src/account-pool.ts` / `src/account-probe.ts` / `src/account-hub-rpc.ts` /
 `src/types.ts` / `src/service.ts` / `src/login.ts` / `src/refresh.ts` /
-`src/sse.ts` / `src/llm-adapter.ts`（节选）/ `plugin-src/client/jet-hub.js` /
-`plugin-src/client/jet-hub-styles.js` / `plugin-src/client/index.js` /
+`src/sse.ts` / `src/llm-adapter.ts`（节选）/ `plugin-src/client/account-hub.js` /
+`plugin-src/client/account-hub-styles.js` / `plugin-src/client/index.js` /
 `README.md` / `AGENTS.md` / `package.json` / `tests/e2e/README.md`

@@ -31,7 +31,7 @@ declare module '@deepseek-ai/cordis' {
  * `src/account-hub-storage.ts` 的 `ACCOUNT_HUB_DOMAIN`），这里只在**回退路径**
  * （storage 不可用）下继续读写它，以及被迁移模块用于定位旧数据。
  */
-export const JET_HUB_NS = 'jet-hub'
+export const ACCOUNT_HUB_NS = 'jet-hub'
 
 /**
  * 模型黑名单：provider id → **被关闭**的模型 id 列表。
@@ -48,7 +48,7 @@ export type ModelDisableMap = Record<string, Record<string, boolean>>
  * ## 语义（与「专家设置」严格区分）
  *
  * 这里的值**不是用户可以自由填的数字**，而是「该模型目录公布过的档位之一」——
- * 由 `model.setContextBudget` 校验后写入（见 `src/jet-hub-rpc.ts`），适配器读取时
+ * 由 `model.setContextBudget` 校验后写入（见 `src/account-hub-rpc.ts`），适配器读取时
  * 还要**再判一次**「它是否精确等于该模型当前目录的 Max 档」（见
  * `TraeCnAdapter.resolveModel` 的预算覆盖）。
  *
@@ -61,7 +61,7 @@ export type ModelDisableMap = Record<string, Record<string, boolean>>
 export type ContextBudgetMap = Record<string, Record<string, number>>
 
 /** 账号池在 settings 中存储的值结构。 */
-interface JetHubSettingsValue {
+interface AccountHubSettingsValue {
   accounts?: ProviderAccountEntry[]
   /** 模型黑名单（见 {@link ModelDisableMap}）。 */
   disabledModels?: ModelDisableMap
@@ -80,7 +80,7 @@ interface JetHubSettingsValue {
  *
  * 迁移函数在版本号 ≥1 时整体 short-circuit，因此这个数字只会前进。
  */
-export const JET_HUB_SCHEMA_VERSION = 1
+export const ACCOUNT_HUB_SCHEMA_VERSION = 1
 
 /** ctx.settings.register() 返回的 owner scope（只用到 get/replace）。 */
 interface SettingsScopeLike {
@@ -123,7 +123,7 @@ interface SettingsServiceLike {
  * 账号列表是动态结构，此处用 `Schema.array(Schema.any())` 承接，
  * 单项字段由 AccountPool 自身在读写时保证。
  */
-const jetHubSchema = Schema.object({
+const accountHubSchema = Schema.object({
   accounts: Schema.array(Schema.any()).default([]),
   // 模型黑名单：对象（provider id → 模型 id → boolean）而非数组。
   //
@@ -139,7 +139,7 @@ const jetHubSchema = Schema.object({
   // **必须带 `.default({})`**：namespace 首次注册时配置里没有该字段。
   contextBudgets: Schema.dict(Schema.any()).default({}),
   // 数据版本号。`0` = 旧命名（buddy=中国版 / workbuddy=国际版）尚未迁移；
-  // 见 {@link JET_HUB_SCHEMA_VERSION}。**必须带 default**：老配置文件里没有
+  // 见 {@link ACCOUNT_HUB_SCHEMA_VERSION}。**必须带 default**：老配置文件里没有
   // 这个字段，缺失时按 0 处理才等价于「迁移尚未执行」。
   schemaVersion: Schema.number().default(0),
 })
@@ -275,16 +275,16 @@ export class AccountPool {
       // 最终降级状态由 `openStorage()` 统一判定并播报。
       if (this.ctx.get('storageDomain') === undefined) {
         this.ctx.logger?.warn?.(
-          '[jet-hub] settings.register 与 storage 均不可用，账号列表将仅存在于内存中',
+          '[account-hub] settings.register 与 storage 均不可用，账号列表将仅存在于内存中',
         )
       }
       return
     }
     try {
-      this.scope = settings.register(JET_HUB_NS, jetHubSchema)
+      this.scope = settings.register(ACCOUNT_HUB_NS, accountHubSchema)
     } catch (error) {
       // 重复注册（如插件热重载）时降级为内存态。
-      this.ctx.logger?.warn?.(`[jet-hub] settings namespace 注册失败，降级运行: ${String(error)}`)
+      this.ctx.logger?.warn?.(`[account-hub] settings namespace 注册失败，降级运行: ${String(error)}`)
     }
   }
 
@@ -303,9 +303,9 @@ export class AccountPool {
     if (storage === undefined) {
       // storage 缺席：只有连 settings 回退路径也没有时，才是真正的「仅内存」。
       if (this.scope === undefined) {
-        this.ctx.logger?.warn?.('[jet-hub] settings 与 storage 均不可用，账号列表仅存在于内存中')
+        this.ctx.logger?.warn?.('[account-hub] settings 与 storage 均不可用，账号列表仅存在于内存中')
       } else {
-        this.ctx.logger?.warn?.('[jet-hub] storage 不可用，账号池回退 settings 路径')
+        this.ctx.logger?.warn?.('[account-hub] storage 不可用，账号池回退 settings 路径')
       }
       return false
     }
@@ -328,22 +328,22 @@ export class AccountPool {
     const resolveHome = this.ctx.dshHomePath
     if (typeof resolveHome !== 'function') {
       // 没有 home 解析服务就不猜路径：宁可这轮不迁移，也不能读错目录或写坏别处。
-      this.ctx.logger?.warn?.('[jet-hub] 宿主未提供 dshHomePath，跳过账号数据一次性迁移')
+      this.ctx.logger?.warn?.('[account-hub] 宿主未提供 dshHomePath，跳过账号数据一次性迁移')
       return
     }
     try {
       const result = await migrateAccountHubIntoStorage({ home: resolveHome(), storage })
       if (result.outcome === 'migrated') {
         this.ctx.logger?.info?.(
-          `[jet-hub] 账号池已迁入 storage 域（来源 ${result.origin}，${result.accountCount} 个账号）`,
+          `[account-hub] 账号池已迁入 storage 域（来源 ${result.origin}，${result.accountCount} 个账号）`,
         )
       } else if (result.outcome === 'failed') {
         this.ctx.logger?.warn?.(
-          `[jet-hub] 账号数据一次性迁移失败，本轮以现有数据继续（下次启动重试）：${result.error}`,
+          `[account-hub] 账号数据一次性迁移失败，本轮以现有数据继续（下次启动重试）：${result.error}`,
         )
       }
     } catch (error) {
-      this.ctx.logger?.warn?.(`[jet-hub] 账号数据一次性迁移异常，本轮跳过：${String(error)}`)
+      this.ctx.logger?.warn?.(`[account-hub] 账号数据一次性迁移异常，本轮跳过：${String(error)}`)
     }
   }
 
@@ -360,13 +360,13 @@ export class AccountPool {
       return
     }
     if (!this.scope) return
-    const value = this.scope.get() as JetHubSettingsValue | undefined
+    const value = this.scope.get() as AccountHubSettingsValue | undefined
     const accounts = value?.accounts
     if (Array.isArray(accounts)) {
       this.cache = accounts as ProviderAccountEntry[]
     } else {
       this.ctx.logger?.warn?.(
-        `[jet-hub] 账号列表首次载入为空（scope 返回 ${JSON.stringify(value)}）`,
+        `[account-hub] 账号列表首次载入为空（scope 返回 ${JSON.stringify(value)}）`,
       )
     }
     // 黑名单是后来才加入的字段：老配置文件里没有它，缺失时保持空表
@@ -401,7 +401,7 @@ export class AccountPool {
       return
     }
     if (!this.scope) {
-      this.ctx.logger?.warn?.(`[jet-hub] ${warning}`)
+      this.ctx.logger?.warn?.(`[account-hub] ${warning}`)
       return
     }
     await this.scope.replace(document)
@@ -414,7 +414,7 @@ export class AccountPool {
   }
 
   /**
-   * 数据版本号（0 = 旧命名尚未迁移，见 {@link JET_HUB_SCHEMA_VERSION}）。
+   * 数据版本号（0 = 旧命名尚未迁移，见 {@link ACCOUNT_HUB_SCHEMA_VERSION}）。
    *
    * 一次性迁移用它做 short-circuit；普通读取路径不关心它。
    */
@@ -457,7 +457,7 @@ export class AccountPool {
   async replaceAll(
     accounts: ProviderAccountEntry[],
     disabledModels: ModelDisableMap,
-    schemaVersion: number = JET_HUB_SCHEMA_VERSION,
+    schemaVersion: number = ACCOUNT_HUB_SCHEMA_VERSION,
   ): Promise<void> {
     // ⚠️ 必须先 ensureLoaded()：本方法只从调用方接收三件套，**上下文预算取自进程内
     // 副本**（它不是迁移对象）。没载入就写，会把用户已有的档位选择覆盖成空。
@@ -468,7 +468,7 @@ export class AccountPool {
     this.versionCache = schemaVersion
     this.loaded = true
     if (this.storage === undefined && !this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无 storage 域与 settings scope，数据迁移结果未持久化')
+      this.ctx.logger?.warn?.('[account-hub] 无 storage 域与 settings scope，数据迁移结果未持久化')
       return
     }
     await this.persist({
@@ -490,7 +490,7 @@ export class AccountPool {
     this.cache = accounts
     this.loaded = true
     if (this.storage === undefined && !this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无持久化通路，账号变更未持久化')
+      this.ctx.logger?.warn?.('[account-hub] 无持久化通路，账号变更未持久化')
       return
     }
     await this.persist({
@@ -554,7 +554,7 @@ export class AccountPool {
     this.modelCache = disabledModels
     this.loaded = true
     if (this.storage === undefined && !this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无持久化通路，模型黑名单变更未持久化')
+      this.ctx.logger?.warn?.('[account-hub] 无持久化通路，模型黑名单变更未持久化')
       return
     }
     // 与 writeAccounts 对称：整体 replace 必须携带账号列表、上下文预算与版本号，否则会被清空。
@@ -609,7 +609,7 @@ export class AccountPool {
     this.budgetCache = contextBudgets
     this.loaded = true
     if (this.storage === undefined && !this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无持久化通路，上下文窗口预算变更未持久化')
+      this.ctx.logger?.warn?.('[account-hub] 无持久化通路，上下文窗口预算变更未持久化')
       return
     }
     // 与 writeAccounts / writeModels 对称：整体 replace 必须携带另外三件套，否则会被清空。
@@ -807,7 +807,7 @@ export class AccountPool {
     next[idx] = updated
     await this.writeAccounts(next)
     this.ctx.logger?.info?.(
-      `[jet-hub] 已清除限流标记: 账号 ${accountId} 模型 ${targets.join(', ')}（共 ${removed} 条）`,
+      `[account-hub] 已清除限流标记: 账号 ${accountId} 模型 ${targets.join(', ')}（共 ${removed} 条）`,
     )
     return removed
   }
@@ -874,7 +874,7 @@ export class AccountPool {
         const credential = JSON.parse(resolved.value) as CodeArtsCredential | BuddyCredential
         if (failures.length > 0) {
           this.ctx.logger?.warn?.(
-            `[jet-hub] ${failures.length} 个 ${provider} 账号不可用，已跳过：${failures.join('; ')}`,
+            `[account-hub] ${failures.length} 个 ${provider} 账号不可用，已跳过：${failures.join('; ')}`,
           )
         }
         return { entry, credential }
@@ -885,7 +885,7 @@ export class AccountPool {
     }
     if (failures.length > 0) {
       this.ctx.logger?.warn?.(
-        `[jet-hub] 没有可用的 ${provider} 账号：${failures.join('; ')}`,
+        `[account-hub] 没有可用的 ${provider} 账号：${failures.join('; ')}`,
       )
     }
     return null
@@ -904,7 +904,7 @@ export class AccountPool {
     const idx = accounts.findIndex(a => a.id === accountId)
     if (idx === -1) {
       this.ctx.logger?.warn?.(
-        `[jet-hub] updateModelRateLimit: 账号 ${accountId} 不在账号列表中（已知: ${accounts.map(a => a.id).join(', ') || '空'}）`,
+        `[account-hub] updateModelRateLimit: 账号 ${accountId} 不在账号列表中（已知: ${accounts.map(a => a.id).join(', ') || '空'}）`,
       )
       return
     }
@@ -914,7 +914,7 @@ export class AccountPool {
     next[idx] = entry
     await this.writeAccounts(next)
     this.ctx.logger?.info?.(
-      `[jet-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`,
+      `[account-hub] 已记录限流: 账号 ${accountId} 模型 ${modelId} 重置于 ${new Date(resetAtMs).toISOString()}`,
     )
   }
 

@@ -1,8 +1,8 @@
 /**
  * Trae CN 三个积分 RPC 分派的回归测试。
  *
- * `collect*` 那类纯函数的测试（`tests/unit/jet-hub-rpc.spec.ts`）走的是**注入替身**
- * 的路径，**覆盖不到** `registerJetHubRpc` 里的 provider 分发分支 —— 而那正是
+ * `collect*` 那类纯函数的测试（`tests/unit/account-hub-rpc.spec.ts`）走的是**注入替身**
+ * 的路径，**覆盖不到** `registerAccountHubRpc` 里的 provider 分发分支 —— 而那正是
  * 新增 provider 最容易漏的地方（LobsterAI 当初就漏了 `account.refresh` 的
  * workbuddy 分支）。因此这里直接驱动注册出来的 HTTP 处理器，并用**全局 fetch
  * 替身**接住真实下钻函数发出的请求，断言端到端的分派行为。
@@ -14,7 +14,7 @@
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { registerAccountHubRpc } from '../../src/account-hub-rpc.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 import type { TraeCnCredential } from '../../src/trae-cn-oauth.js'
 
@@ -106,7 +106,7 @@ function harness(options: {
     listAllAccounts: async () => options.accounts,
     listAccounts: async (provider: string) => options.accounts.filter((a) => a.provider === provider),
   }
-  registerJetHubRpc(
+  registerAccountHubRpc(
     ctx as never,
     pool as never,
     {} as never,
@@ -124,13 +124,13 @@ function harness(options: {
   return {
     calls,
     call: async (method: string, payload: unknown) => {
-      const response = await handler!(new Request('http://127.0.0.1/api/jet-hub', {
+      const response = await handler!(new Request('http://127.0.0.1/api/account-hub', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           type: 'client-request',
           rpcId: 'r1',
-          method: 'jet-hub',
+          method: 'account-hub',
           payload: { method, payload },
         }),
       }))
@@ -308,7 +308,7 @@ describe('credits.balances 的 trae-cn 分派（按 provider 选池）', () => {
     // 两个问题必须分开答：「查谁的账号」走 `poolProviderFor`（今天恒等），
     // 「显示哪个池」由 `credits.balances` 里的 provider 分支决定。
     // 若有人把选池并进账号映射（或反过来），面板会显示它花不掉的池 —— 且不报错。
-    const { poolProviderFor } = await import('../../src/jet-hub-rpc.js')
+    const { poolProviderFor } = await import('../../src/account-hub-rpc.js')
     expect(poolProviderFor('trae-cn')).toBe('trae-cn')
   })
 

@@ -4,11 +4,11 @@
  * 为什么必须单独成表、且必须在**发起请求之前**判断：
  *
  * Host 侧两个积分端点（`credits.balances` / `credits.claimAll`）都以
- * `productById(provider)` 解析产品配置（见 `src/jet-hub-rpc.ts`），而
+ * `productById(provider)` 解析产品配置（见 `src/account-hub-rpc.ts`），而
  * **CodeArts 不属于 Buddy 系产品**，解析结果为 `undefined`，端点必定回
  * `bad-request: unsupported provider: codearts`。客户端早期在面板挂载时对所有
  * provider 无条件调用 `credits.balances`，于是每打开一次 CodeArts 面板都会：
- *   1. 在控制台留下一条必然失败的报错（`[jet-hub] load credits failed`）；
+ *   1. 在控制台留下一条必然失败的报错（`[account-hub] load credits failed`）；
  *   2. 把该页面每个账号卡片的「积分」渲染成「查询失败」。
  * 这不是偶发故障，而是「请求了后端明确不支持的能力」这一设计缺陷的必然结果。
  * 修法不是在 UI 上吞掉错误，而是**不发起这个请求**。
@@ -56,7 +56,7 @@
  *      **更不是**「与国际版一样不存在该活动」。
  *      **将来拿到端点后把它翻成 `true`**（届时宿主侧还要补
  *      `credits.status` / `credits.claimAll` 的 `qoder-cn` 分支 —— 这两条
- *      现在对两个 region 一律结构性拒绝，见 `src/jet-hub-rpc.ts`）。
+ *      现在对两个 region 一律结构性拒绝，见 `src/account-hub-rpc.ts`）。
  *
  *   两个 region 的 `balance` 都是 true，都**不能**从它推断签到也能做 ——
  *   正如不能用 Buddy（国际版）没有签到反推它查不到余额一样，两个能力彼此独立。
@@ -65,7 +65,7 @@
  *
  * `trae-cn` 的 `balance` 走 `POST /trae/api/v2/pay/web_user_ent_usage`，响应里的
  * 礼包按 `available_endpoint` 分池，而面板只显示**本 provider 实际能花的那个池**
- * （宿主按 provider 选池，见 `src/jet-hub-rpc.ts` 的 `credits.balances` 分支）：
+ * （宿主按 provider 选池，见 `src/account-hub-rpc.ts` 的 `credits.balances` 分支）：
  * Trae CN 面板 = 通用池。显示的是**单数字**，界面上不出现「通用」「Work」字样，
  * 资源包列表同样只含本池的包。
  * 分池前那套「双池超集 + `workTotal` 两段渲染」已删除（同一处显示两池时，

@@ -24,7 +24,7 @@
  *
  * 登录 UI 本身（渲染 / 点击 / 开窗）由 `tests/unit/qoder-hub-blank-screen.spec.ts`
  * 用真实渲染 + 派发点击守住；这里只做源码级断言，因为 `ProviderPanel` 用了
- * hooks 而 react 不在本仓库依赖里（见 `jet-hub-credit-balance-row.spec.ts` 文件头）。
+ * hooks 而 react 不在本仓库依赖里（见 `account-hub-credit-balance-row.spec.ts` 文件头）。
  *
  * ## 为什么 Qoder 不需要 `poolProviderFor` 映射
  *
@@ -42,8 +42,8 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import {
   accountCredentialRefName,
   poolProviderFor,
-  registerJetHubRpc,
-} from '../../src/jet-hub-rpc.js'
+  registerAccountHubRpc,
+} from '../../src/account-hub-rpc.js'
 import { QODER, QODER_CN } from '../../src/qoder-product.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
@@ -51,7 +51,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 
 /** 客户端 bundle 的源码（未打包的 plugin-src 版本），归一化 CRLF。 */
 function readClientSourceNormalized(): string {
-  return readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8').replace(/\r\n/g, '\n')
+  return readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8').replace(/\r\n/g, '\n')
 }
 
 /**
@@ -72,7 +72,7 @@ function codeLinesOf(source: string): string {
 /**
  * 构造 ctx / pool 替身并注册端点，返回一个 `call(method, payload)`。
  *
- * 驱动 `registerJetHubRpc` 注册出来的**真实 HTTP 处理器**，而不是断言源码里
+ * 驱动 `registerAccountHubRpc` 注册出来的**真实 HTTP 处理器**，而不是断言源码里
  * 出现过某个字符串 —— 前者能证明「分派真的走对了」，后者只能证明「提到过」。
  */
 function makeHarness(
@@ -104,7 +104,7 @@ function makeHarness(
       },
     },
     // 生产代码用**惰性注入**（`ctx.inject(['connection'], …)`）挂载端点；
-    // 替身必须复刻这一机制，否则 registerJetHubRpc 会直接抛
+    // 替身必须复刻这一机制，否则 registerAccountHubRpc 会直接抛
     // `ctx.inject is not a function`。
     inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
     logger: { warn: () => {}, info: () => {}, error: () => {} },
@@ -136,7 +136,7 @@ function makeHarness(
     },
   }
 
-  registerJetHubRpc(
+  registerAccountHubRpc(
     ctx as never,
     pool as never,
     {} as never,
@@ -162,13 +162,13 @@ function makeHarness(
     listDisabledCalls,
     setModelDisabledCalls,
     call: async (method: string, payload: unknown) => {
-      const response = await handler!(new Request('http://127.0.0.1/api/jet-hub', {
+      const response = await handler!(new Request('http://127.0.0.1/api/account-hub', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           type: 'client-request',
           rpcId: 'r1',
-          method: 'jet-hub',
+          method: 'account-hub',
           payload: { method, payload },
         }),
       }))
@@ -324,7 +324,7 @@ describe('Qoder 的账号凭据 ref 前缀', () => {
     const name = accountCredentialRefName('qoder', 'A1B2C3D4')
     expect(name).toBe('QODER_ACCOUNT_A1B2C3D4')
     // 不抛 TypeError 才是关键：ref 一旦非法，凭据**从未落盘**，账号池里会留下
-    // 一个永远没有凭据的幽灵条目（见 src/jet-hub-rpc.ts 的后果链说明）。
+    // 一个永远没有凭据的幽灵条目（见 src/account-hub-rpc.ts 的后果链说明）。
     // Qoder 无连字符，归一化前后逐字符相同，故既有形态无需迁移。
     expect(() => credentialRef(name)).not.toThrow()
   })

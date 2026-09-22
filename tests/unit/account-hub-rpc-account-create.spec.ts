@@ -37,7 +37,7 @@ import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { registerAccountHubRpc } from '../../src/account-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { CodeArtsAuth } from '../../src/service.js'
 import { BuddyAuth } from '../../src/buddy-auth.js'
@@ -53,7 +53,7 @@ import {
 import { REDIRECT_PATH, exchangeAuthorizationCode } from '../../src/oauth.js'
 import { hasActiveCodeartsLogin } from '../../src/login.js'
 import { hasActiveLobsteraiLogin } from '../../src/lobsterai-oauth.js'
-import { accountCredentialRefName } from '../../src/jet-hub-rpc.js'
+import { accountCredentialRefName } from '../../src/account-hub-rpc.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 vi.mock('../../src/buddy-oauth.js', async (importOriginal) => ({
@@ -243,7 +243,7 @@ function createHarness(): Harness {
       },
     },
     // 生产代码用**惰性注入**（`ctx.inject(['connection'], …)`）挂载端点。
-    // 替身必须复刻这一机制，否则 registerJetHubRpc 会以
+    // 替身必须复刻这一机制，否则 registerAccountHubRpc 会以
     // `ctx.inject is not a function` 直接抛错。语义对齐真实 cordis：
     // 回调以**同一 ctx** 立即调用。
     inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(rpcCtx) },
@@ -256,20 +256,20 @@ function createHarness(): Harness {
   // `account.create`，而它按 provider 精确分派，这些服务不会被碰到。传空对象是
   // **刻意的**——若哪天有人让某个分支默认落到某一区，这里会立刻以
   // `Cannot read properties of undefined` 暴露，而不是静默走错实现。
-  registerJetHubRpc(
+  registerAccountHubRpc(
     rpcCtx as never, pool, codearts, buddy, workbuddy, lobsterai,
     {} as never, {} as never, {} as never,
   )
   if (handler === undefined) throw new Error('account.create 端点未注册')
 
   const call = async <T>(method: string, payload: unknown): Promise<RpcResult<T>> => {
-    const response = await handler!(new Request('http://127.0.0.1/api/jet-hub', {
+    const response = await handler!(new Request('http://127.0.0.1/api/account-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         type: 'client-request',
         rpcId: 'rpc-1',
-        method: 'jet-hub',
+        method: 'account-hub',
         payload: { method, payload },
       }),
     }))
@@ -694,7 +694,7 @@ describe('login.poll —— 非法 credentialRef 的预检（不抛 TypeError）
    * （`REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/`，连字符**不在**字符集内）。
    *
    * 旧行为：poll 裸用 `credentialRef(entry.credentialRef)` → 抛错 → 被 RPC 层
-   * 包成 `jet-hub/handler-failed` → 客户端把它当网络抖动吞掉继续轮询 →
+   * 包成 `account-hub/handler-failed` → 客户端把它当网络抖动吞掉继续轮询 →
    * 又是一种「静默空等 5 分钟」。这正是 `1e8e285` 修掉的 ref 拼写错误的
    * **表现形态**，本层防御覆盖「未来同类拼写错误」。
    *
@@ -890,7 +890,7 @@ describe('客户端 createAccount 的弹窗形态（源码级回归）', () => {
    * 源码在 Windows 上是 CRLF、在 CI 上是 LF。统一归一化后再做切片与
    * 「相邻行」断言，否则同一份代码在不同平台上结论不同。
    */
-  const source = readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+  const source = readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8')
     .replace(/\r\n/g, '\n')
 
   /** 去掉注释行，避免「注释里叙述 location.href 缺陷」被误判成代码。 */
@@ -930,7 +930,7 @@ describe('客户端 createAccount 的弹窗形态（源码级回归）', () => {
 
   it('弹窗被拦截时在面板内渲染手动登录链接，而不是脚本再开一次窗', () => {
     expect(code).toContain('setManualLogin')
-    expect(code).toContain('dim-jh-manualLogin')
+    expect(code).toContain('dim-ah-manualLogin')
     // 手动链接必须是原生 <a href>（浏览器自行导航，不受脚本开窗策略限制）。
     const manualAt = code.indexOf('manualLogin\n      ? React.createElement')
     expect(manualAt, '未找到手动链接的渲染块').toBeGreaterThan(-1)

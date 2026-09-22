@@ -439,7 +439,7 @@ export interface CodeartsPendingLogin {
  *
  * 用判别联合而非「抛异常」表达互斥：调用方（RPC 层）需要把
  * `login-in-progress` 原样透传给客户端做提示，异常会被 RPC 的统一错误包装
- * 成 `jet-hub/handler-failed`，客户端拿不到可判别的错误码。
+ * 成 `account-hub/handler-failed`，客户端拿不到可判别的错误码。
  */
 export type CodeartsLoginPrepareOutcome =
   | { ok: true; session: CodeartsPendingLogin }

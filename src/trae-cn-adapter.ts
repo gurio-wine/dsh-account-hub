@@ -972,7 +972,7 @@ interface ConsumeCell {
  * `registerProviderSettings` 注册的 namespace 一致，否则模型设置页会因未注册
  * namespace 在 `refFor → deriveKeyRef(provider)` 处崩溃。
  *
- * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerJetHubRpc`，
+ * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerAccountHubRpc`，
  *          供 Account Hub 读取逐模型的窗口档位（`contextTiers`）与校验用户选择。
  *          适配器是**动态目录的唯一持有者**，RPC 层拿不到目录就只能靠猜。
  */

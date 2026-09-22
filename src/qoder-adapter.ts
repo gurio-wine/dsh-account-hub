@@ -1291,7 +1291,7 @@ export class QoderAdapter extends LlmAdapter {
    * 目录的持有者是本实例（12h TTL、失败回退本产品的静态表）。`ctx.llm.listModels()`
    * 帮不上忙 —— `LlmRuntime` 会把条目重建成
    * `{provider, id, name, description?, inputModalities?}`，`contextTiers` 这类额外
-   * 字段在那一层被丢掉。故由 `src/index.ts` 把本实例交给 `registerJetHubRpc`
+   * 字段在那一层被丢掉。故由 `src/index.ts` 把本实例交给 `registerAccountHubRpc`
    * （见 `ContextTierRegistry`）；两个 region 各有一个实例，档位互不顶替。
    *
    * ## 数据源与 `resolveModel` **同源同口径**
@@ -2016,7 +2016,7 @@ interface ConsumeCell {
  * namespace 一致，否则模型设置页会因未注册 namespace 在
  * `refFor → deriveKeyRef(provider)` 处崩溃。
  *
- * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerJetHubRpc`，
+ * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerAccountHubRpc`，
  *          供 Account Hub 读取逐模型的窗口档位（`contextTiers`）与校验用户选择。
  *          适配器是**动态目录的唯一持有者**，RPC 层拿不到目录就只能靠猜。
  */

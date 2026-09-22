@@ -4,7 +4,7 @@
  * ## 为什么不沿用源码级断言
  *
  * 本仓库既有的前端测试都是「读源码、正则断言」（`credits-capabilities.spec.ts`、
- * `jet-hub-rpc-account-create.spec.ts`），理由是 react 不在依赖里、组件渲染不了。
+ * `account-hub-rpc-account-create.spec.ts`），理由是 react 不在依赖里、组件渲染不了。
  * 但**正则断言恰好无法验证本次要证明的东西**：本次的核心命题是「余额对象里
  * 出现任何 Trae 专属字段都不改变渲染 —— 一行永远只有一个数字」，这是**分支
  * 是否还存在的输出差异**，用 `toMatch(/workTotal/)` 只能证明提到过这个名字，
@@ -58,7 +58,7 @@ exports.supportsDailyCheckin = function () { return true };
  * 需要转换的 TS 语法，正则改写足够且没有额外依赖与启动开销。
  *
  * 改写**只覆盖本文件真正用到的两行 import**，并逐条断言命中 —— 若哪天
- * `jet-hub.js` 的 import 形态变了，这里会**立刻报错**，而不是静默加载出一个
+ * `account-hub.js` 的 import 形态变了，这里会**立刻报错**，而不是静默加载出一个
  * 缺了模块的半成品（那种失败会伪装成「组件返回 undefined」）。
  */
 const IMPORT_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
@@ -73,7 +73,7 @@ function toCjs(source: string): string {
   let out = source
   for (const [pattern, replacement] of IMPORT_REWRITES) {
     if (!pattern.test(out)) {
-      throw new Error(`jet-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
+      throw new Error(`account-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
     }
     out = out.replace(pattern, replacement)
   }
@@ -84,18 +84,18 @@ function toCjs(source: string): string {
 }
 
 function loadClientModule(): Record<string, unknown> {
-  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8'))
+  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8'))
 
-  const dir = mkdtempSync(join(tmpdir(), 'jet-hub-row-'))
+  const dir = mkdtempSync(join(tmpdir(), 'account-hub-row-'))
   mkdirSync(join(dir, 'node_modules', 'react'), { recursive: true })
   writeFileSync(join(dir, 'node_modules', 'react', 'package.json'),
     JSON.stringify({ name: 'react', version: '0.0.0-stub', main: 'index.js' }))
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
-  writeFileSync(join(dir, 'jet-hub.js'), cjs)
+  writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
-  const loaded = requireFromTemp(join(dir, 'jet-hub.js')) as { __testExports: Record<string, unknown> }
+  const loaded = requireFromTemp(join(dir, 'account-hub.js')) as { __testExports: Record<string, unknown> }
   tempDir = dir
   return loaded.__testExports
 }
@@ -166,7 +166,7 @@ describe('CreditBalanceRow 的三种基础状态（回归护栏，非本次改�
   it('loading 显示「读取中…」且不显示 0', () => {
     expect(snapshot(CreditBalanceRow({ loading: true }))).toEqual({
       type: 'div',
-      className: 'dim-jh-metaRow',
+      className: 'dim-ah-metaRow',
       title: undefined,
       tone: undefined,
       children: [
@@ -200,7 +200,7 @@ describe('CreditBalanceRow 永远是单数字（分池后无 provider 专属分�
 
   it('渲染层不知道「池」的存在（选池在宿主侧完成）', () => {
     // 宿主选了哪个池，渲染层拿到的都是同一个逐字段同构的 `CreditBalance` ——
-    // 「显示哪个池」的决定在 `src/jet-hub-rpc.ts` 的 `credits.balances` 分支，
+    // 「显示哪个池」的决定在 `src/account-hub-rpc.ts` 的 `credits.balances` 分支，
     // 组件不做也不该做任何池判断。
     const rendered = JSON.stringify(snapshot(CreditBalanceRow({ balance: legacyBalance({ total: 154.22 }) })))
     expect(rendered).not.toContain('通用')
@@ -224,21 +224,21 @@ describe('CreditBalanceRow 永远是单数字（分池后无 provider 专属分�
   })
 
   it('Work 项的独立 class 已随两段式渲染一并删除（样式表里不得残留死类）', () => {
-    // `dim-jh-creditWork` 曾经是 Work 数字的弱化色。留着它等于留着一个
+    // `dim-ah-creditWork` 曾经是 Work 数字的弱化色。留着它等于留着一个
     // 再无引用的死类，而那正是「哪天有人照着旧代码把双池加回来」的邀请。
     const clientSource = readFileSync(
-      resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8',
+      resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8',
     )
     const stylesSource = readFileSync(
-      resolve(here, '../../plugin-src/client/jet-hub-styles.js'), 'utf8',
+      resolve(here, '../../plugin-src/client/account-hub-styles.js'), 'utf8',
     )
     // 正文里不得出现该 class 的**使用**（注释中叙述历史是允许的）。
     const codeLines = clientSource
       .split('\n')
       .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
       .join('\n')
-    expect(codeLines).not.toContain('dim-jh-creditWork')
-    expect(stylesSource).not.toMatch(/\.dim-jh-creditWork\s*\{/)
+    expect(codeLines).not.toContain('dim-ah-creditWork')
+    expect(stylesSource).not.toMatch(/\.dim-ah-creditWork\s*\{/)
   })
 })
 
@@ -257,21 +257,21 @@ describe('CreditBalanceRow 的基础渲染（回归护栏）', () => {
       },
     }))).toEqual({
       type: 'div',
-      className: 'dim-jh-metaRow',
+      className: 'dim-ah-metaRow',
       title: undefined,
       tone: undefined,
       children: [
         { type: 'dt', className: undefined, title: undefined, tone: undefined, children: ['积分'] },
         {
           type: 'dd',
-          className: 'dim-jh-creditValue',
+          className: 'dim-ah-creditValue',
           // 明细按 packages 顺序逐行拼接（失效包带自己的失效时间，有效包显示周期）。
           title: '免费额度: 100 / 200 · 本周期至 2026-10-01\n[已失效] 活动包: 147.87 / 300 · 失效于 2026-09-01',
           tone: undefined,
           children: [
-            { type: 'strong', className: 'dim-jh-creditTotal', title: undefined, tone: undefined, children: ['247.87'] },
-            { type: 'span', className: 'dim-jh-creditPackages', title: undefined, tone: undefined, children: ['1/2 个资源包有效'] },
-            { type: 'span', className: 'dim-jh-creditExpired', title: undefined, tone: undefined, children: ['另有 12.50 已失效'] },
+            { type: 'strong', className: 'dim-ah-creditTotal', title: undefined, tone: undefined, children: ['247.87'] },
+            { type: 'span', className: 'dim-ah-creditPackages', title: undefined, tone: undefined, children: ['1/2 个资源包有效'] },
+            { type: 'span', className: 'dim-ah-creditExpired', title: undefined, tone: undefined, children: ['另有 12.50 已失效'] },
           ],
         },
       ],

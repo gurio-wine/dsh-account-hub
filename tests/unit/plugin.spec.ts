@@ -326,7 +326,7 @@ describe('WorkBuddy provider 注册', () => {
    * —— chicheng-cron 的 skill/agent 任务正是跑在 `dsh --profile headless` 下，
    * 会全部 exit 1。
    *
-   * 正确做法是 `registerJetHubRpc` 内部用惰性注入（`ctx.inject(['connection'], …)`）
+   * 正确做法是 `registerAccountHubRpc` 内部用惰性注入（`ctx.inject(['connection'], …)`）
    * 挂载端点：Web 下正常注册，其余 profile 只是不注册 Account Hub 端点。
    *
    * 这条断言锁住的是「**能不能加载**」而非某个功能细节，所以即便日后有人为了

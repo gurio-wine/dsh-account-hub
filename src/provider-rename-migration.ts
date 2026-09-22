@@ -50,7 +50,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { JET_HUB_SCHEMA_VERSION, type AccountPool, type ModelDisableMap } from './account-pool.js'
+import { ACCOUNT_HUB_SCHEMA_VERSION, type AccountPool, type ModelDisableMap } from './account-pool.js'
 import type { ProviderAccountEntry } from './types.js'
 
 /** 旧命名 → 新命名的 provider 映射（本模块的唯一真相源）。**数组顺序即执行顺序**。 */
@@ -160,7 +160,7 @@ async function moveRef(ctx: Context, oldRef: string, newRef: string): Promise<Mo
     oldValue = resolved.value
   } catch (error) {
     ctx.logger?.error?.(
-      `[jet-hub] provider 改名迁移：读取凭据 ${oldRef} 失败，保留原状（${String(error)}）`,
+      `[account-hub] provider 改名迁移：读取凭据 ${oldRef} 失败，保留原状（${String(error)}）`,
     )
     return 'failed'
   }
@@ -169,7 +169,7 @@ async function moveRef(ctx: Context, oldRef: string, newRef: string): Promise<Mo
     const existing = await ctx.credentials.resolve(credentialRef(newRef))
     if (existing !== undefined && existing.value !== oldValue) {
       ctx.logger?.error?.(
-        `[jet-hub] provider 改名迁移：凭据冲突，未覆盖 —— 目标 ${newRef} 已存在且与源 `
+        `[account-hub] provider 改名迁移：凭据冲突，未覆盖 —— 目标 ${newRef} 已存在且与源 `
         + `${oldRef} 值不同；旧 ref 保留，请人工确认后处理`,
       )
       return 'conflict'
@@ -183,7 +183,7 @@ async function moveRef(ctx: Context, oldRef: string, newRef: string): Promise<Mo
   } catch (error) {
     // 只读凭据源（shadow）会让 set 抛错：此时**不**删旧 ref，保持可重试。
     ctx.logger?.error?.(
-      `[jet-hub] provider 改名迁移：搬移凭据 ${oldRef} → ${newRef} 失败，保留旧 ref（${String(error)}）`,
+      `[account-hub] provider 改名迁移：搬移凭据 ${oldRef} → ${newRef} 失败，保留旧 ref（${String(error)}）`,
     )
     return 'failed'
   }
@@ -248,7 +248,7 @@ export async function migrateProviderNames(
 
   // 版本号已达标 → 整体跳过。放在最前面：迁移是「一次性」的，重复执行不只是
   // 浪费，还会在冲突场景下反复刷错误日志。
-  if (pool.schemaVersion >= JET_HUB_SCHEMA_VERSION) {
+  if (pool.schemaVersion >= ACCOUNT_HUB_SCHEMA_VERSION) {
     report.shortCircuited = true
     return report
   }
@@ -274,7 +274,7 @@ export async function migrateProviderNames(
         if (next === undefined) {
           // provider 命中但 ref 形态不符：不猜，原样保留并点名，便于人工排查。
           ctx.logger?.warn?.(
-            `[jet-hub] provider 改名迁移：账号 ${entry.id} 标为 ${from} 但凭据 ref `
+            `[account-hub] provider 改名迁移：账号 ${entry.id} 标为 ${from} 但凭据 ref `
             + `${entry.credentialRef} 不符合该产品的前缀形态，已原样保留`,
           )
           continue
@@ -305,30 +305,30 @@ export async function migrateProviderNames(
 
     if (!accountsChanged && !modelsChanged) {
       // 没有任何待迁移数据：仍然落一次版本号，避免每次启动都重新扫一遍。
-      await pool.replaceAll(renamed, after, JET_HUB_SCHEMA_VERSION)
+      await pool.replaceAll(renamed, after, ACCOUNT_HUB_SCHEMA_VERSION)
       report.wrote = true
       return report
     }
 
     // 一次性原子写：账号 + 黑名单 + 版本号三件套同时落盘，
     // 中途崩溃不会留下「账号搬了、版本号没搬」的半迁移状态。
-    await pool.replaceAll(renamed, after, JET_HUB_SCHEMA_VERSION)
+    await pool.replaceAll(renamed, after, ACCOUNT_HUB_SCHEMA_VERSION)
     report.wrote = true
     ctx.logger?.info?.(
-      `[jet-hub] provider 改名迁移完成：账号 ${report.accountsRenamed} 条改写`
+      `[account-hub] provider 改名迁移完成：账号 ${report.accountsRenamed} 条改写`
       + `（保留 ${report.accountsSkipped}）、凭据 ${report.refsMoved} 份搬移`
       + `（跳过 ${report.refsSkipped}）、模型黑名单键 ${report.disabledModelsRenamed} 个`,
     )
     if (report.accountsSkipped > 0) {
       ctx.logger?.warn?.(
-        `[jet-hub] provider 改名迁移存在未处理项：保留账号 ${report.accountsSkipped} 条、`
+        `[account-hub] provider 改名迁移存在未处理项：保留账号 ${report.accountsSkipped} 条、`
         + `凭据冲突 ${report.refsConflicted} 份 —— 详见上文 error 日志`,
       )
     }
   } catch (error) {
     // 迁移失败绝不能让插件启动失败：数据保持原状，下次启动重试。
     ctx.logger?.error?.(
-      `[jet-hub] provider 改名迁移失败，数据保持原状（将在下次启动重试）：${String(error)}`,
+      `[account-hub] provider 改名迁移失败，数据保持原状（将在下次启动重试）：${String(error)}`,
     )
   }
   return report

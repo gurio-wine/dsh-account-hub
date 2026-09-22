@@ -511,7 +511,7 @@ export interface TraeCnProduct {
    * provider 标识：注册到 `ctx.llm` 的路由名，也是账号列表的 provider 字段值。
    *
    * **带连字符**：对齐用户与生态的叫法（`dsh-connect-trae` 等插件同样用
-   * `trae-cn`）。注意它同时被 `jet-hub-rpc` 用来拼凭据 ref 前缀
+   * `trae-cn`）。注意它同时被 `account-hub-rpc` 用来拼凭据 ref 前缀
    * （`${provider.toUpperCase()}_ACCOUNT_XXX` → `TRAE_CN_ACCOUNT_XXX`），
    * 这是**合法**的（连字符经 toUpperCase 后由 `_` 承接，
    * 见 `src/trae-cn-oauth.ts` 的 `traeCnAccountRefPrefix`）。

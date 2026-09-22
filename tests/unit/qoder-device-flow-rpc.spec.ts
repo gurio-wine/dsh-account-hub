@@ -19,7 +19,7 @@
  * ## 替身边界
  *
  * 只有**出网**与**时间**被替换（注入 fetcher / sleep / homeDir）。
- * `QoderAuth`、`AccountPool`、`registerJetHubRpc` 全是真实实现 —— 这样
+ * `QoderAuth`、`AccountPool`、`registerAccountHubRpc` 全是真实实现 —— 这样
  * 「凭据落到哪个 ref」「占位条目的 refreshable 是什么」才是被断言的对象。
  */
 
@@ -29,7 +29,7 @@ import { rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { registerAccountHubRpc } from '../../src/account-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { QoderAuth } from '../../src/qoder-auth.js'
 import { QODER, QODER_CN, type QoderCredential } from '../../src/qoder-product.js'
@@ -188,20 +188,20 @@ function createHarness(
     get: () => undefined,
   }
 
-  registerJetHubRpc(
+  registerAccountHubRpc(
     rpcCtx as never, pool, {} as never, {} as never, {} as never,
     {} as never, {} as never, qoder, qoderCn,
   )
   if (handler === undefined) throw new Error('Account Hub 端点未注册')
 
   const call = async <T>(method: string, payload: unknown): Promise<RpcResult<T>> => {
-    const response = await handler!(new Request('http://127.0.0.1/api/jet-hub', {
+    const response = await handler!(new Request('http://127.0.0.1/api/account-hub', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         type: 'client-request',
         rpcId: 'rpc-1',
-        method: 'jet-hub',
+        method: 'account-hub',
         payload: { method, payload },
       }),
     }))

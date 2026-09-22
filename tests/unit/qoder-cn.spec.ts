@@ -61,7 +61,7 @@ import {
   recordsQoderCooldown,
   shouldSwitchQoderAccount,
 } from '../../src/qoder-errors.js'
-import { accountCredentialRefName } from '../../src/jet-hub-rpc.js'
+import { accountCredentialRefName } from '../../src/account-hub-rpc.js'
 import { QODER_SIGNED_CHAT_PATH } from '../../src/qoder-wasm-context.js'
 import type { QoderInferRequest } from '../../src/qoder-wasm-context.js'
 import type { QoderSigningSource } from '../../src/qoder-signing.js'
@@ -290,7 +290,7 @@ describe('QODER_CN 配置逐字段', () => {
   it('凭据 ref：默认与账号池前缀都带 CN，机械派生与之一致', () => {
     expect(QODER_CN.defaultCredentialRef).toBe('QODER_CN_PERSONAL_TOKEN')
     expect(QODER_CN.accountCredentialRefPrefix).toBe('QODER_CN_ACCOUNT')
-    // 账号池前缀不是手写惯例，而是必须与 jet-hub-rpc 的机械派生**逐字符一致**：
+    // 账号池前缀不是手写惯例，而是必须与 account-hub-rpc 的机械派生**逐字符一致**：
     // 带连字符的 provider id 会被 `toUpperCase().replace(/-/g,'_')` 转成下划线。
     expect(accountCredentialRefName(QODER_CN.id, 'A1B2C3D4'))
       .toBe(`${QODER_CN.accountCredentialRefPrefix}_A1B2C3D4`)

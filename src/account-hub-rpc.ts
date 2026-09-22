@@ -3,7 +3,7 @@
  *
  * 使用 DSH 的 connection.fetch.register() 模式注册 HTTP API 端点，
  * 与 dsh-im 的 registerManagementRpc 一致。
- * 通道名 jet-hub → 路径 /api/jet-hub
+ * 通道名 account-hub → 路径 /api/account-hub
  * 端点方法：account.list / account.create / account.update / account.delete /
  *           account.refresh / account.retest / account.retestAll /
  *           account.reset / account.resetAll / login.poll /
@@ -97,9 +97,9 @@ import type {
 } from './types.js'
 
 /** Account Hub RPC API 路径 */
-export const JET_HUB_API_PATH = '/api/jet-hub'
+export const ACCOUNT_HUB_API_PATH = '/api/account-hub'
 /** Gateway RPC 端点名（connection.rpc.call 的 endpoint 参数） */
-const JET_HUB_ENDPOINT = 'jet-hub'
+const ACCOUNT_HUB_ENDPOINT = 'account-hub'
 
 /** 生成 8 字符随机短 ID（小写 hex） */
 function shortId(): string {
@@ -407,7 +407,7 @@ export interface CreditsEndpointDeps<
  * 关键约束：**凭据解析也在 try 之内**。`credentialRef()` 会对名称做正则校验
  * （非法名称抛 TypeError），`deps.resolve()` 也可能抛错。若把它们留在 try
  * 之外，任一账号的异常都会冒泡到 handleMethod 外层 catch，使整批请求以
- * `jet-hub/handler-failed` 失败——违背「单个账号失败不中断整体」的设计。
+ * `account-hub/handler-failed` 失败——违背「单个账号失败不中断整体」的设计。
  */
 export async function collectCreditsStatus<TCredential = BuddyCredential, TProduct = BuddyProduct>(
   accounts: readonly ProviderAccountEntry[],
@@ -427,7 +427,7 @@ export async function collectCreditsStatus<TCredential = BuddyCredential, TProdu
       }
     } catch (error) {
       // 单个账号的凭据缺失 / JSON 损坏 / 名称非法 / 网络失败都不影响其余账号
-      deps.warn?.(`[jet-hub] credits.status 账号 ${entry.id} 失败: ${String(error)}`)
+      deps.warn?.(`[account-hub] credits.status 账号 ${entry.id} 失败: ${String(error)}`)
       status = null
     }
     results.push({ accountId: entry.id, nickname: entry.nickname, status })
@@ -482,7 +482,7 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
         }
       }
     } catch (error) {
-      deps.warn?.(`[jet-hub] credits.claimAll 账号 ${entry.id} 失败: ${String(error)}`)
+      deps.warn?.(`[account-hub] credits.claimAll 账号 ${entry.id} 失败: ${String(error)}`)
       outcome = {
         kind: 'failed', code: -1,
         message: error instanceof Error ? error.message : String(error),
@@ -529,7 +529,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
         if (balance === null) error = '余额查询失败'
       }
     } catch (caught) {
-      deps.warn?.(`[jet-hub] credits.balances 账号 ${entry.id} 失败: ${String(caught)}`)
+      deps.warn?.(`[account-hub] credits.balances 账号 ${entry.id} 失败: ${String(caught)}`)
       error = caught instanceof Error ? caught.message : String(caught)
       balance = null
     }
@@ -592,7 +592,7 @@ export type { ContextTierRegistry, ContextTierSource } from './context-tiers.js'
  *        省略时 `model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝 ——
  *        这是 headless / 测试场景的既定降级，不是缺陷。
  */
-export function registerJetHubRpc(
+export function registerAccountHubRpc(
   ctx: Context,
   pool: AccountPool,
   codearts: CodeArtsAuth,
@@ -605,14 +605,14 @@ export function registerJetHubRpc(
   contextTiers?: ContextTierRegistry,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(
+    registerAccountHubEndpoints(
       connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTiers,
     )
   })
 }
 
 /** 注册 Account Hub 管理 API 端点。使用 ctx.connection.fetch.register() 注册 HTTP POST 端点。 */
-function registerJetHubEndpoints(
+function registerAccountHubEndpoints(
   ctx: Context,
   pool: AccountPool,
   codearts: CodeArtsAuth,
@@ -627,12 +627,12 @@ function registerJetHubEndpoints(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
   if (!connection || typeof connection.fetch?.register !== 'function') {
-    ctx.logger.warn('[jet-hub] connection.fetch not available, RPC endpoints not registered')
+    ctx.logger.warn('[account-hub] connection.fetch not available, RPC endpoints not registered')
     return
   }
 
   connection.fetch.register({
-    path: JET_HUB_API_PATH,
+    path: ACCOUNT_HUB_API_PATH,
     methods: ['POST'],
     requestBody: 'buffered' as const,
     async fetch(request: Request): Promise<Response> {
@@ -655,7 +655,7 @@ function registerJetHubEndpoints(
       const call = message.payload as Record<string, unknown> | undefined
       if (
         message.type !== 'client-request' || typeof message.rpcId !== 'string'
-        || message.method !== JET_HUB_ENDPOINT
+        || message.method !== ACCOUNT_HUB_ENDPOINT
         || !call || typeof call.method !== 'string'
         || !Object.prototype.hasOwnProperty.call(call, 'payload')
       ) {
@@ -669,10 +669,10 @@ function registerJetHubEndpoints(
         // 必须返回规范的 RPC 错误响应（而不是裸 500 文本），
         // 否则客户端 unwrapRpcResult 无法识别错误，表现为"点击无反应"。
         const message = error instanceof Error ? error.message : String(error)
-        ctx.logger.warn(`[jet-hub] ${String(call.method)} failed: ${message}`)
+        ctx.logger.warn(`[account-hub] ${String(call.method)} failed: ${message}`)
         return reply(rpcId, {
           ok: false,
-          error: { code: 'jet-hub/handler-failed', message },
+          error: { code: 'account-hub/handler-failed', message },
         })
       }
     },
@@ -740,7 +740,7 @@ function registerJetHubEndpoints(
               refreshable: Boolean(credential?.refresh_token),
             })
           }).catch((err) => {
-            ctx.logger.warn(`[jet-hub] background ${product.id} login failed for ${id}: ${err}`)
+            ctx.logger.warn(`[account-hub] background ${product.id} login failed for ${id}: ${err}`)
             // 登录失败是**终态**：先登记失败（poll 据此收窗并提示），
             // 再移除占位条目，避免留下无凭据的幽灵账号。
             recordLoginFailure(id, err)
@@ -767,7 +767,7 @@ function registerJetHubEndpoints(
           }
           if (!prepared.ok) {
             // provider 级互斥：已有未结算的登录会话。原样返回可判别错误码，
-            // 而不是抛异常 —— 抛异常会被包装成 jet-hub/handler-failed，
+            // 而不是抛异常 —— 抛异常会被包装成 account-hub/handler-failed，
             // 客户端就无法据以提示「已有登录进行中」。
             return { ok: false, error: { code: prepared.error, message: prepared.message } }
           }
@@ -791,7 +791,7 @@ function registerJetHubEndpoints(
             await codearts.persistLoginResult(flow, { refName, accountId: id, pool })
           }).catch(async (error: unknown) => {
             ctx.logger.warn(
-              `[jet-hub] background codearts login failed for ${id}: `
+              `[account-hub] background codearts login failed for ${id}: `
               + `${error instanceof Error ? error.message : String(error)}`,
             )
             // 登录失败是**终态**（见 loginFailures 的说明）：登记后再删占位。
@@ -822,7 +822,7 @@ function registerJetHubEndpoints(
           }
           if (!prepared.ok) {
             // provider 级互斥：已有未结算的登录会话。原样返回可判别错误码，
-            // 而不是抛异常 —— 抛异常会被包装成 jet-hub/handler-failed，
+            // 而不是抛异常 —— 抛异常会被包装成 account-hub/handler-failed，
             // 客户端就无法据以提示「已有登录进行中」。
             return { ok: false, error: { code: prepared.error, message: prepared.message } }
           }
@@ -846,7 +846,7 @@ function registerJetHubEndpoints(
             await lobsterai.persistLoginResult(flow, { refName, accountId: id, pool })
           }).catch(async (error: unknown) => {
             ctx.logger.warn(
-              `[jet-hub] background ${LOBSTERAI.id} login failed for ${id}: `
+              `[account-hub] background ${LOBSTERAI.id} login failed for ${id}: `
               + `${error instanceof Error ? error.message : String(error)}`,
             )
             // 登录失败是**终态**（见 loginFailures 的说明）：登记后再删占位。
@@ -872,7 +872,7 @@ function registerJetHubEndpoints(
           }
           if (!prepared.ok) {
             // provider 级互斥：已有未结算的登录会话。原样返回可判别错误码，
-            // 而不是抛异常 —— 抛异常会被包装成 jet-hub/handler-failed，
+            // 而不是抛异常 —— 抛异常会被包装成 account-hub/handler-failed，
             // 客户端就无法据以提示「已有登录进行中」。
             return { ok: false, error: { code: prepared.error, message: prepared.message } }
           }
@@ -896,7 +896,7 @@ function registerJetHubEndpoints(
             await traeCn.persistLoginResult(flow, { refName, accountId: id, pool })
           }).catch(async (error: unknown) => {
             ctx.logger.warn(
-              `[jet-hub] background ${TRAE_CN.id} login failed for ${id}: `
+              `[account-hub] background ${TRAE_CN.id} login failed for ${id}: `
               + `${error instanceof Error ? error.message : String(error)}`,
             )
             // 登录失败是**终态**（见 loginFailures 的说明）：登记后再删占位。
@@ -916,7 +916,7 @@ function registerJetHubEndpoints(
           //
           // ## ⚠️ 客户端 UI 已移除 PAT 形态，但这条分支**不是死代码**（2026-09-21）
           //
-          // 用户要求「不要 pat 登录，只要浏览器登录」，故 `plugin-src/client/jet-hub.js`
+          // 用户要求「不要 pat 登录，只要浏览器登录」，故 `plugin-src/client/account-hub.js`
           // 里的 PAT 表单与形态选择器已整体删除 —— **客户端不再发含 `pat` 的载荷**。
           // 但下面这条 `hasPat` 分支**刻意保留**，理由是它是**协议层**的分派
           // （对载荷形态的防御），不是 UI：
@@ -1015,7 +1015,7 @@ function registerJetHubEndpoints(
           }
           if (!prepared.ok) {
             // provider 级互斥：已有未结算的登录会话。**原样返回可判别错误码**，
-            // 而不是抛异常 —— 抛异常会被包装成 jet-hub/handler-failed，
+            // 而不是抛异常 —— 抛异常会被包装成 account-hub/handler-failed，
             // 客户端就无法据以提示「已有登录进行中」。
             return { ok: false, error: { code: prepared.error, message: prepared.message } }
           }
@@ -1035,7 +1035,7 @@ function registerJetHubEndpoints(
           void region.auth.persistLoginResult(loginSession, { refName, accountId: id, pool })
             .catch(async (error: unknown) => {
               ctx.logger.warn(
-                `[jet-hub] background ${provider} device login failed for ${id}: `
+                `[account-hub] background ${provider} device login failed for ${id}: `
                 + `${error instanceof Error ? error.message : String(error)}`,
               )
               // 登录失败是**终态**：登记后再删占位（顺序不可反 —— 见
@@ -1465,7 +1465,7 @@ function registerJetHubEndpoints(
           try {
             tiers = await tierSource.contextTiers()
           } catch (error) {
-            ctx.logger?.warn?.(`[jet-hub] 读取 ${req.provider} 窗口档位失败（不影响模型列表）: ${String(error)}`)
+            ctx.logger?.warn?.(`[account-hub] 读取 ${req.provider} 窗口档位失败（不影响模型列表）: ${String(error)}`)
           }
         }
         // ⚠️ 窗口字段对**目录里的模型**与**回填行**一视同仁（2026-09-21 修复）：
@@ -1550,10 +1550,10 @@ function registerJetHubEndpoints(
                 await pool.setModelDisabled(req.provider, id, false)
               }
               ctx.logger?.info?.(
-                `[jet-hub] 已从 ${req.provider} 显示列表清理 ${junkKeys.length} 个垃圾模型键`,
+                `[account-hub] 已从 ${req.provider} 显示列表清理 ${junkKeys.length} 个垃圾模型键`,
               )
             } catch (error) {
-              ctx.logger?.warn?.(`[jet-hub] 清理 ${req.provider} 垃圾模型键失败: ${String(error)}`)
+              ctx.logger?.warn?.(`[account-hub] 清理 ${req.provider} 垃圾模型键失败: ${String(error)}`)
             }
           }
         }
@@ -1569,7 +1569,7 @@ function registerJetHubEndpoints(
         }
         await pool.setModelDisabled(req.provider, req.modelId, req.disabled === true)
         ctx.logger.info(
-          `[jet-hub] ${req.disabled === true ? '关闭' : '打开'}模型 ${req.provider}/${req.modelId}`,
+          `[account-hub] ${req.disabled === true ? '关闭' : '打开'}模型 ${req.provider}/${req.modelId}`,
         )
         const value: RpcModelSetDisabledResponse = {
           provider: req.provider,
@@ -1626,7 +1626,7 @@ function registerJetHubEndpoints(
         // （**不是**写入默认档）。
         if (req.window === undefined || req.window === fallback) {
           await pool.writeContextBudget(req.provider, req.model, undefined)
-          ctx.logger.info(`[jet-hub] ${req.provider}/${req.model} 上下文窗口档位恢复默认（${fallback}）`)
+          ctx.logger.info(`[account-hub] ${req.provider}/${req.model} 上下文窗口档位恢复默认（${fallback}）`)
           const restored: RpcModelSetContextBudgetResponse = { provider: req.provider, model: req.model }
           return { ok: true, value: restored }
         }
@@ -1642,7 +1642,7 @@ function registerJetHubEndpoints(
           }
         }
         await pool.writeContextBudget(req.provider, req.model, req.window)
-        ctx.logger.info(`[jet-hub] ${req.provider}/${req.model} 上下文窗口档位设为 ${req.window}`)
+        ctx.logger.info(`[account-hub] ${req.provider}/${req.model} 上下文窗口档位设为 ${req.window}`)
         const applied: RpcModelSetContextBudgetResponse = {
           provider: req.provider,
           model: req.model,

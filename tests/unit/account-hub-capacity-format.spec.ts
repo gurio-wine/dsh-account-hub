@@ -5,7 +5,7 @@
  *
  * 本次要钉死的是一个**渲染结果**：「用户看到的到底是 `168K` 还是 `168000`」。
  * 正则只能证明源码里出现过 `1e6` 这种字符串，证明不了 168000 走的是哪一支。
- * 故沿用 `jet-hub-credit-balance-row.spec.ts` 的做法：把 `react` 与
+ * 故沿用 `account-hub-credit-balance-row.spec.ts` 的做法：把 `react` 与
  * `credits-capabilities.js` 换成占位模块后加载客户端源码，直接调用纯函数
  * —— 元素树是普通对象，不需要 DOM、不需要 react-dom。
  *
@@ -44,7 +44,7 @@ exports.supportsDailyCheckin = function () { return true };
 `
 
 /**
- * 与 `jet-hub-credit-balance-row.spec.ts` 同款改写：只覆盖真正用到的两行
+ * 与 `account-hub-credit-balance-row.spec.ts` 同款改写：只覆盖真正用到的两行
  * import，并逐条断言命中 —— import 形态变了要**立刻报错**，而不是静默加载出
  * 一个缺模块的半成品。
  */
@@ -60,7 +60,7 @@ function toCjs(source: string): string {
   let out = source
   for (const [pattern, replacement] of IMPORT_REWRITES) {
     if (!pattern.test(out)) {
-      throw new Error(`jet-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
+      throw new Error(`account-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
     }
     out = out.replace(pattern, replacement)
   }
@@ -71,18 +71,18 @@ function toCjs(source: string): string {
 }
 
 function loadClientModule(): Record<string, unknown> {
-  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8'))
+  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8'))
 
-  const dir = mkdtempSync(join(tmpdir(), 'jet-hub-capacity-'))
+  const dir = mkdtempSync(join(tmpdir(), 'account-hub-capacity-'))
   mkdirSync(join(dir, 'node_modules', 'react'), { recursive: true })
   writeFileSync(join(dir, 'node_modules', 'react', 'package.json'),
     JSON.stringify({ name: 'react', version: '0.0.0-stub', main: 'index.js' }))
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
-  writeFileSync(join(dir, 'jet-hub.js'), cjs)
+  writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
-  const loaded = requireFromTemp(join(dir, 'jet-hub.js')) as { __testExports: Record<string, unknown> }
+  const loaded = requireFromTemp(join(dir, 'account-hub.js')) as { __testExports: Record<string, unknown> }
   tempDir = dir
   return loaded.__testExports
 }

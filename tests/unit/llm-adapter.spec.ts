@@ -1651,7 +1651,7 @@ describe('CodeArtsAdapter', () => {
     // 直到闭标签到达才解析，期间不产出任何文本。
     const parts = [
       '<｜DSML｜tool_calls><｜DSML｜invoke name="pwsh">',
-      '<｜DSML｜parameter name="command" string="true">ls "D:\\jet"',
+      '<｜DSML｜parameter name="command" string="true">ls "D:\\hub"',
       '</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>',
     ]
     const sse = parts.map(p => `data: {"choices":[{"delta":{"content":${JSON.stringify(p)}}}]}\n\n`).join('')
@@ -1672,7 +1672,7 @@ describe('CodeArtsAdapter', () => {
     expect(textDeltas.join('')).toBe('')
     expect(toolCallBlocks).toHaveLength(1)
     expect(toolCallBlocks[0].name).toBe('pwsh')
-    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ command: 'ls "D:\\jet"' })
+    expect(JSON.parse(toolCallBlocks[0].arguments)).toEqual({ command: 'ls "D:\\hub"' })
   })
 
   it('passes through plain text alongside DSML tool_calls', async () => {

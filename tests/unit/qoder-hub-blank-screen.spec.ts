@@ -48,7 +48,7 @@
  * 故 `LoginChoiceForm` / `patLogin` 那条具体路径**已不存在**，上面那段根因叙述
  * 是历史记录。本文件继续守的是**这一类缺陷**，而不是那一行代码：
  *
- *   - 真的渲染 `ProviderPanel` / `JetHubPage`、真的派发点击、真的重渲染；
+ *   - 真的渲染 `ProviderPanel` / `AccountHubPage`、真的派发点击、真的重渲染；
  *   - 八个 provider 逐个冒烟，点击必须**有反应**（浏览器登录 → 开窗）；
  *   - 面板标题必须取显示名而不是裸 id。
  *
@@ -197,14 +197,14 @@ function toCjs(source: string): string {
   let out = source
   for (const [pattern, replacement] of IMPORT_REWRITES) {
     if (!pattern.test(out)) {
-      throw new Error(`jet-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
+      throw new Error(`account-hub.js 的 import 形态已变化，测试的改写规则失效：${String(pattern)}`)
     }
     out = out.replace(pattern, replacement)
   }
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   return out.concat(
     '\nmodule.exports.__testExports = {'
-    + ' JetHubPage: JetHubPage, ProviderPanel: ProviderPanel };\n',
+    + ' AccountHubPage: AccountHubPage, ProviderPanel: ProviderPanel };\n',
   )
 }
 
@@ -266,27 +266,27 @@ function installWindowStub(): { opened: StubWindow[]; restore: () => void } {
 }
 
 function loadClientModule(): {
-  JetHubPage: (props: Record<string, unknown>) => unknown
+  AccountHubPage: (props: Record<string, unknown>) => unknown
   ProviderPanel: (props: Record<string, unknown>) => unknown
   hooks: HookedReact
 } {
-  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8'))
+  const cjs = toCjs(readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8'))
 
-  const dir = mkdtempSync(join(tmpdir(), 'jet-hub-blank-'))
+  const dir = mkdtempSync(join(tmpdir(), 'account-hub-blank-'))
   mkdirSync(join(dir, 'node_modules', 'react'), { recursive: true })
   writeFileSync(join(dir, 'node_modules', 'react', 'package.json'),
     JSON.stringify({ name: 'react', version: '0.0.0-stub', main: 'index.js' }))
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
-  writeFileSync(join(dir, 'jet-hub.js'), cjs)
+  writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
-  const loaded = requireFromTemp(join(dir, 'jet-hub.js')) as { __testExports: Record<string, unknown> }
+  const loaded = requireFromTemp(join(dir, 'account-hub.js')) as { __testExports: Record<string, unknown> }
   const hooks = requireFromTemp(join(dir, 'node_modules', 'react', 'index.js')) as HookedReact
   tempDir = dir
   const exported = loaded.__testExports
   return {
-    JetHubPage: exported.JetHubPage as (props: Record<string, unknown>) => unknown,
+    AccountHubPage: exported.AccountHubPage as (props: Record<string, unknown>) => unknown,
     ProviderPanel: exported.ProviderPanel as (props: Record<string, unknown>) => unknown,
     hooks,
   }
@@ -486,9 +486,9 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     'qoder-cn',
   ] as const
 
-  it('JetHubPage 整页渲染不抛错，且七个 provider 的导航项都在', async () => {
+  it('AccountHubPage 整页渲染不抛错，且七个 provider 的导航项都在', async () => {
     const { rpcCall } = makeRpc()
-    const tree = await renderStable(client.JetHubPage, { rpcCall }, client.hooks)
+    const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
     const expanded = expandTree(tree, client.hooks)
     const text = textsOf(expanded).join('')
 
@@ -504,7 +504,7 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     for (const label of ['Codearts', 'Buddy CN', 'Buddy', 'LobsterAI', 'Trae CN', 'Qoder', 'Qoder CN']) {
       expect(text, `导航里缺少 ${label}`).toContain(label)
     }
-    // 未选中的 provider 不该出现面板（`JetHubPage` 只挂载 selected 那一个）。
+    // 未选中的 provider 不该出现面板（`AccountHubPage` 只挂载 selected 那一个）。
     expect(text).toContain('Codearts 账号管理')
   })
 

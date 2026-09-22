@@ -40,7 +40,7 @@
 | `buddy-claim-probe.e2e.spec.ts` | `DSH_BUDDY_CLAIM_E2E=1` + `DSH_BUDDY_CLAIM_E2E_CONFIRM=yes` | **国际版 Buddy** 真实领取积分（不改模型额度，但会改动账号当日签到状态） |
 | `lobsterai-probe.e2e.spec.ts` | `DSH_LOBSTERAI_E2E=1` | **只读**：凭据结构、客户端版本号动态解析、签到槽位/上下文、积分余额。**不签到、不发模型请求** |
 | `lobsterai-claim-probe.e2e.spec.ts` | `DSH_LOBSTERAI_E2E=1` + `DSH_LOBSTERAI_CLAIM_E2E_CONFIRM=yes` | 真实签到（会改动当日签到状态；**不消耗模型积分**，且重复运行幂等） |
-| `pool-record-check.e2e.spec.ts` | `DSH_JETHUB_POOL_CHECK=1` | 账号池限流记录闭环（会写真实 settings.yaml），按 `buddy-cn` 反查账号 |
+| `pool-record-check.e2e.spec.ts` | `DSH_ACCOUNT_HUB_POOL_CHECK=1` | 账号池限流记录闭环（会写真实 settings.yaml），按 `buddy-cn` 反查账号 |
 
 > CodeArts deepseek-v4 系列使用华为云免费福利额度（每日 1000 万免费 Tokens），
 > 不产生额外费用，因此 `DSH_CODEARTS_E2E=1` 不需要确认变量。

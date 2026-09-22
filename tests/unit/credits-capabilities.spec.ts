@@ -13,7 +13,7 @@ import {
  *
  * 真实缺陷（用户报障）：打开 Account Hub 的 **CodeArts** 面板时控制台必现
  * ```
- * [jet-hub] load credits failed: Error: unsupported provider: codearts
+ * [account-hub] load credits failed: Error: unsupported provider: codearts
  * ```
  * 根因是客户端 `loadCredits()` 在面板挂载时**对所有 provider 无条件**调用
  * `credits.balances`，而该端点以 `productById()` 判能力，CodeArts 根本不是
@@ -191,8 +191,8 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
    * `PROVIDERS` 的**七条**最终形态。
    *
    * 顺序即面板标签页顺序，也是后端注册顺序；`label` 是面板标题与按钮文案里的
-   * 显示名，`logoClass` 必须与 `jet-hub-styles.js` 的
-   * `.dim-jh-providerIcon.<class>` 逐字对齐（下面一条断言守这件事）。
+   * 显示名，`logoClass` 必须与 `account-hub-styles.js` 的
+   * `.dim-ah-providerIcon.<class>` 逐字对齐（下面一条断言守这件事）。
    */
   const EXPECTED = [
     { id: 'codearts', label: 'Codearts', logoClass: 'codearts' },
@@ -271,18 +271,18 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     expect(source).not.toContain('WORKBUDDY_ICON')
   })
 
-  it('logoClass 与 jet-hub-styles.js 的图标容器类逐字对齐', () => {
+  it('logoClass 与 account-hub-styles.js 的图标容器类逐字对齐', () => {
     // 类名对不上不会报错：图标只是**没有白底**，肉眼几乎看不出来，
     // 是那种「改完看着正常、实际已经坏了」的隐性缺陷。
     const styles = readFileSync(
-      resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/jet-hub-styles.js'),
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/account-hub-styles.js'),
       'utf8',
     )
     const styled = new Set(
-      [...styles.matchAll(/\.dim-jh-providerIcon\.([a-z-]+)\s*\{/g)].map((m) => m[1]!),
+      [...styles.matchAll(/\.dim-ah-providerIcon\.([a-z-]+)\s*\{/g)].map((m) => m[1]!),
     )
     for (const { logoClass } of EXPECTED) {
-      expect(styled, `jet-hub-styles.js 缺少 .dim-jh-providerIcon.${logoClass}`).toContain(logoClass)
+      expect(styled, `account-hub-styles.js 缺少 .dim-ah-providerIcon.${logoClass}`).toContain(logoClass)
     }
     // 反向：样式表里不该留下没有条目引用的死类（`workbuddy` 就是改名后的残留）。
     expect([...styled].sort()).toEqual(EXPECTED.map((e) => e.logoClass).sort())
@@ -293,7 +293,7 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
  * 面板结构：登录入口与积分按钮。
  *
  * 这里只断言**面板的渲染条件**，不渲染组件 —— 本仓库把 react 排除在依赖之外
- * （`jet-hub-credit-balance-row.spec.ts` 的文件头有完整说明）。金额/双池那类
+ * （`account-hub-credit-balance-row.spec.ts` 的文件头有完整说明）。金额/双池那类
  * 「分支输出差异」已经由那个文件用整树深比较守住，本组只管辖「谁渲染、谁不渲染」。
  */
 describe('Account Hub 面板的结构（源码级回归）', () => {
@@ -346,7 +346,7 @@ const PROVIDER_FULL_ENTRY_PATTERN =
 /** 读取客户端 bundle 的源码（未打包的 plugin-src 版本）。 */
 function readClientSource(): string {
   const here = dirname(fileURLToPath(import.meta.url))
-  return readFileSync(resolve(here, '../../plugin-src/client/jet-hub.js'), 'utf8')
+  return readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8')
 }
 
 describe('客户端积分请求门控（源码级回归）', () => {
