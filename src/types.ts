@@ -126,6 +126,20 @@ export interface RpcDeleteAccountRequest {
   accountId: string
 }
 
+/**
+ * RPC: 重排某 provider 的账号顺序（Account Hub 拖拽排序）。
+ *
+ * 传该 provider **全部**账号 id 的目标顺序；服务端据此重写数组顺序，
+ * 该顺序即自动选号/限流换号的候选优先级（见 `AccountPool.reorderAccounts`）。
+ *
+ * ⚠️ 必须是一个**排列**：少了 / 多了 / 重复的 id 都会被拒绝（不静默容忍）。
+ */
+export interface RpcReorderAccountsRequest {
+  provider: string
+  /** 该 provider 全部账号 id，按目标顺序排列。 */
+  orderedIds: string[]
+}
+
 export interface RpcRefreshAccountRequest {
   accountId: string
 }

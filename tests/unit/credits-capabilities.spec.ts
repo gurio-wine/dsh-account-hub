@@ -20,15 +20,23 @@ import {
  * BuddyProduct，必定返回 bad-request。
  *
  * 修法是「请求前按能力门控」。因此这里守两件事：
- * 1. 能力矩阵本身正确（尤其 CodeArts 两项全假、Buddy 国际版余额真/签到假）；
+ * 1. 能力矩阵本身正确（CodeArts 两项现在都真、Buddy 国际版余额真/签到假）；
  * 2. 客户端源码里**不存在绕过门控的调用点** —— UI 组件无法在单测里渲染
  *    （react 不在本仓库依赖内），故用源码级断言锁死守卫存在。
+ *
+ * ⚠️ CodeArts 后来已接入真实实现（`src/codearts-credits.ts`），其能力由全假
+ * 变为全真；**门控机制本身不变**，仍是防止「对不支持的 provider 发必然失败的
+ * 请求」的那道闸。
  */
 describe('积分能力矩阵', () => {
-  it('CodeArts 两项能力全为 false（华为云账号体系无腾讯计费接口）', () => {
-    expect(CREDITS_CAPABILITIES.codearts).toEqual({ balance: false, dailyCheckin: false })
-    expect(supportsCreditBalance('codearts')).toBe(false)
-    expect(supportsDailyCheckin('codearts')).toBe(false)
+  it('CodeArts 余额与签到都支持（华为云 SDK-HMAC-SHA256 签名协议）', () => {
+    // ⚠️ 这两项**曾经是全 false**，理由是「华为云账号体系没有腾讯计费接口」——
+    // 那个结论已被上游真机验证推翻：华为云侧有独立的「每日签到得积分」活动，
+    // 端点挂在 `snap-access` 网关（与本仓已在用的 `SNAP_MODEL_BUILTIN_URL` 同域），
+    // 用现有凭据的 AK/SK 签名即可访问。见 `src/codearts-credits.ts`。
+    expect(CREDITS_CAPABILITIES.codearts).toEqual({ balance: true, dailyCheckin: true })
+    expect(supportsCreditBalance('codearts')).toBe(true)
+    expect(supportsDailyCheckin('codearts')).toBe(true)
   })
 
   it('Buddy CN 余额与签到都支持', () => {
@@ -98,43 +106,50 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('qoder')).toBe(false)
   })
 
-  it('Qoder CN 支持余额，签到为 false —— 但那是「**端点未知**」而不是「没有权益」', () => {
+  it('Qoder CN 余额与签到都支持（签到端点已解出并真机验收）', () => {
     // `balance`：CN 与国际版**同协议双 region**，走的是**同一个**
     // `fetchQoderCreditBalance`（按传入的 product 现算 host）。CN 侧实测只有
     // 两个池（userQuota + addOnQuota），而解析器本就是**三池容缺**（缺席按 0），
     // 故 CN 天然兼容、客户端零分支。
-    expect(CREDITS_CAPABILITIES['qoder-cn']).toEqual({ balance: true, dailyCheckin: false })
+    //
+    // `dailyCheckin` **曾经是 false，理由写在注释里的是「端点未知」** ——
+    // 那个待办现已关闭：端点由 keylog 解密抓包解出并真机验收（2026-09-21），
+    // 实现见 `src/qoder-credits.ts`，宿主分支见 `src/account-hub-rpc.ts`。
+    // ⚠️ 它**只对 CN 打开**：国际版 `qoder` 维持 false（见上一条用例）。
+    expect(CREDITS_CAPABILITIES['qoder-cn']).toEqual({ balance: true, dailyCheckin: true })
     expect(supportsCreditBalance('qoder-cn')).toBe(true)
-    expect(supportsDailyCheckin('qoder-cn')).toBe(false)
+    expect(supportsDailyCheckin('qoder-cn')).toBe(true)
   })
 
-  it('⚠️ Qoder 两个 region 的 dailyCheckin 都是 false，但**理由互不相同**，不得合并叙述', () => {
-    // 这条断言守的是**代码注释里那两句理由**，而不是布尔值本身（上面的用例
-    // 已经钉过取值）。原因：这两个 false 极易被后来者「统一」成一句
-    // 「Qoder 没有签到」—— 而其中一句是**待办**，合并之后待办就消失了。
-    //
-    //   - `qoder`（国际版）：CLI2API 实测**国际版不显示签到**，活动不存在；
-    //   - `qoder-cn`（国内版）：CLI2API 的 RegionDescriptor **只在 cn 挂
-    //     Checkin** —— 疑似有签到，但**端点未知、未验收**，拿到端点后要翻 true。
-    //
-    // 故这里以**注释正文**为判据（与 qoder 那条同类手法）：
-    // 若谁把 CN 那段的「端点未知」改写成「没有这项权益」，这条立刻红。
+  it('⚠️ Qoder 只有 CN 能签到，且国际版的 false **不得**推广到 CN', () => {
+    // 这条守的是**「两个 region 的签到理由必须分开写」**这件事，而不是某个
+    // 布尔值（取值已由上面两条用例钉过）。原因：历史上这两个 region 都写 false
+    // 但理由不同（国际版「活动不存在」/ CN「端点未知」待办），极易被后来者
+    // 「统一」成一句「Qoder 没有签到」——
+    //   - 合并成「Qoder 没有签到」：CN 的签到会被误删（功能倒退）；
+    //   - 反过来把国际版也写成 true：给国际版面板挂一个**每次点击都必然失败**
+    //     的按钮（活动只属于 CN，端点打过去只会 404/403）。
+    // 故断言同时锁「取值不同」与「注释里两条理由都在」。
     const source = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/credits-capabilities.js'),
       'utf8',
     )
-    // 两段理由必须各自成句、且都在文件里。
-    expect(source).toContain('疑似有签到，但端点未知')
-    expect(source).toContain('将来拿到端点后把它翻成 `true`')
-    // 国际版那句也必须还在（不然「分开写」就退化成「只写 CN 一句」）。
+    // 国际版那句理由必须还在（它解释的是「活动不存在」，不是「端点未知」）。
     expect(source).toContain('CLI2API 实测**国际版不显示签到**')
-    // 反面锚点：CN 那一段**不得**出现「没有这项权益」的定性。
+    // CN 那句理由必须改成「已解出并真机验收」，且**不得**再留「端点未知」的待办定性。
+    expect(source).toContain('端点已由 keylog 解密抓包解出并')
+    expect(source).not.toContain('端点至今未知、未验收')
+    expect(source).not.toContain('将来拿到端点后把它翻成 `true`')
+    // 反面锚点：CN 那一段不得出现「没有这项权益」或「与国际版一样不存在」的定性。
     const cnCommentStart = source.indexOf('// Qoder **CN（国内版）**')
     const cnEntryStart = source.indexOf("'qoder-cn': Object.freeze(")
     expect(cnCommentStart, '找不到 Qoder CN 的注释段').toBeGreaterThan(-1)
     expect(cnEntryStart).toBeGreaterThan(cnCommentStart)
     const cnSection = source.slice(cnCommentStart, cnEntryStart)
     expect(cnSection).not.toContain('没有这项权益')
+    // 取值本身的方向也要在**同一处**被钉住：CN 真、国际版假。
+    expect(supportsDailyCheckin('qoder-cn')).toBe(true)
+    expect(supportsDailyCheckin('qoder')).toBe(false)
   })
 
   it('能力矩阵的键与 PROVIDERS 的 id 逐字对齐（含连字符 provider）', () => {
@@ -377,7 +392,7 @@ describe('客户端积分请求门控（源码级回归）', () => {
     expect(guardIndex).toBeLessThan(callIndex)
   })
 
-  it('挂载副作用只在支持余额时才拉积分（CodeArts 连 loading 状态都不翻）', () => {
+  it('挂载副作用只在支持余额时才拉积分（不支持的 provider 连 loading 状态都不翻）', () => {
     const start = source.indexOf("void loadAccounts();")
     expect(start).toBeGreaterThan(-1)
     const body = source.slice(start, start + 400)

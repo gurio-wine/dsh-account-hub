@@ -5,7 +5,7 @@
  * 与 dsh-im 的 registerManagementRpc 一致。
  * 通道名 account-hub → 路径 /api/account-hub
  * 端点方法：account.list / account.create / account.update / account.delete /
- *           account.refresh / account.retest / account.retestAll /
+ *           account.reorder / account.refresh / account.retest / account.retestAll /
  *           account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
  *           model.list / model.setDisabled / model.setContextBudget
@@ -35,12 +35,20 @@ import {
 } from './credits.js'
 import { BUDDY, BUDDY_CN, productById, type BuddyProduct } from './product.js'
 import {
+  claimCodeArtsDailyCheckin,
+  fetchCodeArtsAccountInfoDetailed,
+} from './codearts-credits.js'
+import {
   claimLobsteraiDailyCheckin,
   fetchLobsteraiCreditBalance,
 } from './lobsterai-credits.js'
 import { TRAE_CN } from './trae-cn-product.js'
 import { QODER, QODER_CN, qoderProductById } from './qoder-product.js'
-import { fetchQoderCreditBalance } from './qoder-credits.js'
+import {
+  claimQoderDailyCheckin,
+  fetchQoderCheckinStatus,
+  fetchQoderCreditBalance,
+} from './qoder-credits.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { isTraeCnJunkModelId } from './trae-cn-models.js'
 import {
@@ -64,6 +72,7 @@ import {
   retestAccount,
   retestAllAccounts,
 } from './account-probe.js'
+import type { CodeArtsCredential } from './types.js'
 import type {
   ProviderAccountEntry,
   RpcListAccountsRequest,
@@ -74,6 +83,7 @@ import type {
   RpcPollLoginResponse,
   RpcUpdateAccountRequest,
   RpcDeleteAccountRequest,
+  RpcReorderAccountsRequest,
   RpcRefreshAccountRequest,
   RpcRefreshAccountResponse,
   RpcRetestAccountRequest,
@@ -383,6 +393,22 @@ export interface CreditsEndpointDeps<
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
   /**
+   * 带**精确原因**的余额查询（可选，优先于 {@link fetchBalance}）。
+   *
+   * 为什么需要它：`fetchBalance` 只用 `null` 表达「查不到」，调用方统一回
+   * 「余额查询失败」。但 CodeArts 还有第三种情形 —— **非积分计费账户**
+   * （Token 计费）：它不是故障，如实显示「余额查询失败」会把用户引向错误的
+   * 排查方向。该钩子让实现能带回精确文案，同时仍复用本函数的逐账号编排
+   * （顺序执行、单账号失败不中断、凭据解析在 try 之内）。
+   *
+   * `error` 为 `undefined` 且 `balance` 为 `null` 时，调用方按「余额查询失败」
+   * 兜底 —— 实现不必自己造一句笼统文案。
+   */
+  fetchBalanceDetailed?: (
+    credential: TCredential,
+    product: TProduct,
+  ) => Promise<{ balance: CreditBalance | null; error?: string }>
+  /**
    * 默认实现（`fetchCheckinStatus` / `claimDailyCheckin` / `fetchCreditBalance`）
    * 使用的 fetch。
    *
@@ -566,6 +592,7 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsBalancesResponse['accounts']> {
   const { fetchBalance } = resolveCreditsDeps(deps)
+  const fetchDetailed = deps.fetchBalanceDetailed
   const results: RpcCreditsBalancesResponse['accounts'] = []
   // 顺序查询，避免并发触发风控
   for (const entry of accounts) {
@@ -577,9 +604,17 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
         error = '凭据未配置'
       } else {
         const credential = JSON.parse(resolved.value) as TCredential
-        balance = await fetchBalance(credential, product)
-        // 查询函数以 null 表示"查不到"（网络/业务码异常），与"余额为 0"不同
-        if (balance === null) error = '余额查询失败'
+        if (fetchDetailed !== undefined) {
+          // 带原因的查询：实现自己决定「非积分账户」这类业务状态的文案。
+          const detailed = await fetchDetailed(credential, product)
+          balance = detailed.balance
+          error = detailed.error
+          if (balance === null && error === undefined) error = '余额查询失败'
+        } else {
+          balance = await fetchBalance(credential, product)
+          // 查询函数以 null 表示"查不到"（网络/业务码异常），与"余额为 0"不同
+          if (balance === null) error = '余额查询失败'
+        }
       }
     } catch (caught) {
       deps.warn?.(`[account-hub] credits.balances 账号 ${entry.id} 失败: ${String(caught)}`)
@@ -606,6 +641,28 @@ function llmServiceOf(ctx: Context): { listModels(provider: string): Promise<Arr
   return ctx.get('llm') as
     | { listModels(provider: string): Promise<Array<{ id: string; name: string }>> }
     | undefined
+}
+
+/**
+ * 「显示列表」所需的最小适配器接口：能给出**不套用户黑名单、也不套目录门控**的
+ * 完整目录（带最终展示名）。
+ *
+ * ## 为什么需要它
+ *
+ * 适配器的 `listModels` 会按用户黑名单过滤，于是**被关闭的模型不在其返回值里**；
+ * 设置页必须把它们渲染出来（否则用户无法重新打开），此前只能凭黑名单的键（裸 id）
+ * 补回 —— 那条路径拿不到展示名，只能退化成裸 id，**倍率与模型名随之丢失**。
+ * 有了本接口，关闭项与开启项走同一份目录、同一个名字。
+ *
+ * ⚠️ 它**同时不受目录门控影响**（`providerCatalogVisible`）：没有已登录账号时
+ * `listModels` 返回空数组（整个 provider 分组从模型选择器消失），而设置页仍须
+ * 列出该 provider 的全部模型 —— 反而更需要它（此时 `listModels` 一个都不给）。
+ *
+ * ⚠️ **只声明用到的方法**（结构化类型），避免本模块依赖七个具体适配器类。
+ * 实例由 `src/index.ts` 显式收集后传入（`ctx.llm` 不透传自定义方法）。
+ */
+export interface ModelCatalogSource {
+  listAllModels(): readonly { id: string; name: string }[]
 }
 
 /**
@@ -644,6 +701,11 @@ export type { ContextTierRegistry, ContextTierSource } from './context-tiers.js'
  * @param contextTiers - 可选的窗口档位注册表（见 {@link ContextTierRegistry}）。
  *        省略时 `model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝 ——
  *        这是 headless / 测试场景的既定降级，不是缺陷。
+ * @param modelAdapters - 可选的 provider → 适配器实例映射（见
+ *        {@link ModelCatalogSource}）。用于「显示列表」拿到**不套用户黑名单、也不套
+ *        目录门控**的完整目录，使被关闭的模型也显示正确的展示名（含倍率）而不是
+ *        退化成裸 id。省略时退化为「`listModels` 结果 + 黑名单裸 id 回补」的历史
+ *        行为（同样是 headless / 测试的既定降级）。
  */
 export function registerAccountHubRpc(
   ctx: Context,
@@ -656,10 +718,12 @@ export function registerAccountHubRpc(
   qoder: QoderAuth,
   qoderCn: QoderAuth,
   contextTiers?: ContextTierRegistry,
+  modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
     registerAccountHubEndpoints(
-      connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTiers,
+      connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn,
+      contextTiers, modelAdapters,
     )
   })
 }
@@ -676,6 +740,7 @@ function registerAccountHubEndpoints(
   qoder: QoderAuth,
   qoderCn: QoderAuth,
   contextTiers: ContextTierRegistry | undefined,
+  modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -1144,6 +1209,34 @@ function registerAccountHubEndpoints(
         return { ok: true, value: undefined }
       }
 
+      case 'account.reorder': {
+        // 拖拽排序：重写该 provider 账号在池中的顺序。
+        // 该顺序是自动选号与限流换号的候选优先级（见 `AccountPool.reorderAccounts`），
+        // 因此不是纯 UI 操作。⚠️ 客户端暂未发这个 RPC（UI 拖拽是第二阶段），
+        // 入口先就位并单测，避免「后端语义有了但没接线」。
+        const req = payload as RpcReorderAccountsRequest
+        if (typeof req.provider !== 'string' || req.provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 必填' } }
+        }
+        if (!Array.isArray(req.orderedIds) || req.orderedIds.some(id => typeof id !== 'string')) {
+          return { ok: false, error: { code: 'bad-request', message: 'orderedIds 必须是字符串数组' } }
+        }
+        try {
+          await pool.reorderAccounts(poolProviderFor(req.provider), req.orderedIds)
+        } catch (error) {
+          // 集合不一致（前端列表过期）是可预期的并发情况，回可读错误让用户
+          // 刷新重试，而不是抛成 account-hub/handler-failed 那种「未知故障」。
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          }
+        }
+        return { ok: true, value: undefined }
+      }
+
       case 'account.refresh': {
         const req = payload as RpcRefreshAccountRequest
         try {
@@ -1276,18 +1369,33 @@ function registerAccountHubEndpoints(
       // ── 每日签到（积分领取）──
       // 查询某 provider 下全部启用账号的签到状态。
       //
-      // ⚠️ 三个积分端点（status / claimAll / balances）都以 `productById()`
-      // 判能力，而 **CodeArts 不是 BuddyProduct**（华为云账号体系没有腾讯计费
-      // 接口），因此 `codearts` 必定落到下面的 bad-request。这是正确且必要的
-      // 拒绝，但客户端**不应**把这条错误当作运行时故障去展示：它应当在发请求
-      // 之前就按 `plugin-src/client/credits-capabilities.js` 的能力矩阵判掉
-      // （历史缺陷：CodeArts 面板挂载时无条件调用 credits.balances，导致每次
-      // 打开设置页都在控制台报 unsupported provider 并把账号卡片标成查询失败）。
-      // 此处的拒绝是兜底与契约声明，不是常规路径。
+      // ⚠️ 三个积分端点（status / claimAll / balances）分派规则：
+      //   - Buddy 系经 `productById()` 取产品配置；
+      //   - `codearts`（华为云 SDK-HMAC-SHA256 签名）、`lobsterai`、
+      //     `trae-cn`、Qoder 两区**各自提前分支** —— 它们都不是 BuddyProduct。
+      // 只有**未知** provider 才会落到 bad-request。历史上 CodeArts 曾恒回
+      // `unsupported provider: codearts`（客户端在面板挂载时无条件调用
+      // credits.balances，于是每打开一次设置页都在控制台报错并把账号卡片标成
+      // 查询失败）；现在 CodeArts 已有真实实现，客户端仍按
+      // `plugin-src/client/credits-capabilities.js` 的能力矩阵在**发请求之前**门控。
       case 'credits.status': {
         const req = payload as RpcCreditsStatusRequest
         // provider → 池键（见 {@link poolProviderFor}）。
         const provider = poolProviderFor(req.provider)
+        if (provider === 'codearts') {
+          // CodeArts 没有独立的「签到状态」端点：可领状态要经
+          // `statistics/plugin`（账户类型）+ `/v1/ops/delivery`（活动列表）
+          // 两步才能得到，且语义与 Buddy 的 CheckinStatus 不同构
+          //（无 streak_days / daily_credit 等概念）。
+          // 故与 LobsterAI 同样如实返回 null，而不是臆造一份状态对象。
+          const accounts = await pool.listAccounts(provider)
+          return {
+            ok: true,
+            value: {
+              accounts: accounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null })),
+            } satisfies RpcCreditsStatusResponse,
+          }
+        }
         if (provider === LOBSTERAI.id) {
           // LobsterAI 没有独立的「签到状态」端点：活动状态要经
           // slot → context 两步才能得到，且语义与 Buddy 的
@@ -1315,17 +1423,37 @@ function registerAccountHubEndpoints(
           })
           return { ok: true, value: { accounts: results } satisfies RpcCreditsStatusResponse }
         }
+        if (provider === QODER_CN.id) {
+          // **只有 Qoder CN 有签到**：活动端点 `sash/api/v1/me/campaigns` 由
+          // keylog 解密抓包解出并真机验证（2026-09-21），只对 CN 打开；
+          // 国际版 `qoder` **维持拒绝**（落到下面的 `productById()` 分支）——
+          // 上游情报明说该活动在桌面 App 才能领，本插件不去模拟桌面客户端。
+          //
+          // region 解引用必须走 {@link qoderRegionFor}（唯一一处「哪个 region 用
+          // 哪份配置与实例」）：用错实例换来的是另一区的 jt，表现为「凭据失效」。
+          const region = qoderRegionFor(req.provider, qoder, qoderCn)
+          if (region === undefined) {
+            return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+          }
+          const cnAccounts = await pool.listAccounts(provider)
+          const results = await collectCreditsStatus<QoderCredential, QoderProduct>(cnAccounts, region.product, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchStatus: (credential, product) =>
+              fetchQoderCheckinStatus(credential, region.auth, {
+                product,
+                onDebug: (msg) => ctx.logger?.info?.(msg),
+              }),
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: results } satisfies RpcCreditsStatusResponse }
+        }
         const product = productById(provider)
         if (product === undefined) {
-          // ⚠️ **Qoder 系两个 region 都刻意落到这里**（`qoder` 与 `qoder-cn`）：
-          // 它们**没有公开的签到接口**（官方每日 100 Credits 只能在 Qoder 桌面
-          // App 手动领），故 `unsupported provider: qoder-cn` 是**正确契约**，
-          // 不是漏加分支。客户端靠 `credits-capabilities.js` 的
-          // `dailyCheckin: false` 在**发请求之前**就不发（`loadCredits` /
-          // `claimCredits` 各有一道守卫）。
+          // ⚠️ **Qoder 国际版（`qoder`）刻意落到这里**：活动只属于 CN（见上面的
+          // `qoder-cn` 分支），国际版的 `dailyCheckin: false` 由能力矩阵在
+          // **发请求之前**挡掉（`loadCredits` / `claimCredits` 各有一道守卫）。
           // 判据是 `productById()`（Buddy 系）—— Qoder 的产品配置是
-          // `QoderProduct`，**任何 region 都不会命中它**，故这条拒绝是结构性的、
-          // 不需要为 CN 单独写一行。
+          // `QoderProduct`，不会命中它，故这条拒绝是结构性的。
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const accounts = await pool.listAccounts(provider)
@@ -1342,6 +1470,22 @@ function registerAccountHubEndpoints(
         // provider → 池键（见 {@link poolProviderFor}）。
         const provider = poolProviderFor(req.provider)
         const accounts = await pool.listAccounts(provider)
+        if (provider === 'codearts') {
+          // CodeArts（华为云）走**签名**协议，与两个腾讯系 provider 都不同源：
+          // 领取流程自带「账户类型 + 活动列表」预检（见 claimCodeArtsDailyCheckin），
+          // 故 precheckStatus: false 跳过外部那次 Buddy 式的状态查询 ——
+          // 用 fetchCheckinStatus 打华为端点既发错请求又必然失败。
+          //
+          // 第二、三个实参是 `undefined`：CodeArts 没有 BuddyProduct，
+          // 而下钻函数只吃凭据（product 对华为协议无意义）。
+          const value = await collectClaimResults<CodeArtsCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            claim: (credential) => claimCodeArtsDailyCheckin(credential),
+            precheckStatus: false,
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        }
         if (provider === LOBSTERAI.id) {
           // LobsterAI 的 clientVersion 是签到必填参数，需动态解析
           //（带缓存，通常无额外网络开销）。
@@ -1369,11 +1513,33 @@ function registerAccountHubEndpoints(
           })
           return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
         }
+        if (provider === QODER_CN.id) {
+          // **只有 Qoder CN 有签到**（见 credits.status 处那条同源说明）。
+          //
+          // `precheckStatus: false` —— `claimQoderDailyCheckin` **自带活动列表
+          // 查询**（campaigns → 逐个 claim），外部再查一次纯属重复 GET
+          //（与 LobsterAI / Trae CN 同一约定）。
+          const region = qoderRegionFor(req.provider, qoder, qoderCn)
+          if (region === undefined) {
+            return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+          }
+          const value = await collectClaimResults<QoderCredential, QoderProduct>(accounts, region.product, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            claim: (credential, product) =>
+              claimQoderDailyCheckin(credential, region.auth, {
+                product,
+                onDebug: (msg) => ctx.logger?.info?.(msg),
+              }),
+            precheckStatus: false,
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        }
         const product = productById(provider)
         if (product === undefined) {
-          // ⚠️ **Qoder 系两个 region 都刻意落到这里** —— 理由与 `credits.status`
-          // 处那条同源（没有公开的签到接口，`dailyCheckin: false` 由能力矩阵在
-          // 发请求之前挡掉）。这里是**契约声明**，不是待补的分支。
+          // ⚠️ **Qoder 国际版（`qoder`）刻意落到这里** —— 理由与 `credits.status`
+          // 处那条同源（活动只属于 CN；`dailyCheckin: false` 由能力矩阵在发请求
+          // 之前挡掉）。这里是**契约声明**，不是待补的分支。
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const value = await collectClaimResults(accounts, product, {
@@ -1393,6 +1559,37 @@ function registerAccountHubEndpoints(
         // provider → 池键（见 {@link poolProviderFor}）。
         const provider = poolProviderFor(req.provider)
         const accounts = await pool.listAccounts(provider)
+        if (provider === 'codearts') {
+          // 余额来自 `statistics/plugin`（与账户类型检测**同一个响应**），
+          // 故用带原因的钩子：非积分账户要显示「Token 计费账户」而不是
+          // 误导性的「余额查询失败」——账户类型差异不是故障。
+          const values = await collectCreditBalances<CodeArtsCredential, undefined>(accounts, undefined, {
+            resolve: (ref) => ctx.credentials.resolve(ref),
+            fetchBalanceDetailed: async (credential) => {
+              // 用带原因的版本：`fetchCodeArtsAccountInfo` 只回 null，会把
+              // 「AK 限流」「签名失败」「凭据过期」压成同一句笼统文案，
+              // 用户与排查者都拿不到线索（本端点就因此把一次 401 显示成了
+              // 无信息量的「账户信息查询失败」）。
+              const result = await fetchCodeArtsAccountInfoDetailed(credential)
+              if (!result.ok) return { balance: null, error: `账户信息查询失败：${result.message}` }
+              const info = result.info
+              if (!info.isCreditPackage) {
+                return {
+                  balance: null,
+                  error: info.isTokenPackage
+                    ? 'Token 计费账户，无积分余额'
+                    : '非积分计费账户，无积分余额',
+                }
+              }
+              // 积分账户但没有 credit metric：如实报「未返回积分数据」，
+              // 不显示成 0 —— 0 会让用户以为自己把积分用光了。
+              if (info.credit === undefined) return { balance: null, error: '未返回积分数据' }
+              return { balance: info.credit }
+            },
+            warn: (msg) => ctx.logger?.warn?.(msg),
+          })
+          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
+        }
         if (provider === LOBSTERAI.id) {
           const values = await collectCreditBalances(accounts, LOBSTERAI, {
             resolve: (ref) => ctx.credentials.resolve(ref),
@@ -1469,6 +1666,10 @@ function registerAccountHubEndpoints(
         }
         let models: Array<{ id: string; name: string }>
         try {
+          // ⚠️ **即使下面可能不用它的结果，这一次调用也必须保留**：适配器的
+          // `listAllModels()` 是**同步且不触发 IO** 的（它只读目录缓存），远端目录
+          // 要靠 `listModels` 这一趟才会被拉取 / 刷新（`ensureRemoteModels` /
+          // `ensureCatalog`）。去掉它，全量目录会永远停在静态兜底表上。
           models = await llm.listModels(req.provider)
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
@@ -1486,11 +1687,19 @@ function registerAccountHubEndpoints(
         // 编辑 settings.yaml）。这正是「关掉后彻底找不到该模型」的根因。
         //
         // 因此这里以黑名单为准做并集：凡是「黑名单里为 true、却已不在
-        // listModels 结果中」的模型，补回列表并标记为已关闭。设置页据此始终能
+        // 目录结果中」的模型，补回列表并标记为已关闭。设置页据此始终能
         // 渲染出全部开关；而对话框模型选择器读的仍是过滤后的 listModels，
         // 可见性行为完全不变。
         //
-        // ⚠️ **回填必须先过垃圾判定**（2026-09-20 修复的黑名单并集泄漏）：回填的
+        // ⚠️ **目录来源优先用适配器的 `listAllModels()`**（`modelAdapters` 注入）：
+        // 它**不套黑名单、也不套账号门控**，且带**最终展示名**（含倍率 / 多模态名）。
+        // 少了它会有两个后果：① 补回行只能显示裸 id（用户报障「关闭的就没有显示
+        // 倍率」）；② **没有已登录账号的 provider** 在设置页会一行都不剩 —— 门控让
+        // `listModels` 返回 `[]`（对话框里整个分组隐藏，这是需求本身），但「显示
+        // 列表」必须照常列出全部模型开关，否则用户连模型名单都看不到。
+        // 适配器实例不存在时（外部 / 旧适配器）退化为历史行为。
+        //
+        // ⚠️ 回填必须先过垃圾判定（2026-09-20 修复的黑名单并集泄漏）：回填的
         // 候选是**黑名单的键名**——它们不只是「用户显式关过的正常模型」，还包括
         // 用户在目录过滤网上线之前关掉的那批 custom / invisible / 内部项，以及
         // 目录那次快照里存在、后来下线的 id。真机实测：目录 13 项 + 黑名单 30 个
@@ -1504,7 +1713,11 @@ function registerAccountHubEndpoints(
         // 历史行为原样保留，见 README 的「显示列表的回填机制与过滤」）。
         const isTraeProvider = req.provider === TRAE_CN.id
         const junkBackfilled = (id: string): boolean => isTraeProvider && isTraeCnJunkModelId(id)
-        const listedIds = new Set(models.map((model) => model.id))
+        // 全量目录（不套黑名单 / 不套门控），缺失时回退 `listModels` 的结果。
+        const allModels = modelAdapters?.[req.provider]?.listAllModels()
+        const catalog: ReadonlyArray<{ id: string; name: string }> =
+          allModels === undefined ? models : [...allModels]
+        const listedIds = new Set(catalog.map((model) => model.id))
         const filteredOut = Object.keys(disabledMap)
           .filter((id) => disabledMap[id] === true && !listedIds.has(id) && !junkBackfilled(id))
         // 逐模型窗口档位：**问注册表要本 provider 的来源**（不再对 provider
@@ -1557,7 +1770,7 @@ function registerAccountHubEndpoints(
         }
         const value: RpcModelListResponse = {
           models: [
-            ...models.map((model) => withWindows({
+            ...catalog.map((model) => withWindows({
               id: model.id,
               name: model.name,
               disabled: disabledMap[model.id] === true,

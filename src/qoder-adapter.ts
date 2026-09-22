@@ -60,7 +60,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId, ToolCallId } from '@deepseek-a
 import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk, TokenUsage,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { availableContextTiers, effectiveContextWindow, type ContextTier } from './context-tiers.js'
 import { QODER, QODER_CHAT_PATH, qoderClientType, qoderJobTokenHeaders, resolveQoderChatBase } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
@@ -1189,8 +1189,18 @@ export class QoderAdapter extends LlmAdapter {
    * 黑名单在**播报前**过滤（`disabledModelsFor`）：黑名单是黑名单制（键存在且为
    * `true` 才隐藏），每次调用实时读，改开关后无需重建适配器。它**只影响播报、
    * 不影响路由**（见 {@link resolveModel}）。
+   *
+   * 没有已登录账号时返回 `[]`（目录门控，见 {@link providerCatalogVisible}）——
+   * DSH 的 `buildModelCatalog` 会把空分组整个隐藏，模型选择器不再列出用不上的
+   * provider。⚠️ **两个 region 共用本类，但 `this.product.id` 不同**，故 Qoder 与
+   * Qoder CN 各自独立判定，一区没账号不影响另一区。
    */
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️ 门控放在 `ensureCatalog()` **之前**：没有已登录账号时连远端目录都不必拉
+    // （`ensureCatalog` 内部虽然也会因取不到凭据而短路，但那要等一次 resolve）。
+    // ⚠️ 必须返回 `[]` 而**不能抛错**：抛错会被 `buildModelCatalog` 归入
+    // `failures`，界面上反而多出一条 provider 报错，比「不显示」更糟。
+    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
     await this.ensureCatalog()
     const source = this.catalogEntries()
     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
@@ -1209,6 +1219,21 @@ export class QoderAdapter extends LlmAdapter {
       // 不足以支撑「图片能送达上游」这个结论。
       inputModalities: QODER_TEXT_ONLY,
     }))
+  }
+
+  /**
+   * **不套用户黑名单、也不套目录门控**的完整目录（带最终展示名）。
+   *
+   * 供 Account Hub 的「显示列表」使用：设置页必须始终能看到**全部**模型（含被
+   * 用户关闭的那些），否则关掉之后连开关都找不到、更无法重新打开。
+   *
+   * ⚠️ 与 `listModels` 的唯一区别就是「不套黑名单、不套门控」——可见性口径
+   * （动态目录优先 / 静态表兜底）必须同源，故同样走 {@link catalogEntries}。
+   * 本方法**同步且有缓存副作用之外的零 IO**：它不触发目录拉取，冷缓存时读到的
+   * 就是静态表 —— `model.list` 在调用它之前必然已经跑过 `llm.listModels`。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    return this.catalogEntries().map((model) => ({ id: model.id, name: model.name }))
   }
 
   /**
@@ -1553,8 +1578,9 @@ export class QoderAdapter extends LlmAdapter {
     /**
      * 已试过的账号 id。
      *
-     * 换号时必须传给池：刚失败的账号仍是池里排序第一，不排除就会拿回同一个
-     * 账号、命中 `tried.has` 而立即中断 —— 换号形同虚设。
+     * 换号时必须传给池：刚失败的账号**仍在数组原位**（候选顺序即用户手动顺序，
+     * 见 `AccountPool.reorderAccounts`），不排除就会拿回同一个账号、
+     * 命中 `tried.has` 而立即中断 —— 换号形同虚设。
      */
     const tried = new Set<string>()
     let accountId = currentAccountId

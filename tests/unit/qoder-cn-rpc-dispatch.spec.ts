@@ -73,6 +73,8 @@ interface CapturedCall {
   url: string
   method: string
   authorization: string
+  /** 请求体原文（字符串 body 原样记录，其它形态记空串）。 */
+  body: string
 }
 
 /** 判定一个 URL 是否属于 CN 的某个端点（host 含 `.com.cn`）。 */
@@ -157,6 +159,7 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
       url: String(url),
       method: String(init?.method ?? 'GET'),
       authorization: new Headers(init?.headers).get('authorization') ?? '',
+      body: typeof init?.body === 'string' ? init.body : '',
     }
     calls.push(call)
     const response = responds(call)
@@ -563,43 +566,170 @@ describe('credits.balances —— qoder-cn 用 CN 的额度端点与两池 fixtu
   })
 })
 
-// ── 刻意**不**加分支的两个积分端点 ───────────────────────────────────────────
+// ── credits.status / credits.claimAll 的 qoder-cn 分支 ───────────────────────
 
-describe('credits.status / credits.claimAll —— qoder-cn 刻意不加分支', () => {
+/**
+ * 签到**只对 `qoder-cn` 接线**，国际版 `qoder` 维持结构性拒绝。
+ *
+ * ⚠️ 本组用例的前身断言的是「**两个 region 都刻意不加分支**，一律回
+ * `unsupported provider`」—— 那条契约已随 CN 签到端点解出而作废（端点由 keylog
+ * 解密抓包解出并真机验收，2026-09-21）。现在守的是**替换后的契约**：
+ *
+ * 1. `qoder-cn` 被接受，且出网全部落在 **CN 的 host** 上（`/sash/…/campaigns`）；
+ * 2. **国际版 `qoder` 仍回 unsupported provider** —— 活动只属于 CN，给它接线会
+ *    让面板挂上一个每次点击都必然失败的按钮（客户端另有能力矩阵在请求前挡）；
+ * 3. 幂等判据是响应体的 `replayed`，**不是** HTTP 200（重复领取同样回 200）。
+ */
+describe('credits.status / credits.claimAll —— 签到只对 qoder-cn 接线', () => {
+  /** 一条真机形状的可领活动（`CLAIM_BENEFIT` + `CLAIMABLE`）。 */
+  function claimableCampaign(): Record<string, unknown> {
+    return {
+      campaignId: '01a0bf8d-cn-1',
+      campaignKey: 'act-20260921-308',
+      actionType: 'CLAIM_BENEFIT',
+      claimStatus: 'CLAIMABLE',
+      benefit: { amount: 100 },
+    }
+  }
+
   /**
-   * Qoder **没有公开的签到 API**（官方每日 100 Credits 只能在桌面 App 手动领），
-   * 故两个签到端点对**两个 region** 都落到「不支持的 provider」。这是**正确
-   * 契约**（与 CodeArts 的拒绝同源），不是待补的分支：客户端靠
-   * `credits-capabilities.js` 的 `dailyCheckin: false` 在**发请求之前**就不发。
+   * 出网替身：exchange / 活动列表 / 领取三个端点，两区 host 都认。
    *
-   * 判据是结构性的：这两个分支以 `productById()`（Buddy 系）判能力，而 Qoder
-   * 的产品配置是 `QoderProduct`，**任何 region 都不会命中** —— 不需要为 CN
-   * 单独写一行拒绝。
-   *
-   * ⚠️ 若哪天有人给它们补上 Qoder 分支，本组会立刻变红 —— 那正是需要的提醒：
-   * 补分支的前提是先有一个**真实存在**的签到端点。
+   * 「两个 host 都认」是刻意的 —— 若 CN 分支误用了国际版实例或 product，响应
+   * 仍会 200，只有 `calls` 里的 URL 会揭穿它（下面每条用例都断言 host）。
    */
+  function responder(options: { claim?: () => Response; campaigns?: () => Response } = {}) {
+    return (call: CapturedCall): Response => {
+      if (call.url.includes('/api/v1/jobToken/exchange')) {
+        return new Response(exchangeBody(isCnHost(call.url) ? 'cn-user' : 'intl-user'), { status: 200 })
+      }
+      if (call.url.includes('/sash/api/v1/me/campaigns')) {
+        // 领取是 POST（路径以 `/{campaignId}/claim` 结尾），列表是 GET。
+        if (call.method === 'POST') {
+          return options.claim?.() ?? new Response(JSON.stringify({ status: 'CLAIMED', benefit: { amount: 100 } }), { status: 200 })
+        }
+        return options.campaigns?.() ?? new Response(JSON.stringify({
+          showCampaign: true, claimable: true, campaigns: [claimableCampaign()],
+        }), { status: 200 })
+      }
+      return new Response('not found', { status: 404 })
+    }
+  }
+
+  /** 建一个 CN 账号（PAT 粘贴，即时完成），并清空出网记录。 */
+  async function withCnAccount(h: Harness): Promise<void> {
+    const created = await h.call('account.create', { provider: 'qoder-cn', pat: 'pt-cn-token' })
+    expect(created.ok, JSON.stringify(created)).toBe(true)
+    h.calls.length = 0
+  }
+
+  it('credits.status 对 qoder-cn 走 CN 的 sash 活动端点，并报「可领 100」', async () => {
+    const h = createHarness(responder())
+    await withCnAccount(h)
+
+    const result = await h.call<{
+      accounts: Array<{ accountId: string; status: { active: boolean; todayCheckedIn: boolean; dailyCredit: number } | null }>
+    }>('credits.status', { provider: 'qoder-cn' })
+
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    if (!result.ok) return
+    expect(result.value.accounts).toHaveLength(1)
+    expect(result.value.accounts[0]!.accountId).toMatch(/^qoder-cn-/)
+    // ⚠️ `active` **恒为 true**：服务端在「今天已领」时会清空 campaigns，
+    // 据此判 active:false 会把「今天已领」误报成「活动未开启」。
+    expect(result.value.accounts[0]!.status).toMatchObject({
+      active: true, todayCheckedIn: false, dailyCredit: 100,
+    })
+
+    const campaigns = h.calls.find((c) => c.url.includes('/sash/api/v1/me/campaigns'))
+    expect(campaigns, `未打到活动端点：${JSON.stringify(h.calls)}`).toBeDefined()
+    expect(campaigns!.url).toBe(`${QODER_CN.openapiBase}/sash/api/v1/me/campaigns`)
+    expect(campaigns!.url).toContain('.qoder.com.cn')
+    // 只认 jt（PAT 打它回 401 TOKEN_EXPIRE）。
+    expect(campaigns!.authorization).toMatch(/^Bearer jt-/)
+    // 整条链路（含 exchange）不得出现国际版 host。
+    expect(h.calls.every((c) => !c.url.includes('.qoder.sh'))).toBe(true)
+  })
+
+  it('credits.claimAll 对 qoder-cn 领到 100 积分，且 claim 是**空 body 的 POST**', async () => {
+    const h = createHarness(responder())
+    await withCnAccount(h)
+
+    const result = await h.call<{
+      results: Array<{ accountId: string; outcome: { kind: string; credit?: number } }>
+      summary: { claimed: number; totalCredit: number; alreadyClaimed: number; inactive: number; failed: number }
+    }>('credits.claimAll', { provider: 'qoder-cn' })
+
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    if (!result.ok) return
+    expect(result.value.results[0]!.outcome).toMatchObject({ kind: 'claimed', credit: 100 })
+    expect(result.value.summary).toEqual({
+      claimed: 1, totalCredit: 100, alreadyClaimed: 0, inactive: 0, failed: 0,
+    })
+
+    const claim = h.calls.find((c) => c.method === 'POST' && c.url.includes('/claim'))
+    expect(claim, `未发出 claim：${JSON.stringify(h.calls)}`).toBeDefined()
+    expect(claim!.url).toBe(`${QODER_CN.openapiBase}/sash/api/v1/me/campaigns/01a0bf8d-cn-1/claim`)
+    // ⚠️ 抓包实测 `content-length: 0` —— 发 `{}` 属未经验证的形态。
+    expect(claim!.body).toBe('')
+    // `precheckStatus: false`：claim 自带活动列表查询 ⇒ 只应有一次 GET。
+    expect(h.calls.filter((c) => c.url.includes('/sash/api/v1/me/campaigns') && c.method === 'GET')).toHaveLength(1)
+  })
+
+  it('幂等判据是响应体的 `replayed`，不是 HTTP 200（重复领取归一为已领取）', async () => {
+    // 实测：重复领取**同样回 200**，但 `replayed:true`、不含 `benefit`，
+    // 且 `claimedAt` 是上一次领取的旧时间。只看状态码会误报「领取成功 +100」。
+    const h = createHarness(responder({
+      claim: () => new Response(JSON.stringify({ replayed: true, claimedAt: '2026-09-18T02:00:00Z' }), { status: 200 }),
+    }))
+    await withCnAccount(h)
+
+    const result = await h.call<{ summary: { claimed: number; totalCredit: number; alreadyClaimed: number; failed: number } }>(
+      'credits.claimAll', { provider: 'qoder-cn' },
+    )
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    if (!result.ok) return
+    expect(result.value.summary).toEqual({
+      claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0,
+    })
+  })
+
+  it('活动列表清空（今天已领）也是 already-claimed，**不是** failed', async () => {
+    const h = createHarness(responder({
+      campaigns: () => new Response(JSON.stringify({ showCampaign: false, claimable: false, campaigns: [] }), { status: 200 }),
+    }))
+    await withCnAccount(h)
+
+    const result = await h.call<{ summary: { alreadyClaimed: number; failed: number } }>(
+      'credits.claimAll', { provider: 'qoder-cn' },
+    )
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.summary).toMatchObject({ alreadyClaimed: 1, failed: 0 })
+    // 无可领活动 ⇒ 一次 claim 都不发。
+    expect(h.calls.some((c) => c.method === 'POST' && c.url.includes('/claim'))).toBe(false)
+  })
+
   const METHODS = ['credits.status', 'credits.claimAll'] as const
 
-  it.each(METHODS)('%s 对 qoder-cn 回 unsupported provider，且**一次网都不出**', async (method) => {
+  it.each(METHODS)('%s 对国际版 qoder 仍回 unsupported provider，且**一次网都不出**', async (method) => {
+    // 活动**只属于 CN**。给国际版接线会让面板多出一个每次点击都必然失败的按钮
+    // （客户端靠能力矩阵在请求前挡，这里是后端的兜底拒绝）。
     const h = createHarness(() => new Response('{}', { status: 200 }))
-    const result = await h.call(method, { provider: 'qoder-cn' })
+    const result = await h.call(method, { provider: 'qoder' })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.error.message).toBe('unsupported provider: qoder-cn')
+    expect(result.error.message).toBe('unsupported provider: qoder')
     expect(h.calls).toHaveLength(0)
   })
 
-  it.each(METHODS)('%s 对国际版 qoder 的拒绝形态**完全一致**（两区同契约）', async (method) => {
-    const h = createHarness(() => new Response('{}', { status: 200 }))
-    const cn = await h.call(method, { provider: 'qoder-cn' })
-    const intl = await h.call(method, { provider: 'qoder' })
-    expect(cn.ok).toBe(false)
-    expect(intl.ok).toBe(false)
-    if (cn.ok || intl.ok) return
-    // 两区的拒绝**只差 provider 名**，其余文案逐字相同。
-    expect(intl.error.message).toBe('unsupported provider: qoder')
-    expect(cn.error.message.replace('qoder-cn', 'qoder')).toBe(intl.error.message)
+  it.each(METHODS)('%s 不再把 qoder-cn 当成不支持的 provider', async (method) => {
+    // ⚠️ **反向**断言（本组用例的前身正是这条的反面）：CN 必须有分支。
+    // 若谁把 `qoder-cn` 的分支删掉，CN 面板的「一键领取积分」会变成
+    // 一个必然失败的按钮。
+    const h = createHarness(responder())
+    const result = await h.call(method, { provider: 'qoder-cn' })
+    expect(result.ok, `${method} 不该拒绝 qoder-cn：${JSON.stringify(result)}`).toBe(true)
   })
 })
 

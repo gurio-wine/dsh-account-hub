@@ -29,7 +29,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { parseRateLimitError } from './llm-adapter.js'
 import {
   LOBSTERAI_CHAT_PATH,
@@ -590,6 +590,12 @@ export class LobsteraiAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+    // 不必拉（省一次无谓 HTTP）。返回空数组 → DSH 的 `buildModelCatalog` 把整个
+    // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
+    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
+    // 界面上反而多出一条 provider 报错）。
+    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? this.staticFallbackModels()
     // 用户在 Account Hub 关闭的模型（黑名单制：不在表里即默认打开）。
@@ -604,6 +610,20 @@ export class LobsteraiAdapter extends LlmAdapter {
       // 图片输入刻意不声明，判定证据链见 LOBSTERAI_IMAGE_MODALITY_NOTE。
       inputModalities: ['text'] as const,
     }))
+  }
+
+  /**
+   * **不套用户黑名单、也不套目录门控**的完整目录（带最终展示名）。
+   *
+   * 供 Account Hub 的「显示列表」使用：设置页必须始终能看到**全部**模型（含被
+   * 用户关闭的那些），否则关掉之后连开关都找不到、更无法重新打开。
+   *
+   * ⚠️ 与 `listModels` 的唯一区别就是「不套黑名单、不套门控」——可见性口径
+   * （远端优先 / 兜底表）必须同源。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    const source = this.remoteModels ?? this.staticFallbackModels()
+    return source.map((model) => ({ id: model.id, name: model.name }))
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
@@ -837,9 +857,10 @@ export class LobsteraiAdapter extends LlmAdapter {
             )
           }
           // 必须把 `tried` 传给池：失败类别为 5xx / 请求错误时**不写限流标记**
-          // （它们不是限流，不该留徽章），刚失败的账号仍是池里排序第一，
-          // 不排除就会拿回同一个账号、命中下面的 `tried.has` 而**立即 break**
-          // —— 换号形同虚设。对齐 Go 的 `PickExcluding(tried)`（`pool.go:131`）。
+          // （它们不是限流，不该留徽章），刚失败的账号**仍在数组原位**（候选顺序
+          // 即用户手动顺序），不排除就会拿回同一个账号、命中下面的 `tried.has`
+          // 而**立即 break** —— 换号形同虚设。对齐 Go 的 `PickExcluding(tried)`
+          // （`pool.go:131`）。
           const next = await this.options.accountPool.getAvailableAccount(
             this.product.id, options.model, tried,
           )
@@ -1179,13 +1200,20 @@ export class LobsteraiAdapter extends LlmAdapter {
  * `lobsterai` / `llm-lobsterai`。`settingsNs` **必须**与 `src/index.ts` 的
  * `registerProviderSettings` 注册的 namespace 一致，否则模型设置页会因
  * 未注册 namespace 在 `refFor → deriveKeyRef(provider)` 处崩溃。
+ *
+ * ⚠️ **返回适配器实例**（不是 `void`）：Account Hub 的「显示列表」需要它的
+ * `listAllModels()`（不套用户黑名单、也不套目录门控的完整目录，带最终展示名）。
+ * DSH 的 `ctx.llm` 只保证 `listModels`、且会把条目重建后丢掉额外字段，故实例
+ * 必须由调用方持有并注入 RPC 层（见 `src/account-hub-rpc.ts` 的 `ModelCatalogSource`）。
  */
-export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): void {
+export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): LobsteraiAdapter {
   const product = options.product ?? LOBSTERAI
   ctx.llm.registerConfigurableProviders([
     { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([product.id], new LobsteraiAdapter(options))
+  const adapter = new LobsteraiAdapter(options)
+  ctx.llm.registerAdapter([product.id], adapter)
+  return adapter
 }
 
 /** 构造远端模型列表请求的完整 URL（供 auth 服务与测试复用）。 */

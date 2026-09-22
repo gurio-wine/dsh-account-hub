@@ -3,7 +3,7 @@
  *
  * 根因：`src/index.ts` 的 `resolveCredential` 以前把 `getAvailableAccount` 的
  * modelId 写成**空串**，而空串按设计不参与限流过滤（见 `AccountPool` 的说明）。
- * 于是每次请求开头总是拿到「排序第一」的账号——即使它已被记了 24h 积分耗尽
+ * 于是每次请求开头总是拿到「数组顺序最前」的账号——即使它已被记了 24h 积分耗尽
  * 标记——失败后才靠换号循环逐个试。前 3 个账号都耗尽时，每次请求都要等 3 次
  * 「发请求 → 400 → 解析 → 记标记 → 换号」的完整往返。
  *
@@ -231,7 +231,7 @@ describe('凭据在发请求前按目标模型选择（场景 A 核心修复）'
     expect(fetcher).toHaveBeenCalledTimes(1)
   })
 
-  it('无参调用（fetchModels 路径）行为不变：仍取排序第一，忽略限流标记', async () => {
+  it('无参调用（fetchModels 路径）行为不变：仍取数组顺序最前，忽略限流标记', async () => {
     // 拉模型目录不需要按目标模型过滤（目录对所有模型都一样），因此空 modelId
     // 的退化路径必须原样保留 —— 否则模型列表会随某个模型的限流状态而缺号。
     const { resolveCredential } = await makeBuddyPool([
@@ -269,7 +269,7 @@ describe('凭据在发请求前按目标模型选择（场景 A 核心修复）'
     const pick = makeAccountPicker(pool, 'buddy-cn')
 
     expect((await pick(MODEL))?.entry.id).toBe('b')
-    // 空参路径（fetchModels / 默认单凭据场景）仍取排序第一，两者互不串味。
+    // 空参路径（fetchModels / 默认单凭据场景）仍取数组顺序最前，两者互不串味。
     expect((await pick())?.entry.id).toBe('a')
     // 退化路径：B 也被限流后，按模型查为空 → 退回不过滤，仍给出一个账号。
     await pool.updateModelRateLimit('b', MODEL, Date.now() + HOUR)

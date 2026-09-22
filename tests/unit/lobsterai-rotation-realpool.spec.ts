@@ -24,8 +24,13 @@ function options(): GenerateOptions {
 
 /**
  * 复刻**真实** `AccountPool.getAvailableAccount` 的行为：
- * 按 `modelRateLimits` 升序排序、过滤掉仍在重置期内的账号，
- * 但**不支持排除已试过的账号**（这正是真实实现的签名）。
+ * 按**数组顺序**（即用户手动顺序，`reorderAccounts` 写入）返回第一个候选，
+ * 只过滤掉仍在重置期内的账号，但**不支持排除已试过的账号**
+ * （这正是真实实现的签名）。
+ *
+ * ⚠️ 这里**刻意不再复刻**「按 `modelRateLimits` 升序排序」—— 上游 84d0b3f
+ * 已删除该 sort（它会让手动顺序形同虚设）。替身若继续排序，就在一个与生产
+ * 不同的选号语义上做断言。
  */
 function realisticPool(accounts: Array<{ id: string; token: string; resetAt?: number }>) {
   const limits = new Map<string, number>()
@@ -46,7 +51,6 @@ function realisticPool(accounts: Array<{ id: string; token: string; resetAt?: nu
           const resetAt = limits.get(a.id)
           return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
         })
-        .sort((a, b) => (limits.get(a.id) ?? 0) - (limits.get(b.id) ?? 0))
       const first = candidates[0]
       return first === undefined
         ? null

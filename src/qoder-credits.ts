@@ -8,12 +8,13 @@
  * {@link CreditPackage}），故 `collectCreditBalances` 与前端 `CreditBalanceRow`
  * 都不必各写一份 —— 返回值与另外三条线**逐字段同构**。
  *
- * ## 本模块只做两件事
+ * ## 本模块做三件事
  *
  * | 导出 | 消费者 | 说明 |
  * |---|---|---|
  * | {@link fetchQoderCreditBalance} | Account Hub 的 `credits.balances` | 余额卡片 |
  * | {@link checkQoderQuotaExhausted} | **步骤 6** 接线的 `quotaVerdict` | 402 的额度二次判别 |
+ * | {@link fetchQoderCheckinStatus} / {@link claimQoderDailyCheckin} | `credits.status` / `credits.claimAll` | 每日领取（**只给 CN**，见下节） |
  *
  * ## 协议（T1 真机实测，逐字节）
  *
@@ -65,11 +66,43 @@
  * {@link QoderCreditsOptions.persistIdentity} 落盘。账号卡片上的昵称因此
  * 从「账号 id」变成真实的用户 id。
  *
- * ## 不实现签到
+ * ## 每日领取（签到）
  *
- * Qoder 没有公开的签到 API（官方每日 100 Credits 只能桌面 App 手动领），
- * 故本模块**只有余额面**，`credits-capabilities` 里记的是
- * `dailyCheckin: false`。
+ * 端点由 **keylog 解密抓包** 解出（2026-09-21，真机 200）：
+ *
+ * ```
+ * GET  {openapiBase}/sash/api/v1/me/campaigns
+ * POST {openapiBase}/sash/api/v1/me/campaigns/{campaignId}/claim   ← body **空串**
+ * ```
+ *
+ * 头只需 `Authorization: Bearer …`（与余额同源：经 jt 换取），**无需 wasm 签名**
+ * —— 它挂在 `/sash/` 前缀下，不走 `algo` 签名路径。早期只按 `/api/` 前缀搜端点，
+ * 因此误判「Qoder 无签到」（用户报障：「登录成功了，没有获取积分吗？」）。
+ *
+ * 四条硬约束（每条都有对应用例）：
+ *
+ * 1. **幂等判据是响应体的 `replayed`，不是 HTTP 状态码**。重复领取同样回
+ *    **200**，但 `replayed:true`、**不含 `benefit`**，且 `claimedAt` 是**上一次
+ *    领取的旧时间**（实测请求发生在 09-21、`claimedAt` 却是 09-18）。只看状态码
+ *    会把「今天已领」误报成「领取成功 +100」。故 `replayed === true` **归一为
+ *    `already-claimed`**。
+ * 2. **请求体必须是空串**（抓包实测 `content-length: 0`）。
+ * 3. **只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'`** ——
+ *    实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。
+ * 4. **`campaigns` 为空数组不是「没有活动」**：活动**每日 10:00（UTC+8）刷新**，
+ *    服务端在「今天已领」时会**清空 campaigns** 并回
+ *    `{"showCampaign":false,"claimable":false,"campaigns":[]}`。故
+ *    `CheckinStatus.active` **恒为 `true`**（拿到响应即活动开启），**不按列表是否
+ *    为空判** —— 否则调用方会先命中「活动未开启」分支，把「今天已领」误报成
+ *    「签到活动未开启」；而「无活动可领」归一为 `already-claimed`（保守判已领，
+ *    比误报可领更不容易误导用户）。
+ *
+ * ## 签到只接 CN
+ *
+ * 宿主 `credits.status` / `credits.claimAll` **只给 `qoder-cn` 接线**，国际版
+ * `qoder` 维持拒绝（`dailyCheckin: false`）—— 上游情报明说该活动在**桌面 App**
+ * 才能领，本模块的实现只对 CN 打开。协议实现本身按传入的 `product` 现算 host，
+ * 两区共用一份代码。
  */
 
 import {
@@ -85,7 +118,7 @@ import {
   type QoderQuotaVerdict,
 } from './qoder-errors.js'
 import { summarizeQoderErrorBody } from './qoder-auth.js'
-import type { CreditBalance, CreditPackage } from './credits.js'
+import type { CheckinStatus, ClaimOutcome, CreditBalance, CreditPackage } from './credits.js'
 
 // ── 池 ──
 
@@ -742,4 +775,435 @@ export function isQoderQuotaExhausted(usage: QoderQuotaUsage): boolean {
  */
 function roundCredits(value: number): number {
   return Math.round(value * 100) / 100
+}
+
+// ── 每日领取（签到）──
+
+/**
+ * 活动列表路径（挂 `openapiBase`）。
+ *
+ * ⚠️ 挂在 **`/sash/`** 下、**不是** `/api/` —— 早期只按 `/api/` 前缀搜端点，
+ * 因而误判「Qoder 无签到接口」（见模块头注释）。
+ */
+export const QODER_CAMPAIGNS_PATH = '/sash/api/v1/me/campaigns'
+
+/** 可领取活动的 `actionType`（另一类是 `VIEW_DETAILS`，对它发 claim 是错的）。 */
+export const QODER_CAMPAIGN_ACTION_CLAIM = 'CLAIM_BENEFIT'
+
+/** 领取前的权威判据值（`campaigns[].claimStatus`）。 */
+export const QODER_CAMPAIGN_STATUS_CLAIMABLE = 'CLAIMABLE'
+
+/** 领取成功响应里的 `status`（实测原文）。 */
+export const QODER_CAMPAIGN_STATUS_CLAIMED = 'CLAIMED'
+
+/**
+ * 一个活动条目（`campaigns[]` 的一项，**只保留实现需要的字段**）。
+ *
+ * 响应里还有 `description` / `startAt` / `endAt` 等展示字段，本模块不消费，
+ * 故不解析 —— 解析了就会有「谁在用」的疑问，而答案是没有人。
+ */
+export interface QoderCampaign {
+  /** 领取 URL 里的路径段（实测形如 `01a0bf8d-…`）。 */
+  campaignId: string
+  /** 活动键（实测 `act-20260921-308`），用作展示名。 */
+  campaignKey?: string
+  /**
+   * 动作类型：`CLAIM_BENEFIT` = 可领取积分；`VIEW_DETAILS` = 仅跳转详情。
+   *
+   * 实测「Pro 首月翻倍」就是后者 —— 对它发 claim 是错的（见模块头第 3 条）。
+   */
+  actionType?: string
+  /** `CLAIMABLE` / `CLAIMED` / … —— 领取前的权威判据。 */
+  claimStatus?: string
+  /** 可领积分（`benefit.amount`，实测 100）。 */
+  amount?: number
+}
+
+/**
+ * 活动列表的一次解析结果。
+ *
+ * ⚠️ **`claimable:false` + `campaigns:[]` 不代表「没有活动」**：实测「今天已领」
+ * 之后服务端正是这样回的（见模块头第 4 条）。故本类型只是**如实记录**，
+ * 调用方不得据此判「活动未开启」。
+ */
+export interface QoderCampaigns {
+  /** 服务端自报「是否展示活动入口」（仅记录，不参与判定）。 */
+  showCampaign: boolean
+  /** 服务端自报「是否有可领项」（仅记录，不参与判定）。 */
+  claimable: boolean
+  /** 活动列表（**今天已领时服务端会清空它**）。 */
+  campaigns: QoderCampaign[]
+}
+
+/** 读 `benefit.amount`（嵌套一层，与 `campaigns[]` 同级结构不同）。 */
+function readBenefitAmount(source: Record<string, unknown>): number | undefined {
+  const benefit = source.benefit
+  if (!isRecord(benefit)) return undefined
+  return readNumber(benefit, 'amount')
+}
+
+/** 把一条活动条目归一成 {@link QoderCampaign}；缺 `campaignId` 的条目**跳过**。 */
+function parseQoderCampaign(value: unknown): QoderCampaign | undefined {
+  if (!isRecord(value)) return undefined
+  const campaignId = readString(value, 'campaignId')
+  if (campaignId.length === 0) return undefined
+  const campaignKey = readString(value, 'campaignKey')
+  const actionType = readString(value, 'actionType')
+  const claimStatus = readString(value, 'claimStatus')
+  const amount = readBenefitAmount(value)
+  return {
+    campaignId,
+    ...campaignKey.length === 0 ? {} : { campaignKey },
+    ...actionType.length === 0 ? {} : { actionType },
+    ...claimStatus.length === 0 ? {} : { claimStatus },
+    ...amount === undefined ? {} : { amount },
+  }
+}
+
+/**
+ * 解析 `/sash/api/v1/me/campaigns` 的 200 响应体。
+ *
+ * ## 容缺规则
+ *
+ * - **顶层不是对象** → `undefined`（形态不认识 ⇒ 查不到，不是「无活动」）；
+ * - **`campaigns` 不是数组**（缺失 / null / 其它类型）→ 按**空列表**归一：
+ *   「今天已领」时服务端确实会回空数组，而字段整个缺失与空数组在语义上同向
+ *   （都没有可领项），故不把它当成形态错误；
+ * - **单条缺 `campaignId`** → 跳过该条（拿不到 id 就发不出 claim，
+ *   伪造一个只会打出一个 404）；
+ * - `showCampaign` / `claimable` **只认显式 `true`**（缺失按 false），
+ *   但它们**不参与**任何判定，仅作诊断。
+ *
+ * @param body - 响应体 JSON 的解析结果。
+ * @returns 解析结果；顶层形态无法识别时 undefined。
+ */
+export function parseQoderCampaigns(body: unknown): QoderCampaigns | undefined {
+  if (!isRecord(body)) return undefined
+  const raw = body.campaigns
+  const campaigns: QoderCampaign[] = []
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const campaign = parseQoderCampaign(item)
+      if (campaign !== undefined) campaigns.push(campaign)
+    }
+  }
+  return {
+    showCampaign: readBool(body, 'showCampaign') === true,
+    claimable: readBool(body, 'claimable') === true,
+    campaigns,
+  }
+}
+
+/**
+ * 可领取的活动：`actionType === 'CLAIM_BENEFIT'` **且** `claimStatus === 'CLAIMABLE'`。
+ *
+ * 两个条件**缺一不可**：只判 `claimStatus` 会把 `VIEW_DETAILS` 型活动
+ * （如「Pro 首月翻倍」）也拿去 claim；只判 `actionType` 会把已领过的再领一次。
+ */
+export function claimableQoderCampaigns(parsed: QoderCampaigns): QoderCampaign[] {
+  return parsed.campaigns.filter(
+    (campaign) => campaign.actionType === QODER_CAMPAIGN_ACTION_CLAIM
+      && campaign.claimStatus === QODER_CAMPAIGN_STATUS_CLAIMABLE,
+  )
+}
+
+/**
+ * 用 jt 发一次签到请求，**带一次 401 `TOKEN_EXPIRE` 自愈重试**。
+ *
+ * 与 {@link fetchQoderQuotaUsage} 的令牌自愈同因（缓存里的 jt 名义未过期、
+ * 服务端却已失效），但**刻意不复用那段代码**：额度线还要把失败喂给分类器
+ * （`jobTokenExpired` / `credentialInvalid` 两个标志位），签到线只需要
+ * 「成 / 败 + 可读原因」，两处合并会让分类器语义渗进一条不消费它的链路。
+ *
+ * @returns 响应；取令牌或出网失败时 `{ error }`。
+ */
+async function sendQoderCheckinRequest(
+  credential: QoderCredential,
+  auth: QoderJobTokenProvider,
+  options: QoderCreditsOptions,
+  build: (jobToken: string) => { url: string; init: { method: string; body?: string; headers?: Record<string, string> } },
+): Promise<{ response: Response } | { error: string }> {
+  const product = options.product ?? QODER
+  const fetcher = options.fetcher ?? fetch
+  const pat = credential.access_token
+  if (pat.length === 0) {
+    // 空 PAT 是**本地**就能判定的终态，不必浪费一次网络往返。
+    return { error: '凭据缺少 PAT，请重新粘贴个人访问令牌' }
+  }
+
+  let jobToken: string
+  try {
+    jobToken = await auth.getJobToken(pat)
+  } catch (error) {
+    if (isCredentialExpiredError(error)) {
+      return { error: `PAT 已失效或不被接受，请重新粘贴：${error instanceof Error ? error.message : String(error)}` }
+    }
+    return { error: `换取 Qoder job token 失败：${error instanceof Error ? error.message : String(error)}` }
+  }
+
+  // 至多两次：第一次 401 TOKEN_EXPIRE 时丢弃缓存重换一次再打。
+  for (let attempt = 0; ; attempt += 1) {
+    const { url, init } = build(jobToken)
+    const timeout = AbortSignal.timeout(QODER_REQUEST_TIMEOUT_MS)
+    const signal = options.signal === undefined ? timeout : AbortSignal.any([timeout, options.signal])
+    let response: Response
+    try {
+      response = await fetcher(url, { ...init, headers: { ...qoderJobTokenHeaders(jobToken, product), ...init.headers }, signal })
+    } catch (error) {
+      return { error: `Qoder 签到请求网络失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+
+    if (response.status !== 401 || attempt > 0) return { response }
+
+    // 401 分型：只有 `TOKEN_EXPIRE` 才值得重换（`TOKEN_INVALID` 是 PAT 类型错，
+    // 重换 jt 只会再撞一次同一堵墙）。
+    let rawText = ''
+    try {
+      rawText = await response.clone().text()
+    } catch {
+      // 读不出原文就**不重试**：无法分型时保守按终态处理（与额度线同向）。
+      return { response }
+    }
+    const classification = classifyQoderError({
+      httpStatus: 401,
+      source: 'quota',
+      message: summarizeQoderErrorBody(rawText),
+      body: rawText.slice(0, QODER_ERROR_BODY_LIMIT),
+      product,
+    })
+    if (!classification.jobTokenExpired) return { response }
+    options.onDebug?.(`[qoder] 签到端点 401 TOKEN_EXPIRE，丢弃 jt 缓存后重试一次`)
+    auth.invalidateJobToken(pat)
+    try {
+      jobToken = await auth.getJobToken(pat)
+    } catch (error) {
+      if (isCredentialExpiredError(error)) {
+        return { error: `PAT 已失效或不被接受，请重新粘贴：${error instanceof Error ? error.message : String(error)}` }
+      }
+      return { error: `重换 Qoder job token 失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+  }
+}
+
+/**
+ * 拉取活动列表。
+ *
+ * 抽出来是因为 {@link fetchQoderCheckinStatus} 与 {@link claimQoderDailyCheckin}
+ * **都需要它** —— 两处各写一次会重复发一次 GET（与 LobsterAI 传
+ * `precheckStatus: false` 同一个道理：claim 内部自带列表查询）。
+ *
+ * @returns `{ ok: true, campaigns }`；失败 / 形态不认识时 `{ ok: false, reason }`
+ *          —— **保留原因**，见下。
+ */
+async function loadQoderCampaigns(
+  credential: QoderCredential,
+  auth: QoderJobTokenProvider,
+  options: QoderCreditsOptions,
+): Promise<{ ok: true; campaigns: QoderCampaigns } | { ok: false; reason: string }> {
+  const product = options.product ?? QODER
+  const sent = await sendQoderCheckinRequest(credential, auth, options, (jobToken) => ({
+    url: `${product.openapiBase}${QODER_CAMPAIGNS_PATH}`,
+    init: { method: 'GET' },
+  }))
+  if ('error' in sent) {
+    options.onDebug?.(`[qoder] 活动列表查询失败：${sent.error}`)
+    // ⚠️ **原因必须带出去**：凭据失效（`PAT 已失效，请重新粘贴`）与网络抖动
+    // 对用户是**两种完全不同的处置**。把它压成一句「活动列表查询失败」会让
+    // 用户在一个自己修不了的方向上排查（与 `describeQoderClaimFailure` 同因）。
+    return { ok: false, reason: sent.error }
+  }
+  const response = sent.response
+  if (!response.ok) {
+    const text = await response.text().catch(() => '')
+    const reason = describeQoderClaimFailure(response.status, text)
+    options.onDebug?.(`[qoder] 活动列表查询失败 HTTP ${response.status}：${summarizeQoderErrorBody(text)}`)
+    return { ok: false, reason }
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(await response.text()) as unknown
+  } catch {
+    options.onDebug?.('[qoder] 活动列表响应不是 JSON')
+    return { ok: false, reason: '活动列表响应不是 JSON' }
+  }
+  const campaigns = parseQoderCampaigns(parsed)
+  if (campaigns === undefined) {
+    options.onDebug?.('[qoder] 活动列表响应结构无法识别')
+    return { ok: false, reason: '活动列表响应结构无法识别' }
+  }
+  return { ok: true, campaigns }
+}
+
+/**
+ * 查询每日领取状态。
+ *
+ * 返回 `null` 表示**查不到**（网络失败 / 非 2xx / 形态不认识），与
+ * 「无活动可领」严格区分。`CheckinStatus` 是五条签到线共用的结构，此处按
+ * Qoder 的语义映射（三条判据见模块头「每日领取」小节）：
+ *
+ * - `active` **恒为 `true`** —— 拿到响应即活动开启。⚠️ **不按列表是否为空判**：
+ *   服务端在「今天已领」时会把 `campaigns` 清空，据此判 `active:false` 会让
+ *   `collectClaimResults` 先命中「活动未开启」分支，把「今天已领」误报成
+ *   「签到活动未开启」。
+ * - `todayCheckedIn`：**没有可领活动即为 true**（含列表为空）。「已领」与
+ *   「本来就没活动」在响应上无法区分，而这是个**每日 10:00（UTC+8）刷新**的
+ *   活动 —— 保守判「已领」比误报「可领」更不容易误导用户。
+ * - `dailyCredit`：可领活动声明的 `benefit.amount`（实测 100）；没有可领项时
+ *   回退到任一 `CLAIM_BENEFIT` 活动的声明值（供 UI 显示「每日 100」）。
+ */
+export async function fetchQoderCheckinStatus(
+  credential: QoderCredential,
+  auth: QoderJobTokenProvider,
+  options: QoderCreditsOptions = {},
+): Promise<CheckinStatus | null> {
+  const loaded = await loadQoderCampaigns(credential, auth, options)
+  // ⚠️ 失败一律回 `null`（= 查不到）：`CheckinStatus` 没有「失败原因」字段，
+  // 原因由 {@link claimQoderDailyCheckin} 那条路径带给用户（见 loadQoderCampaigns）。
+  if (!loaded.ok) return null
+  const parsed = loaded.campaigns
+
+  const claimable = claimableQoderCampaigns(parsed)
+  const benefitCampaigns = parsed.campaigns.filter(
+    (campaign) => campaign.actionType === QODER_CAMPAIGN_ACTION_CLAIM,
+  )
+  return {
+    active: true,
+    todayCheckedIn: claimable.length === 0,
+    streakDays: 0,
+    dailyCredit: claimable[0]?.amount ?? benefitCampaigns[0]?.amount ?? 0,
+    todayCredit: 0,
+    isStreakDay: false,
+    totalCredits: 0,
+    checkinDates: [],
+    activityName: benefitCampaigns[0]?.campaignKey ?? '',
+    themeName: '',
+    endTime: '',
+  }
+}
+
+/** 领取响应里我们需要的字段（实测原文见模块头）。 */
+interface QoderClaimResult {
+  status?: string
+  replayed?: boolean
+  amount?: number
+}
+
+/** 解析 claim 响应；形态不认识时回空对象（由调用方按 `status` 缺失处理）。 */
+function parseQoderClaimResult(body: unknown): QoderClaimResult {
+  if (!isRecord(body)) return {}
+  const status = readString(body, 'status')
+  const replayed = readBool(body, 'replayed')
+  const amount = readBenefitAmount(body)
+  return {
+    ...status.length === 0 ? {} : { status },
+    ...replayed === undefined ? {} : { replayed },
+    ...amount === undefined ? {} : { amount },
+  }
+}
+
+/** 非 JSON 响应 / 非 2xx 的可读原因（凭据失效时网关会回 HTML）。 */
+function describeQoderClaimFailure(status: number, text: string): string {
+  if (status === 401 || status === 403) return `凭据已失效（HTTP ${status}），请重新登录该账号`
+  const snippet = text.trim().slice(0, 80).replace(/\s+/g, ' ')
+  return snippet.length === 0
+    ? `服务端返回了非 JSON 响应（HTTP ${status}）`
+    : `服务端返回了非 JSON 响应（HTTP ${status}）：${snippet}`
+}
+
+/**
+ * 领取**一个**活动的积分。
+ *
+ * ## 幂等判据是响应体的 `replayed`，不是 HTTP 状态码
+ *
+ * 重复领取同样返回 **200**，但 `replayed:true`、**不含 `benefit`**，且
+ * `claimedAt` 是**上一次领取的旧时间**（实测请求发生在 09-21、`claimedAt`
+ * 却是 09-18）。只看状态码会把「今天已领」误报成「领取成功 +100」——
+ * 故 `replayed === true` **归一为 `already-claimed`**。
+ *
+ * ## 请求体必须是空串
+ *
+ * 抓包实测 `content-length: 0`；源码里该请求无 payload。发 `{}` 属未经验证的
+ * 形态，故照实发空串（`qoderJobTokenHeaders` 已带 `Content-Type: application/json`）。
+ */
+export async function claimQoderCampaign(
+  credential: QoderCredential,
+  auth: QoderJobTokenProvider,
+  campaignId: string,
+  options: QoderCreditsOptions = {},
+): Promise<ClaimOutcome> {
+  const product = options.product ?? QODER
+  const sent = await sendQoderCheckinRequest(credential, auth, options, (jobToken) => ({
+    url: `${product.openapiBase}${QODER_CAMPAIGNS_PATH}/${encodeURIComponent(campaignId)}/claim`,
+    init: { method: 'POST', body: '' },
+  }))
+  if ('error' in sent) return { kind: 'failed', code: -1, message: sent.error }
+
+  const response = sent.response
+  const text = await response.text().catch(() => '')
+  let body: unknown
+  try {
+    body = text.length > 0 ? JSON.parse(text) as unknown : {}
+  } catch {
+    return { kind: 'failed', code: response.status, message: describeQoderClaimFailure(response.status, text) }
+  }
+  if (!response.ok) {
+    return { kind: 'failed', code: response.status, message: describeQoderClaimFailure(response.status, text) }
+  }
+
+  const result = parseQoderClaimResult(body)
+  // `replayed:true` = 本次活动此前已领（服务端回放上次结果）—— **不是** claimed。
+  if (result.replayed === true) return { kind: 'already-claimed', message: '今天已领取' }
+  if (result.status !== undefined && result.status !== QODER_CAMPAIGN_STATUS_CLAIMED) {
+    return { kind: 'failed', code: -1, message: `领取未成功（status=${result.status}）` }
+  }
+  return { kind: 'claimed', credit: result.amount ?? 0, streakDays: 0, isStreakDay: false }
+}
+
+/**
+ * 领取该账号**当前所有**可领活动。
+ *
+ * 一个账号可能同时有多个 `CLAIM_BENEFIT` 活动（实测有每日 100 Credits 与其它
+ * 运营活动），故逐个领取而非只领第一个。
+ *
+ * 汇总为**一条** {@link ClaimOutcome}（与另外四条签到线同构，前端摘要 UI 共用）：
+ *
+ * - 列表查不到 → `failed`（不是 `already-claimed`：查不到 ≠ 已领）；
+ * - **无可领活动 → `already-claimed`**（服务端在「今天已领」时清空列表，
+ *   而「本来就没活动」无法区分 —— 保守判已领，见模块头第 4 条）；
+ * - 至少一个成功 → `claimed`（`credit` 为累计值）；
+ * - 全部失败 → `failed`（带第一条错误原因）。
+ *
+ * ⚠️ **自带活动列表查询**，故宿主 RPC 分支必须传 `precheckStatus: false`，
+ * 否则会先多发一次 GET（与 LobsterAI / Trae CN 同约定）。
+ */
+export async function claimQoderDailyCheckin(
+  credential: QoderCredential,
+  auth: QoderJobTokenProvider,
+  options: QoderCreditsOptions = {},
+): Promise<ClaimOutcome> {
+  const loaded = await loadQoderCampaigns(credential, auth, options)
+  if (!loaded.ok) {
+    // ⚠️ 带上**精确原因**（`PAT 已失效，请重新粘贴` 与 `HTTP 502` 的处置完全
+    // 不同）。压成笼统文案会把可修问题伪装成未知故障。
+    return { kind: 'failed', code: -1, message: `活动列表查询失败：${loaded.reason}` }
+  }
+  const parsed = loaded.campaigns
+
+  const targets = claimableQoderCampaigns(parsed)
+  if (targets.length === 0) {
+    // 服务端在「今天已领」时清空 campaigns ⇒ 无目标即已领（见函数注释）。
+    return { kind: 'already-claimed', message: '今天已领取' }
+  }
+
+  let total = 0
+  let firstError: string | undefined
+  for (const target of targets) {
+    const outcome = await claimQoderCampaign(credential, auth, target.campaignId, options)
+    if (outcome.kind === 'claimed') total += outcome.credit
+    else if (outcome.kind === 'failed' && firstError === undefined) firstError = outcome.message
+  }
+  if (total > 0) return { kind: 'claimed', credit: total, streakDays: 0, isStreakDay: false }
+  if (firstError !== undefined) return { kind: 'failed', code: -1, message: firstError }
+  // 全部 `already-claimed`：没有任何新领取，但仍不是失败。
+  return { kind: 'already-claimed', message: '今天已领取' }
 }

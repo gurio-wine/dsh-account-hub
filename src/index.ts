@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
-import { registerCodeArtsLlm } from './llm-adapter.js'
+import { PROVIDER as CODEARTS_PROVIDER, registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerTraeCnLlm } from './trae-cn-adapter.js'
@@ -15,7 +15,7 @@ import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
 import { createContextTierRegistry } from './context-tiers.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
-import { registerAccountHubRpc } from './account-hub-rpc.js'
+import { registerAccountHubRpc, type ModelCatalogSource } from './account-hub-rpc.js'
 import { BUDDY_CN, BUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE_CN } from './trae-cn-product.js'
@@ -165,7 +165,7 @@ export function makeReadImage(ctx: Context) {
  * 抽成独立函数是**必需的**，不是为了复用：`resolveCredential` 与 LobsterAI 的
  * `refresh` 回调都要「按模型挑一个账号」，而两者的挑号结果**必须一致**。
  * 若各写一份，resolve 在 A 对模型 M 限流时会挑到 B，而 refresh 用空
- * modelId 会挑回排序第一的 A —— 于是「刷新的是解析凭据时所用的那个账号」
+ * modelId 会挑回数组顺序最前的 A —— 于是「刷新的是解析凭据时所用的那个账号」
  * 这条不变量（见 `lobsterai-wiring.spec.ts` 的 S1）被破坏：适配器拿到 B 的
  * 凭据却刷新了 A，B 的过期 token 始终不更新，用户看到的是「刚登录好却
  * 一直认证失败」，而日志里续期全绿。
@@ -197,7 +197,7 @@ export function makeAccountPicker(
  *
  * **`model` 参数就是本函数存在的理由**：`getAvailableAccount` 的限流过滤是
  * **逐模型**的，`modelId` 传空串时按设计不过滤（见 `AccountPool` 的说明）。
- * 历史接线把空串写死在这里 —— 于是每次请求开头总是拿到「排序第一」的账号，
+ * 历史接线把空串写死在这里 —— 于是每次请求开头总是拿到「数组顺序最前」的账号，
  * 即使它已被记了 24h 积分耗尽标记；失败后才靠适配器的换号循环逐个试。
  * 前几个账号都耗尽时，每次请求都要白跑 N 次完整往返（发请求 → 400 → 解析
  * → 记标记 → 换号）。
@@ -365,7 +365,9 @@ export function apply(ctx: Context): void {
       }
     },
   })
-  registerCodeArtsLlm(ctx, {
+  // 适配器实例要交给 RPC 层：Account Hub 的「显示列表」用它拿**不套用户黑名单、
+  // 也不套目录门控**的完整目录（`listAllModels`），被关闭的模型才有正确的展示名。
+  const codeartsAdapter = registerCodeArtsLlm(ctx, {
     credentialRef: credentialRef(CODEARTS_CREDENTIAL_REF),
     // 优先使用账号池获取可用账号（按目标模型过滤），回退到单凭据解析。
     resolveCredential: makeCredentialResolver<CodeArtsCredential>(
@@ -426,7 +428,9 @@ export function apply(ctx: Context): void {
   // 否则「刷新的是解析凭据时所用的那个账号」这条不变量会被打破
   // （详因见 makeAccountPicker 的说明）。
   const pickLobsteraiAccount = makeAccountPicker(pool, LOBSTERAI.id)
-  registerLobsteraiLlm(ctx, {
+  // 适配器实例要交给 RPC 层：Account Hub 的「显示列表」用它拿**不套用户黑名单、
+  // 也不套目录门控**的完整目录（`listAllModels`），被关闭的模型才有正确的展示名。
+  const lobsteraiAdapter = registerLobsteraiLlm(ctx, {
     credentialRef: credentialRef(LOBSTERAI.defaultCredentialRef),
     // 只从 LobsterAI 自己的账号池取账号，回退到自己的单凭据 ref，
     // 保证不会串用 CodeBuddy / WorkBuddy / CodeArts 的凭据。
@@ -450,7 +454,7 @@ export function apply(ctx: Context): void {
       // `RefreshToken(acct)`（而非某个全局单例）。
       //
       // **必须用同一个 model 选号**：resolveCredential 已按目标模型过滤，
-      // 若这里退回空 modelId，就会挑回排序第一的（可能正是对 M 限流的那个）
+      // 若这里退回空 modelId，就会挑回数组顺序最前的（可能正是对 M 限流的那个）
       // 账号，从而重新引入上面那段错配。
       const available = await pickLobsteraiAccount(model)
       if (available) await lobsterai.refreshAccountCredential(available.entry.credentialRef)
@@ -497,7 +501,7 @@ export function apply(ctx: Context): void {
       // 全是成功的，极难排查。
       //
       // **必须用同一个 model 选号**：resolveCredential 已按目标模型过滤，若这里
-      // 退回空 modelId，就会挑回排序第一的（可能正是对 M 限流的那个）账号，
+      // 退回空 modelId，就会挑回数组顺序最前的（可能正是对 M 限流的那个）账号，
       // 从而重新引入上面那段错配。
       const available = await pickTraeCnAccount(model)
       if (available) await traeCn.refreshAccountCredential(available.entry.credentialRef)
@@ -772,9 +776,13 @@ export function apply(ctx: Context): void {
 
   // ===== Account Hub RPC 注册 =====
   // 参数次序照既有惯例：provider 服务的排列顺序与上面注册顺序一致，
-  // 新增的 `qoderCn` 排在尾（`qoder` 之后）；末位是**按 provider 分派**的窗口档位
-  // 注册表（见 `ContextTierRegistry`），省略时 `model.list` 不带窗口字段、
-  // `model.setContextBudget` 一律拒绝（headless / 测试的既定降级）。
+  // 新增的 `qoderCn` 排在尾（`qoder` 之后）；其后的两个可选实参都是
+  // **按 provider 分派**的注册表：
+  // - 第 10 个是窗口档位表（见 `ContextTierRegistry`），省略时 `model.list`
+  //   不带窗口字段、`model.setContextBudget` 一律拒绝；
+  // - 第 11 个是适配器映射（见 `ModelCatalogSource`），省略时「显示列表」退化为
+  //   「`listModels` 结果 + 黑名单裸 id 回填」的历史行为。
+  // 两者都是 headless / 测试场景的既定降级。
   //
   // ## 键 = provider id（**不是**面板 id、不是池键）
   //
@@ -791,6 +799,31 @@ export function apply(ctx: Context): void {
     [QODER.id]: qoderAdapter,
     [QODER_CN.id]: qoderCnAdapter,
   })
-  registerAccountHubRpc(ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTierRegistry)
+  // provider → 适配器实例：Account Hub「显示列表」需要 `listAllModels()`
+  // —— **不套用户黑名单、也不套目录门控**的完整目录（带最终展示名）。
+  //
+  // ⚠️ 与上面的档位注册表**不是同一件事，两处都要登记**：档位表只服务有窗口
+  // 元数据的五个 provider（CodeArts / LobsterAI 刻意不在其中），而「显示列表」
+  // 七个 provider **一个都不能少** —— 缺一个，那一个的关闭项就会退回裸 id，
+  // 用户看到「关掉的模型没有倍率 / 没有人话名字」。
+  //
+  // ⚠️ 为什么必须由这里注入：DSH 的 `ctx.llm` 只保证 `listModels`（且会把条目
+  // **重建**成 `{provider,id,name,description?,inputModalities?}`），自定义方法在
+  // 那一层被丢掉，ctx 上也没有「按 provider 取适配器」的入口（与档位注册表同一
+  // 制约，见 `src/account-hub-rpc.ts` 的 `ModelCatalogSource`）。
+  //
+  // 键取 `*.id` / 常量，别写字面量（理由同上）。
+  const modelAdapters: Record<string, ModelCatalogSource> = {
+    [CODEARTS_PROVIDER]: codeartsAdapter,
+    [BUDDY_CN.id]: buddyCnAdapter,
+    [BUDDY.id]: buddyAdapter,
+    [LOBSTERAI.id]: lobsteraiAdapter,
+    [TRAE_CN.id]: traeCnAdapter,
+    [QODER.id]: qoderAdapter,
+    [QODER_CN.id]: qoderCnAdapter,
+  }
+  registerAccountHubRpc(
+    ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTierRegistry, modelAdapters,
+  )
   ctx.provide('accountPool', pool)
 }

@@ -1560,19 +1560,20 @@ describe('model.list / model.setDisabled 端点', () => {
 /**
  * 三个积分端点的 provider 能力边界（后端侧契约）。
  *
- * CodeArts 是华为云账号体系，**不是** BuddyProduct —— `productById('codearts')`
- * 返回 undefined，因此 `credits.status` / `credits.claimAll` / `credits.balances`
- * 必然回 `bad-request: unsupported provider: codearts`。
+ * CodeArts **已接入真实实现**（华为云 SDK-HMAC-SHA256 签名，见
+ * `src/codearts-credits.ts`），故它**必须被接受**，不再回 bad-request。
  *
- * 这不是缺陷，而是正确的能力边界声明。真实缺陷在客户端：它在面板挂载时对
+ * 历史背景（本用例的由来）：CodeArts 曾**不是** BuddyProduct，
+ * `productById('codearts')` 返回 undefined，于是三个端点必然回
+ * `bad-request: unsupported provider: codearts`。当时客户端在面板挂载时对
  * **所有** provider 无条件调用 `credits.balances`，把这条必然的拒绝当成运行时
  * 故障打进了控制台，并把账号卡片的「积分」渲染成「查询失败」（修法见
  * `plugin-src/client/credits-capabilities.js` 与 `tests/unit/credits-capabilities.spec.ts`）。
  *
- * 此用例锁住后端这一侧，防止两种「好心改坏」：
- * - 把拒绝改成「返回空结果」→ 前端会以为 CodeArts 真没有积分可查，永远查不出问题；
- * - 让它抛异常 → 退化成 `account-hub/handler-failed`，丢失「provider 不支持」这一原因。
- * 同时也验证拒绝是**按 provider 精确生效**的，没有连 Buddy 系一起误拒。
+ * 此用例锁三件事：
+ * 1. 未知 provider 仍回可读的 bad-request（契约不变，只是不再拿 CodeArts 当例子）；
+ * 2. CodeArts 被**接受**并返回结构化结果（新能力的回归保护）；
+ * 3. 拒绝是**按 provider 精确生效**的，没有连 Buddy 系一起误拒。
  */
 describe('积分端点的 provider 能力边界', () => {
   /** 从 connection.fetch.register 捕获到的处理器。 */
@@ -1619,12 +1620,15 @@ describe('积分端点的 provider 能力边界', () => {
 
   const CREDITS_METHODS = ['credits.status', 'credits.claimAll', 'credits.balances']
 
-  it.each(CREDITS_METHODS)('%s 对 codearts 返回 unsupported provider（可读的 bad-request）', async (method) => {
+  it.each(CREDITS_METHODS)('%s 对未知 provider 返回 unsupported provider（可读的 bad-request）', async (method) => {
+    // ⚠️ 历史上这条用例断言的是 **codearts** 被拒 —— 当时 CodeArts 确实没有
+    // 实现。现在它已接入（`src/codearts-credits.ts`），故改用真正未登记的
+    // provider 名来守住「未知 provider 必须被可读地拒绝」这条契约。
     const call = registerCreditsEndpoints()
-    const result = await call(method, { provider: 'codearts' })
+    const result = await call(method, { provider: 'not-a-provider' })
 
     expect(result.ok).toBe(false)
-    expect(result.error?.message).toBe('unsupported provider: codearts')
+    expect(result.error?.message).toBe('unsupported provider: not-a-provider')
   })
 
   it.each(CREDITS_METHODS)('%s 不会把 Buddy 系一并误拒', async (method) => {
@@ -1634,5 +1638,159 @@ describe('积分端点的 provider 能力边界', () => {
       const result = await call(method, { provider })
       expect(result.ok, `${method}/${provider}`).toBe(true)
     }
+  })
+
+  /**
+   * CodeArts 现在**必须**被接受（不再回 bad-request）。
+   *
+   * 这是本次接入的核心契约：三个积分端点都要为 `codearts` 分支。
+   * 替身 pool 返回空列表，故结果结构可断言、不会发任何网络请求。
+   */
+  it.each(CREDITS_METHODS)('%s 接受 codearts（已接入华为云签名协议）', async (method) => {
+    const call = registerCreditsEndpoints()
+    const result = await call(method, { provider: 'codearts' })
+    expect(result.ok, `${method} 不该拒绝 codearts`).toBe(true)
+  })
+
+  it('credits.balances 对 codearts 返回 accounts 数组', async () => {
+    const call = registerCreditsEndpoints()
+    const result = await call('credits.balances', { provider: 'codearts' })
+    expect((result.value as { accounts: unknown[] }).accounts).toEqual([])
+  })
+
+  it('credits.status 对 codearts 返回 accounts 数组（状态如实为 null）', async () => {
+    // CodeArts 没有独立的签到状态端点：可领状态要经「账户类型 + 活动列表」
+    // 两步才能得到，语义与 CheckinStatus 不同构 —— 故如实回 null，
+    // 由 claimAll 内部自行预检（precheckStatus: false）。
+    const call = registerCreditsEndpoints()
+    const result = await call('credits.status', { provider: 'codearts' })
+    expect((result.value as { accounts: unknown[] }).accounts).toEqual([])
+  })
+
+  it('credits.claimAll 对 codearts 返回 summary 结构', async () => {
+    const call = registerCreditsEndpoints()
+    const result = await call('credits.claimAll', { provider: 'codearts' })
+    expect((result.value as { summary: unknown }).summary).toEqual({
+      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+    })
+  })
+})
+
+/**
+ * `account.reorder` 端点（Account Hub 拖拽排序的后端部分，移植上游 84d0b3f）。
+ *
+ * 用**真实 AccountPool** + 内存 settings 替身，而不是给 pool 打桩：
+ * 这个端点的价值全在「参数校验 + 转交 pool.reorderAccounts」，用桩替换 pool
+ * 就只剩「调用了某方法」这种无信息量的断言，无法发现「集合校验被绕过」
+ * 「顺序没持久化」这类真实问题。
+ *
+ * ⚠️ 客户端**暂不发**这个 RPC（UI 拖拽属第二阶段），但入口必须能单测 ——
+ * 否则「后端语义有了、接线坏了」要等到 UI 落地才暴露。
+ */
+describe('account.reorder 端点', () => {
+  type Handler = (request: Request) => Promise<Response>
+
+  /** 建一个真实 pool（内存 settings）+ 端点调用器。 */
+  function setup(initial: Array<{ id: string; provider: string }>) {
+    let stored: { accounts: unknown[]; disabledModels: Record<string, unknown> } = {
+      accounts: initial.map(a => ({
+        ...a,
+        nickname: a.id,
+        enabled: true,
+        credentialRef: `${a.provider.toUpperCase().replace(/-/g, '_')}_ACCOUNT_${a.id.toUpperCase()}`,
+        createdAt: 1,
+        refreshable: true,
+      })),
+      disabledModels: {},
+    }
+    let handler: Handler | undefined
+    const pool = new AccountPool({
+      get: (key: string) => key === 'settings'
+        ? {
+            register: () => ({
+              get: () => stored,
+              replace: async (value: typeof stored) => { stored = value },
+            }),
+          }
+        : undefined,
+      logger: { warn: () => {}, info: () => {} },
+      credentials: {
+        describe: async () => ({ configured: false, writable: true }),
+        resolve: async () => undefined,
+        set: async () => {},
+        unset: async () => {},
+      },
+    } as never)
+    const ctx = {
+      get: (key: string) => key === 'connection'
+        ? { fetch: { register: (config: { fetch: Handler }) => { handler = config.fetch } } }
+        : undefined,
+      inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
+      logger: { warn: () => {}, info: () => {} },
+      credentials: { resolve: async () => undefined },
+    }
+    registerAccountHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never)
+
+    const call = async (method: string, payload: unknown) => {
+      if (handler === undefined) throw new Error('endpoint handler was not registered')
+      const response = await handler(new Request('http://localhost/api/account-hub', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          type: 'client-request', rpcId: 'rpc-1', method: 'account-hub',
+          payload: { method, payload },
+        }),
+      }))
+      const body = await response.json() as { result: { ok: boolean; value?: unknown; error?: { code?: string; message: string } } }
+      return body.result
+    }
+    return { call, orderInStore: () => (stored.accounts as Array<{ id: string }>).map(a => a.id) }
+  }
+
+  it('重排成功并把新顺序写入存储', async () => {
+    const { call, orderInStore } = setup([
+      { id: 'a', provider: 'buddy-cn' },
+      { id: 'b', provider: 'buddy-cn' },
+      { id: 'c', provider: 'buddy-cn' },
+    ])
+    const result = await call('account.reorder', { provider: 'buddy-cn', orderedIds: ['c', 'a', 'b'] })
+    expect(result.ok).toBe(true)
+    expect(orderInStore()).toEqual(['c', 'a', 'b'])
+  })
+
+  it('集合不一致（列表过期）回可读的 bad-request，而不是 handler-failed', async () => {
+    // 这类并发是可预期的：用户拖拽期间在别处新增/删除了账号。
+    // 回 bad-request + 可读文案，前端能提示「刷新后重试」；
+    // 若抛异常会退化成 account-hub/handler-failed，用户只看到「未知故障」。
+    const { call, orderInStore } = setup([
+      { id: 'a', provider: 'buddy-cn' },
+      { id: 'b', provider: 'buddy-cn' },
+    ])
+    const result = await call('account.reorder', { provider: 'buddy-cn', orderedIds: ['a'] })
+    expect(result.ok).toBe(false)
+    expect(result.error?.code).toBe('bad-request')
+    expect(result.error?.message).toContain('账号列表已变化')
+    // 数据未被破坏
+    expect(orderInStore()).toEqual(['a', 'b'])
+  })
+
+  it('缺 provider 或 orderedIds 非字符串数组 → bad-request', async () => {
+    const { call } = setup([{ id: 'a', provider: 'buddy-cn' }])
+    expect((await call('account.reorder', { orderedIds: ['a'] })).ok).toBe(false)
+    expect((await call('account.reorder', { provider: '', orderedIds: ['a'] })).ok).toBe(false)
+    expect((await call('account.reorder', { provider: 'buddy-cn' })).ok).toBe(false)
+    expect((await call('account.reorder', { provider: 'buddy-cn', orderedIds: [1, 2] })).ok).toBe(false)
+  })
+
+  it('重排不影响其他 provider 账号的位置', async () => {
+    const { call, orderInStore } = setup([
+      { id: 'b1', provider: 'buddy-cn' },
+      { id: 'c1', provider: 'codearts' },
+      { id: 'b2', provider: 'buddy-cn' },
+    ])
+    const result = await call('account.reorder', { provider: 'buddy-cn', orderedIds: ['b2', 'b1'] })
+    expect(result.ok).toBe(true)
+    // buddy-cn 的两个账号在各自原下标上互换，codearts 仍在中间
+    expect(orderInStore()).toEqual(['b2', 'c1', 'b1'])
   })
 })

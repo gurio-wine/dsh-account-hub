@@ -23,7 +23,8 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 - **qoder-cn（Qoder CN）** — Qoder 的**国内版 region**（同协议、另一组 host，
   见 [Qoder provider](#qoder-providerqoder) 的「Qoder CN：第二个 region」）；
   登录形态与登录实现均与国际版共用，**账号池与 Credits 与国际版完全独立、令牌互不承认**；
-  亦不支持「一键领取积分」（疑似有该权益，但**端点未知**，见能力矩阵说明）。
+  **支持「一键领取积分」**（每日领取端点已解出并真机验收，见
+  [Qoder CN（两步）](#qoder-cn两步)）。
 
 七个 provider 的 Account Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
@@ -155,6 +156,29 @@ settings 写入目标是 profile 的 `cordis.patch.yml`（配置）。storage �
 > ⚠️ `'jet-hub'` 这个字面量仍然存在（`AccountPool.ACCOUNT_HUB_NS`），但它的角色**只剩两件**：
 > ① 回退路径继续读写它；② 迁移模块用它定位旧数据。**新写入一律走 storage**，
 > 别按旧 namespace 命名新存储位置。
+
+### 账号顺序 = 选号优先级
+
+账号在持久层里是**一个全局扁平数组**（各 provider 混排，靠 `provider` 字段区分）。
+**数组顺序本身就是 `getAvailableAccount` 的候选优先级** —— 自动选号与限流后的
+换号重试都按这个顺序取「第一个可用账号」。因此调整顺序会真实改变实际用哪个
+账号发请求，不是 UI 装饰。
+
+- **手动顺序优先，限流豁免**：候选顺序完全由用户决定；正处于限流期的账号已被
+  逐模型 filter 排除，不会被选到。⚠️ **不要重新引入「按限流重置时间最早到期
+  重排候选」的 sort**（早期实现如此，上游 `84d0b3f` 已移除）：它会让手动顺序
+  形同虚设 —— 用户把某账号拖到首位，只要另一个账号的重置时间更早，实际选中的
+  仍是后者。
+- **RPC `account.reorder`**：载荷 `{ provider, orderedIds }`，`orderedIds` 必须是
+  该 provider **全部**账号 id 的一个**排列**（集合相等、无重复），否则回
+  `bad-request` 且不改动数据。少了 id 若静默忽略，那个账号会莫名掉到末尾
+  （用户看到「顺序自己变了」）；多了未知 id 说明前后端状态不一致 —— 两种情况
+  都让用户刷新重试，比悄悄改数据安全。
+- `reorderAccounts` **只动该 provider 原本占用的那些下标**，其他 provider 的账号
+  位置不变（设置页按 provider 分组渲染，跨面板的顺带位移属于意外副作用）。
+- ⚠️ **UI 拖拽待接（第二阶段）**：客户端目前**不发**这个 RPC，入口已就位并有
+  单测覆盖；落地 UI 时还需处理 before/after 落点判定与「移除源元素后下标前移」
+  两个前端坑。
 
 ### provider 改名与数据迁移（2026-09-18）
 
@@ -583,9 +607,11 @@ Account Hub 面板标题栏的「**显示列表**」按钮展开该 provider 的
 - 开关状态持久化在同一份账号池文档的 `disabledModels` 字段（storage 域
   `dsh_account_hub`；旧 settings 的 `jet-hub` namespace 仅作回退路径）
   （形如 `{ 'buddy-cn': { 'glm-5.2': true } }`），与账号池同处一个文档。
-- 模型列表来自 `ctx.llm.listModels()`，**即对话框模型选择器读取的同一份目录**
-  （会话控制器的 `buildModelCatalog`），因此设置页展示的模型与实际可选集合始终
-  一致，不会出现「设置里有、选择器里没有」的错位。
+- **对话框**的模型列表来自 `ctx.llm.listModels()`（会话控制器的 `buildModelCatalog`
+  读的就是它）；**设置页**的目录来自适配器的 `listAllModels()` —— 后者**不套黑名单、
+  也不套账号门控**（见「设置页目录与目录门控」）。因此设置页**故意**显示得比对话框
+  更多：被关闭的模型、以及未登录 provider 的模型都还在这里，否则用户无法重新打开
+  它们；而对话框选择器始终只显示「真正能选的」。
 - 过滤发生在适配器的 `listModels`（`src/llm-adapter.ts` / `src/buddy-adapter.ts` /
   `src/lobsterai-adapter.ts`），
   每次调用都直接读账号池的黑名单，因此**改开关后下一轮模型目录刷新即生效**，
@@ -598,6 +624,68 @@ Account Hub 面板标题栏的「**显示列表**」按钮展开该 provider 的
   一并搬到新命名，见「provider 改名与数据迁移」。
 - 相关 RPC 端点：`model.list`（列出模型并回填 `disabled`）、`model.setDisabled`
   （打开/关闭单个模型），实现见 `src/account-hub-rpc.ts`。
+
+#### 设置页目录与目录门控（`listAllModels`）
+
+**设置页目录来自适配器实例的 `listAllModels()`**：返回**不套用户黑名单、也不套账号
+门控**的完整目录，且带**最终展示名**（含倍率）。`model.list` 端点优先用它并自行回填
+`disabled`；它缺失时退化回「`listModels` 结果 + 黑名单裸 id 补回」的历史行为。
+
+⚠️ **为什么设置页必须单拿一条目录**：`listModels` 会按黑名单过滤，被关闭的模型不在
+其返回值里，端点只能凭黑名单的键（裸 id）补回 —— 那条路径拿不到展示名，关闭项就退化
+成裸 id（用户报障「**关闭的就没有显示倍率**」）。有了 `listAllModels`，开启项与关闭项
+走同一份目录、同一个名字（实测修复前 `deepseek-v4.1-flash`，修复后
+`DeepSeek-V4.1-Flash · x0.13`）。
+
+⚠️ **`ctx.llm` 不透传自定义方法**（DSH 只保证 `listModels`，且会把条目重建为
+`{provider,id,name,description?,inputModalities?}`，额外字段全丢），`ctx` 上也没有
+「按 provider 取适配器」的入口 ⇒ 五个 `register*Llm` 都**返回适配器实例**，由
+`src/index.ts` 收集成 `modelAdapters` 注入 `registerAccountHubRpc` 的**第 11 个实参**
+（第 10 个是窗口档位注册表 `contextTiers` —— **两件事、两处登记**：档位表只服务有窗口
+元数据的五个 provider，而「显示列表」七个 provider 一个都不能少）。省略时即上述降级，
+这是 headless / 测试的既定行为。
+
+##### 目录门控：没有已登录账号就隐藏整个 provider
+
+**需求**：「如果某供应商没有已登录的账号，就不显示该供应商的所有模型，这样对大多数
+用户来说模型选择选项卡臃肿的问题能改善很多。」
+
+DSH 的 `buildModelCatalog` 显式做了 `.filter(group => group.models.length > 0)`，所以
+适配器 `listModels` 返回 `[]` 就能让整个 provider 分组从模型选择器消失，**无需前端
+改动**。两条约束：
+
+1. ⚠️ **返回空数组，绝不抛错** —— 抛错会被归入 catalog 的 `failures`，界面上反而多出
+   一条 provider 报错，比「不显示」更糟；
+2. ⚠️ **不影响路由** —— `routableProviders` 由 `listProviders()` 单独生成，且 DSH 约定
+   「目录是建议性的」。被隐藏的模型仍可 `resolveModel` / 正常收发。
+
+**判据是「凭据可解析」，不是「有没有账号条目」**（`AccountPool.hasLoggedInAccount`，
+由 `providerCatalogVisible` 包装）：
+
+| 语义 | 原因 |
+|---|---|
+| 只看凭据能否解析 | `logout()` **只清凭据、保留账号条目**；若只看条目，用户登出后模型仍显示，门控形同虚设 |
+| **不看 `enabled`** | 停用只影响自动选号，与「是否已登录」无关。若过滤 `enabled`，把所有账号停用的用户会发现整个 provider 的模型凭空消失 |
+
+**保守放行三种情形**（门控是展示优化，不是安全边界）：`accountPool === undefined`
+（headless / CLI / 单测）、替身未实现 `hasLoggedInAccount`（能力检测 —— 大量既有单测的
+账号池替身只 mock 了 `disabledModelsFor`）、读凭据抛异常（存储损坏等）。三种都返回
+「可见」：判定不可用时宁多勿少，否则用户会看到「所有模型凭空消失」且无从排查。
+
+**开关 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` 默认开启**，只有显式假值
+（`0` / `false` / `no` / `off`）才关闭。门控放在各 `listModels` 的
+`ensureRemoteModels()` / `ensureCatalog()` **之前**：无账号时连远端目录都不拉。
+七个 provider 各自按 `this.product.id` 独立判定（buddy-cn 与 buddy 共用适配器类、
+qoder 与 qoder-cn 共用实现，都是两个实例、两套判定；一区登录不会让另一区的模型冒出来）。
+
+⚠️ **本仓特有：CodeArts 的单凭据路径必须计入判据**。上游已把单凭据模式整体移除，而本仓
+的 `/codearts-login` 仍活跃（凭据写进固定的 `CODEARTS_ACCESS_TOKEN`），适配器的凭据
+解析器也在池空时回退读它 —— 故 `providerCatalogVisible(…, [CODEARTS_CREDENTIAL_REF])`
+额外接受一组 ref，**只给 codearts**（其余六个 provider 的 `Auth.login()` 在本仓没有
+调用者，传了就是死代码）。若只看账号池，纯单凭据用户的 codearts 模型会全部消失。
+
+测试：`tests/unit/model-catalog-gate.spec.ts`（七个 provider 的主路径 / 保守放行 /
+开关真假值 / CodeArts 单凭据 / 设置页在门控生效时仍列出全部模型）。
 
 #### 显示列表的回填机制与过滤
 
@@ -636,8 +724,9 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
 设置页**零写入**（有测试钉死这一点）。**正常**被关闭的模型哪怕暂时不在目录里也
 **一律保留**，只删被垃圾判定点名的键。
 
-**回填行与目录行在窗口档位上等同（2026-09-21 修复）。** 回填行除 `disabled: true`
-与 `name = id`（拿不到原始展示名）外，**与目录行带同一组窗口字段**（`contextWindow` /
+**回填行与目录行在窗口档位上等同（2026-09-21 修复）。** 回填行（黑名单里为 `true`、
+但连**全量目录**里也查不到的 id）的名字走两级查名（`tierSource.displayName` → 裸 id），
+其余**与目录行带同一组窗口字段**（`contextWindow` /
 `maxContextWindow` / `contextTiers` / `contextBudget`）。判据只有一条：**档位数据来自
 适配器目录（`contextTiers`），与用户的显示开关无关** —— 关掉一个模型只是让它从对话框
 选择器里消失，它在目录里的档位一字未变；而 `model.setContextBudget` 的校验读的
@@ -737,16 +826,40 @@ PAT」），而「三池全为 0」是一个**成功的查询结果**（`total: 
 > `account-probe.ts` 三处的 `trae-cn` 分支与 `registerAccountHubRpc` 的 `traeCn`
 > 实例均已就位，Trae CN 面板可以新建账号、刷新凭据与重测限流标记。
 
-**CodeArts 不支持**：它是华为云账号体系，没有上述任何一条计费接口。因此 CodeArts
-面板**不显示「积分」行，也不显示「刷新积分」按钮**，且不会发起
-`credits.balances` 请求。这一点由 `plugin-src/client/credits-capabilities.js`
-的能力矩阵在**请求前**判定，而非等后端返回错误再吞掉。
+**CodeArts 支持**（华为云 SDK-HMAC-SHA256 签名）：余额与账户类型检测是**同一个
+响应**，走 IDE 直连的 snap-access 网关：
 
-> 历史缺陷：早期客户端在面板挂载时对所有 provider 无条件调用
+```
+GET /snap-manager/v1/statistics/plugin    ← 与 SNAP_MODEL_BUILTIN_URL 同域
+```
+
+响应是**裸对象**（没有 `{code,data}` 信封，与 `ops/*` 相反），余额取 `metrics[]`
+中 `usageTotalPackageCredit` 的 `package_credit_remain`：
+
+- ⚠️ **不累加** `usageBasicPackageCredit` / `usageOnDemandPackageCredit` /
+  `usageBonusPackageCredit` —— 它们是总额的**构成明细**，相加会重复计算；
+- `package.is_credit_package === true` 才是积分账户。非积分账户（Token 计费）
+  的文案是「**Token 计费账户，无积分余额**」而**不是**「查询失败」——账户类型
+  差异不是故障，故走 `CreditsEndpointDeps.fetchBalanceDetailed` 钩子带回精确原因；
+- 积分账户但没有 credit metric 时如实报「未返回积分数据」，**不显示成 0**
+  （0 会让用户以为自己把积分用光了）。
+
+> 历史结论已作废：早期文档写「CodeArts 是华为云账号体系，没有计费接口，
+> 故两项积分能力全假」。**「没有腾讯计费接口」本身没错，但据此推断「没有积分
+> 能力」是错的** —— 华为云侧有独立的「每日签到得积分」活动，端点挂在
+> `snap-access` 网关（与本仓已在用的 `SNAP_MODEL_BUILTIN_URL` 同域），用现有
+> 凭据的 AK/SK 签名即可访问，**无需任何新登录流程**。见
+> `src/codearts-credits.ts`（上游真机验证）。
+>
+> 但**门控机制本身不变**：能力矩阵仍是「请求前判定」的那道闸，只是 `codearts`
+> 两项由全假变为全真。
+
+> 历史缺陷（仍值得记着）：早期客户端在面板挂载时对所有 provider 无条件调用
 > `credits.balances`，于是每次打开 CodeArts 面板都会在控制台报
 > `unsupported provider: codearts`，并把每个账号卡片的「积分」渲染成
-> 「查询失败」。修法是不发起该请求——后端 `productById()` 的拒绝是正确的
-> 契约行为，不该被当作运行时故障展示。
+> 「查询失败」。修法是不发起该请求——当时后端 `productById()` 的拒绝确实是
+> 正确契约行为，**而现在后端已经接受 `codearts`**（三个积分端点都补了分支），
+> 拒绝只对**未知** provider 生效。
 
 **查询与「显示哪个池」是两件事，别把面板 id 当池键用**：`credits.balances` 里
 账号查询走 `poolProviderFor()`（今天恒等），**显示池**则在 trae-cn 分支里内联
@@ -757,13 +870,12 @@ PAT」），而「三池全为 0」是一个**成功的查询结果**（`total: 
 
 ### 一键领取积分（每日签到）
 
-**当前由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供**该按钮。签到在本插件里
-共有**三套互不相通的实现**（Buddy CN / LobsterAI / Trae CN，协议、端点、幂等
-判据全不同，各自独立成文件）；三者的客户端能力登记均已落地，故三个面板都显示
-该按钮。Codearts 是华为云账号体系不参与；Buddy（国际版）后端没有签到接口，
-故其面板不显示；**Qoder 的每日
-100 Credits 只能在 Qoder 桌面 App 里手动领取** —— 官方没有公开的签到端点，
-故其面板也不显示该按钮。详见「积分余额」一节末尾的说明。
+**当前由 Buddy CN、LobsterAI、Trae CN、CodeArts 与 Qoder CN 五个面板提供**该按钮。
+签到在本插件里共有**五套互不相通的实现**（Buddy CN / LobsterAI / Trae CN / CodeArts /
+Qoder CN，协议、端点、幂等判据全不同，各自独立成文件）；五者的客户端能力登记均已落地，
+故五个面板都显示该按钮。Buddy（国际版）后端没有签到接口、**Qoder 国际版的每日
+100 Credits 只能在 Qoder 桌面 App 里手动领取**（官方没有公开该端点）—— 这两个面板
+不显示该按钮。详见「积分余额」一节末尾的说明。
 
 在 Account Hub 对应面板标题栏点击「**一键领取积分**」，插件会对该面板下
 **全部账号**顺序执行每日签到领取：
@@ -978,6 +1090,116 @@ kind）。
   `Authorization: Cloud-IDE-JWT` + 设备头（`x-device-id` / `x-device-type` /
   `x-os-version` / `x-app-version`）；**不发** `Accept` / `Origin` / `Referer` /
   两个等值 token 头（官方 claim 没有），也**不发**任何腾讯系或 LobsterAI 归属头。
+
+#### CodeArts（四步，见 `src/codearts-credits.ts`）
+
+华为云这套与上面三套**没有一处共用**（认证是 `SDK-HMAC-SHA256` 签名、流程四步），
+故独立成文件；但复用 `credits.ts` 的 `ClaimOutcome` / `CreditBalance` 类型，
+结果摘要 UI 与 `CreditBalanceRow` 一行都不用改。
+
+```
+账户类型   GET  {snapEngineUrl}/snap-manager/v1/statistics/plugin   ← 裸对象
+活动列表   GET  {snapEngineUrl}/v1/ops/delivery?channel=IDE
+领取       POST {snapEngineUrl}/v1/ops/claim   { campaignId, channel: 'IDE' }
+领取确认   POST {snapEngineUrl}/v1/ops/confirm { campaignId }        ← 仅当 id !== null
+```
+
+1. **先判账户类型** —— `package.is_credit_package === true` 才是积分账户。
+   活动范围明确限定「已升级到积分计费模式的用户」，Token 计费账户直接判
+   `inactive`（**不是** `failed`：那是正常业务状态，报失败会让用户去排查并不
+   存在的故障），且不发任何领取请求；
+2. 查活动列表，只挑 `type === 'USER_LOGIN'` 那一项（`INVITE_USER` /
+   `NEW_USER_REGISTER` / `STUDENT_CERTIFIED` 是邀请、新人、学生认证，**不能混领**）；
+3. `claimable` 为假且 `status` ∈ {`CLAIMED`, `CONFIRMED`, `CONSUMED`} → `already-claimed`；
+   其余不可领取 → `inactive`；
+4. `POST /v1/ops/claim`；响应 `id` **既不是 `null` 也不是 `undefined`** 时补
+   `POST /v1/ops/confirm`（漏掉会让积分停在「待确认」而不入账）。
+   **confirm 失败不把整体判为失败** —— 积分已进入待确认态，报 `failed` 会让用户
+   以为没领到而重复点击。
+
+> ⚠️ **幂等只有第 3 步这一道保护**：本协议**没有幂等键、也没有「今天已签到」业务码**，
+> 唯一依据就是活动列表的 `claimable` / `status` 预检（IDE 的实现同样如此 ——
+> 按钮在已领取态下被 `disabled`）。
+
+> ⚠️ **`/v1/ops/delivery` 的字段类型与名字跟直觉不符**（实测 2026-09-18，两个坑
+> 叠加曾导致「1 个失败」且积分实际没领到）：
+>
+> | 直觉写法 | 真实情况 | 后果 |
+> |---|---|---|
+> | `readString(campaignId)` | **`campaignId` 是数字** `1` | 恒空串 → 判 `failed`「活动缺少 campaignId」 |
+> | `readNumber(amount)` | 可领积分字段是 **`benefitAmount`**（`1000`） | 恒为 0（显示「+0 积分」） |
+> | `status` 是字符串 | 不可领取时 **`status` 是 `null`** | 读取必须容忍 `null` |
+>
+> 完整真实 item 字段：`campaignId` / `title` / `type` / `benefitAmount` /
+> `benefitUnit` / `displayConfig` / `pageUrl` / `claimable` / `hooks` / `extra` /
+> `description` / `status` / `pendingCount` / `pendingTotalAmount`。
+> **单测必须喂真实响应形状** —— 早期用例喂的是编造的 `campaignId: 'c-1'` 与
+> `amount: 1000`，因此完全没抓到上面这两个 bug（现已改为实测字段集合）。
+
+> ⚠️ **`Agent-Type` / `X-Language` 必须在签名之后追加，绝不能参与签名**：实测把它们
+> 作为 `signRequestHuawei` 的 `extraHeaders` 传入（进入 canonical request 与
+> `SignedHeaders`）会得到
+> `401 {"error_code":"APIG.0301","error_msg":"...verify ak sk sign signature fail"}`；
+> 签名后追加则 200 并返回真实数据。做法与 `src/models.ts` 的 `fetchSignedGet` 一致
+> （其参数注释写明「签名后追加的头（不参与签名计算）」）。**真实缺陷**：本模块早期
+> 误当作签名头，界面显示「积分：账户信息查询失败」。⚠️ 注意 `src/llm-adapter.ts` 的
+> `maas_type: benefit` 是**反例** —— 那个头确实需要参与签名，不要据此推断。
+
+> ⚠️ **非 2xx 必须带出服务端 `error_code` / `error_msg`**（`describeHttpFailure`）：
+> 只报 `HTTP 401` 会让「签名头位置错」「AK 限流（`AK access failed to reach the
+> limit`）」「凭据过期」这些**处置方式完全不同**的问题看起来一模一样。
+
+> ⚠️ **官方文档给的 portal 路径不可用**：`codearts.huaweicloud.com/portal/...` 是
+> BFF 接口、依赖浏览器 Cookie，实测带 AK/SK 签名也只会返回 IAM 登录跳转 HTML。
+> 本协议逆向自本机码道 IDE（`out/main.js` 的 `PackageInfoService`、workbench 的
+> `ActivityWelfarePane`）。`snapEngineUrl` 取自 IDE 的 `product.json`，值与
+> `SNAP_MODEL_BUILTIN_URL` 同域。
+
+> ⚠️ **`refresh_token` 是一次性轮换的**（用一次即作废，服务端回
+> `STS5.1806 the refresh token has been used`）：积分模块**只读凭据、绝不刷新**
+> （只用 AK/SK/security_token 发签名请求），刷新归 `src/refresh.ts` 的调度器，
+> 且任何刷新都必须**立刻回写**新凭据。E2E 凭据读取同理 —— 只读，不刷新。
+> `tests/unit/codearts-credits.spec.ts` 有一条用例断言整条领取流程的每个请求都落在
+> `snap-access` 域内、且凭据对象调用前后逐字段不变。
+
+#### Qoder CN（两步）
+
+**只对 `qoder-cn` 打开**（国际版维持结构性拒绝 —— 活动只属于 CN）。协议由 **keylog
+解密抓包**解出并真机验收（2026-09-21，HTTP 200）：
+
+```
+活动列表   GET  {openapiBase}/sash/api/v1/me/campaigns
+领取       POST {openapiBase}/sash/api/v1/me/campaigns/{campaignId}/claim   ← body 空串
+```
+
+⚠️ **它挂在 `/sash/` 前缀下、不是 `/api/`，也不走 wasm 签名路径** —— 只要
+`Authorization: Bearer <jt>`（与余额同源：经 PAT 换来的 job token）。早期只按
+`/api/` 前缀搜端点，因此误判「Qoder 无签到」（用户报障：「登录成功了，没有获取积分吗？」）。
+出站头沿用余额线那套 `qoderJobTokenHeaders`（已被真机证明可用），**不追加
+`Cosy-ClientType`**：签名路径之外没有它也可用的证据，多一个未验证的头比少一个更危险。
+
+四条硬约束（每条都有对应用例）：
+
+1. **幂等判据是响应体的 `replayed`，不是 HTTP 状态码**：重复领取**同样回 200**，
+   但 `replayed:true`、**不含 `benefit`**，且 `claimedAt` 是**上一次领取的旧时间**
+   （实测请求发生在 09-21、`claimedAt` 却是 09-18）。只看状态码会把「今天已领」
+   误报成「领取成功 +100」⇒ `replayed === true` **归一为 `already-claimed`**；
+2. **请求体必须是空串**（抓包实测 `content-length: 0`）。发 `{}` 属未经验证的形态；
+3. **只领 `actionType === 'CLAIM_BENEFIT'` 且 `claimStatus === 'CLAIMABLE'`** ——
+   实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的；
+4. **`campaigns` 为空数组不是「没有活动」**：活动**每日 10:00（UTC+8）刷新**，
+   服务端在「今天已领」时会**清空 `campaigns`** 并回
+   `{"showCampaign":false,"claimable":false,"campaigns":[]}`。故
+   `CheckinStatus.active` **恒为 `true`**（拿到响应即活动开启）、**不按列表是否为空判**
+   —— 否则 `collectClaimResults` 会先命中「活动未开启」分支，把「今天已领」误报成
+   「签到活动未开启」；「无活动可领」归一为 `already-claimed`（保守判已领，
+   比误报可领更不容易误导用户）。
+
+宿主侧 `credits.status` 逐账号查列表；`credits.claimAll` 传 `precheckStatus: false`
+（`claimQoderDailyCheckin` **自带列表查询**，外部再查一次纯属重复 GET —— 与 LobsterAI /
+Trae CN 同一约定），并**逐个领取**所有 `CLAIM_BENEFIT` 活动后累加积分。凭据失效
+（`PAT 已失效，请重新粘贴`）与 HTTP 失败**都带精确原因**回给用户，不压成笼统文案。
+实现见 `src/qoder-credits.ts`。
 
 ### 失败诊断的 logid 透传
 
@@ -2054,7 +2276,7 @@ CN 的地方外，两个 region 行为一致。
 | 长期凭据 | access + refresh | access + refresh + 身份字段 | 五件套 | **两件**（设备流 `token` + `refresh_token`） |
 | 鉴权 | `Bearer` + 归属头 | `Bearer` | `Cloud-IDE-JWT` | **`Bearer`（但分令牌族：设备令牌直接用，PAT 先换 `jt-`）** |
 | 续期 | `X-Refresh-Token` 头 | `POST /api/auth/refresh` | exchange（body 四字段） | **按令牌族分派**：PAT 重打 exchange、设备令牌打 `deviceToken/refresh` |
-| 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **不做**（国际版无此活动；CN **疑似有但端点未知**） |
+| 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **只有 CN 有**（`sash/…/campaigns` 两步；国际版无此活动） |
 
 ### 登录：浏览器设备流
 
@@ -2319,24 +2541,23 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
   `expiresAt`，**池本身没有失效字段** —— 拿账号级时间戳当池失效判据会在哨兵值上
   产出**假的**「另有 N 已失效」，把一个满额账号显示成 0 分。
 
-**能力矩阵**：`balance: true`、`dailyCheckin: false`。
+**能力矩阵**：`qoder` 是 `balance: true`、`dailyCheckin: false`；`qoder-cn` 是
+**两项都 `true`**。
 
-⚠️ **签到刻意不做，且理由与 Buddy（国际版）不是同一种**：
-
-⚠️ **签到刻意不做，且两个 region 的理由不是同一种**（这一条与 `credits-capabilities.js`
-的矩阵注释同源，改一处必须改另一处）：
+⚠️ **两个 region 的签到理由必须分开读**（与 `credits-capabilities.js` 的矩阵注释
+同源，改一处必须改另一处）：
 
 - **Qoder（国际版）**：**活动不存在** —— CLI2API 实测国际版不显示签到；官方的
   每日 **100 Credits** 只能在 **Qoder 桌面 App 里手动领取**，服务端没有暴露可编程
   的签到端点。本插件也不打算用任何「模拟桌面客户端」的手段去领
-  （既不可靠，也超出本插件的边界）；
-- **Qoder CN（国内版）**：**疑似有这项权益，但端点未知** —— CLI2API 的
-  `RegionDescriptor` **只在 cn 一侧挂了 Checkin**。故矩阵里的 `false` 是
-  「**端点未知、未验证**」，**不是**「没有权益」、更不是「与国际版一样不存在该活动」。
-  **拿到端点后要把它翻成 `true`**（届时宿主侧还要补 `credits.status` /
-  `credits.claimAll` 的 `qoder-cn` 分支）。
+  （既不可靠，也超出本插件的边界）。这条**不变**；
+- **Qoder CN（国内版）**：**已 `true`** —— 端点由 keylog 解密抓包解出并**真机验收**
+  （2026-09-21），宿主侧 `credits.status` / `credits.claimAll` 的 `qoder-cn` 分支
+  同步接线，协议见下方「Qoder CN（两步）」。原先那句「端点未知、拿到端点后翻 true」
+  是**待办**，现已关闭 —— ⚠️ 但**不要把国际版也一起翻 `true`**：活动只属于 CN。
 
-故 Qoder CN 面板**渲染**积分行与「刷新积分」、**不渲染**「一键领取积分」。
+故两个 Qoder 面板都**渲染**积分行与「刷新积分」，但**只有 Qoder CN** 渲染
+「一键领取积分」。
 
 ### Qoder CN：第二个 region
 
@@ -2519,23 +2740,22 @@ $env:QODER_MODEL_SERVER_HOST = 'http://127.0.0.1:8080'
 ### Account Hub 里的 Qoder 面板
 
 `PROVIDERS` 含 **Qoder** 与 **Qoder CN** 两栏（Qoder CN 紧随 Qoder 之后），
-能力矩阵两行都是 `balance ✓ / dailyCheckin ✗`：
+能力矩阵两行分别是 `balance ✓ / dailyCheckin ✗`（国际版）与 **`✓ / ✓`**（CN）：
 
 | 项 | Qoder 面板 | Qoder CN 面板 |
 |---|---|---|
 | 账号列表 | ✓ 自己的账号（`QODER_*`） | ✓ 自己的账号（`QODER_CN_*`），**与国际版互不可见** |
 | 「+ 新建账号」 | ✓ **浏览器设备流**（登录弹窗 + 轮询） | ✓ 同一套实现，只是授权页指向 `qoder.cn` |
 | 积分行 / 「刷新积分」 | ✓ 三池之和的**单数字**与资源包明细 | ✓ 同口径（CN 实测两池，容缺解析天然兼容） |
-| 「一键领取积分」 | ✗ 无公开 API | ✗ **端点未知**（见上，拿到端点后翻 true） |
+| 「一键领取积分」 | ✗ 活动不存在（只能在桌面 App 手动领） | ✓ **`sash/api/v1/me/campaigns` 两步**（见「积分领取」） |
 | 卡片操作（刷新 / 删除 / 启停 / 重测 / 重置） | ✓ 「刷新」= **重打一次 exchange** | ✓ 同上，打的是 **CN 的** exchange |
 | 「显示列表」（模型开关） | ✓ 作用于 **`qoder` 这个键** | ✓ 作用于 **`qoder-cn` 这个键**（两区模型池不同，黑名单必须分开） |
 
-**三处积分端点里只有 `credits.balances` 有 qoder 系分支**：`credits.status` 与
-`credits.claimAll` 对 **`qoder` 与 `qoder-cn` 两个 region 都**如实回
-`unsupported provider: qoder` / `unsupported provider: qoder-cn` —— 这是
-**正确的契约**（两个 region 确实都没有签到流程），不是缺陷。客户端靠能力矩阵在
-**发请求之前**就不发这两个请求，与 CodeArts 的既有约定同源。
-（⚠️ CN 将来拿到签到端点时，这两条**结构性拒绝**就是要动的地方。）
+**三处积分端点里，`credits.balances` 与签到两项（`credits.status` / `credits.claimAll`）
+都有 qoder 系分支**：`qoder-cn` 走 CN 的端点，**国际版 `qoder` 的签到两项仍回
+`unsupported provider: qoder`** —— 那是**正确的契约**（活动只属于 CN），不是缺陷。
+客户端靠能力矩阵在**发请求之前**就不发这两个请求，与 CodeArts 的既有约定同源。
+（⚠️ 给国际版接线前，先确认那边真有活动与端点。）
 
 > **账号昵称不是「真实用户名回填」。** 账号条目的 `nickname` 取凭据里的
 > `user_id`，取不到就回退到 accountId —— 本步**没有**做任何「把昵称换成真实

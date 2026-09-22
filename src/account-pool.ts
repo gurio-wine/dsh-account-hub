@@ -711,6 +711,74 @@ export class AccountPool {
   }
 
   /**
+   * 重排某 provider 下账号的顺序（Account Hub 拖拽排序）。
+   *
+   * ## 为什么顺序有实际意义
+   *
+   * 账号列表的数组顺序就是 {@link getAvailableAccount} 的**候选优先级**：
+   * 自动选号、限流后的换号重试都按这个顺序取「第一个可用账号」。
+   * 因此拖拽不是 UI 装饰，它直接决定实际用哪个账号发请求。
+   *
+   * ## 只动本 provider 的槽位
+   *
+   * 账号存在**一个全局数组**里（各 provider 混排，靠 `provider` 字段区分），
+   * 而设置页是按 provider 分组渲染的。因此这里取「该 provider 账号原本占用的
+   * 那些下标」，把新顺序填回这些下标 —— 其他 provider 的账号**位置不变**。
+   *
+   * 不这么做（例如把该 provider 的账号整体挪到数组头部）会让拖拽 CodeArts
+   * 的顺序顺带改变 Buddy 账号的相对位置，属于跨面板的意外副作用。
+   *
+   * ## 校验：必须是同一集合的一个排列
+   *
+   * `orderedIds` 必须恰好包含该 provider 的**全部**账号 id（顺序可变、集合不可变）。
+   * 不满足就抛错而不是「尽力而为」：
+   * - 少了某个 id（前端列表过期，期间账号被别处新增）→ 若静默忽略，那个账号
+   *   会莫名其妙掉到末尾，用户看到的是"顺序自己变了"；
+   * - 多了未知 id、或同一个 id 出现两次 → 说明前端状态与服务端不一致。
+   * 两种情况都让用户刷新重试，比悄悄改数据安全。
+   *
+   * @param provider - provider id
+   * @param orderedIds - 该 provider 全部账号 id 的目标顺序
+   */
+  async reorderAccounts(provider: string, orderedIds: readonly string[]): Promise<void> {
+    const accounts = this.readAccounts()
+    // 该 provider 占用的下标，与这些下标上的条目一一对应。
+    const indices: number[] = []
+    const currentIds: string[] = []
+    const byId = new Map<string, ProviderAccountEntry>()
+    accounts.forEach((entry, index) => {
+      if (entry.provider !== provider) return
+      indices.push(index)
+      currentIds.push(entry.id)
+      byId.set(entry.id, entry)
+    })
+
+    // 集合一致性校验（顺序无关）：数量相等 + 无重复 + 每个 id 都属于本 provider。
+    const got = new Set(orderedIds)
+    const sameSet = orderedIds.length === byId.size
+      && got.size === orderedIds.length
+      && orderedIds.every(id => byId.has(id))
+    if (!sameSet) {
+      throw new Error(
+        `账号列表已变化，请刷新后重试（${provider} 期望 ${byId.size} 个账号 id 的一个排列，`
+        + `收到 ${orderedIds.length} 个）`,
+      )
+    }
+
+    // 顺序没变（含该 provider 无账号、只有一个账号两种退化情形）→ 不写盘：
+    // 拖拽落回原位是常见操作，没必要为一次无变化的整体 replace 惊动持久层。
+    if (orderedIds.every((id, position) => id === currentIds[position])) return
+
+    const next = [...accounts]
+    // 按新顺序回填到该 provider 原本占用的下标上。
+    indices.forEach((accountIndex, position) => {
+      next[accountIndex] = byId.get(orderedIds[position])!
+    })
+    await this.writeAccounts(next)
+    this.ctx.logger?.info?.(`[account-hub] 已重排 ${provider} 账号顺序: ${orderedIds.join(', ')}`)
+  }
+
+  /**
    * 按凭据内容反查账号 id（供适配器记录"当前用的是哪个账号"）。
    *
    * 适配器不持有 ctx，也不该直接访问本类的私有凭据存储，
@@ -753,6 +821,60 @@ export class AccountPool {
   /** 列出某 provider 的全部账号（含已停用），供「重测所有 / 重置所有」使用。 */
   listAccountsByProvider(provider: string): ProviderAccountEntry[] {
     return this.readAccounts().filter(a => a.provider === provider)
+  }
+
+  /**
+   * 该 provider 是否**至少有一个已登录（凭据可解析）的账号**。
+   *
+   * 供适配器的 `listModels` 做目录门控：没有已登录账号时返回空目录，让 DSH 的
+   * `buildModelCatalog` 把整个 provider 分组隐藏（它显式
+   * `.filter(group => group.models.length > 0)`），从而显著减少模型选择列表里
+   * 用不上的条目。
+   *
+   * ## 为什么判据是「凭据可解析」而不是「有条目」
+   *
+   * 1. **`logout()` 只清凭据、保留账号条目**（删除条目是另一条路径
+   *    `removeAccount`）。若只看「有没有条目」，用户登出后模型仍会显示，
+   *    门控形同虚设。
+   * 2. **不看 `enabled`**：停用只应影响「自动选号」，与「是否已登录」无关。
+   *    这与续期调度器「只按 `refreshable` 过滤、不看 `enabled`」是同一条既有
+   *    约定（停用账号同样参与积分领取），故这里保持一致。
+   *
+   * ⚠️ **这是异步的**：需要逐个解析凭据。但只解析到**第一个可用凭据**即返回
+   * （短路），多账号场景下通常第一次就命中。
+   *
+   * ⚠️ **本方法只用于「目录展示」的门控**，绝不能用于路由判定 —— DSH 约定
+   * `listModels` 结果仅供参考，隐藏目录不等于拒绝请求（被隐藏的模型仍可
+   * `resolveModel` / 正常收发）。
+   *
+   * ## `extraCredentialRefs`：本仓特有的**单凭据路径**（不要照抄上游删掉）
+   *
+   * 上游把 CodeArts 的单凭据回退整体移除（`extraCredentialRefs` 参数一并删除），
+   * 因为它的登录入口只剩设置页、凭据一律写入 `CODEARTS_ACCOUNT_XXX`。
+   *
+   * **本仓不同**：`/codearts-login` 命令仍然存在且活跃（`src/index.ts` 的
+   * `service.login()`），它把凭据写进固定的 `CODEARTS_ACCESS_TOKEN`；适配器的
+   * `makeCredentialResolver` 也在池中取不到账号时回退读同一个 ref。若门控只看
+   * 账号池，**纯单凭据登录的用户会看到 codearts 的全部模型凭空消失**。
+   * 故这里额外接受一组 ref，任一可解析即视为「已登录」。
+   *
+   * 其余五个 provider 的 `Auth.login()` 在本仓**没有任何调用者**（Account Hub
+   * 一律走两段式直接写 `*_ACCOUNT_XXX`），故它们的默认 ref 不构成活跃登录路径，
+   * 刻意不传 —— 传了是死代码。
+   *
+   * @param provider - provider id。
+   * @param extraCredentialRefs - 额外的单凭据 ref（如 `CODEARTS_ACCESS_TOKEN`）。
+   */
+  async hasLoggedInAccount(provider: string, extraCredentialRefs?: readonly string[]): Promise<boolean> {
+    for (const entry of this.listAccountsByProvider(provider)) {
+      const credential = await this.resolveCredentialByRef(entry.credentialRef)
+      if (credential !== undefined) return true
+    }
+    for (const ref of extraCredentialRefs ?? []) {
+      const credential = await this.resolveCredentialByRef(ref)
+      if (credential !== undefined) return true
+    }
+    return false
   }
 
   /**
@@ -826,9 +948,9 @@ export class AccountPool {
    *
    * **为什么需要 `excludeAccountIds`**：调用方在「请求级轮换」时会逐个换号
    * 重试，必须能拿到**下一个**账号而不是每次都拿回同一个。
-   * 本池默认按「重置时间最早到期」排序，当失败类别**不写限流标记**时
-   * （如 5xx / 请求错误 —— 它们不是限流，不该留徽章），
-   * 刚失败的账号仍是排序第一，调用方若不排除它就会原地打转、
+   * 候选顺序是**用户手动顺序**（见 {@link reorderAccounts}），当失败类别
+   * **不写限流标记**时（如 5xx / 请求错误 —— 它们不是限流，不该留徽章），
+   * 刚失败的账号仍排在原位，调用方若不排除它就会原地打转、
    * 换号形同虚设。Go 侧对应的是 `PickExcluding(tried)`（`pool.go:131`）。
    *
    * 在池这一层排除（而非让调用方自己跳过）是必要的：调用方只能拿到
@@ -850,12 +972,17 @@ export class AccountPool {
         return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
       })
     if (candidates.length === 0) return null
-    // 优先选择无限制或限制最早到期的
-    candidates.sort((a, b) => {
-      const ra = a.modelRateLimits?.[modelId] ?? 0
-      const rb = b.modelRateLimits?.[modelId] ?? 0
-      return ra - rb
-    })
+    // 候选顺序即**用户在 Account Hub 拖拽设定的手动顺序**（`reorderAccounts` 写入）。
+    //
+    // 为什么不再按「限流重置时间最早到期」重排（早期实现如此，上游 84d0b3f 移除）：
+    // 那个排序会让手动顺序形同虚设 —— 用户把某账号拖到首位，只要另一个
+    // 账号的限流重置时间更早，实际选中的仍是后者，拖拽变成纯 UI 装饰。
+    // 现在的语义是「手动顺序优先，限流豁免」：顺序完全由用户决定，
+    // 而当前正处于限流期的账号已被上面的 filter 排除，不会选到。
+    //
+    // 注意 candidates 来自 readAccounts() 的 filter，而 filter 保持原数组
+    // 顺序，故这里天然就是手动顺序，无需任何排序。
+    //
     // 逐个尝试解析凭据，跳过占位/损坏条目（并记录原因，避免静默失败）
     const failures: string[] = []
     for (const entry of candidates) {
@@ -935,4 +1062,73 @@ export class AccountPool {
     })
     if (changed) await this.writeAccounts(next)
   }
+}
+
+/**
+ * `listModels` 的目录门控：**该 provider 是否应在模型目录中展示**。
+ *
+ * ## 需求来源
+ *
+ * 「如果某供应商没有已登录的账号，就不显示该供应商的所有模型 —— 这样对大多数
+ * 用户来说模型选择选项卡臃肿的问题能改善很多。」
+ *
+ * ## 为什么可行：DSH 原生支持「空目录即隐藏」
+ *
+ * `packages/api/session-controller/src/catalog.ts` 的 `buildModelCatalog` 显式做了
+ * `.filter(group => group.models.length > 0)`（注释：*"successful non-empty
+ * provider groups"*）。因此适配器返回 `[]` 就能让整个 provider 分组从模型选择器
+ * 中消失 —— **无需任何前端改动**。
+ *
+ * ⚠️ **必须返回空数组，不能抛错**：`buildModelCatalog` 的 `catch` 会把抛错归入
+ * `failures`，界面上会多出一条 provider 报错，比「不显示」更糟。
+ *
+ * ⚠️ **不影响路由**：`catalog.routableProviders` 由 `listProviders()` 单独生成
+ * （不经过该 filter），且 DSH 明确约定 *"Catalog membership is advisory and never
+ * changes routing"* —— 隐藏目录不等于拒绝请求，已持久化的模型仍能 `resolveModel`
+ * / 正常收发。
+ *
+ * ## 判定语义
+ *
+ * - **默认开启**（`DSH_HIDE_MODELS_WITHOUT_ACCOUNT=0` 可关）：与
+ *   `DSH_TRAE_MAX_MODE` 同为「默认开、显式假值才关」的语义，故单列一个解析
+ *   函数，**不要与「默认关」的解析混用**。
+ * - `accountPool` 缺失（headless / CLI / 单测）或替身未实现
+ *   `hasLoggedInAccount` 时**视为可见** —— 门控是**展示优化而非安全边界**，
+ *   判定不可用时宁多勿少（否则会让整个 provider 的模型凭空消失且无从排查）。
+ * - 读凭据抛异常（存储损坏等）时同样**保守展示**。
+ * - `extraCredentialRefs` 承载本仓的**单凭据路径**（见
+ *   {@link AccountPool.hasLoggedInAccount} 的说明），仅 CodeArts 需要。
+ *
+ * @param accountPool - 适配器的账号池（可能为 undefined）。
+ * @param provider - provider id。
+ * @param extraCredentialRefs - 额外的单凭据 ref（CodeArts 的单凭据回退）。
+ */
+export async function providerCatalogVisible(
+  accountPool: AccountPool | undefined,
+  provider: string,
+  extraCredentialRefs?: readonly string[],
+): Promise<boolean> {
+  if (!resolveHideWithoutAccountFlag(process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT)) return true
+  if (accountPool === undefined) return true
+  // 能力检测：单测替身通常只 mock 了 disabledModelsFor 等少量方法。
+  if (typeof accountPool.hasLoggedInAccount !== 'function') return true
+  try {
+    return await accountPool.hasLoggedInAccount(provider, extraCredentialRefs)
+  } catch {
+    // 读凭据异常（存储损坏等）时保守展示：宁可多显示，也不要让用户因为一次
+    // 读取抖动而「所有模型都不见了」且无从排查。
+    return true
+  }
+}
+
+/**
+ * 解析 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT`；**默认开启**。
+ *
+ * 只有显式假值（`0` / `false` / `no` / `off`）才关闭。与「默认关」的 flag 解析
+ * 语义相反，故单列一个函数，**不要混用**。
+ */
+function resolveHideWithoutAccountFlag(raw: string | undefined): boolean {
+  if (raw === undefined) return true
+  const value = raw.trim().toLowerCase()
+  return !(value === '0' || value === 'false' || value === 'no' || value === 'off')
 }

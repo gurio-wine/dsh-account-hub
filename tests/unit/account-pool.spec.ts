@@ -207,6 +207,144 @@ describe('AccountPool', () => {
     expect(list[0].modelRateLimits?.['deepseek-v4-pro']).toBeDefined()
   })
 
+  // ── 手动排序（Account Hub 拖拽，移植上游 84d0b3f 的后端部分）──
+  // 顺序即 getAvailableAccount 的候选优先级，故这些用例同时守「持久化」与
+  // 「真的影响选号」两件事 —— 只测前者会让拖拽退化成 UI 装饰。
+  describe('reorderAccounts', () => {
+    /** 建同 provider 账号，凭据齐备，便于验证选号结果。 */
+    async function seed(ids: string[], provider = 'buddy-cn'): Promise<void> {
+      for (const id of ids) {
+        const ref = `${provider.toUpperCase().replace(/-/g, '_')}_ACCOUNT_${id.toUpperCase()}`
+        await ctx.credentials.set(credentialRef(ref), JSON.stringify({ access_token: id }))
+        await pool.addAccount(makeMockAccount({ id, provider, credentialRef: ref }))
+      }
+    }
+
+    it('重排后 listAccounts 顺序随之改变', async () => {
+      await seed(['a', 'b', 'c'])
+      await pool.reorderAccounts('buddy-cn', ['c', 'a', 'b'])
+      const list = await pool.listAccounts('buddy-cn')
+      expect(list.map(a => a.id)).toEqual(['c', 'a', 'b'])
+    })
+
+    it('重排真正影响 getAvailableAccount 的选号结果', async () => {
+      await seed(['a', 'b', 'c'])
+      expect((await pool.getAvailableAccount('buddy-cn', ''))?.entry.id).toBe('a')
+      await pool.reorderAccounts('buddy-cn', ['c', 'b', 'a'])
+      expect((await pool.getAvailableAccount('buddy-cn', ''))?.entry.id).toBe('c')
+    })
+
+    /**
+     * 删除「按限流重置时间最早到期重排候选」的 sort 之后的行为锁。
+     *
+     * 两个账号对目标模型的限流标记**都已过期**（故都在候选里），且重置时间
+     * 一前一后：旧排序会把更早到期的 b 提到前面，新语义必须取数组顺序第一的 a。
+     */
+    it('数组顺序即优先级：限流重置时间不再参与候选排序', async () => {
+      const pastLater = Date.now() - 5_000
+      const past = Date.now() - 10_000
+      await ctx.credentials.set(credentialRef('BUDDY_CN_ACCOUNT_A'), JSON.stringify({ access_token: 'a' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'a',
+        credentialRef: 'BUDDY_CN_ACCOUNT_A',
+        // a 的限流重置时间**更晚**（但已过期）
+        modelRateLimits: { 'deepseek-v4-flash': pastLater },
+      }))
+      await ctx.credentials.set(credentialRef('BUDDY_CN_ACCOUNT_B'), JSON.stringify({ access_token: 'b' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'b',
+        credentialRef: 'BUDDY_CN_ACCOUNT_B',
+        // b 更早到期 → 旧排序会把 b 排到 a 前面
+        modelRateLimits: { 'deepseek-v4-flash': past },
+      }))
+
+      expect(
+        (await pool.getAvailableAccount('buddy-cn', 'deepseek-v4-flash'))?.entry.id,
+        '数组顺序即选号优先级（上游 84d0b3f 删除了按限流重置时间重排候选的 sort）',
+      ).toBe('a')
+      // 拖到首位后选号跟着变，证明顺序确实是唯一的优先级来源。
+      await pool.reorderAccounts('buddy-cn', ['b', 'a'])
+      expect((await pool.getAvailableAccount('buddy-cn', 'deepseek-v4-flash'))?.entry.id).toBe('b')
+    })
+
+    it('限流期内的账号被跳过，即使它排在最前（限流豁免）', async () => {
+      await ctx.credentials.set(credentialRef('BUDDY_CN_ACCOUNT_A'), JSON.stringify({ access_token: 'a' }))
+      await pool.addAccount(makeMockAccount({
+        id: 'a',
+        credentialRef: 'BUDDY_CN_ACCOUNT_A',
+        modelRateLimits: { 'deepseek-v4-flash': Date.now() + 3_600_000 },
+      }))
+      await ctx.credentials.set(credentialRef('BUDDY_CN_ACCOUNT_B'), JSON.stringify({ access_token: 'b' }))
+      await pool.addAccount(makeMockAccount({ id: 'b', credentialRef: 'BUDDY_CN_ACCOUNT_B' }))
+
+      await pool.reorderAccounts('buddy-cn', ['a', 'b'])
+      expect((await pool.getAvailableAccount('buddy-cn', 'deepseek-v4-flash'))?.entry.id).toBe('b')
+    })
+
+    it('只动本 provider 占用的下标，其他 provider 位置不变', async () => {
+      // 账号存在一个全局数组里，而设置页按 provider 分组渲染。
+      // 拖 buddy-cn 不应顺带改动 codearts 账号的位置。
+      await seed(['b1'])
+      await seed(['c1'], 'codearts')
+      await seed(['b2'])
+
+      await pool.reorderAccounts('buddy-cn', ['b2', 'b1'])
+      const all = await pool.listAllAccounts()
+      // 两个 buddy-cn 账号在各自原本的下标（0 与 2）上互换，codearts 仍在中间
+      expect(all.map(a => a.id)).toEqual(['b2', 'c1', 'b1'])
+    })
+
+    it('id 集合不一致（少 / 多 / 重复）时抛错且不改动数据', async () => {
+      await seed(['a', 'b', 'c'])
+      await expect(pool.reorderAccounts('buddy-cn', ['a', 'b'])).rejects.toThrow()
+      await expect(pool.reorderAccounts('buddy-cn', ['a', 'b', 'c', 'zzz'])).rejects.toThrow()
+      await expect(pool.reorderAccounts('buddy-cn', ['a', 'a', 'b'])).rejects.toThrow()
+      // 数据未被破坏
+      const list = await pool.listAccounts('buddy-cn')
+      expect(list.map(a => a.id)).toEqual(['a', 'b', 'c'])
+    })
+
+    it('空数组（该 provider 无账号）是 no-op，不写盘', async () => {
+      await seed(['a', 'b'])
+      const before = ctx.replaceCalls.length
+      await pool.reorderAccounts('codearts', [])
+      expect(ctx.replaceCalls.length).toBe(before)
+      expect((await pool.listAccounts('buddy-cn')).map(a => a.id)).toEqual(['a', 'b'])
+    })
+
+    it('顺序未变时不写盘（拖拽落回原位是常见操作）', async () => {
+      await seed(['a', 'b', 'c'])
+      const before = ctx.replaceCalls.length
+      await pool.reorderAccounts('buddy-cn', ['a', 'b', 'c'])
+      expect(ctx.replaceCalls.length).toBe(before)
+    })
+
+    it('重排结果落盘，新池从同一持久层读回同一顺序', async () => {
+      await seed(['a', 'b', 'c'])
+      await pool.reorderAccounts('buddy-cn', ['c', 'b', 'a'])
+      // 同一个 ctx（同一份 settings 存储）上新建的池必须读到新顺序
+      const reopened = new AccountPool(ctx as never)
+      expect((await reopened.listAccounts('buddy-cn')).map(a => a.id)).toEqual(['c', 'b', 'a'])
+    })
+
+    it('重排只写账号字段，不抹掉黑名单 / 上下文预算 / 版本号', async () => {
+      // writeAccounts 是整体 replace，漏带另外三件套会一起清空。
+      await pool.setModelDisabled('buddy-cn', 'glm-5.2', true)
+      await pool.writeContextBudget('buddy-cn', 'glm-5.2', 200_000)
+      await seed(['a', 'b', 'c'])
+      await pool.reorderAccounts('buddy-cn', ['c', 'b', 'a'])
+
+      expect([...pool.disabledModelsFor('buddy-cn')]).toEqual(['glm-5.2'])
+      expect(pool.contextBudget('buddy-cn', 'glm-5.2')).toBe(200_000)
+      const payload = ctx.replacePayloads.at(-1)!
+      expect(payload.accounts).toBeDefined()
+      expect(payload.disabledModels).toEqual({ 'buddy-cn': { 'glm-5.2': true } })
+      expect(payload.contextBudgets).toEqual({ 'buddy-cn': { 'glm-5.2': 200_000 } })
+      // schemaVersion 必须原样携带（漏带会让改名迁移每次启动重跑）
+      expect(payload.schemaVersion).toBe(0)
+    })
+  })
+
   it('should list all accounts', async () => {
     await pool.addAccount(makeMockAccount())
     await pool.addAccount(makeMockAccount({ id: 'codearts-001', provider: 'codearts', credentialRef: 'CODEARTS_ACCOUNT_C1' }))

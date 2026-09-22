@@ -17,7 +17,7 @@ import {
   LlmAdapter, LlmError,
   ReasoningEffortId,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { availableContextTiers, effectiveContextWindow, type ContextTier } from './context-tiers.js'
 import { isQuotaExhausted, isRateLimited, parseQuotaExhausted, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
@@ -767,6 +767,13 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+    // 不必拉（省一次无谓 HTTP）。返回空数组 → DSH 的 `buildModelCatalog` 把整个
+    // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
+    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
+    // 界面上反而多出一条 provider 报错）。
+    // ⚠️ 两个产品共用本类，但 `this.product.id` 不同 → 各自独立判定，互不影响。
+    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
     await this.ensureRemoteModels()
     const source = this.remoteModels ?? this.staticFallbackModels()
     // 用户在 Account Hub 关闭的模型（黑名单制：不在表里即默认打开）。
@@ -781,6 +788,21 @@ export class BuddyAdapter extends LlmAdapter {
       name: model.name,
       inputModalities: this.inputModalitiesFor(model.id),
     }))
+  }
+
+  /**
+   * **不套用户黑名单、也不套目录门控**的完整目录（带最终展示名）。
+   *
+   * 供 Account Hub 的「显示列表」使用：设置页必须始终能看到**全部**模型（含被
+   * 用户关闭的那些），否则关掉之后连开关都找不到、更无法重新打开。同名消歧的
+   * 展示名也要在这里算出来，否则回填行只能显示裸 id。
+   *
+   * ⚠️ 与 `listModels` 的唯一区别就是「不套黑名单、不套门控」——可见性口径
+   * （远端优先 / 兜底表）必须同源。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    const source = this.remoteModels ?? this.staticFallbackModels()
+    return source.map((model) => ({ id: model.id, name: model.name }))
   }
 
   /**
@@ -1118,7 +1140,7 @@ export class BuddyAdapter extends LlmAdapter {
           // 永远取不到候选账号，限流后无法自动切换）。
           //
           // 必须把 `tried` 传给池：见 `AccountPool.getAvailableAccount` 的说明 ——
-          // 池按「重置时间最早到期」排序，刚失败的账号可能仍排第一，
+          // 候选顺序是用户手动顺序（`reorderAccounts`），刚失败的账号**仍在原位**，
           // 不排除就会拿回同一个、命中下面的 `tried.has` 而立即 break。
           const next = await this.options.accountPool.getAvailableAccount(
             this.product.id, options.model, tried,

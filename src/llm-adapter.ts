@@ -6,9 +6,13 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import type { RemoteModel } from './models.js'
 import { signRequestHuawei } from './sign.js'
+// 单凭据 ref 的**唯一真相源**（`CODEARTS_ACCESS_TOKEN`）：目录门控要判它是否
+// 可解析，写死字面量会在改名时静默失配。⚠️ 本导入不构成循环依赖 ——
+// `service.ts` 不 import 本模块（它只依赖 account-pool / login / oauth / models）。
+import { CODEARTS_CREDENTIAL_REF } from './service.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 import type { CodeArtsCredential } from './types.js'
 
@@ -800,15 +804,25 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️ 没有任何已登录账号时返回空数组 → DSH 的 `buildModelCatalog` 把整个
+    // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
+    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
+    // 界面上反而多出一条 provider 报错）。
+    //
+    // ⚠️ **本仓保留 CodeArts 的单凭据路径**（与上游相反）：`/codearts-login`
+    // 命令仍活跃，凭据写进固定的 `CODEARTS_ACCESS_TOKEN`，适配器的
+    // `makeCredentialResolver` 也在池空时回退读它。故判据必须**同时覆盖
+    // 「账号池有可用凭据」与「单凭据 ref 可解析」两条路径** —— 只查池会让纯
+    // 单凭据登录的用户看到 codearts 的全部模型凭空消失。
+    //
+    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+    // 不必拉（省一次无谓 HTTP）。
+    if (!await providerCatalogVisible(this.options.accountPool, PROVIDER, [CODEARTS_CREDENTIAL_REF])) return []
     // 必须 await：ensureRemoteModels 是异步的，早期实现用 `void` 丢弃 Promise，
     // 冷缓存时远端目录尚未落地就走静态兜底表，模型选择器会短暂显示错误的
     // 模型集合（Account Hub 的模型开关也据此渲染，会造成"关掉的模型又冒出来"）。
     await this.ensureRemoteModels()
-    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
-    // 屏蔽视觉（VL）多模态模型（id 含 -VL- 或以 -VL 结尾，如 Qwen3-VL-235B）：
-    // 这类模型上下文小（32768 tokens）、不支持工具调用（vLLM 未启用
-    // auto-tool-choice，发 tools 会 400），不适合当 agent 主模型，故从列表隐藏。
-    const visible = source.filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+    const visible = this.listAllModels()
     // 用户在 Account Hub 关闭的模型（黑名单制：不在表里即默认打开）。
     // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
     // ——与 DSH 对 listModels 的约定一致（目录是建议性的，缺省不构成拒绝）。
@@ -817,6 +831,25 @@ export class CodeArtsAdapter extends LlmAdapter {
       ? visible
       : visible.filter((m) => !disabled.has(m.id))
     return listed.map((m) => ({ provider: PROVIDER, id: m.id, name: m.name, inputModalities: ['text'] as const }))
+  }
+
+  /**
+   * **不套用户黑名单、也不套目录门控**的完整目录（带最终展示名）。
+   *
+   * 供 Account Hub 的「显示列表」使用：设置页必须始终能看到**全部**模型（含被
+   * 用户关闭的那些），否则关掉之后连开关都找不到、更无法重新打开。
+   *
+   * ⚠️ **必须与 `listModels` 共用同一份可见性过滤**（此处是 VL 多模态屏蔽），
+   * 唯一区别就是不套黑名单、不套账号门控。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+    // 屏蔽视觉（VL）多模态模型（id 含 -VL- 或以 -VL 结尾，如 Qwen3-VL-235B）：
+    // 这类模型上下文小（32768 tokens）、不支持工具调用（vLLM 未启用
+    // auto-tool-choice，发 tools 会 400），不适合当 agent 主模型，故从列表隐藏。
+    return source
+      .filter((m) => !/-VL-/i.test(m.id) && !/-VL$/i.test(m.id))
+      .map((m) => ({ id: m.id, name: m.name }))
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
@@ -1486,12 +1519,21 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 }
 
-/** 在 ctx.llm 上注册 codearts 提供商路由和适配器。 */
-export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): void {
+/**
+ * 在 ctx.llm 上注册 codearts 提供商路由和适配器。
+ *
+ * ⚠️ **返回适配器实例**（不是 `void`）：Account Hub 的「显示列表」需要它的
+ * `listAllModels()`（不套用户黑名单、也不套目录门控的完整目录，带最终展示名）。
+ * DSH 的 `ctx.llm` 只保证 `listModels`、且会把条目重建后丢掉额外字段，故实例
+ * 必须由调用方持有并注入 RPC 层（见 `src/account-hub-rpc.ts` 的 `ModelCatalogSource`）。
+ */
+export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): CodeArtsAdapter {
   ctx.llm.registerConfigurableProviders([
     { provider: PROVIDER, displayName: 'Codearts', settingsNs: 'llm-codearts', settingsPath: [] },
   ])
-  ctx.llm.registerAdapter([PROVIDER], new CodeArtsAdapter(options))
+  const adapter = new CodeArtsAdapter(options)
+  ctx.llm.registerAdapter([PROVIDER], adapter)
+  return adapter
 }
 
 /**

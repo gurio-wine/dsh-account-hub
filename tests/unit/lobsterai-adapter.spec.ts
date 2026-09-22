@@ -782,8 +782,8 @@ describe('LobsteraiAdapter 限流切换', () => {
     })
     const chunks = await collect(generateOptions(), adapter)
     expect(updateModelRateLimit).toHaveBeenCalledWith('acc-1', 'glm-5.2', expect.any(Number))
-    // 第三个实参是 `tried` 集合：必须把已试账号传给池，否则池按「重置时间
-    // 最早」排序时会再次返回刚失败的账号，换号立即因 tried 命中而中断。
+    // 第三个实参是 `tried` 集合：必须把已试账号传给池，否则池会再次返回
+    // 刚失败的账号（候选顺序即数组顺序），换号立即因 tried 命中而中断。
     expect(getAvailableAccount).toHaveBeenCalledWith('lobsterai', 'glm-5.2', expect.any(Set))
     expect(calls).toHaveLength(2)
     expect(chunks.some((c) => c.type === 'text-delta')).toBe(true)

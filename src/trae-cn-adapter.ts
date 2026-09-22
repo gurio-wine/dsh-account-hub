@@ -34,7 +34,7 @@ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { isTraeCnExpired } from './trae-cn-oauth.js'
 import type { TraeCnCredential } from './trae-cn-oauth.js'
 import {
@@ -373,6 +373,12 @@ export class TraeCnAdapter extends LlmAdapter {
   }
 
   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+    // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+    // 不必拉（省一次无谓 HTTP）。返回空数组 → DSH 的 `buildModelCatalog` 把整个
+    // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
+    // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
+    // 界面上反而多出一条 provider 报错）。
+    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
     await this.ensureRemoteModels()
     const source = this.catalogEntries()
     // 用户在 Account Hub 关闭的模型（黑名单制：不在表里即默认打开）。
@@ -387,6 +393,19 @@ export class TraeCnAdapter extends LlmAdapter {
       // 模态按目录条目给（静态表 11 项里 6 项多模态）；远端条目无该字段时判纯文本。
       inputModalities: this.inputModalitiesFor(model.supportsImages),
     }))
+  }
+
+  /**
+   * **不套用户黑名单、也不套目录门控**的完整目录（带最终展示名）。
+   *
+   * 供 Account Hub 的「显示列表」使用：设置页必须始终能看到**全部**模型（含被
+   * 用户关闭的那些），否则关掉之后连开关都找不到、更无法重新打开。
+   *
+   * ⚠️ 与 `listModels` 的唯一区别就是「不套黑名单、不套门控」——可见性口径
+   * （动态目录优先 / 静态表兜底）必须同源，故同样走 {@link catalogEntries}。
+   */
+  listAllModels(): readonly { id: string; name: string }[] {
+    return this.catalogEntries().map((model) => ({ id: model.id, name: model.name }))
   }
 
   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
@@ -570,8 +589,9 @@ export class TraeCnAdapter extends LlmAdapter {
      * 已试过的账号 id。
      *
      * 换号时必须传给池：失败类别为 5xx / 请求错误时**不写冷却标记**，
-     * 刚失败的账号仍是池里排序第一，不排除就会拿回同一个账号、命中 `tried.has`
-     * 而立即中断 —— 换号形同虚设。对齐 Go 的 `PickExcluding(tried)`。
+     * 刚失败的账号**仍在数组原位**（候选顺序即用户手动顺序），不排除就会拿回
+     * 同一个账号、命中 `tried.has` 而立即中断 —— 换号形同虚设。
+     * 对齐 Go 的 `PickExcluding(tried)`。
      */
     const tried = new Set<string>()
     let accountId = currentAccountId
@@ -684,7 +704,7 @@ export class TraeCnAdapter extends LlmAdapter {
       }
 
       // 走到这里就说明「池里没有下一个可试的账号了」：`getAvailableAccount` 返回空，
-      // 或返回的账号已在本轮试过（它被记了冷却标记后仍是排序第一时会出现）。
+      // 或返回的账号已在本轮试过（它被记了冷却标记后仍排在数组原位时会出现）。
       // 两种情况对用户都是「换号已到头」，与 `rotate-cap` 刻意区分。
       const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model, tried)
       if (!next || tried.has(next.entry.id)) {

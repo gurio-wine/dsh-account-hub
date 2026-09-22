@@ -3,15 +3,19 @@
  *
  * 为什么必须单独成表、且必须在**发起请求之前**判断：
  *
- * Host 侧两个积分端点（`credits.balances` / `credits.claimAll`）都以
- * `productById(provider)` 解析产品配置（见 `src/account-hub-rpc.ts`），而
- * **CodeArts 不属于 Buddy 系产品**，解析结果为 `undefined`，端点必定回
- * `bad-request: unsupported provider: codearts`。客户端早期在面板挂载时对所有
- * provider 无条件调用 `credits.balances`，于是每打开一次 CodeArts 面板都会：
+ * Host 侧积分端点按 provider 分派到**四套互不相同的协议**（见
+ * `src/account-hub-rpc.ts`）：Buddy 系经 `productById()` 取产品配置，
+ * 而 LobsterAI / Trae CN / CodeArts 与 Qoder 两区各自提前分支。**未知**
+ * provider 仍会落到 `bad-request`，因此客户端必须
+ * 在发请求之前按本表门控 —— 历史缺陷正是「对不支持的 provider 无条件发请求」：
+ * 早期 CodeArts 两项能力皆无（当时它确实没有实现），客户端却在面板挂载时对所有
+ * provider 调用 `credits.balances`，于是每打开一次 CodeArts 面板都会：
  *   1. 在控制台留下一条必然失败的报错（`[account-hub] load credits failed`）；
  *   2. 把该页面每个账号卡片的「积分」渲染成「查询失败」。
- * 这不是偶发故障，而是「请求了后端明确不支持的能力」这一设计缺陷的必然结果。
  * 修法不是在 UI 上吞掉错误，而是**不发起这个请求**。
+ * ⚠️ CodeArts 后来已接入真实实现（`src/codearts-credits.ts`，华为云
+ * SDK-HMAC-SHA256 签名），故其能力由全假变为全真 —— **门控机制本身不变**，
+ * 仍是防止「对不支持的 provider 发必然失败的请求」的那道闸。
  *
  * 之所以用一张表而不是散落的 `provider === 'buddy-cn' || provider === 'buddy'`
  * 判断：能力集合将来会随产品变化（新增 provider、某产品开放/下线接口），集中
@@ -21,47 +25,45 @@
  *
  * | provider        | balance（积分余额） | dailyCheckin（每日签到领取） |
  * |-----------------|---------------------|------------------------------|
- * | `codearts`      | ✗ 华为云账号体系     | ✗                            |
+ * | `codearts`      | ✓ 华为云签名         | ✓ 华为云签名（四步）          |
  * | `buddy-cn`      | ✓                   | ✓ Buddy CN 有签到接口         |
  * | `buddy`         | ✓                   | ✗ 国际版后端无签到接口        |
  * | `lobsterai`     | ✓                   | ✓ `client-activities` 三步流程 |
  * | `trae-cn`       | ✓ 通用池（IDE 路径能花的） | ✓ `checkin_credits` 两步 + 设备头 |
- * | `qoder`         | ✓ 与 CreditBalance 同构 | ✗ 每日 100 Credits 只能桌面 App 手动领 |
- * | `qoder-cn`      | ✓ 与 CreditBalance 同构（CN 两池容缺） | ✗ **疑似有签到但端点未知**（未验收） |
+ * | `qoder`         | ✓ 与 CreditBalance 同构 | ✗ 国际版无此活动 |
+ * | `qoder-cn`      | ✓ 与 CreditBalance 同构（CN 两池容缺） | ✓ `sash/api/v1/me/campaigns` 领取 |
  *
  * - `balance`：Buddy 系走 `POST /v2/billing/meter/get-user-resource`，该端点
  *   在 Buddy CN 与 Buddy（国际版）**通用**（仅 baseURL 随 `product.endpoint`
  *   切换）；LobsterAI 走 `GET /api/user/profile-summary`；Trae CN 走
  *   `POST /trae/api/v2/pay/web_user_ent_usage`，并按 `available_endpoint`
- *   取池（见下）。
+ *   取池（见下）；CodeArts 走 `GET /snap-manager/v1/statistics/plugin`
+ *   （与账户类型检测**同一响应**，见 `src/codearts-credits.ts`）。
  * - `dailyCheckin`：Buddy 系是 `checkin-activity-status` + `daily-checkin`，
  *   **仅 Buddy CN（中国版）**有；Buddy（国际版）内核里只有 `get-dosage-notify`
  *   （用量通知），没有签到接口，故其面板不渲染「一键领取积分」。LobsterAI 是
  *   `client-activities` 三步流程（`src/lobsterai-credits.ts`）；Trae CN 是
  *   `checkin_credits/status` → `claim` 两步（`src/trae-cn-credits.ts`，claim 必须
- *   带设备四件套），故两者都支持。Qoder **不支持**（见下）。
- * - ⚠️ Qoder 系**两个 region 的 `dailyCheckin` 都是 `false`，但理由互不相同**。
- *   下面两条必须**分开读**，不要合并成一句「Qoder 没有签到」：
+ *   带设备四件套）；CodeArts 是 `/v1/ops/delivery` → `/v1/ops/claim`
+ *   →（`id !== null` 时）`/v1/ops/confirm` 四步（`src/codearts-credits.ts`）；
+ *   Qoder CN 是 `sash/api/v1/me/campaigns` → `…/{campaignId}/claim` 两步
+ *   （`src/qoder-credits.ts`）。
+ * - ⚠️ Qoder 系**两个 region 的 `dailyCheckin` 不同，且 `qoder` 的 `false`
+ *   不能推广到 CN**。两条必须**分开读**：
  *
- *   1. `qoder`（**国际版**）—— **没有签到**：CLI2API 实测**国际版不显示签到**，
- *      该活动在国际版不存在（与 `buddy` 的「后端无接口」同形但不是同一种，
- *      国际版的每日 100 Credits 只能在 **Qoder 桌面 App 里手动领取**，
- *      服务端未暴露可编程的签到端点）。本插件也不打算用任何「模拟桌面客户端」
- *      的手段去领（那既不可靠也超出本插件的边界）。
+ *   1. `qoder`（**国际版**）—— `false`：CLI2API 实测**国际版不显示签到**，
+ *      该活动在国际版不存在（官方的每日 100 Credits 只能在 **Qoder 桌面 App
+ *      里手动领取**，服务端未暴露该端点）。本插件也不用任何「模拟桌面客户端」
+ *      的手段去领（既不可靠也超出本插件边界）。
  *
- *   2. `qoder-cn`（**国内版**）—— **疑似有签到，但端点未知**：CLI2API 的
- *      `RegionDescriptor` **只在 cn 一侧挂了 Checkin**，即国内版很可能有这项
- *      权益；但**端点至今未知、未验收**。故这里的 `false` 表达的是
- *      「**端点未知、未验证**」，**不是**「没有这项权益」、
- *      **更不是**「与国际版一样不存在该活动」。
- *      **将来拿到端点后把它翻成 `true`**（届时宿主侧还要补
- *      `credits.status` / `credits.claimAll` 的 `qoder-cn` 分支 —— 这两条
- *      现在对两个 region 一律结构性拒绝，见 `src/account-hub-rpc.ts`）。
+ *   2. `qoder-cn`（**国内版**）—— **`true`**：端点已由 keylog 解密抓包解出并
+ *      真机验收（2026-09-21），宿主侧 `credits.status` / `credits.claimAll`
+ *      的 `qoder-cn` 分支同步接线，**只对 CN 打开**。
  *
  *   两个 region 的 `balance` 都是 true，都**不能**从它推断签到也能做 ——
  *   正如不能用 Buddy（国际版）没有签到反推它查不到余额一样，两个能力彼此独立。
- *   在面板上的表现是：Qoder CN 面板**渲染**积分行与「刷新积分」、**不渲染**
- *   「一键领取积分」。
+ *   在面板上的表现是：两个 Qoder 面板都**渲染**积分行与「刷新积分」，
+ *   但**只有 Qoder CN** 渲染「一键领取积分」。
  *
  * `trae-cn` 的 `balance` 走 `POST /trae/api/v2/pay/web_user_ent_usage`，响应里的
  * 礼包按 `available_endpoint` 分池，而面板只显示**本 provider 实际能花的那个池**
@@ -78,7 +80,14 @@
 
 /** 单个 provider 的积分能力。 */
 export const CREDITS_CAPABILITIES = Object.freeze({
-  codearts: Object.freeze({ balance: false, dailyCheckin: false }),
+  // CodeArts（华为云）：余额与签到**两项都有**，走 `SDK-HMAC-SHA256` 签名协议
+  // （`src/codearts-credits.ts`，与另外三套协议都不共用）。
+  // ⚠️ 这里曾经是**全 false**，理由是「华为云账号体系没有腾讯计费接口」——
+  // 那个结论**已被上游真机验证推翻**：华为云侧有独立的「每日签到得积分」活动，
+  // 端点挂在 `snap-access` 网关（与本仓已在用的 `SNAP_MODEL_BUILTIN_URL` 同域），
+  // 用现有凭据的 AK/SK 签名即可访问，无需任何新登录流程。
+  // 「没有腾讯计费接口」本身没错，但**不能据此推断没有积分能力**。
+  codearts: Object.freeze({ balance: true, dailyCheckin: true }),
   // ⚠️ 下面两行是**对调式搬运**，不要照键名机械对应：
   // 签到能力**跟产品走、不跟键名走** —— 有签到接口的是中国版，而中国版改名后
   // 占用了 `buddy-cn` 这个键；国际版拿走了 `buddy` 键，它**没有**签到接口。
@@ -120,15 +129,14 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   ⚠️ 与 Trae CN 那条**不同**：Qoder 两 region 是**各自的池**，
   //   不存在「选哪个池显示」的问题，宿主侧也没有选池分支。
   //
-  // `dailyCheckin: false` —— ⚠️ **理由是「端点未知、未验证」，不是「没有权益」**，
-  //   也**不是**「与 `qoder` 一样不存在该活动」：
-  //   - `qoder`（国际版）：CLI2API 实测**国际版不显示签到**，活动不存在；
-  //   - `qoder-cn`：CLI2API 的 `RegionDescriptor` **只在 cn 挂 Checkin** ——
-  //     疑似有签到，但**端点至今未知、未验收**。
-  //   故这一行是**待办**而不是结论：**拿到端点后翻 true**
-  //   （届时宿主侧还要补 credits.status / claimAll 的 qoder-cn 分支）。
-  //   单测有断言钉死当前取值与「两个 region 理由不同」这件事。
-  'qoder-cn': Object.freeze({ balance: true, dailyCheckin: false }),
+  // `dailyCheckin: true` —— 签到**只对 CN 打开**（国际版维持 false，见上）。
+  //   端点经 keylog 解密抓包解出并真机验收（2026-09-21）：
+  //   `GET /sash/api/v1/me/campaigns` → `POST …/{campaignId}/claim`（body 空串）。
+  //   ⚠️ 它挂在 **`/sash/`** 前缀下、**不是** `/api/`，也**不走 wasm 签名路径** ——
+  //   早期只按 `/api/` 前缀搜端点，因此误判「Qoder 无签到」（那时这里的值是
+  //   `false`，理由是「端点未知」）。宿主侧 `credits.status` / `credits.claimAll`
+  //   的 `qoder-cn` 分支已同步接线（`src/account-hub-rpc.ts`），国际版仍结构性拒绝。
+  'qoder-cn': Object.freeze({ balance: true, dailyCheckin: true }),
 });
 
 /**
@@ -144,7 +152,8 @@ export function supportsCreditBalance(provider) {
 /**
  * 该 provider 是否能执行每日签到领取（一键领取积分）。
  *
- * 为 false 时面板不渲染该按钮（CodeArts 无此能力；Buddy 国际版后端无接口）。
+ * 为 false 时面板不渲染该按钮（Buddy 国际版后端无接口；Qoder 国际版活动不存在
+ * —— 两者理由不同，见上）。
  */
 export function supportsDailyCheckin(provider) {
   return CREDITS_CAPABILITIES[provider]?.dailyCheckin === true;
