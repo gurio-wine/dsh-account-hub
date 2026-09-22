@@ -375,7 +375,7 @@ function CreditBalanceRow({ balance, error, loading }) {
       : null));
 }
 
-function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, credits, creditsLoading, showCredits }) {
+function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, credits, creditsLoading, showCredits, showCheckin, checkedIn, checkingThisAccount, onCheckin }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
@@ -432,6 +432,15 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, cre
             }, `${modelId} · ${formatTime(resetAt)}`)))
       : null,
     React.createElement('div', { className: 'dim-ah-accountActions' },
+      showCheckin
+        ? React.createElement('button', {
+            className: 'dim-ah-btn',
+            'data-kind': 'success',
+            title: checkedIn ? '今日已签到' : `为 ${account.nickname || account.id} 执行每日签到`,
+            disabled: busy || checkedIn || checkingThisAccount,
+            onClick: () => onCheckin(account.id),
+          }, checkedIn ? '已签' : checkingThisAccount ? '签到中…' : '签到')
+        : null,
       React.createElement('button', {
         className: 'dim-ah-btn',
         title: RETEST_HELP,
@@ -847,6 +856,11 @@ function ProviderPanel({ provider, rpcCall }) {
   // 账号发网络请求，不能拖慢账号列表本身的渲染。
   const [credits, setCredits] = React.useState({});
   const [creditsLoading, setCreditsLoading] = React.useState(false);
+  // 各账号今日签到状态：accountId → { checkedInToday, checking }。由
+  // `credits.checkinStatus`（读内存零网络）在挂载时拉取，单账号签到成功后再由
+  // `checkin.perform` 响应局部更新。已签/未签判定只信宿主的 `checkedIn`，客户端
+  // 不自己算今日纪元日数。
+  const [checkinsByAccount, setCheckinsByAccount] = React.useState({});
   /**
    * 弹窗被拦截时的**手动登录链接**（`{ url }` | null）。
    *
@@ -966,12 +980,51 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   }, [provider, rpcCall, canLoadCredits]);
 
+  /**
+   * 拉取本 provider 各账号的今日签到状态（`credits.checkinStatus`）。
+   *
+   * 纯内存读、不发任何网络请求。结果映射为 `accountId → { checkedInToday }`，
+   * 供头部「一键签到」的「全部已签」与每账号「签到」按钮的「已签」态使用。
+   *
+   * 只在支持签到的 provider 上调用（`supportsCredits` 门控，与按钮渲染同源），
+   * 否则宿主对无签到能力 provider 返回空表、拉它也是空转。
+   *
+   * **用 accountsRef 而非闭包里的 accounts**：本函数与 loadAccounts 在挂载时并发
+   * 发起（见下方 useEffect），此刻闭包捕获的 accounts 仍是初始空数组——仅凭空数组
+   * 提前 `setCheckinsByAccount({})` 会把稍后来自宿主的状态整个清掉。ref 始终指向
+   * 最新值，只有当它非空（账号列表已就绪）才用宿主返回的结果覆盖。
+   */
+  const loadCheckinStatus = React.useCallback(async () => {
+    if (!supportsCredits) return;
+    try {
+      const res = await rpcCall('credits.checkinStatus', { provider });
+      if (!mounted.current) return;
+      // 用 accountsRef 的当前快照比对：宿主按 today 算好 checkedIn，这里只看
+      // 「账号真的在列表里」就采纳；账号为空时（列表还没就绪）不写，避免清空。
+      if (accountsRef.current.length > 0 || res.checkedIn) {
+        const next = {};
+        for (const account of accountsRef.current) {
+          next[account.id] = { checkedInToday: Boolean(res.checkedIn?.[account.id]) };
+        }
+        setCheckinsByAccount(next);
+      }
+    } catch (caught) {
+      // 签到状态是可选的增强信息：拉不到不该让面板崩溃或报错，静默即可；
+      // 头部按钮会按「全部未签」推出（allCheckedIn 恒 false），单签按钮正常可点。
+      console.warn('[account-hub] load checkin status failed:', caught);
+    }
+  }, [provider, rpcCall, supportsCredits]);
+
   React.useEffect(() => {
     mounted.current = true;
     void loadAccounts();
     // 只有支持余额查询的 provider 才在挂载时拉积分；CodeArts 不会走到这里
     // （loadCredits 内部也有一道门控，这里提前判掉是为了连 loading 状态都不翻）。
     if (canLoadCredits) void loadCredits();
+    // 只要支持签到就拉一次签到状态：可以是最新账号列表就绪后，但这里与
+    // loadAccounts 并发也无妨——loadCheckinStatus 内部用 accountsRef 防并发读到
+    // 空数组（上面注释）。每次进入 Hub 页面都会触发本 effect → 每次进入都检测。
+    void loadCheckinStatus();
     return () => { mounted.current = false; };
     // loadCredits 依赖 accounts，但这里只想在挂载/provider 变化时各跑一次；
     // 账号刷新后由操作方显式再调 loadCredits（见 claimCredits）。
@@ -1000,7 +1053,11 @@ function ProviderPanel({ provider, rpcCall }) {
     setClaiming(true);
     setClaimNotice(null);
     try {
-      const res = await rpcCall('credits.claimAll', { provider });
+      // 头部「一键签到」走 `checkin.perform`（不带 accountId = 该 provider 全量）。
+      // 响应与 `credits.claimAll` **同构**（results[].nickname + 完整 ClaimOutcome
+      // 对象），故下方的摘要/失败明细消费代码（buildClaimNotice / claimFailureLines
+      // / formatClaimFailureLine）一字不改即可复用。
+      const res = await rpcCall('checkin.perform', { provider });
       // 摘要与失败明细一起交给 ClaimNotice（含每个失败账号的服务端 code +
       // message —— 早期实现只解构 summary，把用户判断原因的唯一依据整块丢了）。
       const notice = buildClaimNotice(res);
@@ -1009,12 +1066,56 @@ function ProviderPanel({ provider, rpcCall }) {
       await loadAccounts();
       // 领取会改变余额，顺带刷新一次，免得卡片还显示领取前的数字
       await loadCredits();
+      // 一键领取后各账号今日状态已变，刷新签到状态让头部按钮翻成「全部已签」。
+      await loadCheckinStatus();
     } catch (caught) {
       console.error('[account-hub] claim credits failed:', caught);
       if (!mounted.current) return;
       setClaimNotice({ tone: 'error', text: caught?.message || '领取积分失败' });
     } finally {
       if (mounted.current) setClaiming(false);
+    }
+  };
+
+  /**
+   * 本 provider 全部账号今日是否都已签到。
+   *
+   * 由 `credits.checkinStatus` 带回的数据派生：只要列表非空且每个账号
+   * `checkedInToday` 都为 true 即为「全部已签」。头部「一键签到」按钮据此
+   * 显示「全部已签」并禁用。拉取失败（checkinsByAccount 缺失条目）时该账号
+   * 视为未签 → allCheckedIn 恒 false，不会误杀用户的签到入口。
+   */
+  const allCheckedIn = supportsCredits
+    && accounts.length > 0
+    && accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true);
+
+  /**
+   * 单账号签到（「签到」单片按钮）。
+   *
+   * 调 `checkin.perform` 携带 accountId；响应里的 `checkedInToday` 仅作参考，
+   * 关键是用 `results[].outcome` 判定后续状态。**已签或签到成功都算成功**（宿主
+   * 对服务端 already-claimed 也已写今日），失败/未开启不回写为「已签」，下次
+   * 进入/触发重试。成功后局部更新该账号状态，并联动头部按钮（若全签则变「全部
+   * 已签」禁用）。
+   */
+  const checkinAccount = async (accountId) => {
+    if (!supportsCredits) return;
+    setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: false, checking: true } }));
+    try {
+      const res = await rpcCall('checkin.perform', { provider, accountId });
+      if (!mounted.current) return;
+      // 单账号响应带 results[].outcome（完整 object）：kind === 'claimed'（签到
+      // 成功）与 'already-claimed'（服务端今日已领）都算「今日已签」；inactive /
+      // failed **不写**，下次进入或触发重试（对齐设计 §2 宿主口径，失败不落「已签」）。
+      const outcome = res?.results?.[0]?.outcome;
+      const done = outcome?.kind === 'claimed' || outcome?.kind === 'already-claimed';
+      setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: done, checking: false } }));
+      // 签到带起余额刷新（领取可能改变余额数字，与 claimCredits 同款）。
+      if (canLoadCredits) void loadCredits();
+    } catch (caught) {
+      console.error('[account-hub] checkin failed:', caught);
+      if (!mounted.current) return;
+      setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: false, checking: false } }));
     }
   };
 
@@ -1215,10 +1316,11 @@ function ProviderPanel({ provider, rpcCall }) {
         supportsCredits
           ? React.createElement('button', {
               className: 'dim-ah-btn',
-              title: `领取全部 ${providerLabel} 账号（含已停用）的每日签到积分`,
-              disabled: claiming || accounts.length === 0,
+              'data-kind': 'success',
+              title: `为全部 ${providerLabel} 账号（含已停用）执行每日签到`,
+              disabled: claiming || accounts.length === 0 || allCheckedIn,
               onClick: () => void claimCredits(),
-            }, claiming ? '领取中…' : '一键领取积分')
+            }, claiming ? '签到中…' : allCheckedIn ? '全部已签' : '一键签到')
           : null,
         React.createElement('button', {
           className: 'dim-ah-btn',
@@ -1294,6 +1396,10 @@ function ProviderPanel({ provider, rpcCall }) {
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
+                showCheckin: supportsCredits,
+                checkedIn: checkinsByAccount[account.id]?.checkedInToday === true,
+                checkingThisAccount: checkinsByAccount[account.id]?.checking === true,
+                onCheckin: (id) => void checkinAccount(id),
                 onToggle: toggleAccount,
                 onDelete: deleteAccount,
                 onRetest: (id) => void runLimitAction('retest', id),

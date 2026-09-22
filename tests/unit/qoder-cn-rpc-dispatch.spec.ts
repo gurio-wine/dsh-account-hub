@@ -569,18 +569,21 @@ describe('credits.balances —— qoder-cn 用 CN 的额度端点与两池 fixtu
 // ── credits.status / credits.claimAll 的 qoder-cn 分支 ───────────────────────
 
 /**
- * 签到**只对 `qoder-cn` 接线**，国际版 `qoder` 维持结构性拒绝。
+ * 签到对 `qoder-cn` 与 `qoder` 两个 region **都**接线（共用
+ * `src/qoder-credits.ts` 一份实现、按传入的 product 现算 host）。CN 端点由
+ * keylog 解密抓包解出并真机验收（2026-09-21），国际版同端点已真机探测
+ * （2026-09-23）200、响应与 CN 逐字节同构。
  *
- * ⚠️ 本组用例的前身断言的是「**两个 region 都刻意不加分支**，一律回
- * `unsupported provider`」—— 那条契约已随 CN 签到端点解出而作废（端点由 keylog
- * 解密抓包解出并真机验收，2026-09-21）。现在守的是**替换后的契约**：
+ * ⚠️ 本组用例的前身断言的是「**只有 CN 加分支、国际版刻意拒绝**」——
+ * 那条契约已随国际版真机探测推翻（见 `credits-capabilities.spec.ts`）。
+ * 现在守的是**替换后的契约**：
  *
  * 1. `qoder-cn` 被接受，且出网全部落在 **CN 的 host** 上（`/sash/…/campaigns`）；
- * 2. **国际版 `qoder` 仍回 unsupported provider** —— 活动只属于 CN，给它接线会
- *    让面板挂上一个每次点击都必然失败的按钮（客户端另有能力矩阵在请求前挡）；
+ * 2. **国际版 `qoder` 在 `qoder-rpc-dispatch.spec.ts` 单独测**（走 `.qoder.sh`），
+ *    本文件只锁 CN 侧的 host 不串；
  * 3. 幂等判据是响应体的 `replayed`，**不是** HTTP 200（重复领取同样回 200）。
  */
-describe('credits.status / credits.claimAll —— 签到只对 qoder-cn 接线', () => {
+describe('credits.status / credits.claimAll —— qoder-cn 走 CN host 正常分派', () => {
   /** 一条真机形状的可领活动（`CLAIM_BENEFIT` + `CLAIMABLE`）。 */
   function claimableCampaign(): Record<string, unknown> {
     return {
@@ -712,24 +715,13 @@ describe('credits.status / credits.claimAll —— 签到只对 qoder-cn 接线'
 
   const METHODS = ['credits.status', 'credits.claimAll'] as const
 
-  it.each(METHODS)('%s 对国际版 qoder 仍回 unsupported provider，且**一次网都不出**', async (method) => {
-    // 活动**只属于 CN**。给国际版接线会让面板多出一个每次点击都必然失败的按钮
-    // （客户端靠能力矩阵在请求前挡，这里是后端的兜底拒绝）。
+  it.each(METHODS)('%s 对未知 provider 的拒绝形态一致', async (method) => {
+    // 未知 provider（不是 qoder / qoder-cn）才回 unsupported provider。
     const h = createHarness(() => new Response('{}', { status: 200 }))
-    const result = await h.call(method, { provider: 'qoder' })
+    const result = await h.call(method, { provider: 'mystery' })
     expect(result.ok).toBe(false)
     if (result.ok) return
-    expect(result.error.message).toBe('unsupported provider: qoder')
-    expect(h.calls).toHaveLength(0)
-  })
-
-  it.each(METHODS)('%s 不再把 qoder-cn 当成不支持的 provider', async (method) => {
-    // ⚠️ **反向**断言（本组用例的前身正是这条的反面）：CN 必须有分支。
-    // 若谁把 `qoder-cn` 的分支删掉，CN 面板的「一键领取积分」会变成
-    // 一个必然失败的按钮。
-    const h = createHarness(responder())
-    const result = await h.call(method, { provider: 'qoder-cn' })
-    expect(result.ok, `${method} 不该拒绝 qoder-cn：${JSON.stringify(result)}`).toBe(true)
+    expect(result.error.message).toBe('unsupported provider: mystery')
   })
 })
 

@@ -4,6 +4,7 @@ import Schema from '@deepseek-ai/schemastery'
 import {
   emptyAccountHubDocument,
   openAccountHubStorage,
+  sanitizeCheckins,
   type AccountHubStorage,
 } from './account-hub-storage.js'
 import { migrateAccountHubIntoStorage } from './account-hub-migration.js'
@@ -67,6 +68,8 @@ interface AccountHubSettingsValue {
   disabledModels?: ModelDisableMap
   /** 逐模型上下文窗口预算（见 {@link ContextBudgetMap}）。 */
   contextBudgets?: ContextBudgetMap
+  /** 自动签到记录（`provider:accountId` → 本地纪元日数，见 `CheckinsMap`）。 */
+  checkins?: Record<string, number>
   /** 数据版本号，供一次性迁移 short-circuit（见 provider-rename-migration.ts）。 */
   schemaVersion?: number
 }
@@ -76,11 +79,14 @@ interface AccountHubSettingsValue {
  *
  * - `0`（或字段缺失）= 旧命名：provider 为 `buddy`（中国版）/ `workbuddy`（国际版）；
  * - `1` = 新命名（`buddy-cn` / `buddy`），已由
- *   `src/provider-rename-migration.ts` 迁移完毕。
+ *   `src/provider-rename-migration.ts` 迁移完毕；
+ * - `2` = 文档新增第五字段 `checkins`（自动签到记录）。该迁移只是**补字段**
+ *   （旧文档读入时为空对象，无需搬动任何既有数据），由 `src/account-hub-storage.ts`
+ *   的 `sanitizeAccountHubDocument` 在读路径兜底，不改变既有数据的含义。
  *
  * 迁移函数在版本号 ≥1 时整体 short-circuit，因此这个数字只会前进。
  */
-export const ACCOUNT_HUB_SCHEMA_VERSION = 1
+export const ACCOUNT_HUB_SCHEMA_VERSION = 2
 
 /** ctx.settings.register() 返回的 owner scope（只用到 get/replace）。 */
 interface SettingsScopeLike {
@@ -91,7 +97,7 @@ interface SettingsScopeLike {
 /**
  * 一次整体写入的载荷形状。
  *
- * 与 storage 域的 `AccountHubDocument` **刻意同形**（四件套齐全）：两条写路径
+ * 与 storage 域的 `AccountHubDocument` **刻意同形**（五件套齐全）：两条写路径
  * （storage 的 `global.set` 与 settings 的 `replace`）都是整体替换，用同一个形状
  * 可以让 `persist()` 成为唯一写落点，杜绝「某条路径漏带某个字段」。
  */
@@ -99,6 +105,7 @@ interface AccountHubDocumentLike {
   accounts: ProviderAccountEntry[]
   disabledModels: ModelDisableMap
   contextBudgets: ContextBudgetMap
+  checkins: Record<string, number>
   schemaVersion: number
 }
 
@@ -138,6 +145,10 @@ const accountHubSchema = Schema.object({
   // `Schema.dict(Schema.any())`：key 是动态的 provider / 模型 id。
   // **必须带 `.default({})`**：namespace 首次注册时配置里没有该字段。
   contextBudgets: Schema.dict(Schema.any()).default({}),
+  // 自动签到记录（`provider:accountId` → 本地纪元日数）。键与值都是动态的，
+  // 用 dict 承接，单项由 AccountPool 自身在读写时保证。
+  // **必须带 `.default({})`**：老配置里没有该字段（见 schemaVersion 同理）。
+  checkins: Schema.dict(Schema.any()).default({}),
   // 数据版本号。`0` = 旧命名（buddy=中国版 / workbuddy=国际版）尚未迁移；
   // 见 {@link ACCOUNT_HUB_SCHEMA_VERSION}。**必须带 default**：老配置文件里没有
   // 这个字段，缺失时按 0 处理才等价于「迁移尚未执行」。
@@ -251,10 +262,19 @@ export class AccountPool {
   /**
    * 逐模型上下文窗口预算的**权威进程内副本**（同 {@link cache}）。
    *
-   * ⚠️ 它与账号、黑名单、版本号是**同一份文档的四件套**：任何一次写入都是整体
-   * replace，四者必须互相携带，漏一个就会在下次别的写入里被清空。
+   * ⚠️ 它与账号、黑名单、签到、版本号是**同一份文档的五件套**：任何一次写入都是整体
+   * replace，五者必须互相携带，漏一个就会在下次别的写入里被清空。
    */
   private budgetCache: ContextBudgetMap = {}
+  /**
+   * 自动签到记录的**权威进程内副本**（同 {@link cache}）。
+   *
+   * ⚠️ 它与账号、黑名单、预算、版本号是**同一份文档的五件套**：任何一次写入都是
+   * 整体 replace，五者必须互相携带，漏一个就会在下次别的写入里被清空。
+   * 字段语义与 {@link budgetCache} 完全同构（键 `provider:accountId`，见
+   * `sanitizeCheckins`）。
+   */
+  private checkinCache: Record<string, number> = {}
   /**
    * 数据版本号的**权威进程内副本**（同 {@link cache}）。
    *
@@ -347,7 +367,7 @@ export class AccountPool {
     }
   }
 
-  /** 首次访问时从**主路径**载入四件套。 */
+  /** 首次访问时从**主路径**载入五件套。 */
   private ensureLoaded(): void {
     if (this.loaded) return
     this.loaded = true
@@ -356,6 +376,7 @@ export class AccountPool {
       this.cache = doc.accounts
       this.modelCache = doc.disabledModels
       this.budgetCache = doc.contextBudgets
+      this.checkinCache = doc.checkins
       this.versionCache = doc.schemaVersion
       return
     }
@@ -375,6 +396,8 @@ export class AccountPool {
     // 上下文窗口预算同理（比黑名单更晚加入）：缺失时保持空表，
     // 等价于"全部模型用默认档"。
     this.budgetCache = sanitizeContextBudgets(value?.contextBudgets)
+    // 签到记录同理（比预算更晚加入）：缺失时保持空表（等价于"全部未签到"）。
+    this.checkinCache = sanitizeCheckins(value?.checkins)
     // 版本号同理：老配置文件（或首次安装）没有该字段 → 按 0 处理，
     // 即「迁移尚未执行」。
     const version = value?.schemaVersion
@@ -382,9 +405,9 @@ export class AccountPool {
   }
 
   /**
-   * 持久化四件套。
+   * 持久化五件套。
    *
-   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，四件套一起带上。
+   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，五件套一起带上。
    * 主路径是 storage 域的 `global.set`（整体替换那份单例文档）；回退路径是
    * settings scope 的 `replace`（同样是整体替换，漏带即清空）。
    */
@@ -396,6 +419,7 @@ export class AccountPool {
         accounts: document.accounts,
         disabledModels: document.disabledModels,
         contextBudgets: document.contextBudgets,
+        checkins: document.checkins,
         schemaVersion: document.schemaVersion,
       })
       return
@@ -440,11 +464,11 @@ export class AccountPool {
   }
 
   /**
-   * 一次性整体写入账号列表、模型黑名单与上下文预算（外加版本号）。
+   * 一次性整体写入账号列表、模型黑名单与上下文预算（外加版本号和签到）。
    *
    * 为什么需要它：{@link writeAccounts} / {@link writeModels} 各自只接受
    * 自己那一半，调用方要先写一半再写另一半，中间崩溃会留下半迁移状态。
-   * 一次性迁移必须**原子**地落盘「账号 + 黑名单 + 上下文预算 + 版本号」四件套，
+   * 一次性迁移必须**原子**地落盘「账号 + 黑名单 + 上下文预算 + 版本号」五件套，
    * 故这里直接构造完整的 replace 载荷，只发一次写。
    *
    * ⚠️ **上下文预算原样带上**（不是本次迁移的对象，但同属一个 namespace）：
@@ -453,19 +477,22 @@ export class AccountPool {
    * @param accounts - 新的账号列表。
    * @param disabledModels - 新的模型黑名单。
    * @param schemaVersion - 迁移完成后的版本号。
+   * @param checkins - 签到记录；缺省取进程内副本（与 `contextBudgets` 的处理一致）。
    */
   async replaceAll(
     accounts: ProviderAccountEntry[],
     disabledModels: ModelDisableMap,
     schemaVersion: number = ACCOUNT_HUB_SCHEMA_VERSION,
+    checkins?: Record<string, number>,
   ): Promise<void> {
     // ⚠️ 必须先 ensureLoaded()：本方法只从调用方接收三件套，**上下文预算取自进程内
     // 副本**（它不是迁移对象）。没载入就写，会把用户已有的档位选择覆盖成空。
-    // 同 `setModelDisabled` / `writeContextBudget` 的那条陷阱。
+    // 同 `setModelDisabled` / `writeContextBudget` 的那条陷阱。签到同理。
     this.ensureLoaded()
     this.cache = accounts
     this.modelCache = disabledModels
     this.versionCache = schemaVersion
+    if (checkins !== undefined) this.checkinCache = checkins
     this.loaded = true
     if (this.storage === undefined && !this.scope) {
       this.ctx.logger?.warn?.('[account-hub] 无 storage 域与 settings scope，数据迁移结果未持久化')
@@ -475,6 +502,7 @@ export class AccountPool {
       accounts,
       disabledModels,
       contextBudgets: this.budgetCache,
+      checkins: checkins ?? this.checkinCache,
       schemaVersion,
     }, '无 settings scope，数据迁移结果未持久化')
   }
@@ -482,9 +510,9 @@ export class AccountPool {
   /**
    * 持久化账号列表（同时更新进程内权威副本）。
    *
-   * **必须连同黑名单、上下文预算与版本号一起写回**：settings 的 `replace()` 是整体替换，
-   * 只写 `{ accounts }` 会把同一 namespace 下的 `disabledModels` 与 `contextBudgets`
-   * 抹掉，`schemaVersion` 同理会被重置为 0（于是改名迁移会在每次启动时重跑）。
+   * **必须连同黑名单、上下文预算、签到与版本号一起写回**：settings 的 `replace()` 是整体替换，
+   * 只写 `{ accounts }` 会把同一 namespace 下的 `disabledModels`、`contextBudgets`
+   * 与 `checkins` 抹掉，`schemaVersion` 同理会被重置为 0（于是改名迁移会在每次启动时重跑）。
    */
   private async writeAccounts(accounts: ProviderAccountEntry[]): Promise<void> {
     this.cache = accounts
@@ -497,6 +525,7 @@ export class AccountPool {
       accounts,
       disabledModels: this.modelCache,
       contextBudgets: this.budgetCache,
+      checkins: this.checkinCache,
       schemaVersion: this.versionCache,
     }, '无 settings scope，账号变更未持久化')
   }
@@ -557,11 +586,12 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[account-hub] 无持久化通路，模型黑名单变更未持久化')
       return
     }
-    // 与 writeAccounts 对称：整体 replace 必须携带账号列表、上下文预算与版本号，否则会被清空。
+    // 与 writeAccounts 对称：整体 replace 必须携带账号列表、上下文预算、签到与版本号，否则会被清空。
     await this.persist({
       accounts: this.cache,
       disabledModels,
       contextBudgets: this.budgetCache,
+      checkins: this.checkinCache,
       schemaVersion: this.versionCache,
     }, '无 settings scope，模型黑名单变更未持久化')
   }
@@ -612,13 +642,96 @@ export class AccountPool {
       this.ctx.logger?.warn?.('[account-hub] 无持久化通路，上下文窗口预算变更未持久化')
       return
     }
-    // 与 writeAccounts / writeModels 对称：整体 replace 必须携带另外三件套，否则会被清空。
+    // 与 writeAccounts / writeModels 对称：整体 replace 必须携带另外四件套，否则会被清空。
     await this.persist({
       accounts: this.cache,
       disabledModels: this.modelCache,
       contextBudgets,
+      checkins: this.checkinCache,
       schemaVersion: this.versionCache,
     }, '无 settings scope，上下文窗口预算变更未持久化')
+  }
+
+  /**
+   * 读取某账号的签到日（本地时区纪元日数）。
+   *
+   * 只读进程内权威副本，同步返回 —— 与 {@link contextBudget} 同款。不在表里的键
+   * （尚未签过 / 该键不存在）读回 `undefined` = 今日未签。
+   *
+   * @param provider - provider id。
+   * @param accountId - 账号 id。
+   */
+  checkinDay(provider: string, accountId: string): number | undefined {
+    this.ensureLoaded()
+    return this.checkinCache[`${provider}:${accountId}`]
+  }
+
+  /**
+   * 持久化某账号的签到日。
+   *
+   * 只改**单个键**（读 → 改 → 整体 replace），与 {@link writeContextBudget} 同款。
+   * 键格式 `${provider}:${accountId}`。
+   *
+   * ⚠️ 必须先 ensureLoaded()：整体 replace 若在 `loaded` 尚未置位时跑，会把账号、
+   * 黑名单、预算、版本号一起覆盖成空（同 `setModelDisabled` / `writeContextBudget`
+   * 那条陷阱）。读经 `ensureLoaded`、写经 `persist` 的唯一通路。
+   *
+   * @param provider - provider id。
+   * @param accountId - 账号 id。
+   * @param day - 本地时区纪元日数（今日 `todayDayNumber()`）。
+   */
+  async writeCheckinDay(provider: string, accountId: string, day: number): Promise<void> {
+    this.ensureLoaded()
+    const next: Record<string, number> = { ...this.checkinCache }
+    next[`${provider}:${accountId}`] = day
+    await this.writeCheckins(next)
+  }
+
+  /** 持久化签到记录（同时更新进程内权威副本）。 */
+  private async writeCheckins(checkins: Record<string, number>): Promise<void> {
+    this.checkinCache = checkins
+    this.loaded = true
+    if (this.storage === undefined && !this.scope) {
+      this.ctx.logger?.warn?.('[account-hub] 无持久化通路，签到记录变更未持久化')
+      return
+    }
+    // 与 writeAccounts / writeModels / writeBudgets 对称：整体 replace 必须携带
+    // 另外四件套，否则会被清空。
+    await this.persist({
+      accounts: this.cache,
+      disabledModels: this.modelCache,
+      contextBudgets: this.budgetCache,
+      checkins,
+      schemaVersion: this.versionCache,
+    }, '无 settings scope，签到记录变更未持久化')
+  }
+
+  /**
+   * 清理该 provider 的**孤儿签到键**（兜底，供设置页打开面板时调用）。
+   *
+   * 删除 `checkins` 里 `provider:` 前缀匹配、但 accountId **不在当前账号列表**的键。
+   * 「账号删除时」那条清理（{@link removeAccount}）只在单键发生时顺带做；这是
+   * **残留兜底**：太久不删的账号若在别处（如 provider 改名）留下残余，面板打开时
+   * 一次性清掉。无账号时跳过。
+   *
+   * @param provider - provider id。
+   */
+  async pruneOrphanCheckins(provider: string): Promise<void> {
+    const accounts = this.listAccountsByProvider(provider)
+    if (accounts.length === 0) return
+    const keep = new Set(accounts.map((a) => a.id))
+    const prefix = `${provider}:`
+    let changed = false
+    const next: Record<string, number> = {}
+    for (const [key, day] of Object.entries(this.checkinCache)) {
+      if (key.startsWith(prefix) && !keep.has(key.slice(prefix.length))) {
+        changed = true
+        continue
+      }
+      next[key] = day
+    }
+    if (!changed) return
+    await this.writeCheckins(next)
   }
 
   /** 列出某个 provider 的所有账号（含状态信息） */
@@ -699,7 +812,7 @@ export class AccountPool {
     await this.writeAccounts(next)
   }
 
-  /** 删除账号（同时清理凭据） */
+  /** 删除账号（同时清理凭据，并顺带清掉其孤儿签到键） */
   async removeAccount(id: string): Promise<void> {
     const accounts = this.readAccounts()
     const entry = accounts.find(a => a.id === id)
@@ -707,6 +820,11 @@ export class AccountPool {
     try {
       await this.ctx.credentials.unset(credentialRef(entry.credentialRef))
     } catch { /* 凭据可能已被删除 */ }
+    // 清除该账号的签到记录（`provider:${id}` 精确键），随本次整体 replace 顺带写。
+    // 与 `clearModelRateLimits` 同模式：不额外写盘，避免删除账号触发两次落盘。
+    if (Object.prototype.hasOwnProperty.call(this.checkinCache, `${entry.provider}:${id}`)) {
+      delete this.checkinCache[`${entry.provider}:${id}`]
+    }
     await this.writeAccounts(accounts.filter(a => a.id !== id))
   }
 
@@ -1062,6 +1180,35 @@ export class AccountPool {
     })
     if (changed) await this.writeAccounts(next)
   }
+}
+
+/**
+ * 计算「今天」的**本地时区纪元日数**。
+ *
+ * 口径：取 `new Date(...)` 的**本地年月日**（`getFullYear()` / `getMonth()` /
+ * `getDate()`），再换算成 epoch day（`Date.UTC(y,m,d) / 86400000`）。这与
+ * `checkins` 存的值（本地当天的日数）在同一口径，可直接做整数相等比较。
+ *
+ * ⚠️ 不要用 `getUTCDay`，也不用时间戳毫秒数 —— 跨时区 / 跨日边界都会乱。时区切换、
+ * 夏令时的偏移只在**这一处**收敛，存的值本身不依赖「今天」。
+ *
+ * @param now - 要换算的时刻；缺省为当前时间（便于测试注入固定时刻）。
+ */
+export function todayDayNumber(now: Date = new Date()): number {
+  return Math.floor(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) / 86_400_000)
+}
+
+/**
+ * 清理某个 provider 的**孤儿签到键**（兜底，供设置页打开面板时调用）。
+ *
+ * 直接委托给 {@link AccountPool.pruneOrphanCheckins}。以自由函数形态导出，
+ * 便于面板调用方不持有 pool 类型也能直接复用（见设计文档 §孤儿清理策略）。
+ *
+ * @param pool - AccountPool（读账号列表与写 checkins 的唯一入口）。
+ * @param provider - provider id。
+ */
+export async function pruneOrphanCheckins(pool: AccountPool, provider: string): Promise<void> {
+  await pool.pruneOrphanCheckins(provider)
 }
 
 /**

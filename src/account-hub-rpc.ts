@@ -8,12 +8,13 @@
  *           account.reorder / account.refresh / account.retest / account.retestAll /
  *           account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
+ *           credits.checkinStatus / checkin.perform / checkin.sweep /
  *           model.list / model.setDisabled / model.setContextBudget
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, isCredentialRefName, type CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { AccountPool } from './account-pool.js'
+import { AccountPool, todayDayNumber } from './account-pool.js'
 import type { CodeArtsAuth } from './service.js'
 import type { BuddyAuth } from './buddy-auth.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
@@ -94,6 +95,7 @@ import type {
   RpcCreditsStatusResponse,
   RpcCreditsClaimAllRequest,
   RpcCreditsClaimAllResponse,
+  RpcCreditsClaimAccountResult,
   RpcCreditsClaimSummary,
   RpcCreditsBalancesRequest,
   RpcCreditsBalancesResponse,
@@ -110,6 +112,101 @@ import type {
 export const ACCOUNT_HUB_API_PATH = '/api/account-hub'
 /** Gateway RPC 端点名（connection.rpc.call 的 endpoint 参数） */
 const ACCOUNT_HUB_ENDPOINT = 'account-hub'
+
+/**
+ * 自动签到（Auto Check-in）**可签到 provider** 的宿主侧真相源。
+ *
+ * sweep（`checkin.sweep`）与 `checkin.perform` 的 provider 全量退化只遍历这套集合。
+ * ⚠️ 它是宿主侧的独立常量：客户端的能力真相源在
+ * `plugin-src/client/credits-capabilities.js`（esbuild 进 bundle，宿主无法 import）。
+ * 两处靠 `tests/unit/credits-capabilities.spec.ts` 的**相等断言**锁一致，漂移当场抓红。
+ *
+ * 六条（qoder 国际版已拍板接入，2026-09-23）：buddy-cn / lobsterai / trae-cn /
+ * codearts / qoder / qoder-cn。
+ */
+export const CHECKIN_ELIGIBLE_PROVIDERS: ReadonlySet<string> = new Set([
+  'buddy-cn',
+  'lobsterai',
+  'trae-cn',
+  'codearts',
+  'qoder',
+  'qoder-cn',
+])
+
+/**
+ * sweep 的**模块级互斥信号量**。
+ *
+ * 4 小时定时器与页面触发（`checkin.perform` 无 accountId / `checkin.sweep`）可能
+ * 同时跑。入口若非空闲直接跳过本趟（不排队、不重入），返回「进行中」摘要。
+ * 因每账号依次 `await`、服务端本身幂等（already-claimed 也写今日），同一账号
+ * 几乎不可能被两路真正走到 claim；即便竞态，两 claim 中后到者拿到
+ * already-claimed 也写今日，结果一致。—— 语义见设计文档 §9。
+ */
+export let sweepRunning = false
+
+/** 重置 sweep 互斥（仅测试用）。 */
+export function __resetSweepRunning(): void {
+  sweepRunning = false
+}
+
+/**
+ * 执行一次**单个账号**或**单个 provider 全量**的自动签到（复用 claimAll 分派逻辑）。
+ *
+ * 内部实现见下方 `runCreditsClaim`：对账号数组逐账号走与 `credits.claimAll` 分支
+ * **完全相同**的 claim 分派，差异仅在：
+ *  1. accountId 给定时只处理该账号；
+ *  2. 成功（claimed）或已领（already-claimed）都写 `writeCheckinDay`（今日），
+ *     inactive / failed **不写**（失败不写，下次 sweep 重试）。
+ *
+ * 返回按账号的 outcome 摘要（claimed / already-claimed / failed）。互斥由调用方
+ * （`checkin.sweep` case）统一管理，这里不做 —— 单账号 perform 不占互斥。
+ */
+/**
+ * 与 `credits.claimAll` 的 {@link RpcCreditsClaimAccountResult} **同构**的逐账号
+ * 签到结果：`outcome` 是完整 {@link ClaimOutcome} 对象（`{kind, code, message,
+ * logid?}`），不是拍扁成裸字符串 —— 客户端通知 UI（claimFailureLines /
+ * formatClaimFailureLine）依赖它带 code/message/logid。
+ */
+export type CheckinAccountResult = RpcCreditsClaimAccountResult
+
+/** RPC: `credits.checkinStatus` 请求。 */
+export interface RpcCheckinStatusRequest {
+  provider: string
+}
+/** RPC: `credits.checkinStatus` 响应（纯内存读，不发网络请求）。 */
+export interface RpcCheckinStatusResponse {
+  provider: string
+  /** 今日本地纪元日数（`todayDayNumber()` 口径）。 */
+  today: number
+  /** accountId → 今日是否已签（checkinDay === today）。无账号时为空对象。 */
+  checkedIn: Record<string, boolean>
+}
+
+/** RPC: `checkin.perform` 请求（accountId 缺省/空串 → 该 provider 全量）。 */
+export interface RpcCheckinPerformRequest {
+  provider: string
+  accountId?: string
+}
+/** RPC: `checkin.perform` 响应。 */
+export interface RpcCheckinPerformResponse {
+  provider: string
+  today: number
+  results: CheckinAccountResult[]
+  summary: RpcCreditsClaimSummary
+}
+
+/** 单个 provider 的一次 sweep 结果。 */
+export interface RpcCheckinSweepProviderResult {
+  provider: string
+  results: CheckinAccountResult[]
+  summary: RpcCreditsClaimSummary
+}
+/** RPC: `checkin.sweep` 响应。 */
+export interface RpcCheckinSweepResponse {
+  /** 本趟是否真正执行（false = 被互斥排到，返回进行中快照）。 */
+  running: boolean
+  providers: RpcCheckinSweepProviderResult[]
+}
 
 /** 生成 8 字符随机短 ID（小写 hex） */
 function shortId(): string {
@@ -692,6 +789,192 @@ export interface ModelCatalogSource {
 export type { ContextTierRegistry, ContextTierSource } from './context-tiers.js'
 
 /**
+ * 自动签到**全量 sweep**（宿主自触发与 `checkin.sweep` RPC 共用）所需的最小依赖集合。
+ *
+ * 原实现作为 `registerAccountHubEndpoints` 的闭包捕获 `ctx` / `pool` / 各 auth 实例；
+ * 为让 `src/index.ts` 的宿主触发层（启动 sweep + 4h 定时器）能直接调用，把这一整条
+ * 执行链抽成模块级函数，把闭包捕获的依赖显式收进这一个对象。**只搬结构、不改行为**：
+ * `runCreditsClaim` / `performCheckinOnTargets` / `performCheckinSweep` 的执行体与原
+ * 闭包版逐字相同，既有 RPC 分支（`credits.claimAll` / `checkin.perform` / `checkin.sweep`）
+ * 经它调用后行为零变化。
+ */
+export interface CheckinSweepDeps {
+  ctx: Context
+  pool: AccountPool
+  lobsterai: LobsteraiAuth
+  qoder: QoderAuth
+  qoderCn: QoderAuth
+}
+
+/** 未知 provider 的可判别异常（两类调用点据此转成 bad-request）。 */
+class UnsupportedProviderError extends Error {
+  constructor(provider: string) {
+    super(`unsupported provider: ${provider}`)
+    this.name = 'UnsupportedProviderError'
+  }
+}
+
+/**
+ * 该 provider 是否属于「已知可签到」集合（buddy 系 / codearts / lobsterai /
+ * trae-cn / qoder 两区）。**单一真相源**：`credits.claimAll` / `checkin.perform` /
+ * `checkin.sweep` 都经它判定未知 provider 时应拒绝，而不各自散落判断。
+ */
+function isKnownCheckinProvider(provider: string): boolean {
+  if (provider === 'codearts') return true
+  if (provider === LOBSTERAI.id) return true
+  if (provider === TRAE_CN.id) return true
+  if (provider === QODER.id || provider === QODER_CN.id) return true
+  return productById(provider) !== undefined
+}
+
+/**
+ * 复用 `credits.claimAll` 的**逐账号分派逻辑**。
+ *
+ * 五个 provider 分支（codearts / lobsterai / trae-cn / qoder 两区 / buddy 系）
+ * 与 `credits.claimAll` case 内**逐字相同**，只是把「全账号数组」收成一个入参。
+ * `credits.claimAll` 与 `checkin.perform` / `checkin.sweep` 共用这一份实现，
+ * 因此签到领取的分派不会漂移。
+ *
+ * 未知 provider 抛 {@link UnsupportedProviderError}，由调用点决定如何呈现。
+ *
+ * @returns 与 claimAll 同构的逐账号结果数组（含 nickname）。
+ */
+async function runCreditsClaim(
+  deps: CheckinSweepDeps,
+  provider: string,
+  accounts: ProviderAccountEntry[],
+): Promise<RpcCreditsClaimAccountResult[]> {
+  const { ctx, lobsterai, qoder, qoderCn } = deps
+  if (!isKnownCheckinProvider(provider)) throw new UnsupportedProviderError(provider)
+  if (provider === 'codearts') {
+    // CodeArts（华为云）走**签名**协议，与两个腾讯系 provider 都不同源：
+    // 领取流程自带「账户类型 + 活动列表」预检（见 claimCodeArtsDailyCheckin），
+    // 故 precheckStatus: false 跳过外部那次 Buddy 式的状态查询 ——
+    // 用 fetchCheckinStatus 打华为端点既发错请求又必然失败。
+    // 第二、三个实参是 `undefined`：CodeArts 没有 BuddyProduct，
+    // 而下钻函数只吃凭据（product 对华为协议无意义）。
+    const value = await collectClaimResults<CodeArtsCredential, undefined>(accounts, undefined, {
+      resolve: (ref) => ctx.credentials.resolve(ref),
+      claim: (credential) => claimCodeArtsDailyCheckin(credential),
+      precheckStatus: false,
+      warn: (msg) => ctx.logger?.warn?.(msg),
+    })
+    return value.results
+  }
+  if (provider === LOBSTERAI.id) {
+    // LobsterAI 的 clientVersion 是签到必填参数，需动态解析（带缓存）。
+    const clientVersion = await lobsterai.resolveClientVersion()
+    const value = await collectClaimResults(accounts, LOBSTERAI, {
+      resolve: (ref) => ctx.credentials.resolve(ref),
+      claim: (credential, product) =>
+        claimLobsteraiDailyCheckin(credential, product, clientVersion),
+      // 领取流程内部已做 slot/context 预检，不需要外部再查一次状态。
+      precheckStatus: false,
+      warn: (msg) => ctx.logger?.warn?.(msg),
+    })
+    return value.results
+  }
+  if (provider === TRAE_CN.id) {
+    // Trae CN 的领取流程**自身**就是两步（status → 未领则 claim），内部已按
+    // `checked_in` 幂等预检 —— 外部再查一次纯属重复请求，故 precheckStatus: false。
+    const value = await collectClaimResults<TraeCnCredential, TraeCnProduct>(accounts, TRAE_CN, {
+      resolve: (ref) => ctx.credentials.resolve(ref),
+      claim: (credential, product) =>
+        claimTraeCnDailyCheckin(credential, product, { onDebug: (msg) => ctx.logger?.info?.(msg) }),
+      precheckStatus: false,
+      warn: (msg) => ctx.logger?.warn?.(msg),
+    })
+    return value.results
+  }
+  if (provider === QODER.id || provider === QODER_CN.id) {
+    // 两区都有签到：`qoder-credits.ts` 按传入的 `product` 现算 host，region
+    // 差异全部由产品配置承载。`precheckStatus: false` —— claimQoderDailyCheckin
+    // **自带活动列表查询**，外部再查一次纯属重复 GET。
+    // ⚠️ provider → 这里的 region 解析对未知 Qoder region 抛错（即「必须显式接线」）。
+    const region = qoderRegionFor(provider, qoder, qoderCn)
+    if (region === undefined) throw new UnsupportedProviderError(provider)
+    const value = await collectClaimResults<QoderCredential, QoderProduct>(accounts, region.product, {
+      resolve: (ref) => ctx.credentials.resolve(ref),
+      claim: (credential, product) =>
+        claimQoderDailyCheckin(credential, region.auth, {
+          product,
+          onDebug: (msg) => ctx.logger?.info?.(msg),
+        }),
+      precheckStatus: false,
+      warn: (msg) => ctx.logger?.warn?.(msg),
+    })
+    return value.results
+  }
+  const product = productById(provider)
+  if (product === undefined) throw new UnsupportedProviderError(provider)
+  const value = await collectClaimResults(accounts, product, {
+    resolve: (ref) => ctx.credentials.resolve(ref),
+    warn: (msg) => ctx.logger?.warn?.(msg),
+  })
+  return value.results
+}
+
+/**
+ * 对**给定账号数组**执行一次自动签到：成功或已领都写今日，失败不写。
+ *
+ * 与 `credits.claimAll` 的核心差异只在写状态这一步。inactive / failed **不写**
+ * （失败不写，下次 sweep 重试）——见设计文档 §2/§9。
+ *
+ * @param targets - 本次实际要签的账号；空数组 = 无操作（不发起任何请求）。
+ */
+async function performCheckinOnTargets(
+  deps: CheckinSweepDeps,
+  provider: string,
+  targets: ProviderAccountEntry[],
+  today: number,
+): Promise<{ results: CheckinAccountResult[]; summary: RpcCreditsClaimSummary }> {
+  if (targets.length === 0) {
+    return { results: [], summary: computeClaimSummary([]) }
+  }
+  const claimResults = await runCreditsClaim(deps, provider, targets)
+  const results: CheckinAccountResult[] = []
+  for (const r of claimResults) {
+    if (r.outcome.kind === 'claimed' || r.outcome.kind === 'already-claimed') {
+      await deps.pool.writeCheckinDay(provider, r.accountId, today)
+    }
+    // outcome 保留 runCreditsClaim 产出的完整 ClaimOutcome 对象（不拍扁成字符串），
+    // 并带上 nickname —— 与 `credits.claimAll` 同构，客户端通知 UI 直接可用。
+    results.push({ accountId: r.accountId, nickname: r.nickname, outcome: r.outcome })
+  }
+  return { results, summary: computeClaimSummary(claimResults.map((c) => c.outcome)) }
+}
+
+/**
+ * 执行一次**全量 sweep**（`checkin.sweep` RPC / 宿主定时器共用入口）。
+ *
+ * - 只遍历 {@link CHECKIN_ELIGIBLE_PROVIDERS}（六条）；
+ * - 无账号 provider 跳过；
+ * - 每个 provider 只签「今日未签」（`checkinDay !== todayDayNumber()`）的账号；
+ * - 模块级互斥 {@link sweepRunning}：已有一趟在跑就**直接返回进行中快照**，
+ *   不排队不重入（设计文档 §9 并发防重）。
+ */
+export async function performCheckinSweep(deps: CheckinSweepDeps): Promise<RpcCheckinSweepResponse> {
+  const { pool } = deps
+  if (sweepRunning) return { running: false, providers: [] }
+  sweepRunning = true
+  try {
+    const today = todayDayNumber()
+    const providers: RpcCheckinSweepProviderResult[] = []
+    for (const provider of CHECKIN_ELIGIBLE_PROVIDERS) {
+      const accounts = await pool.listAccounts(provider)
+      if (accounts.length === 0) continue
+      // 只签「今日未签」：checkinDay === today 直接短路，不发任何请求。
+      const due = accounts.filter((a) => pool.checkinDay(provider, a.id) !== today)
+      const { results, summary } = await performCheckinOnTargets(deps, provider, due, today)
+      providers.push({ provider, results, summary })
+    }
+    return { running: true, providers }
+  } finally {
+    sweepRunning = false
+  }
+}
+
+/**
  * 注册 Account Hub 管理 API 端点。
  *
  * `connection` 服务只存在于 Web bundle；这里用**惰性注入**而非插件级静态
@@ -795,6 +1078,33 @@ function registerAccountHubEndpoints(
       }
     },
   })
+
+  // 自动签到全量 sweep / 单账号签到所需的宿主依赖：本闭包持有 `ctx`/`pool` 与各 auth
+  // 实例，收进 {@link CheckinSweepDeps} 后交给模块级实现（见模块定义）。执行逻辑
+  // `runCreditsClaim` / `performCheckinOnTargets` / `performCheckinSweep` 已提升到
+  // 模块级，宿主（`src/index.ts`）用同一份 deps 调用，绝不复制第二份。
+  const checkinDeps: CheckinSweepDeps = { ctx, pool, lobsterai, qoder, qoderCn }
+
+  /**
+   * 执行自动签到（`checkin.perform` / `checkin.sweep` 共用）。
+   *
+   * accountId 缺省/空串 → 该 provider 全量账号；否则只处理该账号（若不在列表中，
+   * targets 为空，结果为空、不发请求）。未知 provider **即使无账号也拒绝**（在该
+   * provider 有账号时 `runCreditsClaim` 会二次抛，空数组分支提前兜住）。
+   */
+  async function performCheckin(
+    provider: string,
+    accountId?: string,
+  ): Promise<RpcCheckinPerformResponse> {
+    const accounts = await pool.listAccounts(provider)
+    const targets = accountId !== undefined && accountId.length > 0
+      ? accounts.filter((a) => a.id === accountId)
+      : accounts
+    const today = todayDayNumber()
+    if (!isKnownCheckinProvider(provider)) throw new UnsupportedProviderError(provider)
+    const { results, summary } = await performCheckinOnTargets(checkinDeps, provider, targets, today)
+    return { provider, today, results, summary }
+  }
 
   /** 分发端点方法到对应的处理器 */
   async function handleMethod(method: string, payload: unknown, _signal: AbortSignal): Promise<unknown> {
@@ -1423,20 +1733,18 @@ function registerAccountHubEndpoints(
           })
           return { ok: true, value: { accounts: results } satisfies RpcCreditsStatusResponse }
         }
-        if (provider === QODER_CN.id) {
-          // **只有 Qoder CN 有签到**：活动端点 `sash/api/v1/me/campaigns` 由
-          // keylog 解密抓包解出并真机验证（2026-09-21），只对 CN 打开；
-          // 国际版 `qoder` **维持拒绝**（落到下面的 `productById()` 分支）——
-          // 上游情报明说该活动在桌面 App 才能领，本插件不去模拟桌面客户端。
-          //
-          // region 解引用必须走 {@link qoderRegionFor}（唯一一处「哪个 region 用
-          // 哪份配置与实例」）：用错实例换来的是另一区的 jt，表现为「凭据失效」。
+        if (provider === QODER.id || provider === QODER_CN.id) {
+          // 两区都有签到：活动端点 `sash/api/v1/me/campaigns` 由 keylog 解密抓包
+          // 解出并真机验证（2026-09-21，CN）；国际版 `qoder` 已真机探测
+          // （2026-09-23）同一端点 200、响应与 CN 逐字节同构。`src/qoder-credits.ts`
+          // 按传入的 `product` **现算 host**，两份 region 共用一份实现 —— 这里
+          // 只借 {@link qoderRegionFor} 对齐「哪个 region 用哪份配置与实例」。
           const region = qoderRegionFor(req.provider, qoder, qoderCn)
           if (region === undefined) {
             return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
           }
-          const cnAccounts = await pool.listAccounts(provider)
-          const results = await collectCreditsStatus<QoderCredential, QoderProduct>(cnAccounts, region.product, {
+          const qoderAccounts = await pool.listAccounts(provider)
+          const results = await collectCreditsStatus<QoderCredential, QoderProduct>(qoderAccounts, region.product, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchStatus: (credential, product) =>
               fetchQoderCheckinStatus(credential, region.auth, {
@@ -1449,11 +1757,9 @@ function registerAccountHubEndpoints(
         }
         const product = productById(provider)
         if (product === undefined) {
-          // ⚠️ **Qoder 国际版（`qoder`）刻意落到这里**：活动只属于 CN（见上面的
-          // `qoder-cn` 分支），国际版的 `dailyCheckin: false` 由能力矩阵在
-          // **发请求之前**挡掉（`loadCredits` / `claimCredits` 各有一道守卫）。
-          // 判据是 `productById()`（Buddy 系）—— Qoder 的产品配置是
-          // `QoderProduct`，不会命中它，故这条拒绝是结构性的。
+          // ⚠️ 未知 provider 才落到这里拒绝。Qoder 两区已在上面各自的
+          // `qoderRegionFor` 分支处理；`productById()`（Buddy 系）对它们返回
+          // undefined，但上面已提前 return，故这条拒绝仅是未知 provider 的兜底。
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
         const accounts = await pool.listAccounts(provider)
@@ -1465,88 +1771,71 @@ function registerAccountHubEndpoints(
       }
 
       // 一键领取：逐账号顺序执行（并发易触发风控），单个账号失败不中断整体。
+      // 分派逻辑抽到 {@link runCreditsClaim}，与自动签到（checkin.perform / sweep）共用，
+      // 避免两处漂移。
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
         // provider → 池键（见 {@link poolProviderFor}）。
         const provider = poolProviderFor(req.provider)
         const accounts = await pool.listAccounts(provider)
-        if (provider === 'codearts') {
-          // CodeArts（华为云）走**签名**协议，与两个腾讯系 provider 都不同源：
-          // 领取流程自带「账户类型 + 活动列表」预检（见 claimCodeArtsDailyCheckin），
-          // 故 precheckStatus: false 跳过外部那次 Buddy 式的状态查询 ——
-          // 用 fetchCheckinStatus 打华为端点既发错请求又必然失败。
-          //
-          // 第二、三个实参是 `undefined`：CodeArts 没有 BuddyProduct，
-          // 而下钻函数只吃凭据（product 对华为协议无意义）。
-          const value = await collectClaimResults<CodeArtsCredential, undefined>(accounts, undefined, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential) => claimCodeArtsDailyCheckin(credential),
-            precheckStatus: false,
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
-        }
-        if (provider === LOBSTERAI.id) {
-          // LobsterAI 的 clientVersion 是签到必填参数，需动态解析
-          //（带缓存，通常无额外网络开销）。
-          const clientVersion = await lobsterai.resolveClientVersion()
-          const value = await collectClaimResults(accounts, LOBSTERAI, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential, product) =>
-              claimLobsteraiDailyCheckin(credential, product, clientVersion),
-            // 领取流程内部已做 slot/context 预检，不需要外部再查一次状态。
-            precheckStatus: false,
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
-        }
-        if (provider === TRAE_CN.id) {
-          // Trae CN 的领取流程**自身**就是两步（status → 未领则 claim），
-          // 内部已按 `checked_in` 幂等预检 —— 外部再查一次纯属重复请求，
-          // 故与其他多步流程（LobsterAI）一样传 precheckStatus: false。
-          const value = await collectClaimResults<TraeCnCredential, TraeCnProduct>(accounts, TRAE_CN, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential, product) =>
-              claimTraeCnDailyCheckin(credential, product, { onDebug: (msg) => ctx.logger?.info?.(msg) }),
-            precheckStatus: false,
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
-        }
-        if (provider === QODER_CN.id) {
-          // **只有 Qoder CN 有签到**（见 credits.status 处那条同源说明）。
-          //
-          // `precheckStatus: false` —— `claimQoderDailyCheckin` **自带活动列表
-          // 查询**（campaigns → 逐个 claim），外部再查一次纯属重复 GET
-          //（与 LobsterAI / Trae CN 同一约定）。
-          const region = qoderRegionFor(req.provider, qoder, qoderCn)
-          if (region === undefined) {
-            return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+        let results: RpcCreditsClaimAccountResult[]
+        try {
+          results = await runCreditsClaim(checkinDeps, provider, accounts)
+        } catch (error) {
+          if (error instanceof UnsupportedProviderError) {
+            return { ok: false, error: { code: 'bad-request', message: error.message } }
           }
-          const value = await collectClaimResults<QoderCredential, QoderProduct>(accounts, region.product, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            claim: (credential, product) =>
-              claimQoderDailyCheckin(credential, region.auth, {
-                product,
-                onDebug: (msg) => ctx.logger?.info?.(msg),
-              }),
-            precheckStatus: false,
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+          throw error
         }
-        const product = productById(provider)
-        if (product === undefined) {
-          // ⚠️ **Qoder 国际版（`qoder`）刻意落到这里** —— 理由与 `credits.status`
-          // 处那条同源（活动只属于 CN；`dailyCheckin: false` 由能力矩阵在发请求
-          // 之前挡掉）。这里是**契约声明**，不是待补的分支。
-          return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
+        const summary = computeClaimSummary(results.map((r) => r.outcome))
+        return { ok: true, value: { results, summary } satisfies RpcCreditsClaimAllResponse }
+      }
+
+      // ── 自动签到（Auto Check-in）──
+      //
+      // 三个端点与 claimAll 的关系：
+      //   - `credits.checkinStatus`：**纯内存读**进程内 `checkins`，**不发任何网络
+      //     请求**。供面板挂载时渲染「哪些账号今日已签」。未知/无签到能力 provider
+      //     返回空 checkedIn（能力门控在客户端）。
+      //   - `checkin.perform`：单账号（或 provider 全量）自动签到。**复用
+      //     `credits.claimAll` 的同一份分派逻辑**（{@link runCreditsClaim}），差异仅
+      //     在写 `writeCheckinDay`：成功或 already-claimed 都写今日，failed/inactive
+      //     不写（下次 sweep 重试）。
+      //   - `checkin.sweep`：全量 sweep，遍历 {@link CHECKIN_ELIGIBLE_PROVIDERS}，
+      //     每 provider 只签「今日未签」的账号。模块级互斥防 4h 定时器与页面触发并发。
+      case 'credits.checkinStatus': {
+        const req = payload as RpcCheckinStatusRequest
+        const provider = poolProviderFor(req.provider)
+        const today = todayDayNumber()
+        const accounts = await pool.listAccounts(provider)
+        const checkedIn: Record<string, boolean> = {}
+        for (const entry of accounts) {
+          checkedIn[entry.id] = pool.checkinDay(provider, entry.id) === today
         }
-        const value = await collectClaimResults(accounts, product, {
-          resolve: (ref) => ctx.credentials.resolve(ref),
-          warn: (msg) => ctx.logger?.warn?.(msg),
-        })
-        return { ok: true, value: value satisfies RpcCreditsClaimAllResponse }
+        return { ok: true, value: { provider, today, checkedIn } satisfies RpcCheckinStatusResponse }
+      }
+
+      case 'checkin.perform': {
+        const req = payload as RpcCheckinPerformRequest
+        const provider = poolProviderFor(req.provider)
+        if (typeof provider !== 'string' || provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 必填' } }
+        }
+        let value: RpcCheckinPerformResponse
+        try {
+          value = await performCheckin(provider, req.accountId)
+        } catch (error) {
+          if (error instanceof UnsupportedProviderError) {
+            return { ok: false, error: { code: 'bad-request', message: error.message } }
+          }
+          throw error
+        }
+        return { ok: true, value: value satisfies RpcCheckinPerformResponse }
+      }
+
+      case 'checkin.sweep': {
+        const value = await performCheckinSweep(checkinDeps)
+        return { ok: true, value: value satisfies RpcCheckinSweepResponse }
       }
 
       // 积分余额（Credits Balance）：逐账号顺序查询。

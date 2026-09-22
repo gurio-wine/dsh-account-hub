@@ -539,7 +539,7 @@ POST https://center.qoder.sh/algo/api/v3/user/status?Encode=1
 | **作者明说：「Qoder 国内版、WorkBuddy、Trae 的适配代码已实现，真账号验收仍未完成」** | `README.md:27` |
 
 > **结论（修正我此前的判断）**：
-> - **Qoder 国际版：不做签到**。官方只在桌面 App 手动领，无公开 API —— 与 CLI2API 的行为一致（它的 README 明说国际版不显示签到）
+> - **Qoder 国际版：不做签到**（**已推翻，见 credits.md** —— 国际版端点 2026-09-23 真机验证 200 同构，宿主两区均已接线）。官方只在桌面 App 手动领，无公开 API —— 与 CLI2API 的行为一致（它的 README 明说国际版不显示签到）
 > - **Qoder 国内版：签到存在**，但**连 CLI2API 自己都还没用真账号验收过**，且是「活动关闭时只记录跳过」
 > - **对我们的建议：`dailyCheckin: false`**（国际版场景）。若将来做 `qoder-cn`，签到可以再评估 —— 但别做第一个吃螃蟹的人
 

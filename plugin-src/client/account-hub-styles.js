@@ -98,6 +98,8 @@ const STYLES = `
 .dim-ah-btn[data-kind="primary"]:hover:not(:disabled) { background: #0f5fce; border-color: #0f5fce; color: #fff; }
 .dim-ah-btn[data-kind="danger"] { color: #d93025; border-color: color-mix(in srgb, #d93025 35%, var(--dsw-alias-border-l2, #dfe1e5)); }
 .dim-ah-btn[data-kind="danger"]:hover:not(:disabled) { color: #b3261e; border-color: #d93025; background: rgb(217 48 37 / 6%); }
+.dim-ah-btn[data-kind="success"] { background: #22c55e; color: #fff; border-color: #22c55e; }
+.dim-ah-btn[data-kind="success"]:hover:not(:disabled) { background: #16a34a; border-color: #16a34a; color: #fff; }
 .dim-ah-btn:disabled { opacity: 0.5; cursor: default; }
 
 /* 限流 TTL 徽章 */

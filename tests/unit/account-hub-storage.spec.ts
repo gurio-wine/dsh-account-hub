@@ -75,11 +75,12 @@ describe('账号池 storage 域的域名与版本', () => {
 })
 
 describe('emptyAccountHubDocument', () => {
-  it('空文档是四件套齐全的空表，而不是缺字段的部分对象', () => {
+  it('空文档是五件套齐全的空表，而不是缺字段的部分对象', () => {
     expect(emptyAccountHubDocument()).toEqual({
       accounts: [],
       disabledModels: {},
       contextBudgets: {},
+      checkins: {},
       schemaVersion: 0,
     })
   })

@@ -87,23 +87,20 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('trae-cn')).toBe(true)
   })
 
-  it('Qoder 支持余额但**不支持**签到（100 Credits 只能桌面 App 手动领）', () => {
+  it('Qoder 余额与签到都支持（两区同协议，国际版活动以服务端下发为准）', () => {
     // `balance`：步骤 4 的 src/qoder-credits.ts 提供的余额与 `CreditBalance`
     // 逐字段同构，CreditBalanceRow 直接复用，客户端不需要任何 provider 分支。
     //
-    // `dailyCheckin` 刻意是 false：官方的每日 100 Credits 只能在 Qoder
-    // **桌面 App 里手动领取**，没有公开 API。
+    // `dailyCheckin` 是 true：现有六条签到面板（buddy-cn / lobsterai / trae-cn /
+    // codearts / qoder / qoder-cn）。国际版端点 `sash/api/v1/me/campaigns`
+    // 已于 2026-09-23 真机探测 HTTP 200、响应与 CN 逐字节同构 —— 旧定性
+    // 「国际版无此活动」已推翻；活动以服务端下发为准、空列表归 already-claimed。
     //
-    // ⚠️ 它与 `buddy` 在本矩阵里**同形（true/false）但原因完全不同**：
-    //   - `buddy` 是「后端根本没有这个接口」；
-    //   - `qoder` 是「有这项权益，但只在桌面 App 里手动领」。
-    // 两者只是恰好落成同一组布尔值，**不是**可以互相推导的同一种情况 ——
-    // 将来谁看见这两行「长得一样」想合并、或想「顺手改对称」，这条断言就会红。
-    // 同样不能因为 `balance` 是 true 就顺手把 `dailyCheckin` 也写成 true：
-    // 那会给面板加一个**每次点击都必然失败**的按钮（没有任何端点可打）。
-    expect(CREDITS_CAPABILITIES.qoder).toEqual({ balance: true, dailyCheckin: false })
+    // ⚠️ 它与 `buddy`（`dailyCheckin:false`）**不同**：Buddy 国际版后端没有
+    // 签到接口，是矩阵里唯一签到为 false 的条目。
+    expect(CREDITS_CAPABILITIES.qoder).toEqual({ balance: true, dailyCheckin: true })
     expect(supportsCreditBalance('qoder')).toBe(true)
-    expect(supportsDailyCheckin('qoder')).toBe(false)
+    expect(supportsDailyCheckin('qoder')).toBe(true)
   })
 
   it('Qoder CN 余额与签到都支持（签到端点已解出并真机验收）', () => {
@@ -115,41 +112,40 @@ describe('积分能力矩阵', () => {
     // `dailyCheckin` **曾经是 false，理由写在注释里的是「端点未知」** ——
     // 那个待办现已关闭：端点由 keylog 解密抓包解出并真机验收（2026-09-21），
     // 实现见 `src/qoder-credits.ts`，宿主分支见 `src/account-hub-rpc.ts`。
-    // ⚠️ 它**只对 CN 打开**：国际版 `qoder` 维持 false（见上一条用例）。
+    // ⚠️ 国际版 `qoder` 同为 true（2026-09-23 真机探测 200 同构），见上一条用例。
     expect(CREDITS_CAPABILITIES['qoder-cn']).toEqual({ balance: true, dailyCheckin: true })
     expect(supportsCreditBalance('qoder-cn')).toBe(true)
     expect(supportsDailyCheckin('qoder-cn')).toBe(true)
   })
 
-  it('⚠️ Qoder 只有 CN 能签到，且国际版的 false **不得**推广到 CN', () => {
-    // 这条守的是**「两个 region 的签到理由必须分开写」**这件事，而不是某个
-    // 布尔值（取值已由上面两条用例钉过）。原因：历史上这两个 region 都写 false
-    // 但理由不同（国际版「活动不存在」/ CN「端点未知」待办），极易被后来者
-    // 「统一」成一句「Qoder 没有签到」——
-    //   - 合并成「Qoder 没有签到」：CN 的签到会被误删（功能倒退）；
-    //   - 反过来把国际版也写成 true：给国际版面板挂一个**每次点击都必然失败**
-    //     的按钮（活动只属于 CN，端点打过去只会 404/403）。
-    // 故断言同时锁「取值不同」与「注释里两条理由都在」。
+  it('qoder-cn 与国际版 qoder 的签到理由必须分开读（真机探测日期不丢）', () => {
+    // 这条守的是**「两个 region 的签到口径要分开写」**这件事，而不是某个
+    // 布尔值（取值已由上面两条用例钉过）。历史上国际版定性为「活动不存在」、
+    // CN 定性为「端点未知」待办，极易被后来者「统一」成一句。
+    //
+    // 现在两区 `dailyCheckin` 均为 true：国际版端点已真机探测（2026-09-23）
+    // HTTP 200、响应与 CN 逐字节同构，旧定性「国际版无活动」已推翻。但两区
+    // 依据不同（国际版=真机探测同构 / CN=keylog 解密抓包验收），探测日期与
+    // 「以服务端下发为准」的口径必须保留在注释里。
     const source = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/credits-capabilities.js'),
       'utf8',
     )
-    // 国际版那句理由必须还在（它解释的是「活动不存在」，不是「端点未知」）。
-    expect(source).toContain('CLI2API 实测**国际版不显示签到**')
-    // CN 那句理由必须改成「已解出并真机验收」，且**不得**再留「端点未知」的待办定性。
+    // 国际版那段的真机探测依据与日期必须在。
+    expect(source).toContain('2026-09-23 真机探测 HTTP 200')
+    expect(source).toContain('国际版活动以**服务端下发为准**')
+    // CN 那句理由必须保留（「已解出并真机验收」），且**不得**再留「端点未知」的待办定性。
     expect(source).toContain('端点已由 keylog 解密抓包解出并')
     expect(source).not.toContain('端点至今未知、未验收')
     expect(source).not.toContain('将来拿到端点后把它翻成 `true`')
-    // 反面锚点：CN 那一段不得出现「没有这项权益」或「与国际版一样不存在」的定性。
-    const cnCommentStart = source.indexOf('// Qoder **CN（国内版）**')
-    const cnEntryStart = source.indexOf("'qoder-cn': Object.freeze(")
-    expect(cnCommentStart, '找不到 Qoder CN 的注释段').toBeGreaterThan(-1)
-    expect(cnEntryStart).toBeGreaterThan(cnCommentStart)
-    const cnSection = source.slice(cnCommentStart, cnEntryStart)
-    expect(cnSection).not.toContain('没有这项权益')
-    // 取值本身的方向也要在**同一处**被钉住：CN 真、国际版假。
+    // 反面锚点：旧定性「每日 100 Credits 只能在桌面 App 手动领」「活动不存在」
+    // 不得再作为**能力定性**出现（那意味着真机探测的结论没落地）。历史叙述
+    // 「旧定性…已推翻」是可接受的（见文件头），故这里只查旧文案整句。
+    expect(source).not.toContain('官方没有公开该端点')
+    expect(source).not.toContain('每日 100 Credits 只能在桌面')
+    // 取值本身要在**同一处**被钉住：两区都为真。
     expect(supportsDailyCheckin('qoder-cn')).toBe(true)
-    expect(supportsDailyCheckin('qoder')).toBe(false)
+    expect(supportsDailyCheckin('qoder')).toBe(true)
   })
 
   it('能力矩阵的键与 PROVIDERS 的 id 逐字对齐（含连字符 provider）', () => {
@@ -402,14 +398,14 @@ describe('客户端积分请求门控（源码级回归）', () => {
     expect(body).not.toMatch(/^\s*void loadCredits\(\);/m)
   })
 
-  it('claimCredits 在发起 credits.claimAll 之前先判能力', () => {
+  it('claimCredits（头部「一键签到」）在发起 checkin.perform 之前先判能力', () => {
     const start = source.indexOf('const claimCredits')
     expect(start).toBeGreaterThan(-1)
     const body = source.slice(start, start + 600)
     const guardIndex = body.indexOf('if (!supportsCredits) return;')
-    const callIndex = body.indexOf("rpcCall('credits.claimAll'")
+    const callIndex = body.indexOf("rpcCall('checkin.perform', { provider })")
     expect(guardIndex, 'claimCredits 缺少能力守卫').toBeGreaterThan(-1)
-    expect(callIndex).toBeGreaterThan(-1)
+    expect(callIndex, '头部「一键签到」应改走 checkin.perform').toBeGreaterThan(-1)
     expect(guardIndex).toBeLessThan(callIndex)
   })
 
@@ -422,5 +418,76 @@ describe('客户端积分请求门控（源码级回归）', () => {
     const cardBody = normalized.slice(cardStart, cardStart + 4000)
     expect(cardBody).toContain('showCredits')
     expect(cardBody).toMatch(/showCredits\s*\n?\s*\?[\s\S]*CreditBalanceRow/)
+  })
+})
+
+/**
+ * 自动签到客户端 UI（源码级回归）。
+ *
+ * `plugin-src/` 不在 typecheck/test 视野（react 不在依赖、vitest 只扫
+ * `tests/unit/**`），客户端的唯一语义防线是 `build:client` 顶层求值冒烟 +
+ * 这里的**源码级正则断言**。故本组守的是「单片签到按钮存在且走 `supportsCredits`
+ * 门控」「`checkinStatus` RPC 字符串存在」「成功 `data-kind="success"`」「头部
+ * 文案改名」这些可被正则钉死的事实。
+ */
+describe('自动签到客户端 UI（源码级回归）', () => {
+  const normalized = readClientSource().replace(/\r\n/g, '\n')
+
+  it('单片「签到」按钮存在，且只按 supportsCredits 门控渲染（与既有积分按钮同源）', () => {
+    // AccountCard 收到 showCheckin / onCheckin 两个新 prop。
+    expect(normalized).toContain('showCheckin: supportsCredits')
+    expect(normalized).toContain('onCheckin: (id) => void checkinAccount(id)')
+    // 按钮元素按门控渲染（showCheckin ? 渲染 : null）。
+    expect(normalized).toMatch(/showCheckin\s*\n?\s*\? React\.createElement\('button'/)
+    // 按钮要带绿色成功形态与三态文案机。
+    expect(normalized).toContain("'data-kind': 'success'")
+    expect(normalized).toContain('checkedIn ? \'已签\' : checkingThisAccount ? \'签到中…\' : \'签到\'')
+    // disabled 三态：busy（面板忙碌）|| 已签 || 正在签到。
+    expect(normalized).toContain('disabled: busy || checkedIn || checkingThisAccount')
+  })
+
+  it('`checkin.perform` 单账号签到已接线，且失败不回写「已签」', () => {
+    expect(normalized).toContain("rpcCall('checkin.perform', { provider, accountId })")
+    // 守卫：只在支持签到时才动作。
+    expect(normalized).toContain('if (!supportsCredits) return;')
+    // 响应同构后 outcome 是完整对象，判定按 .kind：claimed 与 already-claimed
+    // 都算已签；inactive/failed 不算。
+    expect(normalized).toContain("outcome?.kind === 'claimed' || outcome?.kind === 'already-claimed'")
+    // 成功带起余额刷新，与 claimCredits 同款。
+    expect(normalized).toContain('if (canLoadCredits) void loadCredits();')
+  })
+
+  it('挂载时经 `credits.checkinStatus` 拉取今日签到状态（进入 Hub 即检测）', () => {
+    expect(normalized).toContain("rpcCall('credits.checkinStatus', { provider })")
+    // 只在支持签到的 provider 上拉。
+    expect(normalized).toContain('if (!supportsCredits) return;')
+    // 用 accountsRef 防并发读到空数组（设计文档点名的坑）。
+    expect(normalized).toContain('accountsRef.current.length > 0')
+    // 结果落地为 `accountId → { checkedInToday }`。
+    expect(normalized).toContain('{ checkedInToday: Boolean(res.checkedIn?.[account.id]) }')
+  })
+
+  it('头部按钮文案改为「一键签到」，全签显示「全部已签」并禁用', () => {
+    expect(normalized).not.toContain(": '一键领取积分'")
+    expect(normalized).toContain(": '一键签到')")
+    // 三态文案机。
+    expect(normalized).toContain("'签到中…' : allCheckedIn ? '全部已签' : '一键签到'")
+    // 全签时禁用。
+    expect(normalized).toContain('disabled: claiming || accounts.length === 0 || allCheckedIn')
+    // allCheckedIn 派生：列表非空且每账号 checkedInToday 全 true。
+    expect(normalized).toContain('accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)')
+    // 头部成功按钮复用绿色形态。
+    expect(normalized).toContain("'data-kind': 'success'")
+  })
+
+  it('styles 提供 success（绿色）按钮形态，复用仓库既有成功绿而非新造色值', () => {
+    const styles = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/account-hub-styles.js'),
+      'utf8',
+    )
+    expect(styles).toMatch(/\.dim-ah-btn\[data-kind="success"\]\s*\{[^}]*#22c55e/)
+    expect(styles).toContain('.dim-ah-btn[data-kind="success"]:hover:not(:disabled)')
+    // 禁用态继承通用 :disabled，不与 success 冲突。
+    expect(styles).toContain('.dim-ah-btn:disabled')
   })
 })

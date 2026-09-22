@@ -15,9 +15,9 @@
  *
  * ## 布局选型：single 布局 + 一个 global 单例文档
  *
- * 账号池的数据量小（十几个账号）且**整体读写**（见 `AccountPool` 的四件套互带），
+ * 账号池的数据量小（十几个账号）且**整体读写**（见 `AccountPool` 的五件套互带），
  * 用 `per-record` 表反而要把「一次原子的整体替换」拆成多次记录写入。故域声明里
- * **不声明任何表**，只用一个 global 单例文档承接四件套 —— 一次 `set` 就是一次整体落盘，
+ * **不声明任何表**，只用一个 global 单例文档承接五件套 —— 一次 `set` 就是一次整体落盘，
  * 落盘形态是 `$DSH_HOME/storages/<域>.json`。
  *
  * ## 域名为什么带下划线
@@ -73,23 +73,41 @@ export type ModelDisableMap = Record<string, Record<string, boolean>>
 export type ContextBudgetMap = Record<string, Record<string, number>>
 
 /**
+ * 自动签到记录：`provider:accountId` → **本地时区的纪元日数**。
+ *
+ * - 键格式 `${provider}:${accountId}`（accountId 已含 provider 前缀，但显式带
+ *   provider 让键自解释、且孤儿清理时可按 provider 前缀批量删）。
+ * - 值 = 本地时区当天（「本地年月日」口径）的纪元日数，`number`。与今日日数做
+ *   整数相等即可判「今日已签」，无需字符串解析 / 时区口径函数。
+ * - 不在表里的键 = 尚未签到（读不到即「今日未签」）。
+ */
+export type CheckinsMap = Record<string, number>
+
+/**
  * storage 里那份单例文档的结构。
  *
- * ⚠️ **四件套是一个整体**：`AccountPool` 的每次写入都是「读 → 改 → 整体 replace」，
+ * ⚠️ **五件套是一个整体**：`AccountPool` 的每次写入都是「读 → 改 → 整体 replace」，
  * 漏带任何一个字段就会在下次别的写入里被清空（`schemaVersion` 丢失会让改名迁移
- * 在每次启动重跑）。这四件与旧 settings namespace 里的四个字段**逐字段对应**，
+ * 在每次启动重跑）。这五件与旧 settings namespace 里的字段**逐字段对应**，
  * 迁移就是原样搬运。
  */
 export interface AccountHubDocument {
   accounts: ProviderAccountEntry[]
   disabledModels: ModelDisableMap
   contextBudgets: ContextBudgetMap
+  checkins: CheckinsMap
   schemaVersion: number
 }
 
 /** 空文档。每次都返回新对象 —— 共享引用会被写入方就地改坏。 */
 export function emptyAccountHubDocument(): AccountHubDocument {
-  return { accounts: [], disabledModels: {}, contextBudgets: {}, schemaVersion: 0 }
+  return {
+    accounts: [],
+    disabledModels: {},
+    contextBudgets: {},
+    checkins: {},
+    schemaVersion: 0,
+  }
 }
 
 /** 把任意外部值归一化为黑名单（同既有 `sanitizeDisabledModels` 的口径）。 */
@@ -123,12 +141,25 @@ function sanitizeContextBudgets(raw: unknown): ContextBudgetMap {
   return result
 }
 
+/** 把任意外部值归一化为签到表（同既有 `sanitizeDisabledModels` 的口径）。 */
+export function sanitizeCheckins(raw: unknown): CheckinsMap {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
+  const result: CheckinsMap = {}
+  for (const [key, day] of Object.entries(raw as Record<string, unknown>)) {
+    // 只收「有限整数日数」：脏值（字符串 / NaN / 小数 / 非法结构）一律丢弃，不抛错。
+    if (typeof day !== 'number' || !Number.isFinite(day) || day < 0 || !Number.isInteger(day)) continue
+    result[key] = day
+  }
+  return result
+}
+
 /**
  * 把存储里读到的原始值归一化为 {@link AccountHubDocument}。
  *
  * 存储文件可能被手工编辑过，也可能残留旧格式，因此逐层校验：任何一层形状不符就
  * 丢弃那一层，**不抛错** —— 存储被外部改坏不该让整个账号管理功能不可用
  * （既有 settings 路径的 `sanitizeDisabledModels` 同一取舍）。
+ * 旧文档（无 `checkins` 字段）读入时补空对象。
  */
 export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
   const empty = emptyAccountHubDocument()
@@ -142,6 +173,7 @@ export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
     accounts,
     disabledModels: sanitizeDisabledModels(value.disabledModels),
     contextBudgets: sanitizeContextBudgets(value.contextBudgets),
+    checkins: sanitizeCheckins(value.checkins),
     schemaVersion: typeof version === 'number' && Number.isFinite(version) ? version : 0,
   }
 }

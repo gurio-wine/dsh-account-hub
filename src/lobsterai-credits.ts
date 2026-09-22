@@ -344,10 +344,17 @@ export async function fetchLobsteraiCreditBalance(
   // 负数一律 clamp 到 0（对齐 Go `client.go:303-308` 的 clamp）：服务端在
   // 超额扣费/计量回滚等异常下可能下发负值，原样透出会让卡片显示「-12.5 积分」，
   // 既无意义又会误导用户以为欠费。
+  // readNumber 对缺失字段返回 0，若直接用它在第 0 判断「总额 + 无明细」，
+  // 会把「真余额为 0」误判成「查不到」。必须先判字段是否真实存在。
+  const hasTotalField = ((): boolean => {
+    const value = envelope.data.totalCreditsRemaining
+    if (typeof value === 'number' && Number.isFinite(value)) return true
+    return typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value.trim())
+  })()
   const total = roundCredits(Math.max(0, readNumber(envelope.data, 'totalCreditsRemaining')))
-  // totalCreditsRemaining 为 0 且拿不到明细 → 视为「查不到」而非「余额为 0」：
-  // 该字段缺失时 readNumber 返回 0，会把解析失败伪装成 0 积分。
-  if (total === 0 && packages.length === 0) return null
+  // totalCreditsRemaining 字段缺失且拿不到明细 → 视为「查不到」而非「余额为 0」：
+  // 字段缺失时 readNumber 返回 0，若漏掉 presence 判据会把解析失败伪装成 0 积分。
+  if (!hasTotalField && packages.length === 0) return null
   // 失效包的余额同样 clamp：负值计入 expiredTotal 会让「另有 N 已失效」变成负数。
   const expiredTotal = roundCredits(
     packages.reduce((sum, pkg) => sum + (pkg.active ? 0 : Math.max(0, pkg.remaining)), 0),

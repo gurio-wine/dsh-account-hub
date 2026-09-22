@@ -598,7 +598,7 @@ describe('迁移与存储契约', () => {
     const payload = h.replacePayloads[0]!
     // `contextBudgets`（Trae CN 的 dev / Max 档位）**不是迁移对象**，但同属这个
     // namespace，故必须原样随写带上 —— 漏带会让改名迁移顺手清空用户的档位选择。
-    expect(Object.keys(payload).sort()).toEqual(['accounts', 'contextBudgets', 'disabledModels', 'schemaVersion'])
+    expect(Object.keys(payload).sort()).toEqual(['accounts', 'checkins', 'contextBudgets', 'disabledModels', 'schemaVersion'])
     expect(payload.schemaVersion).toBe(ACCOUNT_HUB_SCHEMA_VERSION)
   })
 

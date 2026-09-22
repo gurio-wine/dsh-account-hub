@@ -18,8 +18,9 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
   后端已实现签到与积分余额（面板显示**通用积分池**），前端能力矩阵登记见该节说明。
 - **qoder（Qoder）** — 见 [Qoder provider](#qoder-providerqoder)；
   登录形态是**浏览器设备流**（2026-09-21 起 PAT 粘贴形态已从 UI 移除）；
-  不支持「一键领取积分」
-  （该权益只能在 Qoder 桌面 App 里手动领取，服务端没有公开的签到端点）。
+  支持「一键领取积分」—— 与 Qoder CN **同协议、双 region**（签到端点
+  `sash/api/v1/me/campaigns` 国际版真机探测 2026-09-23 同一端点 200、响应与
+  CN 逐字节同构，见前节说明）；支持自动签到。
 - **qoder-cn（Qoder CN）** — Qoder 的**国内版 region**（同协议、另一组 host，
   见 [Qoder provider](#qoder-providerqoder) 的「Qoder CN：第二个 region」）；
   登录形态与登录实现均与国际版共用，**账号池与 Credits 与国际版完全独立、令牌互不承认**；
@@ -870,12 +871,12 @@ GET /snap-manager/v1/statistics/plugin    ← 与 SNAP_MODEL_BUILTIN_URL 同域
 
 ### 一键领取积分（每日签到）
 
-**当前由 Buddy CN、LobsterAI、Trae CN、CodeArts 与 Qoder CN 五个面板提供**该按钮。
+**当前由 Buddy CN、LobsterAI、Trae CN、CodeArts 与 Qoder 两区六个面板提供**该按钮。
 签到在本插件里共有**五套互不相通的实现**（Buddy CN / LobsterAI / Trae CN / CodeArts /
-Qoder CN，协议、端点、幂等判据全不同，各自独立成文件）；五者的客户端能力登记均已落地，
-故五个面板都显示该按钮。Buddy（国际版）后端没有签到接口、**Qoder 国际版的每日
-100 Credits 只能在 Qoder 桌面 App 里手动领取**（官方没有公开该端点）—— 这两个面板
-不显示该按钮。详见「积分余额」一节末尾的说明。
+Qoder 两区，协议、端点、幂等判据全不同，各自独立成文件；Qoder 两区同协议共用一份实现）；
+六者的客户端能力登记均已落地，故六个面板都显示该按钮。**Buddy（国际版）后端没有
+签到接口**（官方没有公开该端点），这一个面板不显示该按钮。Qoder 国际版与 CN 同协议、
+`dailyCheckin` 均为 true —— 详见「积分余额」一节末尾的说明。
 
 在 Account Hub 对应面板标题栏点击「**一键领取积分**」，插件会对该面板下
 **全部账号**顺序执行每日签到领取：
@@ -1164,7 +1165,8 @@ kind）。
 
 #### Qoder CN（两步）
 
-**只对 `qoder-cn` 打开**（国际版维持结构性拒绝 —— 活动只属于 CN）。协议由 **keylog
+**Qoder 两区均打开**（宿主 `credits.status` / `credits.claimAll` / `checkin.perform` 按 region
+分派，见「积分领取」；国际版端点 2026-09-23 真机验证 200 同构）。协议由 **keylog
 解密抓包**解出并真机验收（2026-09-21，HTTP 200）：
 
 ```
@@ -2276,7 +2278,7 @@ CN 的地方外，两个 region 行为一致。
 | 长期凭据 | access + refresh | access + refresh + 身份字段 | 五件套 | **两件**（设备流 `token` + `refresh_token`） |
 | 鉴权 | `Bearer` + 归属头 | `Bearer` | `Cloud-IDE-JWT` | **`Bearer`（但分令牌族：设备令牌直接用，PAT 先换 `jt-`）** |
 | 续期 | `X-Refresh-Token` 头 | `POST /api/auth/refresh` | exchange（body 四字段） | **按令牌族分派**：PAT 重打 exchange、设备令牌打 `deviceToken/refresh` |
-| 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **只有 CN 有**（`sash/…/campaigns` 两步；国际版无此活动） |
+| 签到 | Buddy CN 有、国际版无 | 三步 | 两步 + 设备头 | **两区都有**（`sash/…/campaigns` 两步；国际版与 CN 同协议） |
 
 ### 登录：浏览器设备流
 
@@ -2541,23 +2543,20 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
   `expiresAt`，**池本身没有失效字段** —— 拿账号级时间戳当池失效判据会在哨兵值上
   产出**假的**「另有 N 已失效」，把一个满额账号显示成 0 分。
 
-**能力矩阵**：`qoder` 是 `balance: true`、`dailyCheckin: false`；`qoder-cn` 是
-**两项都 `true`**。
+**能力矩阵**：`qoder` 与 `qoder-cn` 都是 `balance: true`、`dailyCheckin: true`（六个签到面板之一）。
 
-⚠️ **两个 region 的签到理由必须分开读**（与 `credits-capabilities.js` 的矩阵注释
-同源，改一处必须改另一处）：
+⚠️ **Qoder 两区 `dailyCheckin` 均为 true，协议共用**（与 `credits-capabilities.js` 的矩阵注释同源，改一处必须改另一处）：
 
-- **Qoder（国际版）**：**活动不存在** —— CLI2API 实测国际版不显示签到；官方的
-  每日 **100 Credits** 只能在 **Qoder 桌面 App 里手动领取**，服务端没有暴露可编程
-  的签到端点。本插件也不打算用任何「模拟桌面客户端」的手段去领
-  （既不可靠，也超出本插件的边界）。这条**不变**；
-- **Qoder CN（国内版）**：**已 `true`** —— 端点由 keylog 解密抓包解出并**真机验收**
-  （2026-09-21），宿主侧 `credits.status` / `credits.claimAll` 的 `qoder-cn` 分支
-  同步接线，协议见下方「Qoder CN（两步）」。原先那句「端点未知、拿到端点后翻 true」
-  是**待办**，现已关闭 —— ⚠️ 但**不要把国际版也一起翻 `true`**：活动只属于 CN。
+- **Qoder（国际版）**：**`true`** —— 端点 `GET {openapiBase}/sash/api/v1/me/campaigns`
+  已于 **2026-09-23 真机探测 HTTP 200**、响应与 CN **逐字节同构**
+  （`{"uid":…,"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}`）。
+  旧定性「国际版无此活动」不成立 —— 两区同协议，**国际版活动以服务端下发为准**，
+  空列表归 `already-claimed`（判据 4 既有语义）；
+- **Qoder CN（国内版）**：**`true`** —— 端点由 keylog 解密抓包解出并**真机验收**
+  （2026-09-21），宿主侧 `credits.status` / `credits.claimAll` / `checkin.perform`
+  对两区均已接线、按 region 分派，协议见下方「Qoder 两区（两步）」。
 
-故两个 Qoder 面板都**渲染**积分行与「刷新积分」，但**只有 Qoder CN** 渲染
-「一键领取积分」。
+故两个 Qoder 面板都**渲染**积分行、「刷新积分」与「一键领取积分」。
 
 ### Qoder CN：第二个 region
 
@@ -2747,15 +2746,15 @@ $env:QODER_MODEL_SERVER_HOST = 'http://127.0.0.1:8080'
 | 账号列表 | ✓ 自己的账号（`QODER_*`） | ✓ 自己的账号（`QODER_CN_*`），**与国际版互不可见** |
 | 「+ 新建账号」 | ✓ **浏览器设备流**（登录弹窗 + 轮询） | ✓ 同一套实现，只是授权页指向 `qoder.cn` |
 | 积分行 / 「刷新积分」 | ✓ 三池之和的**单数字**与资源包明细 | ✓ 同口径（CN 实测两池，容缺解析天然兼容） |
-| 「一键领取积分」 | ✗ 活动不存在（只能在桌面 App 手动领） | ✓ **`sash/api/v1/me/campaigns` 两步**（见「积分领取」） |
+| 「一键领取积分」 | ✓ 同协议（**两区均已接线**、按 region 分派） | ✓ **`sash/api/v1/me/campaigns` 两步**（见「积分领取」） |
 | 卡片操作（刷新 / 删除 / 启停 / 重测 / 重置） | ✓ 「刷新」= **重打一次 exchange** | ✓ 同上，打的是 **CN 的** exchange |
 | 「显示列表」（模型开关） | ✓ 作用于 **`qoder` 这个键** | ✓ 作用于 **`qoder-cn` 这个键**（两区模型池不同，黑名单必须分开） |
 
 **三处积分端点里，`credits.balances` 与签到两项（`credits.status` / `credits.claimAll`）
-都有 qoder 系分支**：`qoder-cn` 走 CN 的端点，**国际版 `qoder` 的签到两项仍回
-`unsupported provider: qoder`** —— 那是**正确的契约**（活动只属于 CN），不是缺陷。
-客户端靠能力矩阵在**发请求之前**就不发这两个请求，与 CodeArts 的既有约定同源。
-（⚠️ 给国际版接线前，先确认那边真有活动与端点。）
+都有 qoder 系分支**：`qoder-cn` 走 CN 的端点，**国际版 `qoder` 的宿主签到分支也已接线**
+—— `src/account-hub-rpc.ts` 的 `credits.status` / `credits.claimAll` / `checkin.perform`
+对两区均按 region 分派（经 `qoderRegionFor` 各走各的配置与实例）。国际版端点已真机探测
+200 同构（2026-09-23），`CLAIMABLE` 分支待活动刷新自然验证。
 
 > **账号昵称不是「真实用户名回填」。** 账号条目的 `nickname` 取凭据里的
 > `user_id`，取不到就回退到 accountId —— 本步**没有**做任何「把昵称换成真实

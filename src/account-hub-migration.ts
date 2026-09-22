@@ -58,6 +58,8 @@ export interface LegacyAccountHubSection {
   accounts: AccountHubDocument['accounts']
   disabledModels: AccountHubDocument['disabledModels']
   contextBudgets: AccountHubDocument['contextBudgets']
+  /** 签到记录：旧版段里不存在，可选（缺失 = 迁移时补空表）。 */
+  checkins?: AccountHubDocument['checkins']
   schemaVersion: number
 }
 
@@ -210,6 +212,9 @@ export async function migrateAccountHubIntoStorage(
     accounts: section.accounts,
     disabledModels: section.disabledModels,
     contextBudgets: section.contextBudgets,
+    // 签到记录从 storage 全局文档首次迁移时**不存在**（旧 settings 没有该字段）
+    // —— 补空表，与「旧文档读入补空对象」的口径一致。
+    checkins: section.checkins ?? {},
     schemaVersion: section.schemaVersion,
   }
 

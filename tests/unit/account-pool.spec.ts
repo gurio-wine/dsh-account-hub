@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { AccountPool } from '../../src/account-pool.js'
+import { AccountPool, todayDayNumber, pruneOrphanCheckins } from '../../src/account-pool.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 /**
@@ -16,6 +16,7 @@ function createMockContext(
     staleReads?: boolean
     initialDisabledModels?: Record<string, Record<string, boolean>>
     initialContextBudgets?: Record<string, Record<string, number>>
+    initialCheckins?: Record<string, number>
     initialSchemaVersion?: number
   } = {},
 ) {
@@ -23,11 +24,13 @@ function createMockContext(
     accounts?: ProviderAccountEntry[]
     disabledModels?: Record<string, Record<string, boolean>>
     contextBudgets?: Record<string, Record<string, number>>
+    checkins?: Record<string, number>
     schemaVersion?: number
   } = {
     accounts: initialAccounts,
     ...options.initialDisabledModels !== undefined ? { disabledModels: options.initialDisabledModels } : {},
     ...options.initialContextBudgets !== undefined ? { contextBudgets: options.initialContextBudgets } : {},
+    ...options.initialCheckins !== undefined ? { checkins: options.initialCheckins } : {},
     ...options.initialSchemaVersion !== undefined ? { schemaVersion: options.initialSchemaVersion } : {},
   }
   // 滞后读：get() 返回的这个值只在"下一次 replace 之后"才追平
@@ -43,6 +46,7 @@ function createMockContext(
         accounts?: ProviderAccountEntry[]
         disabledModels?: Record<string, Record<string, boolean>>
         contextBudgets?: Record<string, Record<string, number>>
+        checkins?: Record<string, number>
         schemaVersion?: number
       }) => {
         if (options.staleReads) {
@@ -981,5 +985,176 @@ describe('AccountPool 上下文窗口预算', () => {
     const pool = new AccountPool({ get: () => undefined, logger: { warn: () => {}, info: () => {} } } as never)
     await pool.writeContextBudget('trae-cn', 'glm-5.3', 1_048_576)
     expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
+  })
+})
+
+// ── 自动签到存储层（第五件套 checkins）──
+
+describe('todayDayNumber —— 本地时区纪元日数', () => {
+  /** 假时钟让"今天"固定在某时刻，再断言跨时区/跨日的日数口径。 */
+  function freezeNow(iso: string): void {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date(iso))
+  }
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('用本地日期的纪元日数（秒级：一天的毫秒数，日数 = floor(date/86400000) 的本地口径）', () => {
+    // UTC 中午的时刻：东京（UTC+9）已是当天深夜、美西（UTC-7）还是当天凌晨，
+    // 本地日数都应在「本地当日」的语义下给出。
+    freezeNow('2026-06-15T12:00:00.000Z')
+    const now = new Date('2026-06-15T12:00:00.000Z')
+    // 参考：本地时区的年月日 → epoch day = Date.UTC(y,m,d)/86400000。
+    const local = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    expect(todayDayNumber(now)).toBe(Math.floor(Date.UTC(local.getFullYear(), local.getMonth(), local.getDate()) / 86_400_000))
+  })
+
+  it('跨日翻转：UTC 与本地日界不一致处以本地年月日为准（JP 时区 UTC+9）', () => {
+    // 东京时间 2026-06-16 00:30 = UTC 2026-06-15 15:30。
+    // 固定系统时钟为 UTC 时刻，但 todayDayNumber 必须按本地（此处为宿主机时区）算。
+    freezeNow('2026-06-15T15:30:00.000Z')
+    const now = new Date('2026-06-15T15:30:00.000Z')
+    const local = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    const expected = Math.floor(Date.UTC(local.getFullYear(), local.getMonth(), local.getDate()) / 86_400_000)
+    expect(todayDayNumber(now)).toBe(expected)
+    // 跨过本地日边界后再翻转一次：06-16 的东八区零点 == UTC 前一天的 16 点。
+    // 这一步验证的是公式在「同一 Date 实例、只看本地年月日」下稳定，不漂移。
+    const tomorrow = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+    const expectedTomorrow = Math.floor(Date.UTC(tomorrow.getFullYear(), tomorrow.getMonth(), tomorrow.getDate()) / 86_400_000)
+    expect(todayDayNumber(new Date(tomorrow.getTime()))).toBe(expectedTomorrow)
+  })
+
+  it('凌晨时分日数不等于前一毫秒（同日边界唯一、跨日严格递增）', () => {
+    freezeNow('2026-01-02T16:00:00.000Z')
+    const a = new Date('2026-01-02T16:00:00.000Z')
+    const aDay = todayDayNumber(a)
+    // 往前 24h 的同一瞬时（农历/时区不变），日数应恰好少 1（无夏令时越界的普通场景）。
+    const b = new Date(a.getTime() - 86_400_000)
+    expect(todayDayNumber(a) - todayDayNumber(b)).toBe(1)
+    expect(aDay).toBeGreaterThan(0)
+  })
+})
+
+describe('AccountPool 签到存储（checkins 第五件套）', () => {
+  let ctx: ReturnType<typeof createMockContext>
+  let pool: AccountPool
+
+  /** 顶层需要的账号工厂（外层 describe 里的 makeMockAccount 作用域不可达）。 */
+  function makeMockAccount(overrides: Partial<ProviderAccountEntry> = {}): ProviderAccountEntry {
+    return {
+      id: 'buddy-001',
+      provider: 'buddy-cn',
+      nickname: 'test-user',
+      enabled: true,
+      credentialRef: 'BUDDY_CN_ACCOUNT_T1',
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 3600000,
+      refreshable: true,
+      ...overrides,
+    }
+  }
+
+  beforeEach(() => {
+    ctx = createMockContext()
+    pool = new AccountPool(ctx as any)
+  })
+
+  it('写签到日经整体 replace 落盘，读回一致（读经 ensureLoaded 从进程内副本）', async () => {
+    const day = 20_831
+    await pool.writeCheckinDay('trae-cn', 'trae-cn-a1b2', day)
+    expect(pool.checkinDay('trae-cn', 'trae-cn-a1b2')).toBe(day)
+    // 写账号操作不得抹掉已写入的签到日（五件套互带）
+    await pool.addAccount(makeMockAccount({ id: 'trae-cn-x', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_X' }))
+    expect(pool.checkinDay('trae-cn', 'trae-cn-a1b2')).toBe(day)
+    // 未写入的键读不到（undefined = 今日尚未签）
+    expect(pool.checkinDay('trae-cn', 'never')).toBeUndefined()
+  })
+
+  it('回退路径下 checkins 照常读写（settings 整体 replace 同样携带第五件套）', async () => {
+    await pool.writeCheckinDay('codearts', 'codearts-c1', 42)
+    expect(pool.checkinDay('codearts', 'codearts-c1')).toBe(42)
+    const last = ctx.replacePayloads.at(-1)!
+    expect(last.checkins).toEqual({ 'codearts:codearts-c1': 42 })
+  })
+
+  it('从已有配置载入签到日（重启后不丢，键格式 provider:accountId）', () => {
+    const seeded = createMockContext([], { initialCheckins: { 'trae-cn:trae-cn-a1b2': 20_831 } })
+    const p = new AccountPool(seeded as never)
+    expect(p.checkinDay('trae-cn', 'trae-cn-a1b2')).toBe(20_831)
+    // 其他键读不到，不串
+    expect(p.checkinDay('trae-cn', 'other')).toBeUndefined()
+    expect(p.checkinDay('buddy', 'trae-cn-a1b2')).toBeUndefined()
+  })
+
+  it('旧文档（无 checkins 字段）读入时补空对象，不抛错、不崩', async () => {
+    // 手工构造缺 checkins 的 settings 值（0.1.x 老配置没有第五字段）。
+    const p = new AccountPool(createMockContext([makeMockAccount()], { initialSchemaVersion: 1 }) as never)
+    expect(p.checkinDay('buddy-cn', 'buddy-001')).toBeUndefined()
+    // 老配置（没有任何 checkins 键）读写新字段后，再次读仍是同一份权威副本。
+    await p.writeCheckinDay('buddy-cn', 'buddy-001', 7)
+    expect(p.checkinDay('buddy-cn', 'buddy-001')).toBe(7)
+  })
+
+  it('removeAccount 顺带清掉该账号的孤儿 checkins 键（provider:accountId 精确键）', async () => {
+    await pool.writeCheckinDay('trae-cn', 'trae-cn-x', 10)
+    await pool.writeCheckinDay('trae-cn', 'trae-cn-y', 20)
+    await pool.addAccount(makeMockAccount({ id: 'trae-cn-x', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_X' }))
+    await pool.addAccount(makeMockAccount({ id: 'trae-cn-y', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_Y' }))
+    await pool.removeAccount('trae-cn-x')
+    expect(pool.checkinDay('trae-cn', 'trae-cn-x')).toBeUndefined()
+    expect(pool.checkinDay('trae-cn', 'trae-cn-y')).toBe(20)
+    // 删除的键真的不复存在（而不是被覆盖成空表丢了 y —— 五件套互带不允许丢）
+    expect(pool.checkinDay('trae-cn', 'trae-cn-y')).toBe(20)
+  })
+
+  it('pruneOrphanCheckins 按 provider 前缀清除不在账号列表里的孤儿键', async () => {
+    await pool.addAccount(makeMockAccount({ id: 'a', provider: 'buddy-cn', credentialRef: 'B1' }))
+    await pool.writeCheckinDay('buddy-cn', 'a', 1)
+    await pool.writeCheckinDay('buddy-cn', 'gone', 2)   // 孤儿
+    await pool.writeCheckinDay('codearts', 'c-keep', 3) // 别的 provider，不该被清
+    await pruneOrphanCheckins(pool, 'buddy-cn')
+    expect(pool.checkinDay('buddy-cn', 'a')).toBe(1)
+    expect(pool.checkinDay('buddy-cn', 'gone')).toBeUndefined()
+    expect(pool.checkinDay('codearts', 'c-keep')).toBe(3)
+  })
+
+  /** 无账号 provider：prune 返回不炸，且一个键都不清（无账号跳过）。 */
+  it('无账号时 pruneOrphanCheckins 跳过（不清任何键）', async () => {
+    await pool.writeCheckinDay('buddy-cn', 'a', 1)
+    await pool.writeCheckinDay('buddy-cn', 'gone', 2)
+    await pruneOrphanCheckins(pool, 'buddy-cn')
+    expect(pool.checkinDay('buddy-cn', 'a')).toBe(1)
+    expect(pool.checkinDay('buddy-cn', 'gone')).toBe(2)
+  })
+
+  it('配置文件里的脏 checkins 值被忽略而不是抛错', () => {
+    const seeded = createMockContext([], {
+      initialCheckins: {
+        'trae-cn:ok': 12,
+        'trae-cn:str': '12',
+        'trae-cn:nan': Number.NaN,
+        'trae-cn:obj': { x: 1 },
+      } as never,
+    })
+    const p = new AccountPool(seeded as never)
+    expect(p.checkinDay('trae-cn', 'ok')).toBe(12)
+    expect(p.checkinDay('trae-cn', 'str')).toBeUndefined()
+    expect(p.checkinDay('trae-cn', 'nan')).toBeUndefined()
+    expect(p.checkinDay('trae-cn', 'obj')).toBeUndefined()
+  })
+
+  it('五件套互带：写账号只带第五件套 checkins，不抹黑名单 / 预算 / 版本号', async () => {
+    await pool.setModelDisabled('buddy-cn', 'glm-5.2', true)
+    await pool.writeContextBudget('buddy-cn', 'glm-5.2', 200_000)
+    await pool.writeCheckinDay('buddy-cn', 'buddy-001', 9)
+    await pool.addAccount(makeMockAccount())
+    const last = ctx.replacePayloads.at(-1)!
+    expect(last.accounts).toBeDefined()
+    expect(last.disabledModels).toEqual({ 'buddy-cn': { 'glm-5.2': true } })
+    expect(last.contextBudgets).toEqual({ 'buddy-cn': { 'glm-5.2': 200_000 } })
+    expect(last.schemaVersion).toBe(0)
+    expect(last.checkins).toEqual({ 'buddy-cn:buddy-001': 9 })
   })
 })

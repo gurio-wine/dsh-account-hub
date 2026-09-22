@@ -21,10 +21,10 @@
  *    一个永远没有凭据的幽灵账号。
  * 2. **失败即拒绝，且不复述 PAT**：前缀不对 / exchange 401 / 网络失败三条路
  *    都必须以可展示原因拒绝，且错误文案里**不得出现 PAT 本体**。
- * 3. **积分只有余额一项**：`credits.status` / `credits.claimAll` **刻意不加**
- *    qoder 分支（官方每日 100 Credits 只能在桌面 App 手动领，无公开 API），
- *    落到 `unsupported provider: qoder` 是**正确契约** —— 客户端靠能力矩阵
- *    （`dailyCheckin: false`）在**发请求之前**就不发，与 CodeArts 的既有约定同源。
+ * 3. **积分含签到**：`credits.status` / `credits.claimAll` **已为 qoder 接线**——
+ *    `src/qoder-credits.ts` 按 product 现算 host，国际版走 `openapi.qoder.sh`
+ *    （2026-09-23 真机探测同端点 200、与 CN 逐字节同构）。未知 provider
+ *    仍回 `unsupported provider`，与其它 provider 的既有约定同源。
  *
  * ## 替身边界
  *
@@ -581,29 +581,75 @@ describe('credits.balances —— qoder 的余额查询（只认 jt）', () => {
   })
 })
 
-// ── 刻意**不**加分支的两个积分端点 ───────────────────────────────────────────
+// ── credits.status / credits.claimAll 的 qoder 分支 ──────────────────────────
 
-describe('credits.status / credits.claimAll —— qoder 刻意不加分支', () => {
+describe('credits.status / credits.claimAll —— qoder 走国际版 host 正常分派', () => {
   /**
-   * Qoder **没有公开的签到 API**：官方每日 100 Credits 只能在 Qoder 桌面 App
-   * 里手动领取。故宿主侧两个签到端点对 qoder 一律落到「不支持的 provider」，
-   * 这是**正确契约**（与 CodeArts 的拒绝同源），不是待修的缺陷：
-   * 客户端靠 `credits-capabilities.js` 的 `dailyCheckin: false` 在**发请求之前**
-   * 就不发（`loadCredits` / `claimCredits` 各有一道守卫）。
+   * Qoder **有签到 API**：国际版与 CN 同一端点（`sash/api/v1/me/campaigns`），
+   * 已真机探测（2026-09-23）HTTP 200、响应与 CN 逐字节同构；由
+   * `src/qoder-credits.ts` 按传入的 `product` 现算 host，国际版走 `openapi.qoder.sh`。
+   * 故两个签到端点对 `qoder` **正常接线**，不再是「不支持的 provider」。
    *
-   * ⚠️ 若哪天有人给它们补上 qoder 分支，本组会立刻变红 —— 那正是需要的提醒：
-   * 补分支的前提是先有一个**真实存在**的签到端点。
+   * ⚠️ 客户端能力矩阵（`creduits-capabilities.js`）的 `dailyCheckin` 对两区均为
+   * true —— 这里的宿主分支是发请求前的门控放行之后的执行层，必须真实可用。
+   *
+   * ## 出网替身
+   *
+   * 按 URL 分流：exchange 回一张 jt、活动列表回一条 `CLAIMABLE` 活动；「两个
+   * host 都认」是刻意的 —— 若国际版分支误用 CN 实例或 product，响应仍会 200，
+   * 只有 `calls` 里的 URL（`openapi.qoder.sh`）会揭穿它。下面每条断言 host。
    */
+  function responder(options: {
+    campaigns?: () => Response
+    claim?: () => Response
+  } = {}) {
+    return (call: CapturedCall): Response => {
+      if (call.url.includes('/api/v1/jobToken/exchange')) {
+        return new Response(exchangeBody(), { status: 200 })
+      }
+      if (call.url.includes('/sash/api/v1/me/campaigns')) {
+        if (call.method === 'POST') {
+          return options.claim?.()
+            ?? new Response(JSON.stringify({ status: 'CLAIMED', benefit: { amount: 100 } }), { status: 200 })
+        }
+        return options.campaigns?.()
+          ?? new Response(JSON.stringify({
+            showCampaign: true, claimable: true,
+            campaigns: [{
+              campaignId: '01a0bf8d-intl-1',
+              campaignKey: 'act-20260923-001',
+              actionType: 'CLAIM_BENEFIT',
+              claimStatus: 'CLAIMABLE',
+              benefit: { amount: 100 },
+            }],
+          }), { status: 200 })
+      }
+      return new Response('not found', { status: 404 })
+    }
+  }
+
+  function withIntlAccount(h: Harness): Promise<void> {
+    return h.call('account.create', { provider: 'qoder', pat: 'pt-intl-token' }).then((created) => {
+      expect(created.ok, JSON.stringify(created)).toBe(true)
+      if (created.ok) h.calls.length = 0
+    })
+  }
+
   const METHODS = ['credits.status', 'credits.claimAll'] as const
 
-  it.each(METHODS)('%s 对 qoder 回 unsupported provider（不加分支是刻意的）', async (method) => {
-    const h = createHarness(() => new Response('{}', { status: 200 }))
+  it.each(METHODS)('%s 对国际版 qoder 正常分派，且出网落在 qoder.sh host', async (method) => {
+    const h = createHarness(responder())
+    await withIntlAccount(h)
+
     const result = await h.call(method, { provider: 'qoder' })
-    expect(result.ok).toBe(false)
-    if (result.ok) return
-    expect(result.error.message).toBe('unsupported provider: qoder')
-    // 拒绝发生在**发请求之前**：没有任何出网。
-    expect(h.calls).toHaveLength(0)
+    expect(result.ok, `${method} 不该拒绝 qoder：${JSON.stringify(result)}`).toBe(true)
+    if (!result.ok) return
+    const campaign = h.calls.find((c) => c.url.includes('/sash/api/v1/me/campaigns'))
+    expect(campaign, `未打到活动端点：${JSON.stringify(h.calls)}`).toBeDefined()
+    expect(campaign!.url).toBe(`${QODER.openapiBase}/sash/api/v1/me/campaigns`)
+    expect(campaign!.url).toContain('.qoder.sh')
+    // 整条链路（含 exchange）不得出现 CN host。
+    expect(h.calls.every((c) => !c.url.includes('.qoder.com.cn'))).toBe(true)
   })
 
   it.each(METHODS)('%s 对未知 provider 的拒绝形态一致', async (method) => {

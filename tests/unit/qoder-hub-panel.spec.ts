@@ -382,14 +382,14 @@ describe('能力矩阵驱动的积分行为在客户端不被 qoder 特判', () 
     expect(code).not.toMatch(/qoderRegionFor\s*\(/);
   })
 
-  it('credits.claimAll 与 credits.balances 的调用点邻域里没有 qoder 字面量', () => {
+  it('checkin.perform 与 credits.balances 的调用点邻域里没有 qoder 字面量', () => {
     // 这两条是「能力矩阵驱动、而非 provider 特判」的可执行形式：只要有人在
     // 调用点旁边加一句 `provider === 'qoder' ? … : …`，这条立刻红。
     //
     // 同样先剥整行注释：窗口取的是**调用点邻域**，紧邻的文档注释里提一句 qoder
     // （解释「Qoder 没有签到能力」是合理叙述）不该被判成违规。
     const code = codeLinesOf(normalized)
-    for (const call of ["rpcCall('credits.claimAll'", "rpcCall('credits.balances'"]) {
+    for (const call of ["rpcCall('checkin.perform'", "rpcCall('credits.balances'"]) {
       const at = code.indexOf(call)
       expect(at, call).toBeGreaterThan(-1)
       const around = code.slice(Math.max(0, at - 400), at + 400)

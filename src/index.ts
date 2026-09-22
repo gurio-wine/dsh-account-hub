@@ -15,7 +15,7 @@ import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
 import { createContextTierRegistry } from './context-tiers.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
-import { registerAccountHubRpc, type ModelCatalogSource } from './account-hub-rpc.js'
+import { registerAccountHubRpc, performCheckinSweep, type ModelCatalogSource } from './account-hub-rpc.js'
 import { BUDDY_CN, BUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE_CN } from './trae-cn-product.js'
@@ -827,4 +827,26 @@ export function apply(ctx: Context): void {
     ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTierRegistry, modelAdapters,
   )
   ctx.provide('accountPool', pool)
+
+  // ===== 自动签到 · 宿主触发层 =====
+  // 进入 Hub 由客户端触发（见 auto-checkin-design.md §7，宿主不监听页面）。宿主只做
+  // **启动 sweep** 与 **每 4 小时定时 sweep** 两件事，共同收口到模块级的
+  // `performCheckinSweep`（RPC `checkin.sweep` case 与定时器共用同一入口；内部
+  // `sweepRunning` 模块级互斥保证定时器与页面触发不并发 —— 设计文档 §9）。
+  const AUTO_CHECKIN_INTERVAL_MS = 4 * 60 * 60 * 1000
+  const runAutoCheckinSweep = () => performCheckinSweep({ ctx, pool, lobsterai, qoder, qoderCn })
+
+  // 启动后首次：等 storage 就绪。`openStorage` 是异步的、且幂等（重入直接返回已
+  // resolve 的 Promise），sweep 的「读 checkins / 写今日」必须在它 return 之后才跑，
+  // 否则会读到旧 settings/内存快照、写入落错通路 —— 顺序约束见设计文档 §4。
+  // fire-and-forget：不 await、不阻塞 apply 返回；openStorage 内部已自吞异常并降级。
+  void pool.openStorage().then(() => queueMicrotask(runAutoCheckinSweep))
+
+  // 每 4 小时定时 sweep。`unref` 与 `ctx.effect` 登记清理与既有「多账号续期调度」
+  // 同款形态（见上方 refreshAllCredentials 的定时器）；插件停用/重载时清掉定时器。
+  const checkinTimer = setInterval(() => void runAutoCheckinSweep(), AUTO_CHECKIN_INTERVAL_MS)
+  checkinTimer.unref?.()
+  ctx.effect(() => () => {
+    clearInterval(checkinTimer)
+  }, 'account-hub: auto check-in scheduler')
 }

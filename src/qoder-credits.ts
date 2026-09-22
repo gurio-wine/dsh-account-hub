@@ -14,7 +14,7 @@
  * |---|---|---|
  * | {@link fetchQoderCreditBalance} | Account Hub 的 `credits.balances` | 余额卡片 |
  * | {@link checkQoderQuotaExhausted} | **步骤 6** 接线的 `quotaVerdict` | 402 的额度二次判别 |
- * | {@link fetchQoderCheckinStatus} / {@link claimQoderDailyCheckin} | `credits.status` / `credits.claimAll` | 每日领取（**只给 CN**，见下节） |
+ * | {@link fetchQoderCheckinStatus} / {@link claimQoderDailyCheckin} | `credits.status` / `credits.claimAll` | 每日领取（两区，见下节） |
  *
  * ## 协议（T1 真机实测，逐字节）
  *
@@ -97,12 +97,12 @@
  *    「签到活动未开启」；而「无活动可领」归一为 `already-claimed`（保守判已领，
  *    比误报可领更不容易误导用户）。
  *
- * ## 签到只接 CN
+ * ## 签到两区共用一份实现
  *
- * 宿主 `credits.status` / `credits.claimAll` **只给 `qoder-cn` 接线**，国际版
- * `qoder` 维持拒绝（`dailyCheckin: false`）—— 上游情报明说该活动在**桌面 App**
- * 才能领，本模块的实现只对 CN 打开。协议实现本身按传入的 `product` 现算 host，
- * 两区共用一份代码。
+ * 宿主 `credits.status` / `credits.claimAll` 对**两个 region** 都接线：
+ * CN 端点由 keylog 解密抓包解出并真机验收（2026-09-21），国际版同一端点已
+ * 真机探测（2026-09-23）HTTP 200、响应与 CN 逐字节同构。协议实现本身按传入
+ * 的 `product` 现算 host，两区共用一份代码，region 差异全部由产品配置承载。
  */
 
 import {

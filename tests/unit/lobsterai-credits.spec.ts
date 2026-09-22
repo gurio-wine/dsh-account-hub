@@ -406,6 +406,34 @@ describe('fetchLobsteraiCreditBalance', () => {
     expect((await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher))?.total).toBe(0)
   })
 
+  it('余额为 0（数字）且无明细时返回 0，而非查不到（缺陷回归）', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: 0 },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance).not.toBeNull()
+    expect(balance?.total).toBe(0)
+    expect(balance?.packages).toHaveLength(0)
+  })
+
+  it('余额为 0（字符串 "0.00" 形态）时返回 0，而非查不到', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: '0.00', creditItems: [] },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance).not.toBeNull()
+    expect(balance?.total).toBe(0)
+  })
+
+  it('余额为 0 且明细为空数组时返回 0（空数组 ≠ 字段缺失）', async () => {
+    const { fetcher } = stubFetch(() => new Response(JSON.stringify({
+      code: 0, data: { totalCreditsRemaining: 0, creditItems: [] },
+    }), { status: 200 }))
+    const balance = await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)
+    expect(balance).not.toBeNull()
+    expect(balance?.total).toBe(0)
+  })
+
   it('既无总额也无明细时返回 null（不把解析失败伪装成 0 积分）', async () => {
     const { fetcher } = stubFetch(() => new Response(JSON.stringify({ code: 0, data: {} }), { status: 200 }))
     expect(await fetchLobsteraiCreditBalance(makeCredential(), LOBSTERAI, fetcher)).toBeNull()

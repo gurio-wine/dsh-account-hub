@@ -30,7 +30,7 @@
  * | `buddy`         | ✓                   | ✗ 国际版后端无签到接口        |
  * | `lobsterai`     | ✓                   | ✓ `client-activities` 三步流程 |
  * | `trae-cn`       | ✓ 通用池（IDE 路径能花的） | ✓ `checkin_credits` 两步 + 设备头 |
- * | `qoder`         | ✓ 与 CreditBalance 同构 | ✗ 国际版无此活动 |
+ * | `qoder`         | ✓ 与 CreditBalance 同构 | ✓ 两区同协议（服务端下发为准） |
  * | `qoder-cn`      | ✓ 与 CreditBalance 同构（CN 两池容缺） | ✓ `sash/api/v1/me/campaigns` 领取 |
  *
  * - `balance`：Buddy 系走 `POST /v2/billing/meter/get-user-resource`，该端点
@@ -48,22 +48,23 @@
  *   →（`id !== null` 时）`/v1/ops/confirm` 四步（`src/codearts-credits.ts`）；
  *   Qoder CN 是 `sash/api/v1/me/campaigns` → `…/{campaignId}/claim` 两步
  *   （`src/qoder-credits.ts`）。
- * - ⚠️ Qoder 系**两个 region 的 `dailyCheckin` 不同，且 `qoder` 的 `false`
- *   不能推广到 CN**。两条必须**分开读**：
+ * - Qoder 两区（`qoder` / `qoder-cn`）`dailyCheckin` **都为 `true`**，
+ *   协议共用（宿主按传入 `product` 现算 host，见 `src/qoder-credits.ts`）：
  *
- *   1. `qoder`（**国际版**）—— `false`：CLI2API 实测**国际版不显示签到**，
- *      该活动在国际版不存在（官方的每日 100 Credits 只能在 **Qoder 桌面 App
- *      里手动领取**，服务端未暴露该端点）。本插件也不用任何「模拟桌面客户端」
- *      的手段去领（既不可靠也超出本插件边界）。
+ *   1. `qoder`（**国际版**）—— **`true`**：端点
+ *      `GET {openapiBase}/sash/api/v1/me/campaigns` 已于 **2026-09-23 真机探测
+ *      HTTP 200**、响应与 CN 逐字节同构（`{"uid":…,"showCampaign":false,
+ *      "claimable":false,"campaignUrl":"","campaigns":[]}`）。旧定性
+ *      「国际版无此活动」不成立 —— 两区同协议，国际版活动以**服务端下发为准**，
+ *      空列表归 `already-claimed`（判据 4 既有语义）。
  *
  *   2. `qoder-cn`（**国内版**）—— **`true`**：端点已由 keylog 解密抓包解出并
  *      真机验收（2026-09-21），宿主侧 `credits.status` / `credits.claimAll`
- *      的 `qoder-cn` 分支同步接线，**只对 CN 打开**。
+ *      的 `qoder-cn` 分支同步接线。
  *
  *   两个 region 的 `balance` 都是 true，都**不能**从它推断签到也能做 ——
- *   正如不能用 Buddy（国际版）没有签到反推它查不到余额一样，两个能力彼此独立。
- *   在面板上的表现是：两个 Qoder 面板都**渲染**积分行与「刷新积分」，
- *   但**只有 Qoder CN** 渲染「一键领取积分」。
+ *   两个能力彼此独立。在面板上的表现是：两个 Qoder 面板都**渲染**积分行、
+ *   「刷新积分」与「一键领取积分」。
  *
  * `trae-cn` 的 `balance` 走 `POST /trae/api/v2/pay/web_user_ent_usage`，响应里的
  * 礼包按 `available_endpoint` 分池，而面板只显示**本 provider 实际能花的那个池**
@@ -110,15 +111,15 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   `CreditBalance` **逐字段同构**（`total` / `packages` / `expiredTotal`），
   //   于是 `CreditBalanceRow` 直接复用，客户端**不需要任何 provider 分支**，
   //   宿主侧也不做选池（Qoder 只有一个池）。
-  // `dailyCheckin: false` —— **刻意不做签到**：官方的每日 100 Credits 只能在
-  //   Qoder **桌面 App 里手动领取**，没有公开 API（Qoder 的接入范围止于
-  //   目录 / chat / 额度，见 docs/qoder-integration-plan.md）。
-  //   ⚠️ 它与 `buddy` 在本矩阵里**同形（true/false）但原因完全不同**：
-  //   前者是「后端无此接口」，后者是「有权益但只在桌面 App 手动领」。
-  //   将来若有人照着 `buddy` 那一行「顺手改对称」，或者因为 `balance` 是 true
-  //   就顺手把 `dailyCheckin` 也写成 true，Qoder 面板就会多出一个**每次点击
-  //   都必然失败**的按钮（没有任何端点可打）。单测有断言钉死这两项。
-  qoder: Object.freeze({ balance: true, dailyCheckin: false }),
+  // `dailyCheckin: true` —— **两区同协议**（宿主按传入 `product` 现算 host，
+  //   见 `src/qoder-credits.ts`）。国际版端点 `GET {openapiBase}/sash/api/v1/me/campaigns`
+  //   已于 **2026-09-23 真机探测 HTTP 200**、响应与 CN 逐字节同构 —— 旧定性
+  //   「国际版无此活动」已推翻，活动以**服务端下发为准**、空列表归
+  //   `already-claimed`（判据 4 既有语义）。
+  //   ⚠️ 它与 `buddy`（`dailyCheckin:false`）**不同**：Buddy 国际版**后端没有
+  //   签到接口**，是矩阵里唯一 `dailyCheckin` 为 false 的条目 —— 不要因为
+  //   `balance` 是 true 就顺手把 Buddy 也写成 true。单测有断言钉死六条签到面板。
+  qoder: Object.freeze({ balance: true, dailyCheckin: true }),
   // Qoder **CN（国内版）**：与国际版**同协议双 region**（另一组 host + 另一组
   // 出站身份值），登录形态同样是 PAT 粘贴。
   //
@@ -129,13 +130,14 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   ⚠️ 与 Trae CN 那条**不同**：Qoder 两 region 是**各自的池**，
   //   不存在「选哪个池显示」的问题，宿主侧也没有选池分支。
   //
-  // `dailyCheckin: true` —— 签到**只对 CN 打开**（国际版维持 false，见上）。
-  //   端点经 keylog 解密抓包解出并真机验收（2026-09-21）：
+  // `dailyCheckin: true` —— 与国际版**同为 true**（见上）。端点在 CN 侧经 keylog
+  //   解密抓包解出并真机验收（2026-09-21）：
   //   `GET /sash/api/v1/me/campaigns` → `POST …/{campaignId}/claim`（body 空串）。
   //   ⚠️ 它挂在 **`/sash/`** 前缀下、**不是** `/api/`，也**不走 wasm 签名路径** ——
   //   早期只按 `/api/` 前缀搜端点，因此误判「Qoder 无签到」（那时这里的值是
   //   `false`，理由是「端点未知」）。宿主侧 `credits.status` / `credits.claimAll`
-  //   的 `qoder-cn` 分支已同步接线（`src/account-hub-rpc.ts`），国际版仍结构性拒绝。
+  //   / `checkin.perform` 对**两区均已接线**、按 region 分派（`src/account-hub-rpc.ts`
+  //   经 `qoderRegionFor`），国际版端点 2026-09-23 真机验证 200 同构。
   'qoder-cn': Object.freeze({ balance: true, dailyCheckin: true }),
 });
 
@@ -152,8 +154,8 @@ export function supportsCreditBalance(provider) {
 /**
  * 该 provider 是否能执行每日签到领取（一键领取积分）。
  *
- * 为 false 时面板不渲染该按钮（Buddy 国际版后端无接口；Qoder 国际版活动不存在
- * —— 两者理由不同，见上）。
+ * 为 false 时面板不渲染该按钮。当前矩阵里**只有 Buddy 国际版**是 `false`
+ *（后端无签到接口）；Qoder 两区都是 `true`，见上。
  */
 export function supportsDailyCheckin(provider) {
   return CREDITS_CAPABILITIES[provider]?.dailyCheckin === true;

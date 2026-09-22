@@ -53,6 +53,7 @@ function createMockStorage(initial?: Record<string, unknown>) {
           accounts: Array.isArray(value.accounts) ? value.accounts : [],
           disabledModels: (value.disabledModels ?? {}) as Record<string, Record<string, boolean>>,
           contextBudgets: (value.contextBudgets ?? {}) as Record<string, Record<string, number>>,
+          checkins: (value.checkins ?? {}) as Record<string, number>,
           schemaVersion: typeof value.schemaVersion === 'number' ? value.schemaVersion : 0,
         }
       },
@@ -150,7 +151,7 @@ describe('AccountPool × storage —— storage 为主', () => {
     expect(pool.schemaVersion).toBe(1)
   })
 
-  it('写入走 storage 的 global.set，且一次写入包含四件套', async () => {
+  it('写入走 storage 的 global.set，且一次写入包含五件套', async () => {
     const mock = createMockStorage()
     const ctx = createMockContext({ storage: mock.storage })
     const pool = new AccountPool(ctx as never)
@@ -161,6 +162,7 @@ describe('AccountPool × storage —— storage 为主', () => {
       accounts: [ACCOUNT],
       disabledModels: {},
       contextBudgets: {},
+      checkins: {},
       schemaVersion: 0,
     })
     // 一次都不该碰 settings 路径（storage 可用时它是唯一写源）
