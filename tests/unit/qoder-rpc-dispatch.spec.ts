@@ -428,13 +428,12 @@ describe('account.create —— qoder 的 PAT 粘贴式登录（非两段式）'
     expect(result.error.message).toMatch(/unknown provider/)
   })
 
-  it('trae-cn-work 仍被拒绝（恒等映射不适用于它）', async () => {
-    // 与 Qoder 无关的**反向**锚点：`poolProviderFor` 把 trae-cn-work 映射到
-    // trae-cn，但 `account.create` **刻意不映射** —— 映射会让面板多出的二次
-    // 点击给同一份凭据建出第二个占位账号。Qoder 是恒等映射，不该被误当成
-    // 「所以所有 provider 都能建号」。
+  it('未登记的 provider 一律被拒绝（`account.create` 不猜登录方式）', async () => {
+    // `account.create` 按 provider 解析产品配置来决定登录怎么做，未登记的一律拒绝。
+    // 它**刻意不经过** `poolProviderFor`：若把某个 provider 映射成宿主 provider，
+    // 面板多出的二次点击会给同一份凭据建出第二个占位账号。
     const h = createHarness(successResponder)
-    const result = await h.call<unknown>('account.create', { provider: 'trae-cn-work' })
+    const result = await h.call<unknown>('account.create', { provider: 'not-a-provider' })
     expect(result.ok).toBe(false)
     if (result.ok) return
     expect(result.error.message).toMatch(/unknown provider/)
@@ -691,7 +690,7 @@ describe('account.refresh —— qoder 账号刷新自己的凭据 ref', () => {
 
 // ── 恒等映射（qoder 不参与任何 provider 映射） ───────────────────────────────
 
-describe('qoder 与账号池键的恒等性（与 trae-cn-work 互为反例）', () => {
+describe('qoder 与账号池键的恒等性', () => {
   it('account.list 按 `qoder` 查池：账号拿得到，且没有发生映射', async () => {
     const h = createHarness(() => new Response(exchangeBody(), { status: 200 }))
     await h.call('account.create', { provider: 'qoder', pat: 'pt-abc123' })

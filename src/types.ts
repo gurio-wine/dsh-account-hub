@@ -300,7 +300,7 @@ export interface RpcModelListEntry {
    *
    * 只有**有档位数据的 provider** 会带（Trae CN 的 `context_window_tokens.dev`、
    * Qoder 的 `default_context_window`、Buddy 的 `min(maxInputTokens, 档位表最大档)`）。
-   * 其余 provider（CodeArts / LobsterAI / Trae CN Work…）的适配器不产出窗口元数据。
+   * 其余 provider（CodeArts / LobsterAI…）的适配器不产出窗口元数据。
    * 缺省 = 无窗口信息，UI 不渲染档位列。
    */
   contextWindow?: number

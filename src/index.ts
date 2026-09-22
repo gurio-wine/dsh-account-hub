@@ -6,7 +6,6 @@ import { registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { registerLobsteraiLlm } from './lobsterai-adapter.js'
 import { registerTraeCnLlm } from './trae-cn-adapter.js'
-import { fetchTraeCnWorkModels, registerTraeCnWorkLlm } from './trae-cn-work-adapter.js'
 import { registerQoderLlm } from './qoder-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
@@ -20,7 +19,6 @@ import { registerJetHubRpc } from './jet-hub-rpc.js'
 import { BUDDY_CN, BUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE_CN } from './trae-cn-product.js'
-import { TRAE_CN_WORK } from './trae-cn-work-product.js'
 import { QODER, QODER_CN } from './qoder-product.js'
 import { checkQoderQuotaExhausted } from './qoder-credits.js'
 import { QoderSigningProvider, qoderDirectorySigningSource } from './qoder-signing.js'
@@ -242,25 +240,22 @@ export function makeCredentialResolver<T>(
 /** 注册 codeartsAuth 服务、命令以及 codearts LLM 路由。 */
 export function apply(ctx: Context): void {
   // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
-  // 五个 namespace 分别对应：codearts 路由、Buddy CN（buddy-cn）路由、
-  // Buddy（buddy）路由、LobsterAI（lobsterai）路由、Trae CN（trae-cn）路由
-  // —— 后四者由 registerXxxLlm 以 `llm-${product.id}` 派生，漏注册会让模型设置页在
+  // 六个 namespace 分别对应：codearts 路由、Buddy CN（buddy-cn）路由、
+  // Buddy（buddy）路由、LobsterAI（lobsterai）路由、Trae CN（trae-cn）路由、
+  // Qoder 两区（qoder / qoder-cn）路由
+  // —— 后五个由 registerXxxLlm 以 `llm-${product.id}` 派生，漏注册会让模型设置页在
   // `refFor → deriveKeyRef(provider)` 处以
   // `provider.toUpperCase is not a function` 崩溃。
   // 注意 `llm-trae-cn` / `llm-buddy-cn` 里的连字符是**正确**的：namespace 是
   // 字符串键而非标识符，与 cordis 服务名（`traeCnAuth` / `buddyCnAuth`）
   // 走的是两套命名规则。
-  // 第六个 namespace 是 Trae CN **Work**（`trae-cn-work`）—— 与 `trae-cn`
-  // 是**两个 provider**（协议不同源、模型池不重合、扣不同积分池），
-  // 但**共用同一批账号与凭据**（Work 无独立登录）。
-  // 第七个是 Qoder（`qoder`）—— 第六条协议线，登录形态是 PAT 粘贴。
-  // 第八个是 Qoder **CN**（`qoder-cn`）—— 与国际版**同协议双 region**，
+  // Qoder 与 Qoder **CN**（`qoder-cn`）是**同协议双 region**，
   // 但两区的账号、用量、PAT **互不相通**，故是**两个独立 provider**
   // （详见 `src/qoder-product.ts` 的模块头）。namespace 用连字符是**正确**的：
   // 它是字符串键而非标识符，与 cordis 服务名 `qoderCnAuth` 走两套命名规则。
   registerProviderSettings(
     ctx,
-    'llm-buddy-cn', 'llm-buddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae-cn', 'llm-trae-cn-work',
+    'llm-buddy-cn', 'llm-buddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae-cn',
     'llm-qoder', 'llm-qoder-cn',
   )
   const service = new CodeArtsAuth(ctx)
@@ -487,50 +482,6 @@ export function apply(ctx: Context): void {
     product: TRAE_CN,
   })
 
-  // ===== Trae CN Work (TraeWork 网页版) 服务 =====
-  //
-  // **复用上面那条 Trae CN 的全部账号基础设施**：同一个 `traeCn` auth 实例、
-  // 同一个 `pickTraeCnAccount` 选号器、同一批 `TRAE_CN_ACCOUNT_*` 凭据。
-  // Work **没有独立登录**（它的登录就是 Trae CN 的登录），故**不注册**独立
-  // auth 服务、不新建选号器 —— 新建只会得到第二个指向同一份凭据的解析器，
-  // 且两处选号可能挑到不同账号。
-  //
-  // ⚠️ **账号池查询一律传 `TRAE_CN_WORK.poolProviderId`（= `'trae-cn'`），
-  // 不是 `TRAE_CN_WORK.id`（= `'trae-cn-work'`）**：
-  // 账号条目的 `provider` 字段是 `trae-cn`，按 `trae-cn-work` 过滤一个都
-  // 匹配不到 → 适配器每次拿 `MISSING_CREDENTIAL`（「请先登录」）而账号明明在
-  // 列表里。这个接线是本插件唯一一处「provider id 与池键不同名」的地方，
-  // 已在 AGENTS.md 单独登记。
-  //
-  // 反方向的错误同样静默：路由名若用池键，`trae-cn-work` 根本不会出现在
-  // 模型选择器里。
-  registerTraeCnWorkLlm(ctx, {
-    credentialRef: credentialRef(TRAE_CN.defaultCredentialRef),
-    // 与 IDE 路径**同一份凭据、同一个池键**（`trae-cn`）—— 两条路径是同一批
-    // 账号的两种用法，不是两批账号。
-    resolveCredential: makeCredentialResolver<TraeCnCredential>(
-      ctx, pool, TRAE_CN_WORK.poolProviderId, TRAE_CN.defaultCredentialRef,
-    ),
-    refresh: async (model?: string) => {
-      // 与 resolveCredential 用**同一个**选号器与同一个 model：否则会出现
-      // 「解析到 B、却刷新了 A」，B 的过期 token 永不更新（历史 S1 缺陷）。
-      const available = await pickTraeCnAccount(model)
-      if (available) await traeCn.refreshAccountCredential(available.entry.credentialRef)
-      else await traeCn.refresh()
-    },
-    // Work 的模型目录**真的可拉**（与 IDE 路径相反，见 parseTraeCnWorkModels）。
-    // 用解析到的凭据拉：目录端点要鉴权，且不消耗积分。
-    fetchRemoteModels: async () => {
-      const credential = await makeCredentialResolver<TraeCnCredential>(
-        ctx, pool, TRAE_CN_WORK.poolProviderId, TRAE_CN.defaultCredentialRef,
-      )()
-      if (credential === undefined || credential.access_token.length === 0) return []
-      return fetchTraeCnWorkModels(credential)
-    },
-    accountPool: pool,
-    product: TRAE_CN_WORK,
-  })
-
   // ===== Qoder (PAT 粘贴式登录) 服务 =====
   //
   // 第六条协议线，与前五条**完全不同源**：没有浏览器 OAuth、没有本地回调
@@ -643,9 +594,8 @@ export function apply(ctx: Context): void {
   // 混在同一组候选里，适配器换号时会把 CN 的 PAT 拿去打国际版端点 ——
   // 得到的是「凭据失效」的假象，且**不报任何配置错误**。
   //
-  // ⚠️ **这与 `trae-cn-work` 的「复用池」方向正好相反，不要照抄那边**：
-  // Work 与 Trae CN 是**同一批账号**的两种用法，故那边把面板 id 映射到
-  // `trae-cn`；而 Qoder CN 与国际版是**两批账号**，池查询一律传
+  // ⚠️ **两个 region 的池查询一律传各自的 id，不做任何映射**：
+  // Qoder CN 与国际版是**两批账号**，池查询一律传
   // `QODER_CN.id`（`'qoder-cn'`），**不做任何 poolProviderId 映射**。
   // 账号条目的 `provider` 字段 = `'qoder-cn'`，凭据 ref 前缀
   // `QODER_CN_ACCOUNT_*`（连字符转下划线的机制已有，见
@@ -799,10 +749,7 @@ export function apply(ctx: Context): void {
   // ## 键 = provider id（**不是**面板 id、不是池键）
   //
   // 与 `contextBudgets` 的存储分键同构。故：
-  // - `trae-cn-work` **刻意不在表里** —— 它的目录实测 `dev == max`（无档位可选），
-  //   且与 `trae-cn` 是同批账号的不同池（模型池、黑名单都不重合），注册进去只会让
-  //   Work 面板多出一列切了没反应的选项；
-  // - CodeArts / LobsterAI 同理不在表里：它们的目录根本没有窗口元数据，
+  // - CodeArts / LobsterAI **刻意不在表里**：它们的目录根本没有窗口元数据，
   //   「无数据不显示」是铁律，不是漏接线。
   //
   // 用 `*.id` 而不是字面量：写死字面量在改名 / 多产品场景下会静默不匹配

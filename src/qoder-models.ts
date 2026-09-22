@@ -544,7 +544,7 @@ function readThinkingConfig(record: Record<string, unknown>): {
  *    与「目录是官方启用集」一致 —— 上游若改名该字段，结果是空目录 → 回退静态表
  *    （用户仍能用），而不是把 17 项（含必然 402 的 tier 名）整批放出去。
  * 2. **`default_effort` 不在 `efforts` 内时只丢默认档、保留档位列表** ——
- *    与 trae-cn / trae-cn-work 的同名规则逐字一致：声明了却不在列表里的默认档
+ *    与 `src/trae-cn-models.ts` 的同名规则逐字一致：声明了却不在列表里的默认档
  *    会被 DSH 判为 `INVALID_MODEL_REASONING` **直接抛错**，把请求打死；
  *    而上游发出不自洽组合时用户仍应能手动选档。
  *
@@ -617,7 +617,7 @@ export function parseQoderSceneDirectory(
 /**
  * 读取 `efforts` / `default_effort`。
  *
- * 规则与 `src/trae-cn-models.ts` / `src/trae-cn-work-adapter.ts` 的同名读取
+ * 规则与 `src/trae-cn-models.ts` 的同名读取
  * **刻意一致**：档位 id 逐字符照抄（不做 `light`→`low` 之类的归一化 ——
  * 它会原样进请求体），`default_effort` 只在落在列表内时才声明。
  */

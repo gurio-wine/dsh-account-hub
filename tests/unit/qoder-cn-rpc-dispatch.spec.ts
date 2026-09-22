@@ -392,7 +392,7 @@ describe('account.create —— qoder-cn 的 PAT 粘贴式登录', () => {
 
 // ── 账号池隔离（两批账号，不是同一批） ───────────────────────────────────────
 
-describe('两个 region 的账号池**互相看不见**（与 trae-cn-work 的复用池方向相反）', () => {
+describe('两个 region 的账号池**互相看不见**（两批账号，不是同一批）', () => {
   it('国际版账号不出现在 qoder-cn 列表里，反之亦然', async () => {
     const h = createHarness((call) => new Response(
       exchangeBody(isCnHost(call.url) ? 'cn-user' : 'intl-user'), { status: 200 },
@@ -420,14 +420,12 @@ describe('两个 region 的账号池**互相看不见**（与 trae-cn-work 的�
   })
 
   it('`poolProviderFor` 对两个 region 都是恒等映射（CN **不**映射到 qoder）', async () => {
-    // 与 `trae-cn-work` 的对照：那边必须映射（同一批账号），这边必须**不**映射
-    // （两批账号）。若有人照抄 Work 的写法把 qoder-cn 映射过去，CN 面板会列出
-    // 国际版的账号，而适配器会拿 CN 的池键去查 —— 两个方向都不报错。
+    // 两个 region 是**两批账号**，故必须**不**映射。若有人照抄「共享账号池」的
+    // 写法把 qoder-cn 映射过去，CN 面板会列出国际版的账号，而适配器会拿 CN 的
+    // 池键去查 —— 两个方向都不报错。
     const { poolProviderFor } = await import('../../src/jet-hub-rpc.js')
     expect(poolProviderFor('qoder-cn')).toBe('qoder-cn')
     expect(poolProviderFor('qoder')).toBe('qoder')
-    // 反例锚点：唯一的非恒等映射仍然是 trae-cn-work。
-    expect(poolProviderFor('trae-cn-work')).toBe('trae-cn')
   })
 })
 
@@ -782,8 +780,8 @@ describe('model.list / model.setDisabled / retestAll / resetAll 用 qoder-cn 键
       expect(result.ok, `${method}: ${JSON.stringify(result)}`).toBe(true)
     }
     // ⚠️ 这条才是本用例的**判据**：`ok: true` 对空集也成立（端点只是回一个空
-    // 结果），故必须断言池**按 `qoder-cn` 查** —— 若有人把它映射到 `qoder`
-    // （照抄 trae-cn-work 的写法），CN 面板的重测/重置会作用到国际版账号上，
+    // 结果），故必须断言池**按 `qoder-cn` 查** —— 若有人把它映射到 `qoder`，
+    // CN 面板的重测/重置会作用到国际版账号上，
     // 而端点仍回 ok: true，界面看不出任何异常。
     expect(h.listByProviderCalls).toEqual(['qoder-cn', 'qoder-cn'])
   })

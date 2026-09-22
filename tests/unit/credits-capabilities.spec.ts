@@ -79,19 +79,6 @@ describe('积分能力矩阵', () => {
     expect(supportsDailyCheckin('trae-cn')).toBe(true)
   })
 
-  it('Trae CN Work 支持余额但**不支持**签到（签到留在 Trae CN 面板）', () => {
-    // Work 与 Trae CN 是同一个账号体系（同一批账号、同一份凭据、同一个余额端点），
-    // 因此余额必须支持 —— 这正是加这个面板要回答的问题（Work 池还能花多少）。
-    //
-    // 但 `dailyCheckin` 刻意是 false：签到是**账号级、当日一次**的操作，与走哪条
-    // 路径无关。两个面板都放按钮必然是同一个账号在两处重复领取，第二次点击只会
-    // 得到「今天已签到」—— 用户看到的就是按钮坏了。这条断言钉死「不要顺手把
-    // Work 也登记成 ✓」：它与 `trae-cn` 只差一个字段，最容易在复制粘贴时改错。
-    expect(CREDITS_CAPABILITIES['trae-cn-work']).toEqual({ balance: true, dailyCheckin: false })
-    expect(supportsCreditBalance('trae-cn-work')).toBe(true)
-    expect(supportsDailyCheckin('trae-cn-work')).toBe(false)
-  })
-
   it('Qoder 支持余额但**不支持**签到（100 Credits 只能桌面 App 手动领）', () => {
     // `balance`：步骤 4 的 src/qoder-credits.ts 提供的余额与 `CreditBalance`
     // 逐字段同构，CreditBalanceRow 直接复用，客户端不需要任何 provider 分支。
@@ -130,7 +117,7 @@ describe('积分能力矩阵', () => {
     //   - `qoder-cn`（国内版）：CLI2API 的 RegionDescriptor **只在 cn 挂
     //     Checkin** —— 疑似有签到，但**端点未知、未验收**，拿到端点后要翻 true。
     //
-    // 故这里以**注释正文**为判据（与 trae-cn-work / qoder 那几条同类手法）：
+    // 故这里以**注释正文**为判据（与 qoder 那条同类手法）：
     // 若谁把 CN 那段的「端点未知」改写成「没有这项权益」，这条立刻红。
     const source = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/credits-capabilities.js'),
@@ -153,27 +140,23 @@ describe('积分能力矩阵', () => {
   it('能力矩阵的键与 PROVIDERS 的 id 逐字对齐（含连字符 provider）', () => {
     // 集合相等那条断言用 PROVIDER_ENTRY_PATTERN 抓 id，而它的字符类必须是
     // `[a-z-]+`：只认小写字母的话，带连字符的 id 抓不到，于是**漏登记时那条
-    // 断言依然是绿的**（集合两边都不含它）。这里直接锁死匹配器覆盖两个
-    // 带连字符的 id，免得将来有人「图省事」把连字符从字符类里去掉。
+    // 断言依然是绿的**（集合两边都不含它）。这里直接锁死匹配器覆盖带连字符的 id，
+    // 免得将来有人「图省事」把连字符从字符类里去掉。
     const ids = [...readClientSource().matchAll(PROVIDER_ENTRY_PATTERN)].map((m) => m[1]!)
     expect(ids).toContain('trae-cn')
-    // 两个 id 只差一个后缀，是最容易被「顺手统一」成 `traeCnWork` 的地方。
-    expect(ids).toContain('trae-cn-work')
     expect(ids).toContain('lobsterai')
     // 改名后的两组 id：中国版是 `buddy-cn`（带连字符），国际版是 `buddy`。
     // 旧的 `workbuddy` 必须彻底消失 —— 它在新体系里既不是 id 也不是 provider 实参，
     // 留在 PROVIDERS 里会让面板渲染出一个后端永远不认的标签页。
     expect(ids).toContain('buddy-cn')
     expect(ids).toContain('buddy')
-    // Qoder 是**第七条**，也是唯一登录形态不是浏览器登录的那条（PAT 粘贴）。
-    // id 无连字符、与后端 `QODER.id` 逐字一致。
+    // Qoder 无连字符，与后端 `QODER.id` 逐字一致。
     expect(ids).toContain('qoder')
-    // Qoder CN 是**第八条**：同一形态的第二个 region，id **带连字符**
-    // （`qoder-cn`），写成 `qoderCn` / `qoder_cn` 都会让能力矩阵查不到它 ——
-    // 面板静默不显示积分，且不报任何错。
+    // Qoder CN 是第二个 region，id **带连字符**（`qoder-cn`），写成 `qoderCn` /
+    // `qoder_cn` 都会让能力矩阵查不到它 —— 面板静默不显示积分，且不报任何错。
     expect(ids).toContain('qoder-cn')
     expect(ids).not.toContain('workbuddy')
-    expect(ids).toHaveLength(8)
+    expect(ids).toHaveLength(7)
   })
 
   it('未登记的 provider 默认不支持任何积分能力（默认关闭）', () => {
@@ -205,7 +188,7 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
   const source = readClientSource()
 
   /**
-   * `PROVIDERS` 的**八条**最终形态。
+   * `PROVIDERS` 的**七条**最终形态。
    *
    * 顺序即面板标签页顺序，也是后端注册顺序；`label` 是面板标题与按钮文案里的
    * 显示名，`logoClass` 必须与 `jet-hub-styles.js` 的
@@ -217,9 +200,8 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     { id: 'buddy', label: 'Buddy', logoClass: 'buddy' },
     { id: 'lobsterai', label: 'LobsterAI', logoClass: 'lobsterai' },
     { id: 'trae-cn', label: 'Trae CN', logoClass: 'trae-cn' },
-    { id: 'trae-cn-work', label: 'Trae CN Work', logoClass: 'trae-cn-work' },
-    // Qoder 排在 Trae CN Work 之后。它与上面六条的差别只在**产品自身**
-    // （另一套 host / 另一套凭据体系），登录形态同样是浏览器设备流 ——
+    // Qoder 排在 Trae CN 之后。它与上面五条的差别只在**产品自身**
+    // （另一套 host / 另一套凭据体系），登录形态同为浏览器设备流 ——
     // PAT 粘贴曾在 2015b03 起并存，已于 2026-09-21 按用户要求移除。
     { id: 'qoder', label: 'Qoder', logoClass: 'qoder' },
     // Qoder CN 紧跟在 Qoder 之后（= PROVIDERS 的书写顺序）：同一个形态的
@@ -228,38 +210,29 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     { id: 'qoder-cn', label: 'Qoder CN', logoClass: 'qoder-cn' },
   ] as const
 
-  it('八条 provider 的 id / label / logoClass 与定稿一致', () => {
+  it('七条 provider 的 id / label / logoClass 与定稿一致', () => {
     const entries = [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)].map((m) => ({
       id: m[1]!, label: m[2]!, logoClass: m[4]!,
     }))
     expect(entries).toEqual(EXPECTED)
   })
 
-  it('只有 trae-cn-work 声明 loginHint（面板不渲染「+ 新建账号」）', () => {
-    // Work 没有独立登录：它的账号与凭据完全复用 Trae CN。若两个面板各放一个
-    // 登录按钮，用户会在「到底该在哪个面板登录」上反复试错，而两条入口写的是
-    // 同一份 TRAE_CN_ACCOUNT_* 数据。
+  it('没有条目声明 loginHint（每个面板都自带「+ 新建账号」入口）', () => {
+    // `loginHint` 曾用于「本面板没有登录入口、去隔壁面板登录」的共用账号
+    // provider（TraeWork 路线，官方已把该通道并入通用通道，那条 provider 已
+    // 整体移除）。字段本身留在匹配器里是因为**加回来是好设计**：新增共用账号的
+    // provider 时，缺省就是「有入口」，最坏结果是多一个本来就能用的按钮。
     //
-    // 判据是「有没有 loginHint」而不是某个显式的布尔标志：新增 provider 忘记
-    // 声明时，最坏结果是多一个本来就能用的按钮，而不是把面板变成没有入口的死面板。
+    // 这条断言守的是**当前形态**：七个面板全部走浏览器设备流登录，
+    // 谁都不该声明 loginHint —— 声明了会让 `canCreateAccount` 变 false、
+    // 「+ 新建账号」整块消失，而**不报任何错**，只是一个没有入口的死面板。
     const entries = [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)]
-    // 先钉死匹配器本身抓全了八条：漏抓的条目 `entry[5]` 恒为 undefined，
-    // 会让下面那条「只有 Work 有」的断言在条目整个消失时反而是绿的。
+    // 先钉死匹配器本身抓全了七条：漏抓的条目 `entry[5]` 恒为 undefined，
+    // 会让下面那条断言在条目整个消失时反而是绿的。
     expect(entries).toHaveLength(EXPECTED.length)
     for (const entry of entries) {
-      expect(entry[5] !== undefined, entry[1]).toBe(entry[1] === 'trae-cn-work')
+      expect(entry[5], entry[1]).toBeUndefined()
     }
-    expect(source).toContain('与 Trae CN 共用账号')
-    // ⚠️ Qoder 的区分（与上面那条断言是**两个方向**，别混为一谈）：
-    // 它**没有** loginHint，因为**它有自己的登录入口**（浏览器设备流）。
-    // loginHint 的语义是「去**隔壁面板**登录」（只用于 Trae CN Work 那种共用账号），
-    // 与「在本面板登录」是两件事：前者删掉入口、后者保留入口。
-    // 若哪天给 qoder 补上 loginHint，`canCreateAccount` 会变成 false，
-    // 面板的「+ 新建账号」整块消失 —— 而且不报错，只会变成一个没有入口的死面板。
-    // 故这里把「qoder 没有 loginHint」也钉死。
-    //
-    // （2026-09-21：Qoder 的登录形态已收敛为**只有浏览器设备流** ——
-    //   PAT 粘贴按用户要求移除，但那条与 loginHint 无关，见 jet-hub.js 文件头。）
     const providerEntryOf = (id: string) =>
       [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)].find((m) => m[1] === id)
     expect(providerEntryOf('qoder')?.[5]).toBeUndefined()
@@ -282,10 +255,9 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     expect(entries.size).toBe(EXPECTED.length)
     expect(entries.get('buddy-cn')).toBe('BUDDY_CN_ICON')
     expect(entries.get('buddy')).toBe('BUDDY_ICON')
-    // 两个 Trae CN 条目各自引用自己的常量：Work 的图标本体与 IDE 路径相同
-    //（同一产品），但常量名分开，将来换图只改一处。
+    // 两个 Trae CN 条目各自引用自己的常量这一约束已随第二条 Trae 路径移除；
+    // 这里只钉死 IDE 路径自己那条。
     expect(entries.get('trae-cn')).toBe('TRAE_CN_ICON')
-    expect(entries.get('trae-cn-work')).toBe('TRAE_CN_WORK_ICON')
     // Qoder 的图标是**官方原图**（qoder.com 首页 rel=icon 指向的 412x412 PNG，
     // 原样 base64 内联），不是 SVG，也不与任何既有常量共用。
     expect(entries.get('qoder')).toBe('QODER_ICON')
@@ -297,9 +269,6 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     // 旧常量名不得残留（它们现在指向不存在的符号，客户端会直接崩）。
     expect(source).not.toContain('CODEBUDDY_ICON')
     expect(source).not.toContain('WORKBUDDY_ICON')
-    // `TRAE_CN_WORK_ICON` 必须是**别名**而不是另一份 base64 字面量：
-    // 两个面板显示不同图标会让人以为它们连的是不同产品。
-    expect(source).toMatch(/const TRAE_CN_WORK_ICON = TRAE_CN_ICON\b/)
   })
 
   it('logoClass 与 jet-hub-styles.js 的图标容器类逐字对齐', () => {
@@ -327,30 +296,28 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
  * （`jet-hub-credit-balance-row.spec.ts` 的文件头有完整说明）。金额/双池那类
  * 「分支输出差异」已经由那个文件用整树深比较守住，本组只管辖「谁渲染、谁不渲染」。
  */
-describe('Trae CN Work 面板的结构（源码级回归）', () => {
+describe('Account Hub 面板的结构（源码级回归）', () => {
   const source = readClientSource()
 
-  it('「+ 新建账号」按 provider 渲染，且判定来自 loginHint 而不是散落的字面量比较', () => {
-    // 面板里**不得**出现 `provider === 'trae-cn-work'` 这类判断：新增共用账号的
-    // provider 时，散落的条件会被漏改一处，而漏改的表现是「按钮还在，点了报
-    // unknown provider」—— 用户只会觉得功能坏了。
+  it('「+ 新建账号」无条件渲染，不按 provider 写分支', () => {
+    // 每个面板都有自己的登录入口（浏览器设备流），故按钮**不该**挂在任何
+    // provider 条件上：曾经那套「共用账号的 provider 不渲染按钮、改渲染提示行」
+    // 的分支已随 TraeWork 路线 provider 一起移除。
+    // 判据：面板代码里不得残留 `canCreateAccount` / `loginHint` 这类判定。
     const start = source.indexOf('const all = models || [];')
     expect(start).toBeGreaterThan(-1)
     const panel = source.slice(start)
-    expect(panel).toContain('canCreateAccount')
-    expect(panel).toContain('loginHint')
-    // 判定函数把「有没有 loginHint」翻译成「能不能建账号」，且**默认能**。
-    expect(source).toMatch(/const canCreateAccount = loginHint === null;/)
-    expect(source).toMatch(/function providerLoginHint\(provider\)/)
+    expect(panel).not.toContain('canCreateAccount')
+    expect(panel).not.toContain('loginHint')
+    expect(source).not.toMatch(/function providerLoginHint\(provider\)/)
   })
 
   it('积分能力仍然只在宿主判定的两处消费，面板不新增 provider 字面量分支', () => {
     // 能力矩阵是唯一真相源（见 credits-capabilities.js 的文件头）。
-    // Work 面板的积分行与「刷新积分」按钮都走 `canLoadCredits`，
-    // 不因为它是 Work 而另写一条路径。
+    // 积分行与「刷新积分」按钮都走 `canLoadCredits`，不为任何 provider 另写路径。
     expect(source).toContain('supportsCreditBalance(provider)')
     expect(source).toContain('showCredits: canLoadCredits')
-    // 签到按钮仍按能力渲染 —— Work 面板没有它（矩阵里 dailyCheckin 为 false）。
+    // 签到按钮仍按能力渲染。
     expect(source).toContain('supportsDailyCheckin(provider)')
     expect(source).toContain('if (!supportsCredits) return;')
   })
@@ -366,7 +333,7 @@ describe('Trae CN Work 面板的结构（源码级回归）', () => {
 /**
  * `PROVIDERS` 条目的匹配器。
  *
- * `[a-z-]+` 而不是 `[a-z]+`：provider id 允许带连字符（`trae-cn` / `trae-cn-work`
+ * `[a-z-]+` 而不是 `[a-z]+`：provider id 允许带连字符（`trae-cn` / `qoder-cn`
  * 都是），而只认小写字母的正则会让**带连字符的条目在 `PROVIDERS` 里隐形** ——
  * 匹配不进 `providerIds`，于是「集合相等」这条断言在漏登记时反而是绿的。
  */

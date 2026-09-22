@@ -13,7 +13,7 @@
  * | Trae CN | `context_window_tokens.{dev,max}` | dev 默认档 + max 升档 |
  * | Qoder | `available_context_windows` | **最小**档是默认档，其余是升档 |
  * | Buddy | `contextWindow.supportedLengths` | 生效档已是**最大**档，其余是降档 |
- * | LobsterAI / Trae CN Work | 单个 `contextWindow` | 无档位可选 |
+ * | LobsterAI | 单个 `contextWindow` | 无档位可选 |
  *
  * 三者的唯一共同点是「**用户能选的档位精确等于目录公布的那些数**」。故本模块
  * 只提供两件与 provider 无关的事：
@@ -202,8 +202,8 @@ export interface ContextTierSource {
  * `model.setContextBudget` 一律拒绝）—— 这正是 headless / 测试场景的既定降级。
  *
  * ⚠️ **注册表按 provider id 分键，与 `contextBudgets` 的存储分键同构**：
- * 同一批账号的两个 provider（`trae-cn` / `trae-cn-work`）各有各的目录，档位
- * 不可互相顶替。
+ * 各 provider 有各自的目录，档位不可互相顶替（写错键会让 A 的档位出现在 B
+ * 的面板上，且不报错）。
  */
 export interface ContextTierRegistry {
   /** 该 provider 的档位来源；未注册返回 `undefined`（不是抛错）。 */

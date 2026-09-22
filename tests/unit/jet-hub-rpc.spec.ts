@@ -1027,22 +1027,6 @@ describe('model.list / model.setDisabled 端点', () => {
     })
   })
 
-  it('**Work 侧走同一道过滤**（僵尸 id 形态同源，黑名单键独立）', async () => {
-    const { call, storedValue } = registerEndpoints({
-      models: [{ id: 'Doubao-Seed-Code', name: 'Seed-Code' }],
-      disabledModels: {
-        'trae-cn-work': { custom_model_foo: true, sagitta: true, 'glm-5.3': true },
-      },
-    })
-
-    const result = await call('model.list', { provider: 'trae-cn-work' })
-    const models = (result.value as { models: Array<{ id: string }> }).models
-
-    // 目录项 + 唯一的正常僵尸键（glm-5.3 是 Work 14 项里的成员）。
-    expect(models.map((m) => m.id).sort()).toEqual(['Doubao-Seed-Code', 'glm-5.3'])
-    expect(storedValue().disabledModels).toEqual({ 'trae-cn-work': { 'glm-5.3': true } })
-  })
-
   it('垃圾键全清后整个 provider 子表被移除（不留空对象噪音）', async () => {
     const { call, storedValue } = registerEndpoints({
       models: TRAE_MODELS,
@@ -1091,7 +1075,7 @@ describe('model.list / model.setDisabled 端点', () => {
    *    单选列并显示选中项；
    * 2. 档位数据**按 provider 分派**（问注册表，而不是对 provider 名写特判）：
    *    注册了就带窗口字段（Trae CN 的两档、Qoder 的三档都走同一条路径），
-   *    没注册就一个字都不带（`trae-cn-work` / CodeArts 这类无档位数据的 provider）；
+   *    没注册就一个字都不带（CodeArts / LobsterAI 这类无档位数据的 provider）；
    * 3. `model.setContextBudget` 只接受**精确等于目录公布的某个档位**的值 ——
    *    编造值被拒，且错误信息里带着可用档位（用户唯一能据以改正的信息）；
    * 4. 未注册的 provider 直接拒绝，而不是静默写一个永不生效的值。
@@ -1220,9 +1204,9 @@ describe('model.list / model.setDisabled 端点', () => {
      * 这一对用例是「推广」这件事的核心防线 —— 早前 `model.list` 写死
      * `req.provider === TRAE_CN.id`，于是 buddy / qoder 的目录数据即使存在也带不出来。
      */
-    it('未注册的 provider **一个窗口字段都不带**（trae-cn-work / codearts 刻意不注册）', async () => {
+    it('未注册的 provider **一个窗口字段都不带**（codearts / lobsterai 刻意不注册）', async () => {
       const { call } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
-      for (const provider of ['trae-cn-work', 'codearts', 'lobsterai']) {
+      for (const provider of ['codearts', 'lobsterai']) {
         const result = await call('model.list', { provider })
         for (const model of (result.value as { models: Array<Record<string, unknown>> }).models) {
           expect(model, provider).not.toHaveProperty('contextWindow')
@@ -1356,9 +1340,9 @@ describe('model.list / model.setDisabled 端点', () => {
       expect(storedValue().contextBudgets ?? {}).toEqual({})
     })
 
-    it('**非注册 provider 一律拒绝**（`trae-cn-work` 刻意不在注册表里）', async () => {
+    it('**非注册 provider 一律拒绝**（codearts / lobsterai 刻意不在注册表里）', async () => {
       const { call } = registerEndpoints({ models: MODELS, contextTiers: TIER_REGISTRY })
-      for (const provider of ['trae-cn-work', 'codearts', 'lobsterai']) {
+      for (const provider of ['codearts', 'lobsterai']) {
         const result = await call('model.setContextBudget', { provider, model: 'glm-5.2', window: 1_048_576 })
         expect(result.ok, provider).toBe(false)
         expect((result.error as { message: string }).message, provider).toContain('不支持上下文窗口档位')
@@ -1402,7 +1386,7 @@ describe('model.list / model.setDisabled 端点', () => {
     })
 
     it('**档位数据按 provider 隔离**：同一个模型 id 在两个 provider 上各按各的档位校验', async () => {
-      // 同一批账号的两个 provider（trae-cn / trae-cn-work）在存储上也是分开的；
+      // 各 provider 的档位在存储上也是分开的；
       // 这里用 trae-cn 与 qoder 造同样的「同名模型、不同档位」场景，确认校验读的是
       // **该 provider 自己的目录**，而不是某个全局表。
       const { call, storedValue } = registerEndpoints({

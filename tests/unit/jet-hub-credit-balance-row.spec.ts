@@ -198,15 +198,13 @@ describe('CreditBalanceRow 永远是单数字（分池后无 provider 专属分�
     }
   })
 
-  it('无论余额是哪个池的数字，渲染都逐元素相同（渲染层不知道池的存在）', () => {
-    // Trae CN 面板拿到的是通用池之和、Trae CN Work 面板拿到的是 Work 池之和，
-    // 两者在**渲染层**是完全同构的输入 —— 「显示哪个池」的决定在宿主侧的
-    // `traeCnPoolFor()`，组件不做也不该做任何池判断。
-    const universal = snapshot(CreditBalanceRow({ balance: legacyBalance({ total: 154.22 }) }))
-    const work = snapshot(CreditBalanceRow({ balance: legacyBalance({ total: 154.22 }) }))
-    expect(work).toEqual(universal)
-    expect(JSON.stringify(universal)).not.toContain('通用')
-    expect(JSON.stringify(universal)).not.toContain('Work')
+  it('渲染层不知道「池」的存在（选池在宿主侧完成）', () => {
+    // 宿主选了哪个池，渲染层拿到的都是同一个逐字段同构的 `CreditBalance` ——
+    // 「显示哪个池」的决定在 `src/jet-hub-rpc.ts` 的 `credits.balances` 分支，
+    // 组件不做也不该做任何池判断。
+    const rendered = JSON.stringify(snapshot(CreditBalanceRow({ balance: legacyBalance({ total: 154.22 }) })))
+    expect(rendered).not.toContain('通用')
+    expect(rendered).not.toContain('Work')
   })
 
   it('资源包列表只渲染传进来的那些包（过滤在宿主侧完成）', () => {

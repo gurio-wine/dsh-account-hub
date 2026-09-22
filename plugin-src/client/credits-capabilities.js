@@ -26,7 +26,6 @@
  * | `buddy`         | ✓                   | ✗ 国际版后端无签到接口        |
  * | `lobsterai`     | ✓                   | ✓ `client-activities` 三步流程 |
  * | `trae-cn`       | ✓ 通用池（IDE 路径能花的） | ✓ `checkin_credits` 两步 + 设备头 |
- * | `trae-cn-work`  | ✓ Work 池（TraeWork 能花的） | ✗ 签到留在 Trae CN 面板       |
  * | `qoder`         | ✓ 与 CreditBalance 同构 | ✗ 每日 100 Credits 只能桌面 App 手动领 |
  * | `qoder-cn`      | ✓ 与 CreditBalance 同构（CN 两池容缺） | ✗ **疑似有签到但端点未知**（未验收） |
  *
@@ -34,19 +33,13 @@
  *   在 Buddy CN 与 Buddy（国际版）**通用**（仅 baseURL 随 `product.endpoint`
  *   切换）；LobsterAI 走 `GET /api/user/profile-summary`；Trae CN 走
  *   `POST /trae/api/v2/pay/web_user_ent_usage`，并按 `available_endpoint`
- *   **分池显示**（见下）；`trae-cn-work` 是同一个端点的**同一个实现**（同批账号、
- *   同一份凭据），差别只在**显示哪个池** —— 账号池键由宿主侧的 `poolProviderId`
- *   映射承载、显示池由 `traeCnPoolFor()` 承载，客户端不为此写第二套逻辑。
+ *   取池（见下）。
  * - `dailyCheckin`：Buddy 系是 `checkin-activity-status` + `daily-checkin`，
  *   **仅 Buddy CN（中国版）**有；Buddy（国际版）内核里只有 `get-dosage-notify`
  *   （用量通知），没有签到接口，故其面板不渲染「一键领取积分」。LobsterAI 是
  *   `client-activities` 三步流程（`src/lobsterai-credits.ts`）；Trae CN 是
  *   `checkin_credits/status` → `claim` 两步（`src/trae-cn-credits.ts`，claim 必须
  *   带设备四件套），故两者都支持。Qoder **不支持**（见下）。
- * - `trae-cn-work` 的 `dailyCheckin` 是 **false**（尽管它属于 Trae CN 账号体系）：
- *   签到是**账号级、当日一次**的操作，与走哪条路径无关。两个面板都放签到按钮
- *   必然是同一个账号两处重复领取 —— 第二次点击只会得到「今天已签到」，
- *   这在用户看来就是按钮坏了。故签到**只留在 Trae CN 面板**。
  * - ⚠️ Qoder 系**两个 region 的 `dailyCheckin` 都是 `false`，但理由互不相同**。
  *   下面两条必须**分开读**，不要合并成一句「Qoder 没有签到」：
  *
@@ -71,10 +64,10 @@
  *   「一键领取积分」。
  *
  * `trae-cn` 的 `balance` 走 `POST /trae/api/v2/pay/web_user_ent_usage`，响应里的
- * 礼包按 `available_endpoint` 分池，而**每个面板只显示自己那条路径能花的池**
- * （宿主按面板 id 选池，见 `src/jet-hub-rpc.ts` 的 `traeCnPoolFor()`）：
- * Trae CN 面板 = 通用池、Trae CN Work 面板 = Work 池。两边都是**单数字**，
- * 界面上不出现「通用」「Work」字样，资源包列表同样只含本池的包。
+ * 礼包按 `available_endpoint` 分池，而面板只显示**本 provider 实际能花的那个池**
+ * （宿主按 provider 选池，见 `src/jet-hub-rpc.ts` 的 `credits.balances` 分支）：
+ * Trae CN 面板 = 通用池。显示的是**单数字**，界面上不出现「通用」「Work」字样，
+ * 资源包列表同样只含本池的包。
  * 分池前那套「双池超集 + `workTotal` 两段渲染」已删除（同一处显示两池时，
  * 永远有一段是那个面板花不掉的）。
  *
@@ -101,22 +94,13 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // 签到走 checkin_credits 两步流程（claim 带设备四件套），两项都支持。
   // 键名是 `trae-cn`（带连字符，与 `PROVIDERS` 的 id 及后端 provider 实参一致）。
   'trae-cn': Object.freeze({ balance: true, dailyCheckin: true }),
-  // Trae CN **Work**（TraeWork 网页协议）。同一个产品、同一个账号体系、
-  // 同一个余额端点（同一个 `fetchTraeCnCreditBalance`）—— 但**显示 Work 池**
-  // （TraeWork 能花的那笔），故面板上的数字与 Trae CN 面板不同、且都是各自
-  // 实际能花的钱。**不支持签到**：签到是账号级当日一次的操作，两个面板都放
-  // 按钮必然重复领取。
-  // 宿主侧两条接线各管一件事：`credits.balances` 的**账号池键**映射到 trae-cn
-  // （`poolProviderFor()`）、**显示池**映射到 Work（`traeCnPoolFor()`），都在
-  // `src/jet-hub-rpc.ts`；客户端不为此写第二套逻辑。
-  'trae-cn-work': Object.freeze({ balance: true, dailyCheckin: false }),
-  // Qoder：登录形态是 **PAT 粘贴**（其余六个 provider 全是浏览器登录），
+  // Qoder：登录形态是**浏览器设备流**（PAT 粘贴曾并存，已按用户要求移除），
   // 但它同样落进**账号池**，故余额行、「刷新积分」等既有通用路径一并适用。
   //
   // `balance: true` —— 步骤 4 的 `src/qoder-credits.ts` 提供的余额与
   //   `CreditBalance` **逐字段同构**（`total` / `packages` / `expiredTotal`），
   //   于是 `CreditBalanceRow` 直接复用，客户端**不需要任何 provider 分支**，
-  //   宿主侧也不走 `traeCnPoolFor()` 那类选池映射（Qoder 只有一个池）。
+  //   宿主侧也不做选池（Qoder 只有一个池）。
   // `dailyCheckin: false` —— **刻意不做签到**：官方的每日 100 Credits 只能在
   //   Qoder **桌面 App 里手动领取**，没有公开 API（Qoder 的接入范围止于
   //   目录 / chat / 额度，见 docs/qoder-integration-plan.md）。
@@ -133,8 +117,8 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   //   `product` 现算 host），返回结构与 `CreditBalance` 逐字段同构；
   //   CN 侧实测只有**两个池**（`userQuota` + `addOnQuota`，无 `orgResourcePackage`），
   //   而解析器本就是**三池容缺**（缺席按 0），故 CN 两池天然兼容、客户端零分支。
-  //   ⚠️ 与 trae-cn / trae-cn-work 那对**不同**：Qoder 两 region 是**各自的池**，
-  //   不存在「选哪个池显示」的问题，宿主侧也没有 `traeCnPoolFor()` 那类映射。
+  //   ⚠️ 与 Trae CN 那条**不同**：Qoder 两 region 是**各自的池**，
+  //   不存在「选哪个池显示」的问题，宿主侧也没有选池分支。
   //
   // `dailyCheckin: false` —— ⚠️ **理由是「端点未知、未验证」，不是「没有权益」**，
   //   也**不是**「与 `qoder` 一样不存在该活动」：

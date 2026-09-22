@@ -737,7 +737,10 @@ describe('fetchTraeCnCreditBalance', () => {
     expect(balance!.packages.map((pkg) => pkg.name)).toEqual(['礼包A', '礼包B'])
   })
 
-  it('Trae CN Work 面板（Work 池）：只有 Work 包与 Work total，通用包被过滤掉', async () => {
+  it('传入 Work 池时只返回 Work 包与 Work total，通用包被过滤掉', async () => {
+    // ⚠️ 池过滤本身是**上游协议事实**（`available_endpoint` 仍分池），故这条
+    // 覆盖保留；但本插件**已无任何面板显示 Work 池**（TraeWork 通道已被官方
+    // 并入通用通道，那条 provider 已整体移除），生产路径只传 `POOL_UNIVERSAL`。
     const { fetcher } = balanceFetch([
       gift({ available_endpoint: TRAE_CN_POOL_UNIVERSAL, remain_amount: 54.22, name: '礼包A' }),
       gift({ available_endpoint: TRAE_CN_POOL_UNIVERSAL, remain_amount: 100, name: '礼包B' }),
@@ -752,8 +755,8 @@ describe('fetchTraeCnCreditBalance', () => {
     expect(balance!.packages[0]!.name).not.toContain('[Work')
   })
 
-  it('另一池整个为空时该面板显示 0（不是 null）—— 池为空 ≠ 查不到', async () => {
-    // 真实场景：账号只有通用积分、一分 Work 积分都没有。此时 Work 面板该显示
+  it('另一池整个为空时该池显示 0（不是 null）—— 池为空 ≠ 查不到', async () => {
+    // 真实场景：账号只有通用积分、一分 Work 积分都没有。此时查 Work 池该显示
     // 「0」，而不是「余额查询失败」—— 服务端确实回了、只是本池一个包都没有。
     const { fetcher } = balanceFetch([
       gift({ available_endpoint: TRAE_CN_POOL_UNIVERSAL, remain_amount: 30, name: '通用包' }),
@@ -1063,7 +1066,7 @@ describe('fetchTraeCnCreditBalance —— 真机样例（2026-09-18 校准）', 
     expect(balance!.packages[0]!.remaining).toBe(0)
   })
 
-  it('真机样例 —— Trae CN Work 面板只见 Work 池 2000（通用包的 0 不进这个数字）', async () => {
+  it('真机样例 —— 查 Work 池只见 Work 池 2000（通用包的 0 不进这个数字）', async () => {
     const { fetcher } = stubFetch(() => new Response(
       JSON.stringify(realDeviceBalanceResponse()), { status: 200 },
     ))

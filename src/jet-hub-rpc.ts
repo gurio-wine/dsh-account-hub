@@ -39,7 +39,6 @@ import {
   fetchLobsteraiCreditBalance,
 } from './lobsterai-credits.js'
 import { TRAE_CN } from './trae-cn-product.js'
-import { TRAE_CN_WORK } from './trae-cn-work-product.js'
 import { QODER, QODER_CN, qoderProductById } from './qoder-product.js'
 import { fetchQoderCreditBalance } from './qoder-credits.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
@@ -55,11 +54,9 @@ import type { QoderDevicePendingLogin } from './qoder-device-flow.js'
 import type { TraeCnProduct } from './trae-cn-product.js'
 import {
   TRAE_CN_POOL_UNIVERSAL,
-  TRAE_CN_POOL_WORK,
   claimTraeCnDailyCheckin,
   fetchTraeCnCheckinStatus,
   fetchTraeCnCreditBalance,
-  type TraeCnPoolId,
 } from './trae-cn-credits.js'
 import {
   resetAccount,
@@ -145,71 +142,29 @@ export function accountCredentialRefName(provider: string, suffix: string): stri
 }
 
 /**
- * provider id → **账号池的 provider 键**（未映射的 provider 原样返回）。
+ * provider id → **账号池的 provider 键**（当前对每个 provider 都是恒等）。
  *
- * ## 为什么需要它
+ * ## 为什么留着一个恒等函数
  *
- * 绝大多数 provider 的路由名与账号池键是同一个字符串，但 **`trae-cn-work`
- * 不是**：Work 没有独立登录，账号、凭据（`TRAE_CN_ACCOUNT_*`）与限流切换全部
- * 复用 `trae-cn`（详见 `src/trae-cn-work-product.ts` 的 `poolProviderId`）。
- * Account Hub 的 Work 面板必须列出 `provider === 'trae-cn'` 的那批账号，
- * 否则面板是空的；积分余额也必须查同一批账号的同一个端点。
+ * 它存在的理由是**收敛点**，不是映射本身：账号列表 / 余额 / 签到状态 / 领取 /
+ * 重测 / 重置六个入口都经它把「面板 id」翻成「池键」，客户端因此永远不需要
+ * 知道池键与面板 id 可能不同（客户端发的就是面板 id）。
  *
- * ## 为什么收敛在这里（客户端不映射）
+ * 它曾经有过非恒等分支 —— 某个复用 `trae-cn` 账号的 TraeWork 路线 provider
+ * （官方已把该通道并入通用通道，那个 provider 已整体移除）。**恒等是
+ * 今天的取值，不是这个函数的语义**：将来若再出现「复用别人账号」的 provider，
+ * 在这里加一行即可，而不必把 if 撒进客户端六处调用点。
  *
- * 三个理由，缺一不可：
+ * ## 刻意**不**经过本函数的入口
  *
- * 1. **它取代的正是宿主侧既有的字面量分支**。积分三端点原先硬编码
- *    `req.provider === TRAE_CN.id`，账号列表走 `pool.listAccounts(req.provider)`。
- *    若把映射放在客户端，宿主这三个分支**必须一起改**（否则积分端点仍会以
- *    `productById('trae-cn-work')` 判成 unsupported），等于同一件事写两遍；
- * 2. **这是同一个概念的宿主侧落点**。池键的真相源是 `TraeCnWorkProduct.poolProviderId`，
- *    把映射写成引用该常量、而不是再抄一遍 `'trae-cn'` 字面量，两个方向就永远同步；
- * 3. **它让「面板 id 与池键不同」这件事只在一个函数里可见**。将来再加
- *    「复用别人账号」的 provider，只需在这里加一行，而不是把 if 撒进客户端
- *    六处调用点（账号列表 / 余额 / 签到状态 / 领取 / 重测 / 重置）。
- *
- * ## 刻意**不**映射的两个入口
- *
- * - **`account.create`**：`trae-cn-work` 没有独立登录，面板也不渲染「+ 新建账号」。
- *    这里若把它映射成 `trae-cn`，两次点击会派生出两个 `trae-cn-<shortId>` 占位
- *    账号，而它们背后是同一份凭据体系 —— 一个账号被建两次。故该入口对未知
- *    provider 的拒绝行为**保持不变**（宁可拒绝，不可静默重复建号）。
+ * - **`account.create`**：它按 provider 解析产品配置来决定「登录怎么做」。
+ *   若某天出现共用账号的 provider，这里**不能**映射成宿主 provider ——
+ *   那会派生出一个占位账号，而它背后是另一份凭据体系，等于把一个账号建两遍。
+ *   故该入口对未知 provider 的拒绝行为**保持不变**（宁可拒绝，不可静默重复建号）。
  * - **`login.poll`**：轮询的键是 accountId + 该账号自己的 provider，与面板 id 无关。
  */
 export function poolProviderFor(provider: string): string {
-  if (provider === TRAE_CN_WORK.id) return TRAE_CN_WORK.poolProviderId
   return provider
-}
-
-/**
- * 面板 id → **积分池**（余额显示口径；未映射的 provider 取通用池）。
- *
- * ## 与 {@link poolProviderFor} 是**两个不同的问题**，不要合并
- *
- * | 问题 | 函数 | `trae-cn` | `trae-cn-work` |
- * |---|---|---|---|
- * | **查谁的账号 / 打哪个端点** | {@link poolProviderFor} | `trae-cn` | `trae-cn`（映射过去） |
- * | **显示哪个积分池** | 本函数 | 通用池（0） | Work 池（1） |
- *
- * 前者必须把两个面板映射到**同一个键**（它们查的就是同一批账号与同一个端点），
- * 后者必须把它们**分成两个池**（各自只能花自己那个）。把两者混为一谈，就会
- * 出现「两个面板显示同一个池」——而且**不报错**：数字看着正常，只是 Work 面板
- * 显示的是它花不掉的那笔钱。
- *
- * ## 语义锚点
- *
- * **面板显示的数字 = 该 provider 实际能花的池**：Trae CN 面板显示通用池
- * （IDE 对话扣的），Trae CN Work 面板显示 Work 池（TraeWork 网页版能花的）。
- * 两个池互不通用，故各自只显示自己那一个。
- *
- * 取通用池是**默认值而非兜底猜测**：本函数目前只被 Trae 的余额分支调用，
- * 而该分支的守卫是 `provider === TRAE_CN.id`，即调用方只可能是 `trae-cn` 或
- * `trae-cn-work`；写成「非 Work 即通用」使将来新增的 Trae 路径默认看到
- * IDE 那个池（本插件主路径消耗的池），而不是看到一个空池。
- */
-export function traeCnPoolFor(provider: string): TraeCnPoolId {
-  return provider === TRAE_CN_WORK.id ? TRAE_CN_POOL_WORK : TRAE_CN_POOL_UNIVERSAL
 }
 
 /**
@@ -230,12 +185,12 @@ export function traeCnPoolFor(provider: string): TraeCnPoolId {
  * 再自己按 id 挑实例」这种写法在将来新增 region 时极易只改一半。本函数把它们
  * 绑成一个返回值，调用点拿到的是**已经对齐的**一对。
  *
- * ## 与 `poolProviderFor` / `traeCnPoolFor` 的区别
+ * ## 与 `poolProviderFor` 的区别
  *
- * 那两者答的是「面板 id 该查哪个池 / 显示哪个池」，本函数答的是「这个 region
- * 该用哪份配置与哪个实例」。Qoder **没有**池映射（两区是两批账号），故
+ * 那个答的是「面板 id 该查哪个账号池」，本函数答的是「这个 region
+ * 该用哪份配置与哪个实例」。Qoder **没有**任何池映射（两区是两批账号），故
  * `qoder-cn` 既不被映射到 `qoder`，也不反向映射 —— 这正是与国际版账号隔离的
- * 实现方式，与 `trae-cn-work` 的「复用池」方向刻意相反。
+ * 实现方式。
  *
  * @returns 该 provider 的 region；**不是 Qoder 系 provider 时 `undefined`**
  *          （由调用方决定是拒绝还是走别的分支 —— 本函数不抛错，因为
@@ -620,10 +575,9 @@ function llmServiceOf(ctx: Context): { listModels(provider: string): Promise<Arr
  * 就走通用路径，没有来源就维持既定降级（`model.list` 不带窗口字段、
  * `model.setContextBudget` 拒绝）。
  *
- * ⚠️ **注册表按 provider id 分键，与 `contextBudgets` 的存储分键同构**。特别是
- * `trae-cn-work` **不进注册表**：它的目录实测 `dev == max`（无档位可选），且与
- * `trae-cn` 是同批账号的**不同池**（黑名单、模型池都不重合），注册进去只会让 Work
- * 面板多出一列切了没反应的选项 —— 与「宁缺毋编」同一条铁律。
+ * ⚠️ **注册表按 provider id 分键，与 `contextBudgets` 的存储分键同构**。
+ * 没有档位数据源的 provider（如 LobsterAI：目录里没有档位元数据）**不进注册表**
+ * —— 注册进去只会让面板多出一列切了没反应的选项，与「宁缺毋编」同一条铁律。
  */
 export type { ContextTierRegistry, ContextTierSource } from './context-tiers.js'
 
@@ -729,8 +683,7 @@ function registerJetHubEndpoints(
     switch (method) {
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
-        // 面板 id → 池键的映射：`trae-cn-work` 面板列出的是 `trae-cn` 的账号
-        //（它们就是能跑 Work 路径的账号）。见 {@link poolProviderFor}。
+        // provider → 池键（见 {@link poolProviderFor}）。
         const accounts = await pool.listAccounts(poolProviderFor(req.provider))
         return { ok: true, value: { accounts } }
       }
@@ -1095,9 +1048,9 @@ function registerJetHubEndpoints(
             })
           return { ok: true, value: { accountId: id, loginUrl: loginSession.loginUrl } }
         } else {
-          // 刻意**不做** `poolProviderFor()` 映射：`trae-cn-work` 没有独立登录，
-          // 面板也不渲染「+ 新建账号」。若这里把它映射成 `trae-cn`，多出来的
-          // 二次点击会派生第二个 `trae-cn-<shortId>` 占位账号，而两者背后是
+          // 本入口**刻意不经过** `poolProviderFor()`：它按 provider 解析产品配置来
+          // 决定登录怎么做，对未知 provider 一律拒绝。若把某个 provider 映射成
+          // 宿主 provider，多出来的二次点击会派生第二个占位账号，而两者背后是
           // 同一份凭据体系 —— 等于把一个账号建两遍。宁可拒绝，不可静默重复建号。
           return { ok: false, error: { code: 'bad-request', message: `unknown provider: ${provider}` } }
         }
@@ -1280,8 +1233,7 @@ function registerJetHubEndpoints(
       // 此处的拒绝是兜底与契约声明，不是常规路径。
       case 'credits.status': {
         const req = payload as RpcCreditsStatusRequest
-        // provider → 池键：`trae-cn-work` 与 `trae-cn` 是同一批账号，
-        // 签到状态自然也是同一份（见 {@link poolProviderFor}）。
+        // provider → 池键（见 {@link poolProviderFor}）。
         const provider = poolProviderFor(req.provider)
         if (provider === LOBSTERAI.id) {
           // LobsterAI 没有独立的「签到状态」端点：活动状态要经
@@ -1301,10 +1253,6 @@ function registerJetHubEndpoints(
           // 「今天领了没」与 `enable` 两项，其余字段（连续天数 / 每日积分 /
           // 活动名…）协议里没有已确认的对应字段，故由 fetchTraeCnCheckinStatus
           // 如实补零。与 LobsterAI 的「压根没有状态端点」不是同一种情况。
-          //
-          // `trae-cn-work` 也会落到这里（poolProviderFor 把它映射成 `trae-cn`）：
-          // Work 面板不渲染签到按钮，但**端点仍如实工作** —— 客户端不渲染只是
-          // UI 便利，不是安全边界，这与 `credits.balances` 的既有约定一致。
           const accounts = await pool.listAccounts(provider)
           const results = await collectCreditsStatus<TraeCnCredential, TraeCnProduct>(accounts, TRAE_CN, {
             resolve: (ref) => ctx.credentials.resolve(ref),
@@ -1338,7 +1286,7 @@ function registerJetHubEndpoints(
       // 一键领取：逐账号顺序执行（并发易触发风控），单个账号失败不中断整体。
       case 'credits.claimAll': {
         const req = payload as RpcCreditsClaimAllRequest
-        // 与 status 同源：`trae-cn-work` 走 trae-cn 的同一批账号。
+        // provider → 池键（见 {@link poolProviderFor}）。
         const provider = poolProviderFor(req.provider)
         const accounts = await pool.listAccounts(provider)
         if (provider === LOBSTERAI.id) {
@@ -1389,9 +1337,7 @@ function registerJetHubEndpoints(
       // 网络耗时拖慢，且一次查询失败会让整份列表都取不到。
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
-        // **Account Hub 的 Work 面板就靠这一行拿到余额**：`trae-cn-work` →
-        // `trae-cn`，同一批账号、同一个端点。刻意不新写一套 Work 专用逻辑
-        // —— 余额**账号**属性是共用的，但**显示哪个池**是路径属性，见下。
+        // provider → 池键（见 {@link poolProviderFor}）。
         const provider = poolProviderFor(req.provider)
         const accounts = await pool.listAccounts(provider)
         if (provider === LOBSTERAI.id) {
@@ -1403,24 +1349,22 @@ function registerJetHubEndpoints(
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         if (provider === TRAE_CN.id) {
-          // ⚠️ 选池用 **`req.provider`（面板 id）而不是上面映射后的 `provider`**：
-          // 两个面板查的是同一份响应，但**显示的是各自能花的池** —— Trae CN 面板
-          // 显示通用池（IDE 对话扣的），Trae CN Work 面板显示 Work 池（TraeWork
-          // 能花的）。若误用 `provider`，两个面板都会显示通用池，而 Work 面板
-          // 的数字将永远不是它实际能花的钱（静默且方向一致地错）。
-          const pool = traeCnPoolFor(req.provider)
+          // Trae CN 面板显示**通用池**（`available_endpoint === 0`）—— IDE 对话
+          // 扣的就是它，即本 provider 实际能花的钱。
+          // ⚠️ 池是**路径属性**，与账号无关（账号池那条链路见上面的
+          // {@link poolProviderFor}）：将来若再出现别的 Trae 路径，在这里按
+          // `req.provider` 分支选池，而不是把池并进账号映射。
           const values = await collectCreditBalances<TraeCnCredential, TraeCnProduct>(accounts, TRAE_CN, {
             resolve: (ref) => ctx.credentials.resolve(ref),
             fetchBalance: (credential, product) =>
-              fetchTraeCnCreditBalance(credential, product, pool, { onDebug: (msg) => ctx.logger?.info?.(msg) }),
+              fetchTraeCnCreditBalance(credential, product, TRAE_CN_POOL_UNIVERSAL, { onDebug: (msg) => ctx.logger?.info?.(msg) }),
             warn: (msg) => ctx.logger?.warn?.(msg),
           })
           return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
         }
         if (provider === QODER.id || provider === QODER_CN.id) {
           // Qoder **只有一个池**（三池结构里另外两个本账号缺席，且它们同属这一个
-          // 端点的同一个数字口径），故没有任何选池映射 —— 与 Trae 系那条
-          // `traeCnPoolFor()` 刻意不同，不要为「形态对称」凭空造一个。
+          // 端点的同一个数字口径），故没有任何选池分支，不要为「形态对称」凭空造一个。
           // CN 同样如此：实测 CN 的 quota 响应只有 `userQuota` + `addOnQuota`，
           // `orgResourcePackage` 键**整个不存在** —— 而三池解析本来就是容缺的
           // （每个池独立解析，缺席 = 该池不存在），故**无需任何 CN 专属分支**。
@@ -1505,14 +1449,13 @@ function registerJetHubEndpoints(
         // 判据与目录侧**同源**（`isTraeCnJunkModelId`，见 src/trae-cn-models.ts），
         // 且只对 Trae 系 provider 生效：其它 provider 的黑名单语义没变（它们的
         // 历史行为原样保留，见 README 的「显示列表的回填机制与过滤」）。
-        const isTraeProvider = req.provider === TRAE_CN.id || req.provider === TRAE_CN_WORK.id
+        const isTraeProvider = req.provider === TRAE_CN.id
         const junkBackfilled = (id: string): boolean => isTraeProvider && isTraeCnJunkModelId(id)
         const listedIds = new Set(models.map((model) => model.id))
         const filteredOut = Object.keys(disabledMap)
           .filter((id) => disabledMap[id] === true && !listedIds.has(id) && !junkBackfilled(id))
-        // 逐模型窗口档位：**问注册表要本 provider 的来源**（推广后不再对 provider
-        // 名字写特判）。未注册 = 该 provider 没有档位数据（如 `trae-cn-work`：目录
-        // 实测 dev == max，无档位可选），缺省即「不渲染档位列」。
+        // 逐模型窗口档位：**问注册表要本 provider 的来源**（不再对 provider
+        // 名字写特判）。未注册 = 该 provider 没有档位数据，缺省即「不渲染档位列」。
         //
         // 读失败**不影响列表本身**：档位是附加信息，拿不到就不渲染那一列，
         // 而不是让整个「显示列表」报错（用户会以为模型目录没了）。
@@ -1653,7 +1596,6 @@ function registerJetHubEndpoints(
         }
         // 未注册的 provider 一律拒绝，而不是静默写下一个永远不生效的值：
         // 没有目录就没有校验依据，而「写进去却不生效」比拒绝更难排查。
-        // `trae-cn-work` 走的正是这一支（它的目录 dev == max，无档位可选）。
         const tierSource = contextTiers?.sourceFor(req.provider)
         if (tierSource === undefined) {
           return {

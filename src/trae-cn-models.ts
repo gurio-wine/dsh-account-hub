@@ -250,12 +250,11 @@ export const TRAE_CN_INVISIBLE_MODEL_IDS: readonly string[] = [
  * 正常 id 的代价是它在设置页少一行（模型本身仍可在对话框里选用，只是无法重新
  * 打开 —— 而它本来就已经被关闭了），远小于把僵尸行重新灌回列表。
  *
- * ## 对两个 Trae provider 通用
+ * ## 判据来源
  *
- * 判据全部是 **id 形态**，不含任何 provider 专属字段：`trae-cn` 与 `trae-cn-work`
- * 的黑名单各存一份键，但两边的垃圾 id 形态同源（同一个 Trae 账号体系）。
- * Work 的 14 项表里当前没有 custom 项，然而用户若在过滤网上线前关过 Work 侧的
- * 条目，僵尸键会长得一样，故两个 provider 走同一道过滤。
+ * 判据全部是 **id 形态**，不含任何 provider 专属字段：垃圾 id（内部 agent 项、
+ * 账号私有 BYOK 的 `custom_model_*`、客户端自隐项）都来自同一个 Trae 账号体系
+ * 的目录形态，故本函数不依赖调用方是谁。
  */
 export function isTraeCnJunkModelId(id: string): boolean {
   if (isInternalTraeCnConfig(id)) return true
@@ -359,8 +358,8 @@ export interface TraeCnFallbackModel {
  * 动态目录成功时本来也不会列出它们（它们不在 SOLO roster 里），故剔除后两条
  * 路径的目录**首次一致**。
  *
- * 注意 `Doubao-Seed-Code` 的剔除**只针对本 provider**：它在
- * `trae-cn-work`（`solo_agent_remote` 代际）里是**默认模型**，两张表互不影响。
+ * 注意 `Doubao-Seed-Code` 的剔除**只针对本表**：它在 agent 池别的代际里是
+ * **默认模型**，两张表互不影响。
  *
  * ## 现在的角色：**回退表**（不再是唯一目录）
  *
@@ -694,8 +693,7 @@ export function parseTraeCnDirectory(body: unknown, functionName: string): TraeC
 /**
  * 读取 `reasoning_effort_config`（形态 `{support_thinking, options, default_level}`）。
  *
- * 判据与 `src/trae-cn-work-adapter.ts` 的同名函数**刻意保持一致**（两条 Trae
- * 协议线共用同一份真机形态）：只在 `support_thinking === true` **且** `options`
+ * 判据取自上游客端的真机形态：只在 `support_thinking === true` **且** `options`
  * 是非空字符串数组时声明档位；`default_level` 不在 `options` 内时只丢默认档、
  * 保留档位列表（上游发出不自洽组合时，用户仍能手动选档）。
  *
@@ -866,15 +864,9 @@ export interface TraeCnAgentTierOptions {
  *    "context_window_tokens":{"dev":200000,"max":1000000}, …}]}]}}
  * ```
  *
- * 与 `src/trae-cn-work-adapter.ts` 的 `locateWorkModelArray` **同族端点、逐字段
- * 同构**（两条 Trae 协议线打的是同一个 `/api/remote/v1/models`，只是 host、
- * query、头集与解析全部分开）—— 故这里**只参考其字段语义，不 import 复用**：
- * AGENTS.md 对这两条协议线有明确纪律，且两侧的取组规则**刻意不同**（见下）。
- *
  * ## 取组纪律：只认 `function === solo_agent_remote`，绝不跨组拼接
  *
- * ⚠️ **刻意不复刻 Work 侧的第 2 条容忍分支**（「没命中本组但只有一组时也用」）：
- * 那边容忍是为了「服务端忽略 query 时目录仍可用」，而本侧的失败代价只是
+ * ⚠️ **刻意不做「没命中本组但只有一组时也用」那种容忍**：失败代价只是
  * **没有档位**（等价于本次改动之前的状态，静默降级），跨池取值的代价却是把
  * **另一个池的档位**灌进 IDE 目录 —— 用户会看到一个本池未必认的窗口并选中它。
  * 宁可无档位，也不跨池。组不存在 / 本组 `models` 非数组 → 空表。

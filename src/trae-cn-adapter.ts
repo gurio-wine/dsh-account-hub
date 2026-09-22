@@ -709,9 +709,8 @@ export class TraeCnAdapter extends LlmAdapter {
       throw new LlmError(
         this.withOffCatalogHint(lastMessage, options.model, lastSseCode)
           + traeCnContextOverflowHint(lastSseCode)
-          // 池名传 `'通用积分'`：IDE 路径只扣通用池（`endpoint=0`），
-          // 与 `traeCnPoolFor()` 给 Trae CN 面板选的池一致。
-          + traeCnCreditsExhaustedHint(lastSseCode, '通用积分', terminalScope, 'exhausted-verified'),
+          // 池名传 `'通用积分'`：IDE 路径只扣通用池（`endpoint=0`）。
+          + traeCnCreditsExhaustedHint(lastSseCode, '通用积分', terminalScope),
         traeCnErrorCodeForAction(lastAction, lastSseCode),
       )
     }

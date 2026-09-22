@@ -36,20 +36,6 @@ const LOBSTERAI_ICON = 'data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy
 const TRAE_CN_ICON = 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHJlY3Qgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiByeD0iMy42OTIiIGZpbGw9IiMxQTFCMUQiLz48cGF0aCBkPSJNMTMuMjM1IDUuODI5VjQuMzMySDIuNzU4djUuOTg3aDEuNDk2djEuNDk2aDguOTgxVjUuODI4Wm0tMS40OTcgNC40OUg0LjI1NFY1LjgzaDcuNDg0djQuNDlaIiBmaWxsPSIjMzJGMDhDIi8+PHBhdGggZD0iTTYuOTM3IDYuOTkzIDUuODggOC4wNTEgNi45MzcgOS4xMSA3Ljk5NSA4LjA1IDYuOTM3IDYuOTkzWk05LjkzMSA2Ljk5MiA4Ljg3MyA4LjA1IDkuOTMxIDkuMTEgMTAuOTkgOC4wNSA5LjkzIDYuOTkyWiIgZmlsbD0iIzMyRjA4QyIvPjwvc3ZnPg=='
 
 /**
- * Trae CN **Work** 面板图标：与 `TRAE_CN_ICON` **同一个 base64**，不新造图。
- *
- * 两个 provider 是同一个产品的两条路径（Work 复用 Trae CN 的账号与凭据，
- * 见 `src/trae-cn-work-product.ts` 的 `poolProviderId`），品牌标识本就该一致；
- * 面板标签靠 `label`（Trae CN / Trae CN Work）区分，不靠图标。
- *
- * 仍单独起一个常量名而不是在 `PROVIDERS` 里直接复用 `TRAE_CN_ICON`：条目与图标
- * 一一对应，将来若拿到 TraeWork 专属标识只需改这一处，不必回头拆条目；
- * 也让 `tests/unit/credits-capabilities.spec.ts` 的「图标常量名跟着产品走」
- * 那组断言对七个 provider 一视同仁。
- */
-const TRAE_CN_WORK_ICON = TRAE_CN_ICON
-
-/**
  * Qoder 面板图标（内联 base64 PNG）。
  *
  * 来源：Qoder 官网首页 `<link rel="icon" type="image/png">` 指向的官方图标
@@ -62,7 +48,7 @@ const TRAE_CN_WORK_ICON = TRAE_CN_ICON
  * 内容同样是**预先算好的 base64 字面量**，不用 `btoa()` 运行时拼接
  * （理由见 `LOBSTERAI_ICON` 的说明）。
  *
- * 单独一个常量而不是复用别的图标：Qoder 与其余六个 provider 都不同源，
+ * 单独一个常量而不是复用别的图标：Qoder 与其余 provider 都不同源，
  * 共用任何一条都会让面板显示别家的品牌标识。
  */
 const QODER_ICON = 'data:image/png;base64,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'
@@ -79,64 +65,23 @@ const PROVIDERS = Object.freeze([
   // 「WorkBuddy (国际版)」「LobsterAI (有道)」「Trae CN (字节跳动)」）。
   // 图标常量名同样跟着产品走：`BUDDY_CN_ICON` 是中国版那份，`BUDDY_ICON` 是
   // 国际版那份（两者在改名时**没有**换过图标本体，只换了常量名与归属）。
-  // `TRAE_CN_ICON` 归 `trae-cn`、`TRAE_CN_WORK_ICON` 归 `trae-cn-work`（两者
-  // 内容相同，见常量处说明）。
+  // `TRAE_CN_ICON` 归 `trae-cn`（TraeWork 曾是同一产品的第二条路径，官方已把
+  // 该通道并入通用通道，那条 provider 已整体移除）。
   { id: 'trae-cn', label: 'Trae CN', icon: TRAE_CN_ICON, logoClass: 'trae-cn' },
-  // Trae CN **Work**：同一个产品的第二条路径（TraeWork 网页协议、扣 Work 池）。
-  // `loginHint` 是**可选字段**，只有它带 —— 见下面对该字段的说明。
-  {
-    id: 'trae-cn-work',
-    label: 'Trae CN Work',
-    icon: TRAE_CN_WORK_ICON,
-    logoClass: 'trae-cn-work',
-    loginHint: '与 Trae CN 共用账号：请在 Trae CN 面板登录（本面板的账号、凭据、限流切换全部复用 Trae CN）。',
-  },
-  // Qoder：登录形态是**全新的** —— PAT 粘贴（另外六个 provider 全是浏览器登录，
-  // 见下面的 PAT_LOGIN_PROVIDERS）。
-  //
-  // ⚠️ **不声明 `loginHint`**：`loginHint` 的语义是「本面板没有登录入口，去
-  //   **隔壁面板**登录」（目前只用于 Trae CN Work 那种共用账号的情形）。Qoder
-  //   **有自己的入口**，只是形态从「开浏览器」换成了「粘贴 PAT」，入口仍在
-  //   本面板（那条唯一的入口就是这个条目驱动的「+ 新建账号」按钮）。
-  //   若给它加上 loginHint，`canCreateAccount` 会变成 false，按钮整块消失 ——
-  //   PAT 表单就再也没有入口了，而且**不报任何错**，只是一个没有入口的死面板。
-  //   tests/unit/credits-capabilities.spec.ts 有断言钉死它没有 loginHint。
+  // Qoder：登录形态是**全新的** —— 浏览器设备流。
   //
   // 字段严格只有 id / label / icon / logoClass 四项：该条目的形态被
-  // credits-capabilities.spec.ts 的 FULL 匹配器逐字锁死（可选第五项 loginHint），
-  // 这就是「PAT 形态的元数据另立一张表」而不是塞进本条目第三个字段的原因。
+  // credits-capabilities.spec.ts 的 FULL 匹配器逐字锁死。
   { id: 'qoder', label: 'Qoder', icon: QODER_ICON, logoClass: 'qoder' },
   // Qoder **CN（国内版）**：与国际版**同协议双 region**（另一组 host、另一套
-  // 出站身份值），登录形态同样是 PAT 粘贴。
+  // 出站身份值），登录形态同为浏览器设备流。
   //
   // ⚠️ **图标刻意复用 `QODER_ICON`**（不是新造一份）：两个 region 是**同一个
   //   品牌**，官方 `qoder.cn` 首页的 `rel="icon"` 指向的正是**同一张** alicdn
-  //   PNG（与 qoder.com 逐字节同源），靠 `label` 与 `logoClass` 区分面板即可 ——
-  //   与 `TRAE_CN_WORK_ICON` 别名 `TRAE_CN_ICON` 是同一处理。
+  //   PNG（与 qoder.com 逐字节同源），靠 `label` 与 `logoClass` 区分面板即可。
   //   （`qoder.cn` 另有一张内联 `favIcon.svg`，但 73 KB，远超内联预算，故不取。）
-  //
-  // ⚠️ **与 `qoder` 一样不声明 `loginHint`**：本面板**有自己的登录入口**
-  //   （PAT 粘贴表单，见 PAT_LOGIN_PROVIDERS）。`loginHint` 的语义是
-  //   「本面板没有入口，去隔壁面板登录」，加上去会让 `canCreateAccount`
-  //   变成 false、PAT 表单的唯一入口整块消失，而且**不报任何错**。
   { id: 'qoder-cn', label: 'Qoder CN', icon: QODER_ICON, logoClass: 'qoder-cn' },
 ]);
-
-/**
- * 面板自己的**登录入口提示**；`null` 表示该面板自己提供「+ 新建账号」按钮。
- *
- * `PROVIDERS` 条目缺省都有登录入口；只有 `trae-cn-work` 用 `loginHint` 显式
- * 声明自己没有。理由：Work **没有独立登录协议**，它建账号会写入同一份
- * `TRAE_CN_ACCOUNT_*` 凭据体系 —— 两个面板各放一个登录按钮，用户会在
- * 「我到底该在哪个面板登录」上反复试错，而两条入口写的是同一份数据。
- *
- * 默认**显示**按钮（判据是「有没有 loginHint」而不是「有没有某个 true 标志」）：
- * 将来新增 provider 忘记声明时，最坏结果是多一个本来就能用的按钮，
- * 而不是把一个能登录的面板变成没有入口的死面板。
- */
-function providerLoginHint(provider) {
-  return PROVIDERS.find(p => p.id === provider)?.loginHint || null;
-}
 
 /**
  * ⚠️ **PAT 粘贴式登录形态已于 2026-09-21 按用户要求整体移除**，此处不再有
@@ -385,13 +330,13 @@ function ClaimNotice({ tone, text, details }) {
  * - 查到了但余额为 0 → 显示 0
  * - 还没有结果 → 显示"读取中"
  *
- * **单数字**：Trae CN 的两个面板各查各的池（宿主按面板 id 选池，见
- * `src/jet-hub-rpc.ts` 的 `traeCnPoolFor()`），返回的 `total` 与 `packages`
- * 都**只含该面板能花的那个池**，故这里就是普通的一个数字，与其他 provider
+ * **单数字**：Trae CN 面板只查它自己那条路径能花的池（宿主按 provider 选池，
+ * 见 `src/jet-hub-rpc.ts` 的 `credits.balances` 分支），返回的 `total` 与
+ * `packages` 都**只含该池**，故这里就是普通的一个数字，与其他 provider
  * 走的是同一条渲染路径。
  *
  * 历史上这里消费过一个超集字段 `workTotal` 来渲染「通用 X / Work Y」两段，
- * **已删除**：那个字段与它所服务的双段渲染一起没了（两个面板各显示两段数字时，
+ * **已删除**：那个字段与它所服务的双段渲染一起没了（同一处显示两池时，
  * 永远有一段是那个面板花不掉的）。余额对象从此与 `CreditBalance` 逐字段同构，
  * 本组件不再需要任何 provider 专属分支。
  */
@@ -560,7 +505,7 @@ function formatCapacity(value) {
  * 「当前是默认档」这个状态在界面上无法表达（radio 全不选中）。
  *
  * ⚠️ **判据只看数据，不看 provider 名**：数据在，档位列就在；数据不在（LobsterAI /
- * Trae CN Work / CodeArts 的目录只有一个窗口，或目录未达）就整列不渲染 ——
+ * CodeArts 的目录只有一个窗口，或目录未达）就整列不渲染 ——
  * 宁可少一个控件，也不给一个切过去毫无效果的选项（同一原则见 Host 侧
  * `availableContextTiers`）。
  *
@@ -804,7 +749,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
 
   // 档位列按**数据**出现，不按 provider 名出现：只要有一行带出了档位（多档数组或
   // 老形态的 max / dev 两字段），整列就渲染 —— 数据在，列就在；数据不在（LobsterAI /
-  // Trae CN Work / CodeArts 的目录只有一个窗口），ModelTierPicker 自己返回 null。
+  // CodeArts 的目录只有一个窗口），ModelTierPicker 自己返回 null。
   // 判据与组件共用同一个 `tierOptionsOf`，避免「提示行说能选、行上却没有控件」。
   const tierHint = all.some(m => tierOptionsOf(m) !== null)
     ? '上下文窗口档位只切换向对话宿主声明的窗口（影响自动压缩时机），不改变发给上游的请求内容。'
@@ -922,9 +867,9 @@ function ProviderPanel({ provider, rpcCall }) {
     setPhase('loading');
     setError(null);
     try {
-      // 这里**发的是面板 id**（如 `trae-cn-work`），不是它背后的账号池键。
+      // 这里**发的是面板 id**，不是它背后的账号池键。
       // 「面板 id → 池键」的映射收敛在宿主（`src/jet-hub-rpc.ts` 的
-      // `poolProviderFor()`）：共用账号的 provider 若在客户端也映射一次，
+      // `poolProviderFor()`）：客户端若也映射一次，
       // 宿主那几个按池过滤的分支就必须跟着改，同一件事写两遍。
       // 客户端只管把面板 id 原样送出去。
       const res = await rpcCall('account.list', { provider });
@@ -976,9 +921,6 @@ function ProviderPanel({ provider, rpcCall }) {
    * 钉死这一类自由变量。
    */
   const providerLabel = PROVIDERS.find(p => p.id === provider)?.label || provider;
-  // 本面板是否自己提供登录入口（null = 提供；见 providerLoginHint 的说明）。
-  const loginHint = providerLoginHint(provider);
-  const canCreateAccount = loginHint === null;
 
   /**
    * 拉取本页全部账号的积分余额。
@@ -1290,27 +1232,16 @@ function ProviderPanel({ provider, rpcCall }) {
           disabled: probeBusy !== null || accounts.length === 0,
           onClick: () => void runLimitAction('resetAll'),
         }, '重置所有'),
-        // 「+ 新建账号」按 provider 的能力渲染：共用账号的 provider（Trae CN Work）
-        // 不渲染按钮，改为下面那行提示文案 —— 见 providerLoginHint。
-        //
-        // 登录形态**只剩浏览器设备流一种**（PAT 粘贴已于 2026-09-21 按用户要求
-        // 移除）：故这里直接接 `createAccount()`，不再有二选一的选择器，
-        // 也不再需要「点了做什么」的分支。
-        canCreateAccount
-          ? React.createElement('button', {
-              className: 'dim-jh-btn',
-              'data-kind': 'primary',
-              title: '通过浏览器登录一个新的账号并加入账号池。',
-              onClick: () => void createAccount(),
-              disabled: creating,
-            }, creating ? '正在登录…' : '+ 新建账号')
-          : null)),
-    // 共用账号的 provider（Trae CN Work）在这里说明登录入口在哪。
-    // 刻意做成**常驻提示行**而不是「+ 新建账号」按钮的 disabled 形态：
-    // 按钮点了没反应只会让用户以为坏了，而这里要传达的是「去别处登录」。
-    loginHint
-      ? React.createElement('p', { className: 'dim-jh-loginHint' }, loginHint)
-      : null,
+        // 「+ 新建账号」：登录形态**只剩浏览器设备流一种**（PAT 粘贴已于
+        // 2026-09-21 按用户要求移除），故这里直接接 `createAccount()`，
+        // 不再有选择器、也没有「点了做什么」的分支。
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'data-kind': 'primary',
+          title: '通过浏览器登录一个新的账号并加入账号池。',
+          onClick: () => void createAccount(),
+          disabled: creating,
+        }, creating ? '正在登录…' : '+ 新建账号'))),
     probeNotice
       ? React.createElement('div', {
           className: 'dim-jh-probeNotice',
@@ -1352,14 +1283,9 @@ function ProviderPanel({ provider, rpcCall }) {
         : accounts.length === 0
           ? React.createElement('div', { className: 'dim-jh-empty' },
               React.createElement('p', null, '尚未配置账号'),
-              // 共用账号的 provider（Trae CN Work）账号为空时的下一步不是
-              // 「在本面板新建」，而是「回 Trae CN 面板登录」—— 否则用户点进
-              // 这里看到空白，会以为这个 provider 没接通。
-              // 其余 provider（含 Qoder 两区）都是**在本面板浏览器登录**：
+              // 每个 provider（含 Qoder 两区）都是**在本面板浏览器登录**：
               // PAT 形态移除后文案只剩这一种，不再按登录形态分支。
-              React.createElement('p', null, canCreateAccount
-                ? '点击"+ 新建账号"进行浏览器登录。'
-                : '请先在上方提示的 Trae CN 面板登录账号。'))
+              React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。'))
           : React.createElement('div', null,
               accounts.map(account => React.createElement(AccountCard, {
                 key: account.id,

@@ -416,11 +416,8 @@ export function recordsTraeCnCooldown(code: TraeCnErrorCode | undefined): boolea
  * ## 池归属由调用方以**数据**传入，不在本函数里写死
  *
  * `poolLabel` 是「哪个积分池被耗尽」的可读名（如 `'通用积分'`）。刻意做成参数
- * 而不是常量，因为两条 Trae CN 路径的事实强度不同：
- * `trae-cn`（IDE 路径）的 `4008` = **通用池**耗尽，有单变量实测证据；
- * `trae-cn-work` 的 `4008` **未被实测**（Work 码表整体未标定）。若这里写死
- * 「通用积分已耗尽」，Work 路径会把它当作既成事实复述 —— 而那正是本项目
- * 反复禁止的「把未经验证的假设当事实」。Work 传 `'Work 积分'` 时同理。
+ * 而不是常量：池的归属是**协议事实**，将来上游若改分池口径，改的是传参而不是
+ * 本函数。当前 `4008` = 通用池耗尽有单变量实测证据。
  *
  * ## `scope` 决定主语，**绝不能一律说「全部账号」**
  *
@@ -447,24 +444,21 @@ export function recordsTraeCnCooldown(code: TraeCnErrorCode | undefined): boolea
  * 组合会得到「已尝试的账号都在冷却中（池中可能还有未尝试的）」—— 逻辑没错但
  * 信息量为负（用户在冷却语境下本来就会再试），故该组合**返回空串**。
  *
- * ## `semantics`：同厂商同码，两条路径的**证据强度不同**
+ * ## 这里曾有一个「证据强度」参数（已随第二条 Trae 路径移除）
  *
- * `trae-cn` / `trae-cn-work` 共用同一批账号（故共用本函数），但 `4008` 的语义
- * **只在 IDE 路径上实测过**（{@link TRAE_CN_CREDITS_EXHAUSTED_CODES} 的证据来自
- * SOLO 通道）；Work 的码表整体未标定（见 `trae-cn-work-errors.ts` 的模块头），
- * 那里把 `4008` 收进额度表时就写明「**尚未实测**」。故 Work 路径**不能**复述
- * 「积分已耗尽」这个结论 —— 那正是本项目反复禁止的「把未经验证的假设当事实」。
+ * 原有一个必填的 `semantics` 参数，用来区分「同厂商同码、两条路径证据强度
+ * 不同」—— 另一条（TraeWork 网页协议）的码表整体未标定，故只能说「已用尽或
+ * 受限」而不能复述「已耗尽」。官方已把 TraeWork 通道并入通用通道，那条路径已
+ * 整体移除，于是**唯一剩下的调用方就是实测过的那条**，这个维度不再有区分对象。
  *
- * 但**可操作的指引是同一条**（换号已试遍、需充值或等重置），故两条路径共用同一
- * 函数，只是诊断措辞分叉：已确证的说「已耗尽」，未确证的诚实地说
- * 「**已用尽或受限**」（涵盖两种可能，不替上游下结论）。
+ * ⚠️ **不要为「形态对称」把它加回来**：没有第二个取值可传的参数是纯粹的仪式。
+ * 将来若真出现第三条 Trae CN 路径且其码表未标定，正确的做法是**先取证**
+ * （像 `4008` 那样做单变量实测），而不是预先给它一个「未验证」的措辞通道。
  *
  * @param code - 最后一次失败的业务码（原始形态，数字或字符串）。
  * @param poolLabel - 被耗尽/受限的积分池可读名（如 `'通用积分'`）。
  * @param scope - 换号循环的退出原因（见 {@link TraeCnTerminalScope}）；
  *   `undefined` 表示「没有池 / 不该谈账号」，此时一律返回空串。
- * @param semantics - 该路径上「耗尽」语义的证据强度（见
- *   {@link TraeCnQuotaSemantics}）。
  * @returns 追加到错误文案末尾的一句中文说明；无话可说时返回**空串**
  *   （调用方据此决定是否拼接，不留悬挂空格）。
  */
@@ -472,7 +466,6 @@ export function traeCnCreditsExhaustedHint(
   code: TraeCnErrorCode | undefined,
   poolLabel: string,
   scope: TraeCnTerminalScope | undefined,
-  semantics: TraeCnQuotaSemantics,
 ): string {
   const normalized = normalizeTraeCnCode(code)
   if (normalized === undefined || scope === undefined) return ''
@@ -493,10 +486,7 @@ export function traeCnCreditsExhaustedHint(
   const tail = atPoolEnd ? '' : '（换号次数已达上限，池中可能还有未尝试的账号）'
 
   if (exhausted) {
-    const diagnosis = semantics === 'exhausted-verified'
-      ? '均已耗尽：换号已无济于事，请充值或等待额度周期重置；这不是频率限流，稍后重试不会自愈'
-      : '均已用尽或受限：换号已无济于事，请充值或等待额度周期重置'
-    return `（${subject}${diagnosis}）${tail}`
+    return `（${subject}均已耗尽：换号已无济于事，请充值或等待额度周期重置；这不是频率限流，稍后重试不会自愈）${tail}`
   }
   return `（${subject}均在冷却或限额中：可在 Account Hub 查看重置时刻，稍后重试）`
 }
@@ -514,16 +504,3 @@ export type TraeCnTerminalScope =
   /** 换号次数到达上限就停了，池中**可能还有**未尝试的账号。 */
   | 'rotate-cap'
 
-/**
- * 「积分耗尽」这一结论在**当前路径**上的证据强度（见
- * {@link traeCnCreditsExhaustedHint} 的 `semantics` 小节）。
- *
- * 刻意做成必填参数而不是默认值：默认值会让新增的调用方（尤其是将来的第三条
- * Trae CN 路径）在**没想过这个问题**的情况下继承「已确证」的措辞，而它们在
- * 自己那条协议线上多半没有证据。宁可在编译期逼一次。
- */
-export type TraeCnQuotaSemantics =
-  /** 该码的耗尽语义在**本路径**上已单变量实测（`trae-cn` 的 `4008`）。 */
-  | 'exhausted-verified'
-  /** 未实测（`trae-cn-work`：码表整体未标定）—— 只能说「用尽或受限」。 */
-  | 'exhaustion-unverified'

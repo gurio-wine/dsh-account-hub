@@ -292,7 +292,11 @@ export function isTraeCnClaimRetryable(code: number | undefined): boolean {
 export const TRAE_CN_POOL_UNIVERSAL = 0
 /**
  * Work 积分池（`available_endpoint === 1`）—— **只在 TraeWork 里能花**
- * （`work.trae.cn` 网页版 / 桌面版），也是 `trae-cn-work` 那条路径实际扣的池。
+ * （`work.trae.cn` 网页版 / 桌面版）。
+ *
+ * ⚠️ 官方已把 TraeWork 通道并入通用通道，**本插件不再有任何路径走这个池**。
+ * 常量保留是因为 `available_endpoint` 这个上游字段仍然分池、礼包仍按它归类
+ * （见 {@link parseTraeCnPackage} 与 {@link fetchTraeCnCreditBalance}）。
  */
 export const TRAE_CN_POOL_WORK = 1
 
@@ -914,9 +918,10 @@ export type TraeCnPoolId = typeof TRAE_CN_POOL_UNIVERSAL | typeof TRAE_CN_POOL_W
  * - **通用池（`available_endpoint=0`）**：TraeCode / IDE 对话扣的就是它，
  *   也就是 `trae-cn` provider 走的那条路径；**2026-09 起签到发的也是通用积分**；
  * - **Work 池（`available_endpoint=1`）**：**只在 TraeWork 里能花**
- *   （`work.trae.cn` 网页版 / 桌面版），也就是 `trae-cn-work` provider 走的那条
- *   路径；在 TraeWork 中两类积分按**到期时间先后**扣，Work 专属**仅在到期时间
- *   相同时**才优先。
+ *   （`work.trae.cn` 网页版 / 桌面版）；在 TraeWork 中两类积分按**到期时间先后**
+ *   扣，Work 专属**仅在到期时间相同时**才优先。⚠️ 官方已把 TraeWork 通道并入
+ *   通用通道，本插件不再有任何路径走 Work 池 —— 该常量保留是因为
+ *   `available_endpoint` 这个上游字段仍然分池，礼包仍按它归类。
  *
  * ## 展示口径：**按 provider 分池**，一个面板一个池
  *
@@ -1194,16 +1199,15 @@ function parseTraeCnPackage(record: Record<string, unknown>): ParsedPackage {
  * | provider | 面板 | `pool` | 谁在花它 |
  * |---|---|---|---|
  * | `trae-cn` | Trae CN | `TRAE_CN_POOL_UNIVERSAL`（0） | IDE 对话扣的就是它 |
- * | `trae-cn-work` | Trae CN Work | `TRAE_CN_POOL_WORK`（1） | TraeWork 网页版 |
  *
- * 于是两个面板各只显示一个数字与自己那批资源包，界面上不再出现「通用」
+ * 于是一个面板只显示一个数字与自己那批资源包，界面上不再出现「通用」
  * 「Work」字样 —— 每个数字都对应一条**能把钱花掉的真实路径**，不存在
  * 「显示了但花不掉」的那一段。这也让「绝不把两池相加」这条提醒失去对象：
  * 同一处已经不会再同时出现两个池。
  *
- * ⚠️ `pool` **必须取自面板 id（`req.provider`）而不是账号池键**：账号池键把
- * `trae-cn-work` 映射成了 `trae-cn`（见 `src/jet-hub-rpc.ts` 的
- * `poolProviderFor()`），拿它去选池会让 Work 面板显示通用池的数字。
+ * ⚠️ `pool` 是**路径属性、与账号无关**：它必须由面板分支（`req.provider`）
+ * 决定，而不是由账号池那条链路顺带给出 —— 后者答的是「查谁的账号」，
+ * 两个问题混在一起会让某个面板显示它花不掉的池，且**不报错**。
  *
  * ## 解析一行未动
  *

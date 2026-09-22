@@ -482,12 +482,11 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     'buddy',
     'lobsterai',
     'trae-cn',
-    'trae-cn-work',
     'qoder',
     'qoder-cn',
   ] as const
 
-  it('JetHubPage 整页渲染不抛错，且八个 provider 的导航项都在', async () => {
+  it('JetHubPage 整页渲染不抛错，且七个 provider 的导航项都在', async () => {
     const { rpcCall } = makeRpc()
     const tree = await renderStable(client.JetHubPage, { rpcCall }, client.hooks)
     const expanded = expandTree(tree, client.hooks)
@@ -502,7 +501,7 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
       .filter(isElement)
       .filter((el) => el.type === 'button' && el.props.role === 'tab')
     expect(navButtons, '导航项数量与 provider 数量不一致').toHaveLength(ALL_PROVIDERS.length)
-    for (const label of ['Codearts', 'Buddy CN', 'Buddy', 'LobsterAI', 'Trae CN', 'Trae CN Work', 'Qoder', 'Qoder CN']) {
+    for (const label of ['Codearts', 'Buddy CN', 'Buddy', 'LobsterAI', 'Trae CN', 'Qoder', 'Qoder CN']) {
       expect(text, `导航里缺少 ${label}`).toContain(label)
     }
     // 未选中的 provider 不该出现面板（`JetHubPage` 只挂载 selected 那一个）。
@@ -510,7 +509,7 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
   })
 
   it('逐个 provider 渲染面板并点击「+ 新建账号」，一律不得抛错', async () => {
-    // 这是本次白屏的**通盘**闸门：不再只盯 qoder，而是把八个面板都真的渲染
+    // 这是白屏缺陷的**通盘**闸门：不再只盯 qoder，而是把每个面板都真的渲染
     // 一遍、把每个能点的登录按钮都点一次。自由变量、未定义导出、缺字段的
     // 条目 —— 无论落在哪个 provider 上，都会在这里炸出来。
     const windowStub = installWindowStub()
@@ -520,13 +519,8 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
         const tree = await renderStable(client.ProviderPanel, { provider, rpcCall }, client.hooks)
         expect(() => expandTree(tree, client.hooks), `${provider} 渲染抛错`).not.toThrow()
 
-        // 有登录入口的面板（除 Trae CN Work）都必须能点，且点完不炸。
+        // 每个面板都有自己的登录入口，故按钮一律必须存在且能点。
         const button = findButtonByText(tree, '+ 新建账号')
-        if (provider === 'trae-cn-work') {
-          // 共用账号：刻意不渲染按钮，改为常驻提示行（见 providerLoginHint）。
-          expect(button, 'Trae CN Work 不该有新建账号按钮').toBeUndefined()
-          continue
-        }
         expect(button, `${provider} 缺少「+ 新建账号」按钮`).toBeDefined()
         const openedBefore = windowStub.opened.length
         const onClick = button!.props.onClick as () => void
@@ -537,8 +531,8 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
           client.hooks,
         )
         expect(() => afterClick, `${provider} 点击后重渲染抛错`).not.toThrow()
-        // 点击必须**产生效果**，不能是「点了没反应」：PAT 形态移除后七个
-        // 面板（除共用账号的 Trae CN Work）全部走浏览器设备流，故一律必须开窗。
+        // 点击必须**产生效果**，不能是「点了没反应」：全部面板都走浏览器设备流，
+        // 故一律必须开窗。
         // 这条反向锚点很关键：若将来有人把 onClick 改成空实现，
         // 上面那句「不抛错」照样是绿的。
         expect(
@@ -561,7 +555,6 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
       buddy: 'Buddy',
       lobsterai: 'LobsterAI',
       'trae-cn': 'Trae CN',
-      'trae-cn-work': 'Trae CN Work',
       qoder: 'Qoder',
       'qoder-cn': 'Qoder CN',
     }

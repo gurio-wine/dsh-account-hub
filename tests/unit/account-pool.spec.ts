@@ -700,7 +700,7 @@ describe('AccountPool 上下文窗口预算', () => {
     expect(pool.contextBudget('trae-cn', 'glm-5.3')).toBe(1_048_576)
     // 黑名单制同款：没写过的键读出来是 undefined（= 默认档），而不是 0。
     expect(pool.contextBudget('trae-cn', 'glm-5.2')).toBeUndefined()
-    expect(pool.contextBudget('trae-cn-work', 'glm-5.3')).toBeUndefined()
+    expect(pool.contextBudget('lobsterai', 'glm-5.3')).toBeUndefined()
   })
 
   it('写 `undefined` = **删除该键**（恢复默认档），且表空时 provider 整体消失', async () => {

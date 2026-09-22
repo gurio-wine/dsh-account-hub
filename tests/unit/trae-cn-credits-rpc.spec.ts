@@ -271,8 +271,8 @@ describe('credits.claimAll 的 trae-cn 分派', () => {
   })
 })
 
-describe('credits.balances 的 trae-cn 分派（按面板 id 选池）', () => {
-  /** 双池响应：通用 154.22 / Work 2000 —— 两个面板查的都是这一份。 */
+describe('credits.balances 的 trae-cn 分派（按 provider 选池）', () => {
+  /** 双池响应：通用 154.22 / Work 2000 —— 上游仍分池下发。 */
   const dualPoolResponse = (): Response => new Response(JSON.stringify({
     code: 0,
     data: {
@@ -304,35 +304,12 @@ describe('credits.balances 的 trae-cn 分派（按面板 id 选池）', () => {
     expect(value.accounts[0]!.balance!.packages.map((pkg) => pkg.name)).toEqual(['通用礼包'])
   })
 
-  it('provider=trae-cn-work 时只显示 **Work 池**（2000），通用包不出现在 packages 里', async () => {
-    const h = harness({
-      accounts: [entry('a')],
-      credentials: creds(['A', credentialOf(DEVICE_A, 'A')]),
-      responds: () => dualPoolResponse(),
-    })
-    const result = await h.call('credits.balances', { provider: 'trae-cn-work' })
-    expect(result.ok).toBe(true)
-    const value = result.value as {
-      accounts: Array<{ balance: { total: number; packages: Array<{ name: string }> } | null }>
-    }
-    expect(value.accounts[0]!.balance!.total).toBe(2000)
-    expect(value.accounts[0]!.balance!.packages.map((pkg) => pkg.name)).toEqual(['Work礼包'])
-  })
-
-  it('两个面板拿到的是**同一个账号的同一份响应**，只是显示的池不同', async () => {
-    // 这是「分池」与「分账号」的分界：账号池键仍映射到 trae-cn（同批账号），
-    // 变的只有显示哪个池。若哪天有人把选池也写成 `provider`（映射后的值），
-    // 两个面板会显示同一个数字 —— 这条断言就是那道闸。
-    const accounts = [entry('a')]
-    const credentials = creds(['A', credentialOf(DEVICE_A, 'A')])
-    const universal = await harness({ accounts, credentials, responds: () => dualPoolResponse() })
-      .call('credits.balances', { provider: 'trae-cn' })
-    const work = await harness({ accounts, credentials, responds: () => dualPoolResponse() })
-      .call('credits.balances', { provider: 'trae-cn-work' })
-    const totalOf = (result: { value?: unknown }) =>
-      (result.value as { accounts: Array<{ balance: { total: number } }> }).accounts[0]!.balance.total
-    expect(totalOf(universal)).toBe(154.22)
-    expect(totalOf(work)).toBe(2000)
+  it('选池由**面板分支**决定，不由账号池键顺带给出', async () => {
+    // 两个问题必须分开答：「查谁的账号」走 `poolProviderFor`（今天恒等），
+    // 「显示哪个池」由 `credits.balances` 里的 provider 分支决定。
+    // 若有人把选池并进账号映射（或反过来），面板会显示它花不掉的池 —— 且不报错。
+    const { poolProviderFor } = await import('../../src/jet-hub-rpc.js')
+    expect(poolProviderFor('trae-cn')).toBe('trae-cn')
   })
 
   it('查不到时 balance 为 null + error（不是 0 积分）', async () => {

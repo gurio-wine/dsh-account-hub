@@ -423,14 +423,13 @@ export const TRAE_CN_MODELS_PATH = '/api/ide/v1/get_detail_param'
  * 不动）；模型 roster 仍以 IDE 目录为唯一来源 —— 本组独有的 id（如
  * `Doubao-Seed-Code`）**必须被忽略**，加进选择器就是必然 `4001` 的选项。
  *
- * ## ⚠️ 本 host 是第三个 Trae CN 域名，不可与另外三个互换
+ * ## ⚠️ 本 host 是第三个 Trae CN 域名，不可与另外两个互换
  *
  * | 常量 | 值 | 归属 |
  * |---|---|---|
  * | {@link TRAE_CN_API_BASE} | `api.trae.cn` | 签到 / 续期 / 余额 |
  * | {@link TRAE_CN_IDE_API_BASE} | `trae-api-cn.mchost.guru` | SOLO 通道 chat 与 IDE 目录 |
  * | **本常量** | **`solo.trae.cn`** | **agent 池目录（档位数据源）** |
- * | `TRAE_CN_WORK_API_BASE`（work-product） | `work.trae.cn` | TraeWork 网页 RPC |
  *
  * ⚠️ 它与 `work.trae.cn` 上的同名路径（`/api/remote/v1/models`）**不是同一个
  * 服务**：Work 侧那条要带 `?functions=…&show_custom_model=true` 并且必须带
@@ -452,13 +451,9 @@ export const TRAE_CN_AGENT_MODELS_PATH = '/api/remote/v1/models'
  * agent 池目录的 `functions` 参数值 —— **必须是 agent 池，不是 IDE 池**。
  *
  * 该端点的分组由 query 决定：不带 `functions` 时回的是**另一个池**
- * （TraeWork 侧实测为 `solo_coder`，同名 id 的窗口都不同）。本 provider 取
+ * （实测为 `solo_coder`，同名 id 的窗口都不同）。本 provider 取
  * `solo_agent_remote`，因为只有它的 `max_mode` / `context_window_tokens.max`
  * 被实测证明与 IDE 侧那 10 个 id 对得上（2026-09-21 真机核对）。
- *
- * ⚠️ 与 `TRAE_CN_WORK_MODELS_FUNCTIONS`（work-product）**字面量恰好相同**
- * （同一个 `function` 名），但**两条协议线各自声明、互不 import** ——
- * 上游改动其中一条不应牵动另一条，且两侧的 host / 头 / 解析器全都不同。
  */
 export const TRAE_CN_AGENT_MODELS_FUNCTIONS = 'solo_agent_remote'
 

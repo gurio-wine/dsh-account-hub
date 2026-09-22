@@ -31,20 +31,13 @@ const STYLES = `
 /* Trae CN 的品牌标识自带深色圆角底（#1A1B1D），自带底色的图标不该再靠容器配色，
    故与其余图标一致保持 white：容器只负责留白与投影，深色方块居中显示。 */
 .dim-jh-providerIcon.trae-cn { background: white; }
-/* Trae CN Work 与 Trae CN 用**同一个**图标本体（同一产品的两条路径），容器配色
-   自然也一致 —— 但类名必须单独存在：logoClass 与条目逐字对齐由
-   tests/unit/credits-capabilities.spec.ts 的集合相等断言守住，缺了它面板图标
-   就只是少了白底，肉眼几乎看不出来。
-   ⚠️ 本文件整体是一段模板字面量，注释里**不能出现反引号**（会提前结束字符串，
-   esbuild 直接在构建期报 "Expected ; but found …"）。 */
-.dim-jh-providerIcon.trae-cn-work { background: white; }
 /* Qoder 的官方图标是 412x412 的彩色 PNG（自带不透明底色），与 buddy 系那几条
    base64 PNG 同类，故容器配色一致。类名同样必须存在：见上面那条集合相等断言。 */
 .dim-jh-providerIcon.qoder { background: white; }
 /* Qoder CN 与 Qoder **共用同一个图标本体**（同一品牌的两个 region，官方
-   qoder.cn 的 rel="icon" 指向的就是同一张 alicdn PNG）—— 与 trae-cn-work
-   别名 trae-cn 同一处理。容器配色与 .qoder 一致，只多一道极淡的品牌色内描边
-   作为**两区区分**：两个面板的图标完全一样时会让人以为点错了标签页。
+   qoder.cn 的 rel="icon" 指向的就是同一张 alicdn PNG）。容器配色与 .qoder
+   一致，只多一道极淡的品牌色内描边作为**两区区分**：两个面板的图标完全一样时
+   会让人以为点错了标签页。
    类名必须单独存在（logoClass 与条目的集合相等断言守着），缺了它只是少了
    白底与描边，肉眼几乎看不出来。 */
 .dim-jh-providerIcon.qoder-cn { background: white; box-shadow: 0 1px 3px rgb(31 35 41 / 7%), 0 0 0 1px color-mix(in srgb, #1677ff 26%, transparent) inset; }
@@ -87,9 +80,6 @@ const STYLES = `
    数值 + 次要说明，而 dd 默认样式是为单行截断文本准备的。 */
 .dim-jh-metaRow dd.dim-jh-creditValue { display: flex; flex-direction: row; align-items: baseline; gap: 6px; overflow: visible; }
 .dim-jh-creditTotal { font-size: 13px; font-weight: 600; color: #1677ff; font-variant-numeric: tabular-nums; }
-/* 曾经有一个 .dim-jh-creditWork（Work 池的弱化色数字），随「通用 X / Work Y」
-   两段式渲染一起删除：分池后每个面板只显示自己那一个池，同一处不会再出现
-   两个池的数字，也就没有「哪个数字该弱化」的问题。 */
 .dim-jh-creditPackages { font-size: 11px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 /* 已失效额度：弱化的橙色提示，与主数值的蓝色明确区分 */
 .dim-jh-creditExpired { font-size: 11px; color: #b45309; }
@@ -122,10 +112,6 @@ const STYLES = `
    允许换行：按钮数量随 provider 变化（Buddy CN 有「一键领取积分」，其他没有），
    固定单行在窄面板下必然放不下。 */
 .dim-jh-headerActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
-
-/* 共用账号的 provider（Trae CN Work）没有「+ 新建账号」，改为这行常驻说明。
-   用中性信息色而不是警示色：这不是错误状态，只是「登录入口在隔壁面板」。 */
-.dim-jh-loginHint { margin: 0 0 12px; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); background: var(--dsw-alias-bg-layer-2, #f7f8fa); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }
 
 /* 上一次「重测 / 重置」的结果提示 */
 .dim-jh-probeNotice { margin-bottom: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); background: var(--dsw-alias-bg-layer-2, #f7f8fa); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }

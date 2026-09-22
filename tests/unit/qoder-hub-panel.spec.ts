@@ -11,9 +11,9 @@
  *
  * 现在守的是**与登录形态无关**的那些契约：
  *
- * 1. **面板 id 就是账号池键**（A 组）：Qoder 是**恒等映射**，与 Trae CN Work
- *    那对「面板 id ≠ 池键」正好互为反例。改错的失效形态是 CN 面板列出国际版
- *    账号、用 CN 凭据打国际版 host —— 端点仍回 `ok: true`，只是账号对不上。
+ * 1. **面板 id 就是账号池键**（A 组）：Qoder 是**恒等映射**。改错的失效形态是
+ *    CN 面板列出国际版账号、用 CN 凭据打国际版 host —— 端点仍回 `ok: true`，
+ *    只是账号对不上。
  * 2. **凭据 ref 前缀**（`QODER_ACCOUNT_*` / `QODER_CN_ACCOUNT_*`），且必须被真实的
  *    `credentialRef()` 接受。ref 一旦非法，凭据**从未落盘**，账号池里会留下
  *    一个永远没有凭据的幽灵条目。
@@ -28,11 +28,10 @@
  *
  * ## 为什么 Qoder 不需要 `poolProviderFor` 映射
  *
- * Trae CN Work 是本插件里唯一「面板 id ≠ 账号池键」的 provider
- * （见 `tests/unit/trae-cn-work-hub-panel.spec.ts`）。Qoder 是**恒等映射**：
- * 面板 id、账号池键、凭据 ref 前缀、模型黑名单键全是 `qoder` 这一个字符串。
- * 故 A 组的断言是「映射函数对 qoder **原样返回**」，而不是「映射到了别处」——
- * 与 Trae CN Work 那组正好互为反例（Trae CN Work 的映射必须**不**回到自己）。
+ * `poolProviderFor` 今天是**恒等**的（它曾服务过一个「面板 id ≠ 池键」的共用账号
+ * provider，那条路径已整体移除）。它仍是**收敛点**：客户端一律只发面板 id。
+ * Qoder 的断言因此是「映射函数对 qoder **原样返回**」——
+ * 一旦将来有人把某个 region 接进共享账号池，这些断言会立刻变红。
  */
 
 import { readFileSync } from 'node:fs'
@@ -73,9 +72,8 @@ function codeLinesOf(source: string): string {
 /**
  * 构造 ctx / pool 替身并注册端点，返回一个 `call(method, payload)`。
  *
- * 照 `tests/unit/trae-cn-work-hub-panel.spec.ts` 的 `makeHarness` 手法：驱动
- * `registerJetHubRpc` 注册出来的**真实 HTTP 处理器**，而不是断言源码里出现过
- * 某个字符串 —— 前者能证明「分派真的走对了」，后者只能证明「提到过」。
+ * 驱动 `registerJetHubRpc` 注册出来的**真实 HTTP 处理器**，而不是断言源码里
+ * 出现过某个字符串 —— 前者能证明「分派真的走对了」，后者只能证明「提到过」。
  */
 function makeHarness(
   accounts: ProviderAccountEntry[],
@@ -199,22 +197,20 @@ function qoderEntry(id: string, enabled = true, provider: 'qoder' | 'qoder-cn' =
   }
 }
 
-describe('poolProviderFor：qoder 是恒等映射（与 trae-cn-work 互为反例）', () => {
+describe('poolProviderFor：qoder 恒等映射', () => {
   it('qoder 原样返回', () => {
     // Qoder 的面板 id、账号池键、凭据 ref 前缀、模型黑名单键**全是同一个字符串**。
     // 这条断言看似废话，它的价值在于：一旦将来有人把 Qoder 接进某个共享账号池，
-    // 必须同时改这里与宿主的分派，而那时这条会立刻变红提醒他确认「是不是也该
-    // 像 trae-cn-work 那样登记 poolProviderId」。
+    // 必须同时改这里与宿主的分派，而那时这条会立刻变红提醒他确认。
     expect(poolProviderFor('qoder')).toBe('qoder')
     expect(poolProviderFor(QODER.id)).toBe('qoder')
   })
 
   it('qoder-cn 同样原样返回（两个 region 是**各自的**账号池，不做任何映射）', () => {
-    // ⚠️ 与 `trae-cn` / `trae-cn-work` 那对**方向相反**：Trae CN Work 要映射到
-    // `trae-cn`（同批账号），而 Qoder CN 有**自己的凭据体系**（`QODER_CN_ACCOUNT_*`）
+    // Qoder CN 有**自己的凭据体系**（`QODER_CN_ACCOUNT_*`）
     // 与**自己的额度**（两区互不承认令牌）。
-    // 若有人照抄 Work 的写法把 `qoder-cn` 映射到 `qoder`：CN 面板会列出国际版
-    // 账号、打国际版的 host 用 CN 凭据 —— 得到的是「凭据失效」的假象，
+    // 若有人照抄「共享账号池」的写法把 `qoder-cn` 映射到 `qoder`：CN 面板会列出
+    // 国际版账号、打国际版的 host 用 CN 凭据 —— 得到的是「凭据失效」的假象，
     // 而且**不报任何错**。这条断言就是那个陷阱的哨兵。
     expect(poolProviderFor('qoder-cn')).toBe('qoder-cn')
     expect(poolProviderFor(QODER_CN.id)).toBe('qoder-cn')
@@ -222,13 +218,9 @@ describe('poolProviderFor：qoder 是恒等映射（与 trae-cn-work 互为反�
     expect(poolProviderFor('qoder')).not.toBe('qoder-cn')
   })
 
-  it('反例锚点：trae-cn-work **必须**映射到别处（本插件唯一的非恒等映射）', () => {
-    // 这两条断言放在一起，是为了让「恒等」这个词有对照物：
-    // 若有人把 poolProviderFor 改成恒返回入参（或删掉映射），上面那条依然绿，
-    // 而这条会红 —— 那正是「面板空白」这个真实故障的形态。
-    expect(poolProviderFor('trae-cn-work')).not.toBe('trae-cn-work')
-    expect(poolProviderFor('trae-cn-work')).toBe('trae-cn')
-    // 其余 provider（含未登记的）一律原样返回。
+  it('其余 provider（含未登记的）一律原样返回 —— 映射今天是恒等的', () => {
+    // 这是「恒等」这件事的直接锚点：若有人把 poolProviderFor 改成对某个 provider
+    // 做了映射（历史上有过一例共用账号的 provider），这条会红。
     for (const provider of ['codearts', 'buddy-cn', 'buddy', 'lobsterai', 'trae-cn', 'mystery']) {
       expect(poolProviderFor(provider), provider).toBe(provider)
     }
@@ -382,12 +374,11 @@ describe('能力矩阵驱动的积分行为在客户端不被 qoder 特判', () 
     // 故这里断言：文件里 provider 取值的来源只有面板 prop，没有 CN 专属逻辑。
     expect(normalized).not.toMatch(/qoder-cn['"]\s*\)/);  // 不存在 isCn(provider) 之类的调用
     // 两区的**显示池**也不同源（各查各的额度端点），但那是宿主的事：
-    // 客户端不选池、不传 pool 参数（`traeCnPoolFor` 是 Trae CN 那对专属的映射，
+    // 客户端不选池、不传 pool 参数（选池是宿主 `credits.balances` 分支的职责，
     // 客户端从不实现映射 —— 见 client 侧 `account.list` 那条断言）。
-    // 先剥整行注释：文件里叙述 Trae CN 那对映射的**注释**是合理的，
+    // 先剥整行注释：文件里叙述选池这件事的**注释**是合理的，
     // 判据是**调用**而不是子串。
     const code = codeLinesOf(normalized)
-    expect(code).not.toMatch(/traeCnPoolFor\s*\(/);
     expect(code).not.toMatch(/qoderRegionFor\s*\(/);
   })
 

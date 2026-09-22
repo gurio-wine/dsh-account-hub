@@ -30,7 +30,7 @@ describe('availableContextTiers：把三种目录形态归一成升序去重的�
   })
 
   it('只有默认档 → 单元素列表（单档模型没有可选项）', () => {
-    // LobsterAI / Trae CN Work 的真实形态：目录只给一个窗口。
+    // LobsterAI 的真实形态：目录只给一个窗口。
     expect(availableContextTiers({ contextWindow: 1_000_000 })).toEqual([1_000_000])
   })
 

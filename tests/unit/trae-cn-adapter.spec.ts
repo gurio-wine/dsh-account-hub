@@ -350,56 +350,48 @@ describe('Trae CN 终报文案（积分耗尽 vs 限流冷却）', () => {
   })
 
   it('池已试遍 + 4008 → 「全部账号…已耗尽」+ 下一步 + 「等不会自愈」', () => {
-    const hint = traeCnCreditsExhaustedHint(4008, '通用积分', 'pool-exhausted', 'exhausted-verified')
+    const hint = traeCnCreditsExhaustedHint(4008, '通用积分', 'pool-exhausted')
     expect(hint).toMatch(/全部账号的 Trae CN 通用积分均已耗尽/)
     expect(hint).toMatch(/请充值或等待额度周期重置/)
     expect(hint).toMatch(/这不是频率限流，稍后重试不会自愈/)
   })
 
   it('**换号达上限 → 主语降级**，不得谎称「全部账号」', () => {
-    const hint = traeCnCreditsExhaustedHint(4008, '通用积分', 'rotate-cap', 'exhausted-verified')
+    const hint = traeCnCreditsExhaustedHint(4008, '通用积分', 'rotate-cap')
     expect(hint).toMatch(/已尝试的账号的 Trae CN 通用积分均已耗尽/)
     expect(hint).toMatch(/换号次数已达上限，池中可能还有未尝试的账号/)
     expect(hint).not.toMatch(/全部账号的/)
   })
 
   it('**限流冷却（非耗尽）措辞不同**：说「冷却或限额中」而不断言耗尽', () => {
-    const hint = traeCnCreditsExhaustedHint(4007, '通用积分', 'pool-exhausted', 'exhausted-verified')
+    const hint = traeCnCreditsExhaustedHint(4007, '通用积分', 'pool-exhausted')
     // 4007 是退避表里的码，不在限流/额度表 ⇒ 不提账号池。
     expect(hint).toBe('')
-    const limited = traeCnCreditsExhaustedHint(4021, '通用积分', 'pool-exhausted', 'exhausted-verified')
+    const limited = traeCnCreditsExhaustedHint(4021, '通用积分', 'pool-exhausted')
     expect(limited).toMatch(/均在冷却或限额中/)
     expect(limited).toMatch(/可在 Account Hub 查看重置时刻/)
     expect(limited).not.toMatch(/均已耗尽/)
   })
 
   it('cap + 冷却 → 空串（信息量为负，刻意不说）', () => {
-    expect(traeCnCreditsExhaustedHint(4021, '通用积分', 'rotate-cap', 'exhausted-verified')).toBe('')
-  })
-
-  it('**未取证路径不复述「已耗尽」**（Work 的 4008 无实测证据）', () => {
-    const hint = traeCnCreditsExhaustedHint(4008, 'Work 积分', 'pool-exhausted', 'exhaustion-unverified')
-    expect(hint).toMatch(/均已用尽或受限/)
-    expect(hint).toMatch(/请充值或等待额度周期重置/)
-    expect(hint).not.toMatch(/均已耗尽/)
-    expect(hint).not.toMatch(/这不是频率限流/)
+    expect(traeCnCreditsExhaustedHint(4021, '通用积分', 'rotate-cap')).toBe('')
   })
 
   it('不该谈账号的三种情形一律返回空串（不留悬挂括号）', () => {
     // 没有池（scope undefined）
-    expect(traeCnCreditsExhaustedHint(4008, '通用积分', undefined, 'exhausted-verified')).toBe('')
+    expect(traeCnCreditsExhaustedHint(4008, '通用积分', undefined)).toBe('')
     // 业务码缺失
-    expect(traeCnCreditsExhaustedHint(undefined, '通用积分', 'pool-exhausted', 'exhausted-verified')).toBe('')
+    expect(traeCnCreditsExhaustedHint(undefined, '通用积分', 'pool-exhausted')).toBe('')
     // 非额度类码（直报 / 未知 / 账号失效 / 风控）
     for (const code of [4001, 4006, 4022, 4023, 1001, 4011, 99999]) {
-      expect(traeCnCreditsExhaustedHint(code, '通用积分', 'pool-exhausted', 'exhausted-verified'), String(code))
+      expect(traeCnCreditsExhaustedHint(code, '通用积分', 'pool-exhausted'), String(code))
         .toBe('')
     }
   })
 
   it('池名是实参（换池名不改判定，防写死）', () => {
-    expect(traeCnCreditsExhaustedHint(4008, 'Work 积分', 'pool-exhausted', 'exhausted-verified'))
-      .toMatch(/Trae CN Work 积分/)
+    expect(traeCnCreditsExhaustedHint(4008, '签到积分', 'pool-exhausted'))
+      .toMatch(/Trae CN 签到积分/)
   })
 })
 

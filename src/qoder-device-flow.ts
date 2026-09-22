@@ -415,7 +415,6 @@ export interface QoderDevicePrepareOptions {
  * ## 为什么按 provider 分槽（而不是全局一个）
  *
  * 两区是**两批账号、两套令牌**：国际版的登录窗口不该挡住 CN 的登录。
- * 这与 `trae-cn` / `trae-cn-work` 那种「同一批账号」的情形方向相反。
  *
  * ## 为什么 `'preparing'` 也要占位
  *
