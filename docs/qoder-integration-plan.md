@@ -125,14 +125,20 @@
 | Cosy 头 | CN 发 `Cosy-ClientType`（= `clientType`）与 `Cosy-Version`（`1.1.58`）⚠️ 未实测；`Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**（官方条件性发送，本插件不猜机器身份） |
 | 签到 | 矩阵仍是 `dailyCheckin: false`，但理由是**「端点未知、未验证」**（CLI2API 的 `RegionDescriptor` 只在 cn 挂 Checkin），**不是**「没有权益」—— 拿到端点后翻 `true`，届时需补 `credits.status` / `credits.claimAll` 的 `qoder-cn` 分支 |
 
-### 两区隔离（与 `trae-cn` / `trae-cn-work` 那对方向相反）
+### 两区隔离（**不要**照抄任何「共用账号」的先例）
 
-| 维度 | `qoder` / `qoder-cn` | `trae-cn` / `trae-cn-work` |
-|---|---|---|
-| 账号池 | **各自独立**（`QODER_ACCOUNT_*` vs `QODER_CN_ACCOUNT_*`） | 同一批（`TRAE_CN_ACCOUNT_*`） |
-| 令牌 | **互不承认**（拿错 host 打 = 「凭据失效」的假象） | 同一份凭据 |
-| `poolProviderFor()` | **恒等** | **必须映射**到 `trae-cn` |
-| 积分 | 各查各的额度端点，**没有**选池映射 | 同一端点 + `traeCnPoolFor()` 选池 |
+| 维度 | `qoder` / `qoder-cn` |
+|---|---|
+| 账号池 | **各自独立**（`QODER_ACCOUNT_*` vs `QODER_CN_ACCOUNT_*`） |
+| 令牌 | **互不承认**（拿错 host 打 = 「凭据失效」的假象） |
+| `poolProviderFor()` | **恒等** —— 该函数今天对每个 provider 都恒等 |
+| 积分 | 各查各的额度端点，**没有**选池映射 |
+
+⚠️ **历史上存在过一个方向相反的先例**：早期有个复用 `trae-cn` 账号的 TraeWork 路径
+provider（同一批 `TRAE_CN_ACCOUNT_*`、同一份凭据、`poolProviderFor()` 必须映射、
+积分按面板选池）。该 provider 已随官方把 Work 通道合并进通用通道而**整体移除**
+（`47bd690`），今天仓库里**没有任何 provider 共用别人的账号**。Qoder 两区的
+「各自独立」是当前唯一形态，不要再按那份已作废的对照去设计映射。
 
 **逃生阀** `QODER_MODEL_SERVER_HOST` 可覆盖 chat 的 host（与官方 CN CLI 同语义）：
 ⚠️ **只影响 chat**（`openapiBase` / `modelsBase` 两条控制面不受影响）、路径与查询串
@@ -212,7 +218,7 @@
 |---|---|---|
 | A | 产品配置 + 协议字段参数化（`QODER_CN`、`clientType` / `cosyVersion`） | `221d309` |
 | B | 宿主接线（`src/index.ts` 注册第二个 `QoderAuth` 实例与适配器；`jet-hub-rpc.ts` 的 `account.create` / `credits.balances` / `account.refresh` 三分支 + `qoderRegionFor()`；`credits.status` / `claimAll` 结构性拒绝） | `88ad3d2` |
-| C | 客户端面板 + 文档收尾（`PROVIDERS` 第八条、`PAT_LOGIN_PROVIDERS` 第二个 region、能力矩阵行、测试与 README/AGENTS 同步） | `本次提交` |
+| C | 客户端面板 + 文档收尾（`PROVIDERS` 第八条 —— 当时 TraeWork 路径尚在、共 8 条，现为 7 条；能力矩阵行、测试与 README/AGENTS 同步） | `本次提交` |
 
 ### 验收状态（按 region 分开看，不要合并叙述）
 

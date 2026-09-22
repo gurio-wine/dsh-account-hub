@@ -13,9 +13,11 @@
 
 ## 项目概述
 
-本项目是 DeepSeek Harness 的插件 `dsh-account-hub`，提供华为云 Codearts 浏览器登录与凭据管理，并附带八个 LLM provider 路由：`buddy-cn`（**Buddy CN**，腾讯 CodeBuddy 中国版）、`buddy`（**Buddy**，腾讯 WorkBuddy **国际版**）、`lobsterai`（**LobsterAI**，有道）、`trae-cn` / `trae-cn-work`（字节跳动 **Trae 国内版**及其 TraeWork 路径）、`qoder` / `qoder-cn`（**Qoder** 国际版与国内版**两个 region**）。
+本项目是 DeepSeek Harness 的插件 `dsh-account-hub`，提供华为云 Codearts 浏览器登录与凭据管理，并附带七个 LLM provider 路由：`buddy-cn`（**Buddy CN**，腾讯 CodeBuddy 中国版）、`buddy`（**Buddy**，腾讯 WorkBuddy **国际版**）、`lobsterai`（**LobsterAI**，有道）、`trae-cn`（字节跳动 **Trae 国内版**）、`qoder` / `qoder-cn`（**Qoder** 国际版与国内版**两个 region**）。
 
 > **命名（2026-09-18 改名后）**：显示名与 provider id 一律按**产品品牌**，旧命名 `buddy`（中国版）/ `workbuddy`（国际版）已作废，仅出现在历史叙述、迁移映射与**出站协议值**里。迁移见 README「provider 改名与数据迁移」。
+
+> **TraeWork 路径 provider 已于 `47bd690` 整体移除**：官方把 Work 侧模型合并进通用通道，`trae-cn` 一条通道即可覆盖（真机实拉动态目录 14 项，含原 Work 独有的 `kimi-k2.7-code` / `kimi-k2.6` 与新增 `step-5-preview`）。provider 由八个减为七个。`disabledModels` 里可能残留该 provider 的旧键，**无人读取、无害**（按指示不迁移也不清理）。
 
 `buddy-cn` 与 `buddy` 同源：共用同一 CLI 内核与认证协议，差异全部收敛在 `src/product.ts` 的 `BuddyProduct` 配置。关键差异是 **`endpoint`**（中国版 `copilot.tencent.com` / 国际版 `www.workbuddy.ai`，返回不同模型池，**不可当全局常量**）与 `platform`（`ide` / `workbuddy-ai`），国际版登录 URL 还追加 `version` / `loginSessionId`。
 
@@ -27,7 +29,7 @@
 
 ⚠️ **`4022` = 真·上下文窗口溢出，与 `4006` 同路映射 `CONTEXT_WINDOW_EXCEEDED`**：prompt token ≈ 1 000 000 时上游回 HTTP 200 + 流内 `event:error`（钳制二分 998 161 成功 / 1 002 248 失败；4 KB→1.5 MB 十一档全 200 ⇒ **无字节墙**）。修复前落「未知码」→ `INVALID_REQUEST`（致命、不触发压缩）；现在 `TRAE_CN_FATAL_CODES` 收 `4022`、`TRAE_CN_CONTEXT_OVERFLOW_CODES = [4006, 4022]` 供 `traeCnErrorCodeForAction` 映射 —— 那是**宿主唯一的补救路径**（DSH 自动压缩 + 重试），功能性必需。⚠️ 不违反「未知码直报不猜」：`4022` 已由阈值、排除项、同请求对照三件证据定案。⚠️ 中文说明只给 `4022`（`traeCnContextOverflowHint`），`4006` 文案刻意不动。
 
-⚠️ **`4008` 实测是「通用积分池耗尽」，不是频率限流**：某账号通用池 `remain=0` 后连 4 KB 请求都回 `4008`（190 ms 即回、20 分钟不自愈），同刻健康账号 8 连请求全成功 ⇒ 与频率、字节量、并发无关。**动作与徽章不变**：仍留在 `TRAE_CN_RATE_LIMIT_CODES`（换号正确、冷却徽章正确），新增 `TRAE_CN_CREDITS_EXHAUSTED_CODES = [4008]` **只服务终报文案**（`traeCnCreditsExhaustedHint`，上游原文不改）。⚠️ **`scope` 与 `semantics` 必填**：`scope` 由换号循环在退出点判定 —— `'pool-exhausted'` →「全部账号」、`'rotate-cap'` →「已尝试的账号」、`undefined`（无池 / 非换号失败 / 已产出正文后降级）→ **不追加**（此时谈账号是编造）；`trae-cn` 传 `'exhausted-verified'`、`trae-cn-work` 传 `'exhaustion-unverified'`（Work 码表未标定，只说「已用尽或受限」）。两 provider 共用同一批账号故共用此函数，但**码表绝不复用**；池名走实参。限流冷却措辞不同；`rotate-cap` + 冷却返回空串。
+⚠️ **`4008` 实测是「通用积分池耗尽」，不是频率限流**：某账号通用池 `remain=0` 后连 4 KB 请求都回 `4008`（190 ms 即回、20 分钟不自愈），同刻健康账号 8 连请求全成功 ⇒ 与频率、字节量、并发无关。**动作与徽章不变**：仍留在 `TRAE_CN_RATE_LIMIT_CODES`（换号正确、冷却徽章正确），新增 `TRAE_CN_CREDITS_EXHAUSTED_CODES = [4008]` **只服务终报文案**（`traeCnCreditsExhaustedHint`，上游原文不改）。⚠️ **`scope` 必填**（`semantics` 参数已随 Work 路径移除而整体删除）：`scope` 由换号循环在退出点判定 —— `'pool-exhausted'` →「全部账号」、`'rotate-cap'` →「已尝试的账号」、`undefined`（无池 / 非换号失败 / 已产出正文后降级）→ **不追加**（此时谈账号是编造）。池名走实参。限流冷却措辞不同；`rotate-cap` + 冷却返回空串。
 
 ⚠️ **`x-ide-version-code` 是 SOLO 网关的「选表键」（4001 第二个根因）**：网关按该头决定上游返回哪张模型表，发旧 IDE 通道的 `107` 选出**空表** → 任何模型恒回 `4001`。成功组合 `20260820` + `x-ide-version: 0.1.61` + `User-Agent: Trae/0.1.61`；值域必须是 8 位日期式 `YYYYMMDD`（`20260801` 起表非空，**roster 会浮动、别当常量**），**只认这个头**。⚠️ **两组版本码同名不同物、不可合并**：`TRAE_CN_IDE_VERSION_CODE`(`107`) / `TRAE_CN_IDE_GATEWAY_VERSION`(`1.107.1`) 属 IDE 网关代际，`TRAE_CN_SOLO_VERSION_CODE`(`20260820`) / `TRAE_CN_SOLO_IDE_VERSION`(`0.1.61`) 属 SOLO 代际，四常量都在 `src/trae-cn-product.ts`（防「顺手统一」）；签到链路 `traeCnCreditsHeaders` 的版本头不动。
 
@@ -49,7 +51,7 @@
 
 **红线与判据**：机制是**纯声明值切换，出站请求体一个字段都不动** —— 变的只有 `resolveModel().context.contextWindow`（宿主压缩阈值 `0.8×窗口` + 压缩后保留预算），有逐字节比对两次请求体的用例钉死。三条判据缺一不可：① 写入只有一个落点 —— `max` 严格大于**实际生效的默认档**才写（`max<=dev` / `0` / 缺失都不收）；② RPC `model.setContextBudget` 只接受**精确等于**该模型当前目录条目的某个档位（省略 / 等于默认档 = 清除预算），错误信息必须带实际可用档位值；③ 读取时 `effectiveContextWindow` 再判一次。⚠️ **编造值静默退回默认档是设计**。⚠️ **静态回退表 11 项一律不带 `maxContextWindow`**，故静态路径下模型自动无档位 UI。
 
-**档位来源与注册表**：`src/context-tiers.ts` 是档位通用机制（`availableContextTiers` / `effectiveContextWindow` / `createContextTierRegistry`），`src/index.ts` 用 `createContextTierRegistry({ [TRAE_CN.id]: …, [BUDDY_CN.id]: …, [BUDDY.id]: …, [QODER.id]: …, [QODER_CN.id]: … })` 作为 `registerJetHubRpc` 的**第 10 个实参**注入（键取 `*.id`，别写字面量）。**只有 buddy 系（`supportedLengths`）与 qoder 两区（`available_context_windows`）有档位数据源**，trae-cn 走上面那套；**lobsterai / trae-cn-work 没有档位源 ⇒ 不显示档位 UI**（不是遗漏）。
+**档位来源与注册表**：`src/context-tiers.ts` 是档位通用机制（`availableContextTiers` / `effectiveContextWindow` / `createContextTierRegistry`），`src/index.ts` 用 `createContextTierRegistry({ [TRAE_CN.id]: …, [BUDDY_CN.id]: …, [BUDDY.id]: …, [QODER.id]: …, [QODER_CN.id]: … })` 作为 `registerJetHubRpc` 的**第 10 个实参**注入（键取 `*.id`，别写字面量）。**只有 buddy 系（`supportedLengths`）与 qoder 两区（`available_context_windows`）有档位数据源**，trae-cn 走上面那套；**lobsterai 没有档位源 ⇒ 不显示档位 UI**（不是遗漏）。
 
 **存储与通路**：`jet-hub` namespace 的第四个字段 `contextBudgets`（`AccountPool.contextBudget` / `writeContextBudget`）；`writeAccounts` / `writeModels` / `writeBudgets` / `replaceAll` **四件套互带**，后三者都**先 `ensureLoaded()`**（它们不过读路径，漏了就整表 replace 清空账号 / 黑名单 / 版本号）。⚠️ `LlmRuntime.listModels` 会重建条目、丢掉额外字段，`ctx` 也没有「按 provider 取适配器」的入口 ⇒ 由 `register*Llm` **返回适配器实例**经上述参数注入；省略时 `model.list` 不带窗口字段、`setContextBudget` 一律拒绝（headless / 测试的既定降级）。⚠️ **回填行（被关闭的模型）与目录行必须带同一组窗口字段**。⚠️ 客户端 `ModelToggle` 根节点是 `div`、`label` 只包「名称 + 显示开关」，**档位 radio 必须在 label 之外**（放进去会连带翻转显示开关）。
 
@@ -65,7 +67,7 @@
 
 ⚠️ **安全网（不改分类器）**：1.2M 报文被**现有**分类器命中 `CONTEXT_WINDOW_EXCEEDED`（`httpErrorCode` 靠**完整 body**）。⚠️ 承重点是 `displayMsg.en` 那句英文措辞：新报文 `extError.code` 是纯数字、`msg` 无 `for this model` 后缀，结构化正则都认不出，**摘掉 `displayMsg` 即落回 `INVALID_REQUEST`（不触发压缩）**。判据复用宿主 `isContextWindowExceededError`、**不自建关键词表**（同 lobsterai / qoder 先例）；`buddy-adapter.spec.ts` 有钉死用例。
 
-Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Trae CN Work **与 Trae CN 是同一批账号**故签到只在后者提供，Qoder 与 Qoder CN 都不提供（详见下文「积分能力」）。**八个 provider 都有 Account Hub 面板**（Trae CN Work 见下节，Qoder 两区见 README）。
+Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理与限流自动切换；「一键领取积分」（每日签到）**由 Buddy CN、LobsterAI 与 Trae CN 三个面板提供** —— Buddy（国际版）后端没有签到接口，Codearts 是华为云账号体系不参与，Qoder 与 Qoder CN 都不提供（详见下文「积分能力」）。**七个 provider 都有 Account Hub 面板**（Qoder 两区见 README）。
 
 ### Qoder 国际版（`qoder`）—— chat 250 的三条硬事实
 
@@ -99,40 +101,25 @@ Account Hub 设置页（`plugin-src/client/jet-hub.js`）提供多账号管理�
 
 `qoder-cn`（显示名 **Qoder CN**）与 `qoder`（国际版）**同协议双 region**：exchange / quota / models 三个端点的错误信封逐字节同构、PAT 前缀同为 `pt-`、目录字段同构，故**代码只有一份**（`src/qoder*.ts` 按传入的 `product` 现算），差异全部收敛在 `src/qoder-product.ts` 的两份 `QoderProduct` 配置里。
 
-⚠️ **两区是两套账号、两套 Credits、两套令牌 —— 与 `trae-cn` / `trae-cn-work` 那对方向相反**：账号**各自独立**（凭据 ref 前缀 `QODER_ACCOUNT_*` vs `QODER_CN_ACCOUNT_*`）、令牌**互不承认**（拿错 host 打 = 「凭据失效」的假象）、`poolProviderFor()` **恒等**、积分各查各的额度端点（**没有**选池映射）；而 `trae-cn` / `trae-cn-work` 是**同一批** `TRAE_CN_ACCOUNT_*`、同一份凭据、`poolProviderFor()` **必须映射**、同一积分端点按面板选池。
+⚠️ **两区是两套账号、两套 Credits、两套令牌 —— 各自独立，没有任何池映射**：账号**各自独立**（凭据 ref 前缀 `QODER_ACCOUNT_*` vs `QODER_CN_ACCOUNT_*`）、令牌**互不承认**（拿错 host 打 = 「凭据失效」的假象）、`poolProviderFor()` **恒等**、积分各查各的额度端点。⚠️ **不要照抄别的 provider 去造映射**：历史上有一个复用 `trae-cn` 账号的 TraeWork 路径 provider（已于 `47bd690` 随官方合并而移除），它的「同一批账号 + 必须映射」写法**只属于它**。
 
-⚠️ **照抄 Work 的写法把 `qoder-cn` 映射到 `qoder` 是静默故障**：CN 面板会列出国际版账号、用 CN 凭据打国际版 host —— 端点仍回 `ok: true`，只是账号对不上 / 报「凭据失效」。`qoder-hub-panel.spec.ts` 与 `qoder-cn-rpc-dispatch.spec.ts` 从两个方向钉死。
+⚠️ **把 `qoder-cn` 映射到 `qoder` 是静默故障**：CN 面板会列出国际版账号、用 CN 凭据打国际版 host —— 端点仍回 `ok: true`，只是账号对不上 / 报「凭据失效」。（成因是历史上那段「复用宿主 provider 账号」的写法已不存在，任何新映射都必须另有依据。）`qoder-hub-panel.spec.ts` 与 `qoder-cn-rpc-dispatch.spec.ts` 从两个方向钉死。
 
 **CN 三个基址**：`openapi.qoder.com.cn`（✅）、`api.qoder.com.cn`（✅）、**`gateway.qoder.com.cn`（chat，签名路径的 host）**。⚠️ **旧定性「阿里云侧未就绪 / PAT 结构性不可用」被真机推翻两半**：① 「503 是路径级的」**仍成立**（`/model/v1/chat/completions` 在 CN 网关确实不存在，ALB 对该路径恒 503）；② 但「PAT 给不出用户密钥」**错了** —— 签名四要素 PAT 路径全拿得到，空 uid 才回 `101`。**CN chat 现在走 `/algo/…/agent_chat_generation` + wasm 签名**，不再打那条 REST 路径。**错误分类按 region 分流**：CN 的 chat 503 直报 `'fail'`（不退避、不换号、不记徽章、harness 码 `INVALID_REQUEST`）—— ⚠️ **该分支保留不动**（逃生阀把 CN 指到别处、或将来误接回 REST 时的兜底），region 判据**显式列举 `=== QODER_CN.id`**（防第三个 region 被静默归入）；国际版 503 维持 `backoff` → `RATE_LIMIT` 不变。**逃生阀** `QODER_MODEL_SERVER_HOST` 覆盖 chat 的 host（⚠️ **只影响 chat**；路径与查询串一律丢弃；**请求时读取**），作用于两区；对 CN 改的是**传给签名器的 hostBase**（签名后的完整 URL **不再过**该函数）。⚠️ **绝不因「打不通」就改成国际版 host** —— 那会把「路径不存在」伪装成「凭据失效」（实测 **CN 的 `jt-` 打国际版 chat 回 401**，用户会被引向反复重贴 PAT 的死路）。
 
 **CN 的三个出站身份标识**：UA **`qoder/1.1.58`**（官方模板 `` `qoder/${版本}` ``、**与 region 无关**；此前的 `qodercn/1.1.58` 是把 npm 包名当产品名的**推断错值**）、`client_type: "5"`、**Cosy 头**。⚠️ **签名路径下这三个的实际出站者都是 wasm**；适配器 `send()` 里那段 Cosy 追加代码**对 CN 已无可达路径**，属残留（防「将来接回 REST 时出站身份静默变化」）。⚠️ `Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**（**不猜机器身份** —— 缺头比错头安全）。
 
-### Trae CN Work（`trae-cn-work`）—— 第二条 Trae CN 路径
+### TraeWork 路径 provider（已于 `47bd690` 移除）
 
-`trae-cn-work`（显示名 **Trae CN Work**）走 **TraeWork（`work.trae.cn`）网页 RPC**，消耗 **Work 专属积分池**（`available_endpoint=1`）。它与 `trae-cn`（IDE 路径）是**两个 provider**，因为：**扣的池不同**（IDE 只扣通用池，本 provider 只扣 Work 池 —— 两池可用性互相独立）；**模型池完全不重合**（IDE 是动态 `get_detail_param` 目录 + 11 项 `chat_v3` 静态表，Work 是 14 项 `solo_agent_remote` 代际；只有 `Doubao-Seed-Code` 同名且窗口不同，该 id 已从 IDE 侧静态表剔除），合并目录会产生无法路由的条目。
+该 provider 已整体删除：官方把 Work 侧模型合并进通用通道，`trae-cn` 一条通道即可覆盖（真机动态目录 14 项已含原 Work 独有的 `kimi-k2.7-code` / `kimi-k2.6`）。它的整节协议要点、Account Hub 面板与池映射随之作废，**不要再按已删代码去描述它**。Work 专属积分池（`available_endpoint=1`）在服务端仍在，但只有 TraeWork 网页/桌面版能花 —— 与本插件无关，故**不在任何面板展示**。
 
-⚠️ **唯一的非常规接线（改错会静默失效，两个方向都不报错）**：注册到 `ctx.llm` 的路由名 / settingsNs / 模型黑名单用 **`trae-cn-work`**，而**账号池查询**（`getAvailableAccount` / `findAccountIdByCredential` / `updateModelRateLimit`）用 **`trae-cn`**。Work **没有独立登录**：账号、凭据（`TRAE_CN_ACCOUNT_*`）、限流切换全部复用 `trae-cn`，故**不注册独立 auth 服务**。池查询若传 `trae-cn-work`，账号条目的 `provider` 字段（`trae-cn`）一个都匹配不到 → 适配器每次都抛 `MISSING_CREDENTIAL`（「请先登录」）而账号明明在列表里；路由名若传 `trae-cn`，本 provider 根本不会出现在模型选择器里。该值由 `TraeCnWorkProduct.poolProviderId` 显式承载（与 `id` 并列命名，防「顺手统一」）。
+**移除它留下两条结构性事实仍然成立**，见下两段。
 
-**协议要点**（全部真机实测，详见 README「Trae CN Work provider」）：
+**面板 id → 账号池键的收敛点仍是 `src/jet-hub-rpc.ts` 的 `poolProviderFor()`**（客户端不做映射，发的就是面板 id）：移除 Work 后它是**恒等函数**，但**刻意保留** —— 六个入口（`account.list` / `account.retestAll` / `account.resetAll` / `credits.status` / `credits.claimAll` / `credits.balances`）仍经它把「面板 id」翻成「池键」，将来若再出现复用别人账号的 provider，加一行即可，不必把 if 撒进六处调用点。
 
-- **三段式有状态会话**：`POST chat_sessions` → `POST …/messages` → `GET …/events`（SSE），**每轮 `finally` 里 DELETE**（会话会拉起云端沙箱并出现在用户 TraeWork 列表里）；删除覆盖**整次尝试**而非只成功路径，否则会话泄漏；
-- **`query` 是 JSON 字符串**，元素形态 `{type:"text",data:{content}}`（是 `data.content`，不是 IDE 的 `text_content`）；`agent_type` / `agent_id` / `model_selection_strategy` / `origin` 是出站身份标识，一字符不能动；
-- **`plan_item` 是累计快照不是增量**（`thought` / `reasoning_content` 每帧都是「到目前为止的全文」），必须按 `plan_item.id` 差分只发后缀，直接拼接会重复；
-- **正文两条通道都要认**：`plan_item.thought`（流式）与 `plan_item.tool_call_info.params.summary`（`name === "finish"`，真机第 2 轮 `thought` 全程为空）；合流去重；
-- **`model_config.model_name` 带 `__dev` 后缀**（请求发无后缀的），比对静态表前必须归一；
-- **模型目录远端可用**（`GET /api/remote/v1/models`，与 IDE 路径相反）：`{data:{list:[{function,models:[…]}]}}` 按 agent 分组，倍率在 `features` 这个 **JSON 字符串**里二次解析；
-- ⚠️ **目录必须带 `?functions=solo_agent_remote&show_custom_model=true`（`TRAE_CN_WORK_MODELS_QUERY`）且只取本 agent 那组**：`function` 分组**由 query 决定**，裸打回的是 `solo_coder` 组（另一个池）—— 这是「选择器模型比网页版少」的已修复根因。多组且无本组时返回空目录（回退静态表），**刻意不拼接**；
-- **错误分类以 HTTP 状态码为主**：Work 码表**未标定**，未知业务码**一律直报并带原文**，不猜动作；`fail` 不映射 `CONTEXT_WINDOW_EXCEEDED`（会误触发压缩）；⚠️ 终报文案与 IDE 共用同一函数（账号同批），但 `semantics` 传 `'exhaustion-unverified'`（只说「已用尽或受限」）。**码表绝不复用**；
-- **思考档已接线**：`solo_agent_remote` 组 9/14 项声明 `reasoning`（默认档取 `default_level`；`glm-5.2` 只有 `high`/`extra_high`）。⚠️ **下发落点是 `custom_model` 对象内部的 `reasoning_effort_level`，与 IDE 路径（顶层字段）不同** —— 字段名同名、落点不同，**不要「统一」掉**（真机 A/B：不带 131 reasoning tokens、`light` 档 13/17、错名字段 28）。未指定档位时**整个 `custom_model` 都不发**；
-- **2 项账号私有自定义模型只在远端出现**（`deepseek-chat` / `deepseek-reasoner`，`config_source:3`），**不进静态表**；真机实测其三方 key 已失效（SSE `code:4028`）。
+⚠️ **「选显示哪个积分池」是另一件事，不走 `poolProviderFor()`**：`traeCnPoolFor()` 已随 Work 路径删除，`credits.balances` 的 trae-cn 分支**内联 `TRAE_CN_POOL_UNIVERSAL`** 作为 `fetchTraeCnCreditBalance` 的第三个实参（Trae CN 面板显示的就是它实际能花的池）。账号映射与选池**不可合并**：用池键查账号会让面板空白；`TRAE_CN_POOL_WORK` 与 `TraeCnPoolId` **仍保留**（服务上游 `available_endpoint` 分池字段与礼包归类，非 provider 专属）。
 
-**Account Hub 有本 provider 的面板**（`PROVIDERS` 第六条，排在 `trae-cn` 之后；能力矩阵 `balance: true, dailyCheckin: false`），它与 Trae CN 面板是**同一批账号的两个视图**：账号列表与卡片操作（刷新 / 删除 / 启停 / 重测 / 重置）完全相同；积分行 / 「刷新积分」✓ **只显示 Work 池**；「一键领取积分」✗ 与「+ 新建账号」✗ **刻意不渲染**（签到留在 Trae CN 面板避免重复领取；后者改为一常驻提示行 `loginHint`）；「显示列表」✓ 作用于 **`trae-cn-work` 键**（两池模型不重合，黑名单必须分开）。
-
-**面板 id → 账号池键的映射收敛在 `src/jet-hub-rpc.ts` 的 `poolProviderFor()` 一处**（客户端不做映射，发的就是面板 id），取值引用 `TraeCnWorkProduct.poolProviderId` 而非再抄字面量。应用点六处：`account.list` / `account.retestAll` / `account.resetAll` / `credits.status` / `credits.claimAll` / `credits.balances`。
-
-⚠️ **`credits.balances` 上还挂着第二个、方向相反的映射 `traeCnPoolFor()`**（同文件）：按**面板 id** 决定**显示哪个积分池**（`trae-cn` → 通用池 0、`trae-cn-work` → Work 池 1），是 `fetchTraeCnCreditBalance` 的第三个实参。两个映射答的是两个不同问题，不可互相顶替、更不可合并：用池键选池 → 两个面板都显示通用池；用面板 id 查账号 → 面板空白。**两个方向都不报错**。
-
-⚠️ **刻意不映射的两个入口**，改错都是静默的：**`account.create`**（映射会给同一份凭据建出**第二个** `trae-cn-<shortId>` 占位账号；该入口对 `trae-cn-work` 保持 `unknown provider` 拒绝）；**`model.list` / `model.setDisabled`**（黑名单按 provider id 存，映射会把 Work 的开关写进 IDE 的黑名单）。`tests/unit/trae-cn-work-hub-panel.spec.ts` 用真实 RPC 分派锁死上述语义；`credits-capabilities.spec.ts` 的「集合相等」断言已同步到六条，并新增「`loginHint` 只允许出现在 Work 条目上」。
+⚠️ **刻意不经过映射的两个入口**：**`account.create`**（它按 provider 解析产品配置决定「登录怎么做」，对未知 provider 一律回 `unknown provider` —— 映射会给同一份凭据建出第二个占位账号，等于把一个账号建两遍）；**`model.list` / `model.setDisabled`**（黑名单按 provider id 存，映射会把一个 provider 的开关写进另一个的黑名单）。`credits-capabilities.spec.ts` 的「集合相等」断言已同步到七条，并断言**没有条目声明 `loginHint`**（每个面板都自带「+ 新建账号」入口）。
 
 - **包名** `dsh-account-hub`；**入口** `lib/index.js`（宿主侧）、`lib/client/jet-hub.js`（客户端 bundle）；**构建** `pnpm build:all`（`tsc` + `esbuild`）；**语言** TypeScript；**许可** MIT
 
@@ -215,7 +202,7 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 ## LLM Provider 约定
 
-- **provider 名称**：`codearts` / `buddy-cn` / `buddy` / `lobsterai` / `trae-cn` / `trae-cn-work` / `qoder` / `qoder-cn`
+- **provider 名称**：`codearts` / `buddy-cn` / `buddy` / `lobsterai` / `trae-cn` / `qoder` / `qoder-cn`
 - **provider id 与 cordis 服务名是两件事**，不要机械派生。默认规则是 `${product.id}Auth`，但**机械派生结果不合法（带连字符）的 id 必须显式声明 `serviceName`**：`trae-cn` → `traeCnAuth`、`buddy-cn` → `buddyCnAuth`、`qoder-cn` → `qoderCnAuth`（`BuddyProduct` 已有必填字段 `serviceName`）。⚠️ **`qoder` 是反面判据**：它**无连字符**，`qoderAuth` 本身就合法，故 `QoderProduct` **刻意不声明 `serviceName`** —— 那条规则不是「所有 provider 都得声明」，**不要为了「形态统一」把两行写成一样**。`src/plugin.spec.ts` 已钉死 `ctx['qoder-cnAuth']` 为 `undefined`、`ctx.qoderCnAuth` 才是那个实例。新增 provider 时：id 可以带连字符，服务名必须是合法的 JS 标识符风格。
 - 端点格式为 OpenAI 兼容
 - 请求签名/鉴权方式因 provider 而异：
@@ -253,8 +240,8 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 - **Buddy 系**（两产品通用，仅 baseURL 随 `product.endpoint` 切换）：`POST /v2/billing/meter/get-user-resource`，body `{}`。⚠️ 响应**双层嵌套** `data.Response.Data.Accounts[]`（签到是单层 `data`，最易解析错）；余额取各包的 `CycleCapacityRemain`（本周期口径）相加，**不是** `CapacityRemainPrecise` / `CapacityRemain`（终身口径）；精确值经 `readPreciseNumber()` 优先读带 `Precise` 后缀的字符串版；**不用**截断过的 `TotalDosage`；包名回退 `PackageName` → `SubProductName` → `PackageCode`。该接口**不在 CLI 内核**里（内核只有 `get-dosage-notify`），靠真实凭据实测发现。
 - **LobsterAI**：`GET /api/user/profile-summary` → `data.totalCreditsRemaining`；**不要**用 `/api/user/quota`（只有 `freeCreditsTotal=300`，不含活动积分）。
 - **Trae CN**：`POST /trae/api/v2/pay/web_user_ent_usage`，body `{"require_usage":true}`。
-  - 礼包按 `available_endpoint` 分池：`0`=通用积分、`1`=Work 积分。**展示口径 = 一个面板一个池**：宿主按**面板 id** 选池（`traeCnPoolFor()`，即 `fetchTraeCnCreditBalance(credential, product, pool)` 的第三个实参），返回的 `total` / `packages` / `expiredTotal` 只含那一个池。语义锚点：**面板显示的数字 = 该 provider 实际能花的池**。⚠️ **选池必须用 `req.provider`，不能用 `poolProviderFor()` 映射后的账号池键**（后者把两个面板都映射到 `trae-cn`，会让两个面板显示同一个池 —— 不报错，但数字不对）。
-  - Work 积分只在 TraeWork（`work.trae.cn`）能花；TraeCode / IDE 对话（本插件走的路径）只消耗通用积分；TraeWork 中两类按**到期时间先后**扣，Work 专属**仅在到期时间相同时**优先；2026-09 起签到发的是通用积分。
+  - 礼包按 `available_endpoint` 分池：`0`=通用积分、`1`=Work 积分。**Trae CN 面板只显示通用池**：宿主在 `credits.balances` 的 trae-cn 分支**内联 `TRAE_CN_POOL_UNIVERSAL`** 作为 `fetchTraeCnCreditBalance(credential, product, pool)` 的第三个实参，返回的 `total` / `packages` / `expiredTotal` 只含那一个池。语义锚点：**面板显示的数字 = 该 provider 实际能花的池**。⚠️ **选池与账号池映射是两件事**：`poolProviderFor()` 只把面板 id 翻成池键，拿它去选池是错的（历史上曾被映射到同一键，今天恒等因而表现为「恰好正确」—— 不要依赖这个巧合）。
+  - Work 积分只在 TraeWork（`work.trae.cn`）能花；TraeCode / IDE 对话（本插件走的路径）只消耗通用积分；TraeWork 中两类按**到期时间先后**扣，Work 专属**仅在到期时间相同时**优先；2026-09 起签到发的是通用积分。⚠️ 本插件已无 TraeWork 路径，故 Work 积分**不在任何面板展示**。
   - `TraeCnCreditBalance` 与共用的 `CreditBalance` 逐字段同构，收集器与卡片直接复用。⚠️ 曾经的超集字段 `pools` / `workTotal` 与 `[Work 积分]` 包名前缀**已随分池删除**；`CreditBalanceRow` 不做任何池判断。改前端后须 `pnpm build:all` 重建 bundle。**不要**用 `ug/activity/info` 的活动口径（写 200 work 实到 150 通用，口径陷阱）；包名回退链 `BALANCE_NAME_FIELDS`，包名原样透出。
   - ✅ **T7 已按真机校准**：该端点响应**没有 `code` 信封**（顶层是 `is_credits_billing` / `usage_summary` / `user_entitlement_pack_list`），沿用 code 信封会让余额**恒失败**；礼包数组在**根层**，额度嵌在 `entitlement_base_info.product_extra.package_extra.quota.credits_limit`（回退 `entitlement_base_info.quota`）减 `usage.credits_amount`（可为 `{}`，按 0 计）。候选表 + 指纹扫描 + 三级回退**保留作兜底**，主路径是嵌套口径。⚠️ **T8 仍待校准**：领取响应里「本次获得积分」的字段名（`TRAE_CN_CLAIM_CREDIT_FIELDS`），未命中时按 0 计。
 - 累加后一律 `roundCredits` 规整两位小数；「余额为 0」与「查不到」严格区分（失败时 `balance` 为 `null` + `error`，卡片显示原因而非 0）。RPC `credits.balances`；前端 `AccountCard` 的 `CreditBalanceRow`，面板有「刷新积分」按钮。
@@ -264,7 +251,7 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 `plugin-src/client/credits-capabilities.js` 是「哪个 provider 有哪项积分能力」的**唯一真相源**，两项能力彼此独立、不可互相推断。**默认关闭**（未登记者视为两项全无 —— 新增 provider 忘登记时最坏是暂时看不到积分，而不是每次开面板都发一个必然失败的请求）；**门控在发请求之前**（`loadCredits` / `claimCredits` 内部各有一道守卫 —— 按钮不渲染只是 UI 便利，不是安全边界）。
 
-**`dailyCheckin` 为 true 的只有三个**：`buddy-cn`（中国版后端）、`lobsterai`（`client-activities` 三步）、`trae-cn`（`checkin_credits` 两步 + 设备头）。**`balance` 为 true 的是除 `codearts` 外的七个**，含 `buddy`（国际版无签到接口）、`trae-cn-work`（同一批账号同一实现，只显示 Work 池；签到刻意留在 Trae CN 面板以免重复领取）、`qoder`（三池之和 `userQuota` / `addOnQuota` / `orgResourcePackage`，后两池容缺）、`qoder-cn`（同一实现、CN 端点，实测两池）。⚠️ **Qoder 两区 `dailyCheckin` 都是 `false` 但理由不同、不可合并叙述**：`qoder` 是**活动不存在**（每日 100 Credits 只能在桌面 App 手动领 —— 与 `buddy` 的「后端压根没有该接口」不是一回事），`qoder-cn` 是**端点未知**（待办，拿到端点后翻 `true`）；`credits-capabilities.spec.ts` 断言钉死取值。
+**`dailyCheckin` 为 true 的只有三个**：`buddy-cn`（中国版后端）、`lobsterai`（`client-activities` 三步）、`trae-cn`（`checkin_credits` 两步 + 设备头）。**`balance` 为 true 的是除 `codearts` 外的六个**，含 `buddy`（国际版无签到接口）、`qoder`（三池之和 `userQuota` / `addOnQuota` / `orgResourcePackage`，后两池容缺）、`qoder-cn`（同一实现、CN 端点，实测两池）。⚠️ **Qoder 两区 `dailyCheckin` 都是 `false` 但理由不同、不可合并叙述**：`qoder` 是**活动不存在**（每日 100 Credits 只能在桌面 App 手动领 —— 与 `buddy` 的「后端压根没有该接口」不是一回事），`qoder-cn` 是**端点未知**（待办，拿到端点后翻 `true`）；`credits-capabilities.spec.ts` 断言钉死取值。
 
 ⚠️ **改名的语义翻转点**：矩阵里 `buddy` 这个键**换了主人**（新主人是国际版）；迁移由 `src/provider-rename-migration.ts` 搬运。改动矩阵后必须同步 `PROVIDERS`（断言锁死两者条目集合相等），⚠️ **匹配器必须写 `[a-z-]+` 而非 `[a-z]+`** —— 后者让带连字符的 id（`trae-cn`）在 `PROVIDERS` 里隐形，漏登记时断言反而是绿的。CodeArts 面板报 `unsupported provider: codearts` 是后端 `productById()` 的正确契约，不是运行时故障。
 

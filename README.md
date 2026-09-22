@@ -6,7 +6,7 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
 凭证可直接用于 CodeArts 后端模型调用。
 
-此外插件内置另外**七**个 provider 路由：
+此外插件内置另外**六**个 provider 路由：
 
 - **buddy-cn（Buddy CN）** — 见 [Buddy CN provider](#buddy-cn-provider)；
   另支持「一键领取积分」（每日签到）。
@@ -15,11 +15,7 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
   另支持「一键领取积分」（每日签到）。
 - **trae-cn（Trae CN）** — 见
   [Trae CN provider](#trae-cn-provider字节跳动-trae-国内版)；
-  后端已实现签到与积分余额（**积分按 provider 分池显示**），前端能力矩阵登记见该节说明。
-- **trae-cn-work（Trae CN Work）** — Trae CN 的第二条路径（TraeWork 网页协议，
-  扣 Work 专属积分池），见
-  [Trae CN Work provider](#trae-cn-work-providertraework-网页协议)；Account Hub
-  面板**共用 Trae CN 的账号**，只提供积分行（**显示 Work 池**）与模型开关。
+  后端已实现签到与积分余额（面板显示**通用积分池**），前端能力矩阵登记见该节说明。
 - **qoder（Qoder）** — 见 [Qoder provider](#qoder-providerqoder)；
   登录形态是**浏览器设备流**（2026-09-21 起 PAT 粘贴形态已从 UI 移除）；
   不支持「一键领取积分」
@@ -29,7 +25,7 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
   登录形态与登录实现均与国际版共用，**账号池与 Credits 与国际版完全独立、令牌互不承认**；
   亦不支持「一键领取积分」（疑似有该权益，但**端点未知**，见能力矩阵说明）。
 
-八个 provider 的 Account Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
+七个 provider 的 Account Hub 面板都提供「**显示列表**」按钮，可逐个开关模型以控制其
 是否出现在对话框的模型选择里（黑名单制，默认全部显示）——
 见 [模型列表开关](#模型列表开关黑名单)。
 
@@ -248,22 +244,22 @@ Tokens 福利）。
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
 
-除 `codearts` 外，插件另注册**七**个独立路由：`buddy-cn`（见
+除 `codearts` 外，插件另注册**六**个独立路由：`buddy-cn`（见
 [Buddy CN provider](#buddy-cn-provider)）与 `buddy`（见
 [Buddy provider](#buddy-provider)）两个 buddy 系路由、`lobsterai`
 （见 [LobsterAI provider](#lobsterai-provider)）、`trae-cn`
-（见 [Trae CN provider](#trae-cn-provider字节跳动-trae-国内版)）与
-`trae-cn-work`（见 [Trae CN Work provider](#trae-cn-work-providertraework-网页协议)）、
+（见 [Trae CN provider](#trae-cn-provider字节跳动-trae-国内版)）、
 `qoder` 与 `qoder-cn`（Qoder 的**两个 region**，见
 [Qoder provider](#qoder-providerqoder)）。
-八者互不覆盖，可同时使用。
+七者互不覆盖，可同时使用。
 
-> `trae-cn-work` 与 `trae-cn` 是**同一批账号**（Work 无独立登录，见
-> [Account Hub 里的 Trae CN Work 面板](#account-hub-里的-trae-cn-work-面板)），
-> 但它们注册成**两个路由**：协议不同源、模型池不重合、扣的是两个互不通用的积分池。
+> ℹ️ **曾经的第八个路由（TraeWork 网页协议那条路径）已于 `47bd690` 整体移除**：
+> 官方把 Work 侧模型合并进通用通道，`trae-cn` 一条通道即可覆盖（真机实拉动态目录
+> 14 项，含原 Work 独有的 `kimi-k2.7-code` / `kimi-k2.6` 与新增 `step-5-preview`）。
+> `disabledModels` 里可能残留该 provider 的旧键，**无人读取、无害**（按指示不迁移也不清理）。
 >
-> ⚠️ `qoder-cn` 与 `qoder` 与上面那对不同：它们是**两个 region 的两套账号**，
-> 不是同一批账号的两条路径 —— 令牌互不承认、账号池与 Credits 各自独立
+> ⚠️ `qoder-cn` 与 `qoder` 是**两个 region 的两套账号**：令牌互不承认、
+> 账号池与 Credits 各自独立
 > （见 [Qoder CN：第二个 region](#qoder-cn第二个-region)）。
 
 ## 凭证
@@ -494,11 +490,8 @@ Account Hub 面板标题栏的「**显示列表**」按钮展开该 provider 的
   仍能正常收发请求。这是 DSH 对 `listModels` 的约定（目录是建议性的，缺省不构成
   请求拒绝）。好处是已有会话若正用着某个被关闭的模型，不会被强制中断。
 - 开关按 provider 隔离，Codearts / Buddy CN / Buddy / LobsterAI / Trae CN /
-  Trae CN Work / Qoder **七份黑名单互不影响**。改名迁移会把这七份的 provider 键
+  Qoder / Qoder CN **七份黑名单互不影响**。改名迁移会把这七份的 provider 键
   一并搬到新命名，见「provider 改名与数据迁移」。
-- Trae CN Work 是独立的第六份：两个池的模型 id 完全不重合，共用一份黑名单会让
-  关闭 IDE 的某个模型连带影响 Work 路径（`TraeCnWorkAdapter.listModels` 读的正是
-  `trae-cn-work` 这个键）。
 - 相关 RPC 端点：`model.list`（列出模型并回填 `disabled`）、`model.setDisabled`
   （打开/关闭单个模型），实现见 `src/jet-hub-rpc.ts`。
 
@@ -526,8 +519,8 @@ custom / invisible 各为 0，两边自相矛盾。更麻烦的是副作用：�
 
 故回填侧先过一道**与目录同源**的垃圾判定（`isTraeCnJunkModelId`，
 `src/trae-cn-models.ts`）：`custom_model_` 前缀、内部 agent 项（点名 + 形态）、
-实测的 8 项 invisible 点名清单。判定按 **id 形态**，因此对 `trae-cn` 与
-`trae-cn-work` **两个 provider 通用**（同一个 Trae 账号体系，僵尸键长得一样）。
+实测的 8 项 invisible 点名清单。判定按 **id 形态**，只服务 `trae-cn` 这一个 provider
+（已移除的 TraeWork 路径与它同属一个 Trae 账号体系、僵尸键长得一样，故判定对两者都成立）。
 **其它 provider 不套这道过滤**：Buddy 系 / LobsterAI / Codearts 的黑名单语义没变，
 套上只会让一个恰好长成 `xxx_agent` 的真实模型无法被重新打开。
 
@@ -586,11 +579,12 @@ replace」，因此账号列表与数据版本号一并携带，不会被写坏�
   ```
 
   响应里的礼包按 `available_endpoint` **分池**（0=通用积分、1=Work 积分），
-  而**每个面板只显示自己那条路径能花的池**：`trae-cn` 面板显示**通用池**
-  （本插件走的 IDE 对话消耗的就是它），`trae-cn-work` 面板显示 **Work 池**
-  —— 两边都是**单数字**，界面上不出现「通用」「Work」字样，资源包列表也
-  只含本池的包。选池由宿主按**面板 id** 完成（`src/jet-hub-rpc.ts` 的
-  `traeCnPoolFor()`），**不是**按账号池键 —— 后者会把两个面板映射到同一个键。
+  而**Trae CN 面板只显示通用池**（本插件走的 IDE 对话消耗的就是它，
+  也就是该 provider 实际能花的钱；Work 池只有 TraeWork 网页/桌面版能花，本插件已无那条路径）
+  —— 显示的是**单数字**，界面上不出现「通用」「Work」字样，资源包列表也
+  只含本池的包。选池在 `src/jet-hub-rpc.ts` 的 `credits.balances` trae-cn 分支里
+  **内联 `TRAE_CN_POOL_UNIVERSAL`**（历史上有过一层「面板 → 显示池」的映射函数，
+  已随 TraeWork 路径一并删除；`TRAE_CN_POOL_WORK` 常量本身仍保留）。
   **不要**用 `ug/activity/info` 的活动口径：实测它写「200 work 积分」而实际到账
   150 通用积分，是口径陷阱。详见 [Trae CN provider](#trae-cn-provider字节跳动-trae-国内版)
   的「签到与积分余额」。
@@ -650,23 +644,12 @@ PAT」），而「三池全为 0」是一个**成功的查询结果**（`total: 
 > 「查询失败」。修法是不发起该请求——后端 `productById()` 的拒绝是正确的
 > 契约行为，不该被当作运行时故障展示。
 
-**Trae CN Work 面板查的是同一批账号的同一个端点，但显示的是另一个池**：
-`credits.balances` 收到 `trae-cn-work` 时由 `src/jet-hub-rpc.ts` 的
-`poolProviderFor()` 映射到 `trae-cn` 的**同一个实现**（同批账号、同端点），
-再由 `traeCnPoolFor()` 把**显示池**选成 Work 池。这两个映射方向相反、缺一不可：
-
-| 问题 | 函数 | `trae-cn` | `trae-cn-work` |
-|---|---|---|---|
-| 查谁的账号 / 打哪个端点 | `poolProviderFor()` | `trae-cn` | `trae-cn`（映射过去） |
-| **显示哪个积分池** | `traeCnPoolFor()` | 通用池（0） | **Work 池（1）** |
-
-刻意不新写一套 Work 专用逻辑 —— 查询是**账号属性**（同批账号、同一个端点），
-只有**显示口径**是路径属性。Work 面板因此直接回答它存在的那个问题：
-**Work 池还剩多少**（而不是把通用池的数字也摆在那里，那是这个面板花不掉的钱）。
-
-**但 Work 面板不显示签到按钮**（矩阵里 `dailyCheckin: false`）：签到是账号级、
-当日一次的操作，两个面板都放按钮必然导致同一账号重复领取。详见
-[Account Hub 里的 Trae CN Work 面板](#account-hub-里的-trae-cn-work-面板)。
+**查询与「显示哪个池」是两件事，别把面板 id 当池键用**：`credits.balances` 里
+账号查询走 `poolProviderFor()`（今天恒等），**显示池**则在 trae-cn 分支里内联
+`TRAE_CN_POOL_UNIVERSAL` 传给 `fetchTraeCnCreditBalance` 的第三个实参。历史上这两个
+方向各有一个映射函数（查账号一个、选显示池一个），后者已随 TraeWork 路径一并删除；
+今天恒等只是「恰好等价」，**不要依赖这个巧合**去合并两件事 —— 拿池键去查账号会让面板
+一片空白。
 
 ### 一键领取积分（每日签到）
 
@@ -674,8 +657,7 @@ PAT」），而「三池全为 0」是一个**成功的查询结果**（`total: 
 共有**三套互不相通的实现**（Buddy CN / LobsterAI / Trae CN，协议、端点、幂等
 判据全不同，各自独立成文件）；三者的客户端能力登记均已落地，故三个面板都显示
 该按钮。Codearts 是华为云账号体系不参与；Buddy（国际版）后端没有签到接口，
-故其面板不显示；**Trae CN Work 与 Trae CN 是同一批账号**，签到已在 Trae CN
-面板提供，故本面板刻意不显示（否则同一账号两处领取）；**Qoder 的每日
+故其面板不显示；**Qoder 的每日
 100 Credits 只能在 Qoder 桌面 App 里手动领取** —— 官方没有公开的签到端点，
 故其面板也不显示该按钮。详见「积分余额」一节末尾的说明。
 
@@ -1121,7 +1103,7 @@ URL、只把 `redirect` 换成 `1`**（官方 `getLoginUrl(…, 1, …)` →
 provider id 是 `trae-cn`（带连字符，对齐用户与生态叫法），但 cordis 服务名
 **不是**机械派生的 `trae-cnAuth`，而是显式指定的 `ctx.traeCnAuth`
 （见 `src/trae-cn-product.ts` 的 `serviceName`）。理由是带连字符的属性名
-无法用点号语法访问，且与另外七个 provider 的命名风格不一致。
+无法用点号语法访问，且与另外六个 provider 的命名风格不一致。
 
 > ✅ **T5（回调 URL 形态）已用真机日志校准**（2026-09-17 main.log:136/139），
 > 不再是候选表：参数名、编码形态、回调载荷结构（`authCodeInfo` / `userInfo`）
@@ -1317,8 +1299,8 @@ IDE 通道对我方新池请求的恒定回复。归**可重试**（退避）而
 > 「全部账号的 Trae CN 通用积分均已耗尽…这不是频率限流，稍后重试不会自愈」。⚠️ 主语由换号循环的
 > **退出原因**决定：`pool-exhausted`（池里再没有可试的）才说「全部账号」，`rotate-cap`
 > （换号次数达上限就停了）只说「已尝试的账号」并声明池中可能还有未试的，没有池/非换号类失败
-> **不追加**。`trae-cn-work` 共用同一批账号与同一个提示函数，但它的 `4008` **未实测**，
-> 故只说「已用尽或受限」，不复述 IDE 路径的结论。
+> **不追加**。（`semantics` 参数与 `'exhaustion-unverified'` 那套措辞已随 TraeWork 路径
+> provider 一并删除 —— 今天只有 `trae-cn` 一个消费者。）
 
 > ⚠️ **绝不允许把流内错误转成优雅关闭**：`event:error` / `code >= 4000` 必须把
 > 业务码**直报**给 DSH。转成优雅关闭会让 DSH 报「Stream ended without
@@ -1438,8 +1420,9 @@ provider **只走 SOLO**：
 > 本身无关，极难自行诊断。动态目录成功时本来也不会列出它们，故剔除后两条路径的
 > 目录**首次一致**。
 >
-> 注意 `Doubao-Seed-Code` 的剔除**只针对本 provider**：它在
-> `trae-cn-work`（`solo_agent_remote` 代际）里是**默认模型**，两张表互不影响。
+> 注意 `Doubao-Seed-Code` 的剔除**只针对本 provider**：它在 TraeWork 那条路径
+> （`solo_agent_remote` 代际，已随官方合并移除）里曾是**默认模型**，
+> 两张表互不影响。
 
 | id | 展示名 | 多模态 | max_tokens | 上下文（dev/max） |
 |---|---|---|---|---|
@@ -1495,7 +1478,7 @@ agent 池目录，见下文「上下文窗口档位选择」。
   `listModels` 与 `resolveModel` 读的是同一个 `supportsImages` 字段，两处口径强制
   同源（不一致会让选择器与请求路径自相矛盾）；
 - `maxTokens` **只记录不 materialize**：DSH 的 `defaultMaxTokens` 会在调用方未给
-  上限时自动填进请求体，而本仓库另外七个 provider 一个都没设该字段 ——
+  上限时自动填进请求体，而本仓库另外六个 provider 一个都没设该字段 ——
   由适配器替用户决定输出上限是行为变更，不在本次范围内。
 - **消耗倍率不再解析**：旧实现会从 `display_contact_config.consumption_rate.data.rate`
   读出倍率但不展示（DSH 的 `LlmModelInfo` 没有放自定义元数据的位置，塞进
@@ -1628,8 +1611,8 @@ serde 字段块里两者**并列存在**，印证这是「两套账号体系各�
 Trae CN（`dev` / `Max` 两档）、Buddy CN 与 Buddy（`contextWindow.supportedLengths`）、
 Qoder 与 Qoder CN（`available_context_windows`，真机 `[200000, 400000, 1000000]`）。
 host 侧由 `src/context-tiers.ts` 的 `ContextTierRegistry` **按 provider id 分派**，
-`src/index.ts` 只登记这五个键；**`trae-cn-work` / LobsterAI / Codearts 刻意不登记** ——
-它们的目录只有一个窗口、没有可选项（Work 实测 `dev == max`），而「无数据不显示、
+`src/index.ts` 只登记这五个键；**LobsterAI / Codearts 刻意不登记** ——
+它们（以及已移除的 TraeWork 路径）的目录只有一个窗口、没有可选项，而「无数据不显示、
 绝不编造」是铁律：给一个切过去毫无效果的选项比没有控件更糟。
 
 客户端的单选列是**数据驱动**的：`model.list` 带出 `contextTiers` 数组（升序去重、
@@ -1686,10 +1669,9 @@ Buddy 的默认档是最大档 —— 见上面的语义表）。
 用户看到「**只有开启后才能选上下文**」，关掉模型想顺手改档时档位列整个消失。根因是
 **同一份档位数据被两条渲染路径区别对待**，而档位来自适配器目录、本就与显示开关无关。
 
-**只有一个窗口可选的模型不显示这一列**：Work 面板的全部模型（实测 `dev == max`）、
-LobsterAI / Codearts（目录里没有窗口之外的第二档），以及 Trae CN agent 组里
-`max_mode:false` 的那几项（真机为 `Doubao-Seed-2.1-Turbo` / `kimi-k2.7-code` /
-`kimi-k2.6`）。
+**只有一个窗口可选的模型不显示这一列**：LobsterAI / Codearts（目录里没有窗口之外的第二档），
+以及 Trae CN agent 组里 `max_mode:false` 的那几项（真机为 `Doubao-Seed-2.1-Turbo` /
+`kimi-k2.7-code` / `kimi-k2.6`）。
 
 **标签写法**：档位值按 **1000 进制**缩写（`200K` / `1M`），精确 token 数放在 `title`
 里。1000 进制不是为了好看 —— 它是**厂商口径**（OpenAI / Anthropic / 字节的模型卡与
@@ -1808,33 +1790,37 @@ x-app-version: 3.3.102
 这是向服务端追查单次请求的唯一线索。三段链路与取舍见前面的
 「失败诊断的 logid 透传」。
 
-**余额按 `available_endpoint` 分池显示（一个面板一个池）**：
+**余额按 `available_endpoint` 分池，面板只显示通用池**：
 
-| provider | 面板 | `available_endpoint` | 谁在花这个池 |
-|---|---|---|---|
-| `trae-cn` | Trae CN | `0`（通用积分） | **IDE 对话**（本插件主路径） |
-| `trae-cn-work` | Trae CN Work | `1`（Work 积分） | **TraeWork**（`work.trae.cn` 网页版 / 桌面版） |
+| 面板 | `available_endpoint` | 谁在花这个池 |
+|---|---|---|
+| Trae CN（本插件唯一的 Trae 面板） | `0`（通用积分） | **IDE 对话**（本插件主路径） |
+| —（已无面板展示） | `1`（Work 积分） | **TraeWork**（`work.trae.cn` 网页版 / 桌面版） |
 
 **语义锚点：面板显示的数字 = 该 provider 实际能花的池**。两个池**互不通用**，
-各自只有一条路径能花掉它 —— 所以每个面板只显示自己那一个数字与自己那批资源包，
+各自只有一条路径能花掉它 —— Trae CN 面板因此只显示通用池那一个数字与那批资源包，
 界面上不出现「通用」「Work」字样。
 
 **Work 积分的准确口径**（取代早先「chat 只扣通用池」的简写）：
 
-- **Work 专属积分只在 TraeWork 里能花**（`work.trae.cn` 网页版 / 桌面版）；
+- **Work 专属积分只在 TraeWork 里能花**（`work.trae.cn` 网页版 / 桌面版）——
+  本插件的 TraeWork 路径 provider 已于 `47bd690` 随官方合并移除，
+  故这部分积分**不在任何面板展示**；
 - **TraeCode / IDE 对话只消耗通用积分** —— 也就是本插件走的那条路径；
 - 在 TraeWork 中两类积分按**到期时间先后**扣，Work 专属**仅在到期时间相同时**优先；
 - **2026-09 起签到发的是通用积分**（不是 Work 专属）。
 
-选池由宿主按**面板 id** 完成（`src/jet-hub-rpc.ts` 的 `traeCnPoolFor()`），
-`fetchTraeCnCreditBalance` 的第三个参数就是它；返回的 `total` 与 `packages`
+选池在 `credits.balances` 的 trae-cn 分支里**内联 `TRAE_CN_POOL_UNIVERSAL`**，
+作为 `fetchTraeCnCreditBalance` 的第三个参数；返回的 `total` 与 `packages`
 **只含那一个池**（另一个池的礼包被过滤掉，`expiredTotal` 也按本池汇总）。
 `TraeCnCreditBalance` 因此与共用的 `CreditBalance` **逐字段同构**，
 `collectCreditBalances` 直接复用。
 
-> ⚠️ **`pool` 必须取自面板 id，不是映射后的账号池键**。`poolProviderFor()` 把
-> `trae-cn-work` 映射成了 `trae-cn`（账号是同一批），拿它去选池会让两个面板都
-> 显示通用池 —— 不报错，只是 Work 面板的数字根本不是它能花的钱。
+> ⚠️ **选池与「查谁的账号」是两件事，不可合并**。账号查询走 `poolProviderFor()`，
+> 选池走上面那个内联常量：`poolProviderFor()` 只是把面板 id 翻成账号池键的**收敛点**
+> （今天恒等）。历史上面板 id 曾被它映射到 `trae-cn`（那是一个复用同批账号的
+> TraeWork 路径 provider 的需求，该 provider 已移除），拿映射后的键去选池会让面板
+> 显示另一个池的余额 —— 不报错，只是数字不是它能花的钱。
 
 > ✅ **前端只渲染一个数字**：`CreditBalanceRow` 不做任何池判断（它的输入与其余
 > provider 逐字段同构）。历史上那套「双池超集 + `workTotal` 两段渲染」已随分池
@@ -1866,372 +1852,6 @@ x-app-version: 3.3.102
 >
 > 两处的调试出口是 `TraeCnCreditsOptions.onDebug`，在 RPC 分发处接到
 > `ctx.logger.info`（**看宿主日志，面板上看不到**），输出一律只有键名与结构判定。
-
-## Trae CN Work provider（TraeWork 网页协议）
-
-`trae-cn-work`（显示名 **Trae CN Work**）是 Trae CN 的**第二条路径**：
-走 **TraeWork（`work.trae.cn`）网页 RPC**，消耗 **Work 专属积分池**
-（`available_endpoint=1`）。
-
-### 为什么需要它：两个池、两套模型、两条协议
-
-Trae CN 账号的积分**分两个互不通用的池**，而**只有 Work 池能在 TraeWork 里花**
-（见上文「余额按 `available_endpoint` 分池显示」）。IDE 路径只扣通用池，因此当
-**通用池耗尽而 Work 池仍有额度**时，IDE 路径必回 `4008`，而 Work 路径正常扣费 ——
-两条路径的可用性**互相独立**。两个面板因此各显示自己那个池：Trae CN 面板显示
-通用池、Trae CN Work 面板显示 Work 池。
-
-| | `trae-cn`（IDE 路径） | `trae-cn-work`（本 provider） |
-|---|---|---|
-| Host | `trae-api-cn.mchost.guru`（IDE 网关） | `work.trae.cn`（同源网页 RPC） |
-| 网关头 | 必须带齐 `x-app-id` / 日期式 `x-ide-version-code` 等全套 | **不需要**，仅鉴权三头 |
-| 请求形态 | 单次 `POST /api/agent/v3/llm_utils_chat`（无状态） | **三段式**（建会话 → 发消息 → 订阅 SSE） |
-| 模型池 | 动态 `get_detail_param`（回退 11 项静态表） | **14 项 `solo_agent_remote`，id 与 IDE 池完全不重合** |
-| 扣费池 | 通用积分（`endpoint=0`） | **Work 专属（`endpoint=1`）** |
-| 思考档落点 | 请求体**顶层** `reasoning_effort_level` | **`custom_model` 对象内部**同名字段 |
-| 会话清理 | 无状态，无需清理 | **每轮 DELETE** |
-
-> **两个池的模型 id 完全不重合**（只有 `Doubao-Seed-Code` 同名，且上下文窗口不同），
-> 这是「两个 provider 而非一个带开关的 provider」的直接理由 —— 合并目录会产生
-> 无法路由的条目。
-
-**选择指引**：通用池有额度、要用 IDE 那套模型 → 选 `Trae CN`；
-通用池耗尽或想用 Work 的额度 → 选 `Trae CN Work`。
-
-### 账号与凭据：**复用 Trae CN**（本 provider 唯一的非常规接线）
-
-Work **没有独立登录** —— 它用**同一批 Trae CN 账号**（`TRAE_CN_ACCOUNT_*`）、
-同一份凭据、同一套限流切换。故本 provider **不注册独立 auth 服务**。
-
-⚠️ 由此产生一处**必须分开、且两个方向的错误都是静默的**接线：
-
-| 用途 | 取值 |
-|---|---|
-| 注册到 `ctx.llm` 的路由名 / settingsNs / 模型黑名单 | `trae-cn-work` |
-| **账号池查询**（`getAvailableAccount` / `findAccountIdByCredential` / `updateModelRateLimit`） | **`trae-cn`** |
-
-- 池查询若用 `trae-cn-work`：账号条目的 `provider` 字段是 `trae-cn`，
-  **一个都匹配不到** → 适配器每次都抛 `MISSING_CREDENTIAL`（「请先登录」），
-  而账号明明在列表里；
-- 路由名若用 `trae-cn`：本 provider 根本不会出现在模型选择器里。
-
-两个方向都**不报错**，只是查不到/不出现。该值由
-`TraeCnWorkProduct.poolProviderId` 显式承载（与 `id` 并列命名，防止被「顺手统一」）。
-
-### 协议配方（**全部真机实测**，2026-09-18）
-
-三段式，host 恒为 `https://work.trae.cn`，鉴权与 IDE 路径相同
-（`Authorization: Cloud-IDE-JWT <access>` + 同值 `X-Ide-Token` / `X-Cloudide-Token`）：
-
-| # | 请求 | 关键点 |
-|---|---|---|
-| 1 | `POST /api/remote/v1/chat_sessions`，body `{"mode":"code"}` | → `{"code":0,"data":{"chat_session_id":"…"}}` |
-| 2 | `POST /api/remote/v1/chat_sessions/{sid}/messages` | body 见下 |
-| 3 | `GET /api/remote/v1/chat_sessions/{sid}/events?reply_to_message_id={mid}` | `Accept: text/event-stream` → SSE |
-| — | `DELETE /api/remote/v1/chat_sessions/{sid}` | **每轮收完必调** |
-
-发消息 body（官方 `buildSendMessageRequest` 逐字）：
-
-```json
-{"chat_session_id":"…","content":[],"query":"[{\"type\":\"text\",\"data\":{\"content\":\"hi\"}}]",
- "model_name":"Doubao-Seed-Code","agent_type":"solo_agent_remote","agent_id":"solo_agent_remote",
- "model_selection_strategy":"manual","origin":"web"}
-```
-
-- `query` 是 **JSON 字符串**（不是数组），元素形态 `{type:"text",data:{content}}` ——
-  注意是 **`data.content`**，与 IDE 路径的 `text_content` 不同；
-- `agent_type` / `agent_id` / `model_selection_strategy` / `origin` 是**出站身份标识**，
-  服务端按它们归因 agent 形态，一个字符都不能动。
-
-### 会话生命周期：每轮自建自删
-
-每次 `stream()` 调用 = **建会话 → 发消息 → 订阅 → 收完 → DELETE**，删除在
-`finally` 里且**失败仅告警不抛**。
-
-- **为什么必须删**：Work 的会话会在云端拉起**沙箱**（真机
-  `platform_timing.sandbox_name` 形如 `run-agent-<sid>-xxxx`），且会话会出现在
-  用户的 TraeWork 列表里 —— 每问一句就往用户列表塞一条是很糟的副作用；
-- **为什么删除失败不抛**：用户要的是回复，会话残留是**副作用**而非本次请求的
-  失败原因；把清理失败变成用户可见错误，会让一次成功的对话因收尾问题报错；
-- **`finally` 覆盖整次尝试**（不只是成功路径）：建会话成功而**发消息/订阅失败**
-  时，会话已经在云端建起来了 —— 只在成功分支删会让这些会话**全部泄漏**；
-- **为什么不做持久会话复用**：能省两次往返，但引入状态耦合（DSH 的每次
-  `stream()` 是独立的，可能并发/来自不同分支）。每轮新建把该复杂度归零，
-  代价是两次额外往返（真机建会话 ~0.3s、删 ~0.2s，相对 3–13s 的生成时间可忽略）。
-
-### SSE 解析：`plan_item` 是**累计快照**，不是增量
-
-这是本 provider 最容易搞错、且搞错就整段文字重复的地方。
-
-真机逐帧记录显示，同一 `plan_item.id` 的 `thought` 与 `reasoning_content`
-**每一帧都是「到目前为止的全文」**：
-
-```
-[3575ms] thought=""      reason="The"
-[3776ms] thought=""      reason="The user wants me to"
-[3968ms] thought=""      reason="The user wants me to reply with exactly: alpha beta gamma delta"
-[4108ms] thought=""      reason="…alpha beta gamma delta epsilon"
-```
-
-逐帧验证：后一帧恒为前一帧的**前缀扩展**。因此**不能**把每帧当增量拼接 ——
-那会得到 `TheThe user wants me toThe user wants me to reply…`。
-适配器按 `plan_item.id` 记录上一次快照，**只发新增的后缀**
-（`diffCumulativeSnapshot`）。快照若不是前一次的扩展（服务端重算/回退），
-则记一条诊断（`snapshotRewinds`）并**放弃**该次差异，而不是发一段会造成错乱的"差异"。
-
-**正文有两条通道**，真机各出现过一次，两条都必须认：
-
-1. **`plan_item.thought`** —— 逐帧累计增长的流式通道（真机第 1 轮）；
-2. **`plan_item.tool_call_info.params.summary`**（`name === "finish"`）——
-   真机第 2 轮的 `thought` **全程为空**，正文只出现在这里。
-
-只认第一条会漏掉「模型直接收尾」的回复（表现为空回复）；只认第二条则失去流式效果。
-两者合流进同一个正文块并**去重**（只补发 `thought` 尚未覆盖的后缀），
-故第 1 轮那种「summary 与 thought 最终相同」的情形**不会重复**。
-
-**其它事件一律忽略**：真机观测到的事件全集是
-`status_changed` / `platform_timing` / `metadata` / `model_config` /
-`session_title_message` / `session_icon_message` / `timing_events` /
-`plan_item` / `token_usage` / `done`。其中只有 `plan_item` / `token_usage` /
-`done` 对 harness 有意义 —— 把其余帧的 JSON 当正文渲染会让用户看到元数据乱码。
-
-- **`model_config` 的 `model_name` 带 `__dev` 后缀**（真机 `Doubao-Seed-Code__dev`，
-  而请求发的是 `Doubao-Seed-Code`）。`__dev` 是服务端的**配置通道标记**
-  （dev 档上下文窗口），不是模型 id 的一部分 —— 任何拿它去比对静态表的代码都会
-  **一项都匹配不上**，故解析时统一剥掉；
-- **`id:` 行**：Work 的帧比 IDE 路径多一个 `id:` 行，解析器忽略它；
-- **终止判据**：`done` 帧，或 `status_changed.new_status ∈ {4,5}`。
-  ⚠️ 真机两轮**都只出现 `new_status: 3`**（会话开始）并以 `done` 收尾，
-  4/5 **从未出现** —— 它是按调研配方保留的候选判据，不是实测结论；
-- **`token_usage`** 有完整计数（真机含 `cache_read_input_tokens` 与
-  `reasoning_tokens`），已接进 DSH 的用量回调；`inputTokens` 只计**未命中缓存**
-  的部分（与其余 provider 同口径）。
-
-### 模型目录：**远端可用**（与 IDE 路径相反），但**必须按 agent 分组取**
-
-Work 的 `GET /api/remote/v1/models` **真机 200**，故本 provider **已接线**，
-远端是权威来源，静态表（`TRAE_CN_WORK_FALLBACK_MODELS`）只在整体失败时顶替。
-（IDE 路径的目录走的是**另一个**端点 `get_detail_param`，同样已接线，见
-「Trae CN provider」章节的「模型目录」小节。）
-
-⚠️ **这个端点按 `function`（= agent）分池，`function` 由 query 决定**。
-2026-09-19 真机实测（同一凭据，仅 query 不同）：
-
-| 请求 | 返回分组 |
-|---|---|
-| `GET …/models`（**裸打**） | `solo_coder` **12 项** |
-| `?functions=solo_agent_remote` | `solo_agent_remote` **14 项** |
-| `?functions=solo_agent_remote&show_custom_model=true` | `solo_agent_remote` **16 项** |
-
-而本适配器出站请求体的 `agent_type` / `agent_id` 是 **`solo_agent_remote`**，
-所以请求必须带 `functions=solo_agent_remote`（常量 `TRAE_CN_WORK_MODELS_QUERY`）。
-
-> **这是一处已修复的缺陷，不是可选优化**：早期实现裸打端点，于是拿
-> **`solo_coder` 的目录去驱动 `solo_agent_remote` 的请求**。两个池**只有
-> `Doubao-Seed-Code` 一个同名 id**。后果是双向的 —— 选择器里少了本池 13 项，
-> 而列出的 11 项**选中后路由不到**（它们属于另一个池）。
-
-三组**不是同一批模型的三个视图**，故也**不合并**三组：同名 id 的窗口不同
-（`Doubao-Seed-Code` 在本组是 256000，在 `solo_coder` 组是 184000）、
-组内默认项不同（`solo_design_remote` 的默认是 `kimi-k2.7-code`）、
-成员大面积不重合。解析器**只取本 agent 那组**；多组且无本组时返回空目录
-（回退静态表），**刻意不拼接**。
-
-响应结构（注意**分组**，不是顶层平铺数组）：
-
-```json
-{"code":0,"data":{"list":[{"function":"solo_agent_remote","models":[ …14 项… ]}]}}
-```
-
-每项字段：`name` / `multimodal` / `is_default` / `display_name` / `is_new` /
-`is_beta` / `icon` / `features`（**JSON 字符串**）/ `config_source` / `is_preset` /
-`max_mode` / `context_window_tokens`（`{dev,max}`），部分项带
-`reasoning_effort_config`。倍率在 `features.consumption_rate.data.rate` ——
-`features` 要**再解析一次**（它是字符串）。
-
-解析器**只认这个实测形态**，不做「`data` 直接是数组」这类容忍式回退：
-那些形态从未被观测到，写进来只是把未验证的假设固化成代码；上游真改版时，
-一个**空目录**（回退静态表，用户仍能用）比「猜对形状但字段读错」的半成品目录
-更容易诊断。
-
-**静态表 14 项**（真机 `solo_agent_remote` 组逐字，倍率为实测值）：
-
-| id | 展示名 | 多模态 | 上下文 | 倍率 | 思考档 |
-|---|---|---|---|---|---|
-| `Doubao-Seed-Evolving` | Seed-Evolving | ✓ | 256000 | 0.8 | — |
-| `Doubao-Seed-2.1-Pro` | Seed-2.1-Pro-0915 | ✓ | 256000 | 0.8 | light / high |
-| `Doubao-Seed-2.1-Turbo` | Seed-2.1-Turbo | ✓ | 256000 | 0.2 | light / high |
-| `Doubao-Seed-Code` | Seed-Code（默认） | ✓ | 256000 | 0.06 | light / high |
-| `glm-5.3` | GLM-5.3 | ✗ | 200000 | 0.78 | light / high / extra_high |
-| `glm-5.2` | GLM-5.2 | ✗ | 200000 | 0.78 | high / extra_high |
-| `DeepSeek-V4-Flash-Official` | DeepSeek-V4-Flash 正式版 | ✗ | 200000 | 0.08 | light / high / extra_high |
-| `DeepSeek-V4-Pro-Official` | DeepSeek-V4-Pro 正式版 | ✗ | 200000 | 0.36 | light / high / extra_high |
-| `kimi-k3` | Kimi-K3 | ✓ | 200000 | 1.83 | light / high / extra_high |
-| `kimi-k2.7-code` | Kimi-K2.7-Code | ✓ | 200000 | 0.83 | — |
-| `kimi-k2.6` | Kimi-K2.6 | ✓ | 200000 | 0.75 | — |
-| `minimax-m3` | MiniMax-M3 | ✓ | 200000 | 0.26 | — |
-| `qwen3.8-max` | Qwen3.8-Max | ✓ | 200000 | 1.5 | light / high / extra_high |
-| `qwen-3.7-plus` | Qwen3.7-Plus | ✓ | 200000 | 0.25 | — |
-
-远端带 `show_custom_model=true` 时会**多回 2 项账号私有自定义模型**
-（真机 `deepseek-chat` / `deepseek-reasoner`，`config_source:3` / 非 preset /
-带 `custom_model_id`）。它们是**按账号**存在服务端的（三方 key 由服务端持有），
-故**只出现在远端目录、不进静态表** —— 塞进共用静态表会让每个账号都看到
-不属于自己的条目。真机实测这两项**当前路由不通**：发出后收到 SSE
-`error` 帧 `code:4028`「Authentication Fails, Your api key: ****b192 is invalid」
-（`4028` 在网页版错误码表里正是 `custom_model_origin_error`），即服务端确实
-按 id 取到了该账号存的三方 key、但那把 key 已失效。这是**账号侧的三方配置问题**，
-不是适配器缺能力，故如实列出并把上游原文透给用户。
-
-### 思考档：**已接线**（9/14 项声明），落点在 `custom_model` **内部**
-
-> ⚠️ **落点与 IDE 路径不同，不要「统一」掉**：
-> - IDE 路径（`src/trae-cn-adapter.ts`）：`reasoning_effort_level` 在请求体**顶层**；
-> - Work 路径（`src/trae-cn-work-adapter.ts`）：同名字段在 **`custom_model` 对象内部**。
-
-真机 `solo_agent_remote` 组里 **9/14 项**带
-`reasoning_effort_config{support_thinking:true, options:[…], default_level:"…"}`，
-档位 id 逐字符照抄（`light` / `high` / `extra_high`），默认档取自
-`default_level`。其余 5 项（`Doubao-Seed-Evolving` / `minimax-m3` /
-`qwen-3.7-plus` 是 `support_thinking:false`，`kimi-k2.7-code` / `kimi-k2.6`
-连该字段都没有）**保持不声明** —— 给一个上游不认的档位会让每次请求都带上
-无效字段。
-
-**下发字段名与落点的取证链**（网页版 bundle `1626.b49a23c3.js`）：
-
-```js
-// getModelRequestSelection()：档位塞进 custom_model 的构造式里
-r = {provider, is_preset, config_name, config_source, model_name,
-     display_model_name, ak, base_url, custom_model_id,
-     use_remote_service, multimodal, prompt_max_tokens};
-"reasoning_effort_level" === t.field && void 0 !== t.value
-  && (r.reasoning_effort_level = t.value);
-```
-
-而 `resolveReasoningEffortRequestField` 默认返回
-`{field:"reasoning_effort_level", value}`，只有**字节内网账号**
-（`scope===BYTEDANCE`）才走 `reasoning_effort` —— 与 IDE 路径同源结论：
-**字段名同名，落点不同**。
-
-**真机 A/B（2026-09-19）**，同 prompt、模型 `Doubao-Seed-Code`：
-
-| 请求体 | `token_usage.reasoning_tokens` | `plan_item.reasoning_content` |
-|---|---|---|
-| 不带本字段 | **131** | 344 字（15 帧） |
-| `custom_model.reasoning_effort_level="light"` | **13 / 17**（两次） | 56 / 71 字 |
-| `custom_model.reasoning_effort="light"` | 28 | 66 字 |
-
-「不带」与带 `reasoning_effort_level` 差一个数量级，而带**错名**的
-`reasoning_effort` 与「不带」同量级 —— 即上游只认 `reasoning_effort_level`，
-且它确实改变了思考量（不是被静默忽略的无效字段）。
-
-适配器**只在调用方显式给了档位时才构造 `custom_model`**（不主动补档：DSH 已按
-`reasoning.defaultEffort` 在省略时补好，适配器再补一次会与 DSH 的口径分叉）。
-未指定档位时**整个 `custom_model` 都不发** —— 即线上原有行为，零行为变更。
-
-### 错误分类：**以 HTTP 状态码为主**（Work 码表未标定）
-
-与 IDE 路径**关键差异**：IDE 的码表已用官方 bundle + `ai_agent.dll` 三方互证，
-Work 的码表**没有任何实测样本**（真机两轮全绿，一帧错误都没遇到）。
-直接复用 IDE 码表会把未经验证的假设当成事实，故：
-
-- **HTTP 状态码**（两条路径都成立的客观事实）是主判据：401/403 → 换号、
-  429/408/5xx → 退避、其余 → 直报；
-- **业务码**只接住两个跨路径可确证的额度码与几个限流/退避码
-  （`TRAE_CN_WORK_KNOWN_*`），**未知码一律直报并带原文** ——
-  真机第一次遇到就会把真实码暴露在错误文案里，一步即可校准。
-
-> 未知码**刻意不猜动作**：猜成 `switch-account` 会把一个确定性失败放大成 N 次
-> 无用请求，且**真实码被吞掉**（用户只看到「都失败了」）。
-
-同理，`fail` 一律映射为 `INVALID_REQUEST`，**不**照搬 IDE 路径的
-`4006 → CONTEXT_WINDOW_EXCEEDED`：把一个未标定的码当「上下文超长」会让 DSH
-**误触发上下文压缩**，那是会真实改写用户会话历史的副作用。
-
-### 协议漂移风险
-
-⚠️ `/api/remote/v1/*` 是 **TraeWork 前端自己调的浏览器内部 RPC，没有公开契约**，
-随时可能随前端发版改变字段或路径。本 provider 已把全部路径与形态常量集中在
-`src/trae-cn-work-product.ts`，上游一变只需改这一处；但**无法从协议层预防**这类
-漂移 —— 真出现时应以真机重新校准（本仓库的 `TraeCnWork*` 注释里保留了每一次
-实测的原始帧与字段，便于比对）。
-
-### 真机实测记录（2026-09-18，三轮对话）
-
-用**与适配器完全相同的代码路径**（`lib/trae-cn-work-adapter.js` 的
-`stream()`，不是平行脚本）验证：
-
-| 项 | 结果 |
-|---|---|
-| `GET /api/remote/v1/models`（裸打） | HTTP 200，**`solo_coder` 12 项**（⚠️ 不是本 agent 的池，见上） |
-| 三段式全链路 | 建会话 200 → 发消息 200 → 订阅 200（`text/event-stream`） |
-| 正文 | `"work adapter verified"`（走 `thought` 通道） |
-| 思考 | `"\n我现在需要按照用户的要求精确回复：work adapter verified"` |
-| 用量 | `input 332 / output 18 / cacheRead 20792 / reasoning 15` |
-| 收尾 | `finish(stop)`，chunk 序列 `usage → block-start → reasoning-delta×2 → block-start → text-delta → block-end×2 → finish` |
-| **Work 池扣费** | **0.0568**（前 1999.816 → 后 1999.7592） |
-| **通用池扣费** | **0.0000**（未动，印证两池独立） |
-| 会话清理 | 适配器自己发出 `DELETE … → 200`；重复 DELETE 同一 sid 回 **404**（确认已删） |
-
-三轮实测的 Work 池扣费分别为 **0.0616 / 0.0652 / 0.0572 / 0.0568**
-（前两轮为裸协议探针，后两轮走适配器），通用池**全程 0.0000**。
-
-### 模型目录与思考档重新取证（2026-09-19）
-
-用户报障「模型比 TraeWork 网页版少、且不能选思考程度」，重新取证后确认为
-**读错目录分组**（详见「模型目录」一节），并据此修正。取证手段与结论：
-
-| 项 | 结果 |
-|---|---|
-| 目录三组对照 | 裸打 `solo_coder` 12 项 / `?functions=solo_agent_remote` 14 项 / 再加 `show_custom_model=true` 16 项 |
-| 网页版调用形态 | bundle `1626.b49a23c3.js` 的 `fetchModels()` 明确传 `functions` 与 `show_custom_model` |
-| 思考档声明 | `solo_agent_remote` 组 **9/14 项** `support_thinking:true`（旧结论基于 `solo_coder` 组，是错的） |
-| 档位 id | `light` / `high` / `extra_high`（逐字符照抄，`glm-5.2` 只有 `high`/`extra_high`） |
-| 下发落点 | `custom_model.reasoning_effort_level`（bundle `getModelRequestSelection()` 逐字） |
-| 真机 A/B | 不带字段 `reasoning_tokens=131` / `light` 档 13·17 / 错名字段 28（见「思考档」一节的表） |
-| 私有自定义模型 | 2 项 `config_source:3`，按账号存在服务端；实测 `code:4028`（三方 key 失效） |
-
-> 本次取证共消耗 Work 池 10 轮对话（约 0.6 积分），每轮均按适配器同款路径
-> `finally DELETE` 清理会话。
-
-### Account Hub 里的 Trae CN Work 面板
-
-`PROVIDERS` 含 **Trae CN Work** 一栏（排在 Trae CN 之后），能力矩阵登记为
-`balance ✓ / dailyCheckin ✗`。它与 Trae CN 面板的关系是**同一批账号的两个视图**：
-
-| 项 | Trae CN Work 面板 |
-|---|---|
-| 账号列表 | **与 Trae CN 完全相同**（同批 `TRAE_CN_ACCOUNT_*`、同一套限流切换） |
-| 积分行 | ✓ **只显示 Work 池**的单个数字与 Work 池的资源包（同一端点、同一批账号） |
-| 「刷新积分」 | ✓ |
-| 「一键领取积分」 | ✗ **刻意不渲染** —— 签到留在 Trae CN 面板 |
-| 「+ 新建账号」 | ✗ **刻意不渲染** —— 改为一行提示「与 Trae CN 共用账号，请在 Trae CN 面板登录」 |
-| 卡片操作（刷新 / 删除 / 启停 / 重测 / 重置） | ✓ 照常（按 accountId / credentialRef 操作，与面板无关）|
-| 「显示列表」（模型开关） | ✓ 作用于 **`trae-cn-work` 这个键**（两个池的模型不重合，黑名单必须分开） |
-
-**为什么签到不在本面板**：签到是**账号级、当日一次**的操作，与走哪条路径无关。
-两个面板都放按钮，必然导致同一个账号在两处重复领取 —— 第二次点击只会得到
-「今天已签到」，在用户看来就是按钮坏了。
-
-**为什么没有登录入口**：Work 没有独立登录协议，它的账号与凭据完全复用 Trae CN。
-两个面板各放一个登录按钮，用户会在「到底该在哪个面板登录」上反复试错，而两条
-入口写的是同一份数据。
-
-**面板 id → 账号池键的映射收敛在一处**：`src/jet-hub-rpc.ts` 的 `poolProviderFor()`
-把 `trae-cn-work` 映射成 `TraeCnWorkProduct.poolProviderId`（`trae-cn`），
-取代了积分三端点里原本硬编码的 `req.provider === TRAE_CN.id`。客户端**发的是面板
-id**、不做任何映射 —— 若在客户端映射，宿主那几个按池过滤的分支就必须跟着改，
-同一件事写两遍且可能分叉。
-
-**但余额还多一层、方向相反的映射**：`traeCnPoolFor()` 决定**显示哪个积分池**
-（`trae-cn` → 通用池、`trae-cn-work` → Work 池）。它与 `poolProviderFor()` 是
-两个不同的问题（查谁的账号 vs 显示哪个池），**不可互相顶替**：用池键选池会让
-两个面板都显示通用池，用面板 id 查账号会让面板空白 —— 两者都不报错。
-
-刻意**不**映射的两个入口：`account.create`（映射会让二次点击给同一份凭据建出
-第二个占位账号）与 `model.list` / `model.setDisabled`（黑名单按 provider id 存，
-映射过去会把 Work 的开关写进 IDE 路径的黑名单）。锁死这些语义的是
-`tests/unit/trae-cn-work-hub-panel.spec.ts`。
 
 ## Qoder provider（Qoder）
 
@@ -2564,8 +2184,8 @@ DSH 把图片路由过来、然后在序列化时静默丢掉。
   **假象** —— 看起来像「我的 PAT 不对」，实际是打错了 region；
 - **账号池独立**：凭据 ref 前缀 `QODER_CN_ACCOUNT_*`（国际版是 `QODER_ACCOUNT_*`），
   账号条目 `provider` 为 `qoder-cn`。两个面板**互相看不到对方的账号**，
-  且 `poolProviderFor('qoder-cn')` 是**恒等映射**（与 `trae-cn-work` 那条
-  映射到 `trae-cn` 的规则**方向相反**，不要照抄）；
+  且 `poolProviderFor('qoder-cn')` 是**恒等映射** —— 该函数今天对每个 provider 都恒等，
+  **没有任何 provider 共用别人的账号**，不要凭想象给 qoder-cn 造一条映射；
 - **PAT 与设备流授权页都不通用**：CN 面板的签发链接指向 `qoder.cn`，浏览器登录
   也打在 `qoder.cn` 的授权页上 —— 不是国际版那一页/那一站。设备流两区共用同一个
   `client_id`（官方就是一个 CLI 应用覆盖两区），但 `machine_id` **各存各的**
