@@ -100,8 +100,9 @@ dsh plugin --profile <name> add "https://github.com/gurio-wine/dsh-account-hub.g
 别忘了同步 profile 的 `pnpm-workspace.yaml`：`allowBuilds` 里旧包的整行替换为新包名
 （即上面「方式一」那段）。GitHub 对旧地址有自动重定向，但仍建议直接写新地址。
 
-> **账号与模型开关不会丢。** 账号索引与 `disabledModels` 模型开关存在 settings 的
-> `jet-hub` 命名空间里，凭据存在 `ctx.credentials` 中（ref 如
+> **账号与模型开关不会丢。** 账号索引、模型开关（`disabledModels`）与上下文窗口档位
+> （`contextBudgets`）存在 **storage 域** `dsh_account_hub`（落盘
+> `$DSH_HOME/storages/dsh_account_hub.json`），凭据存在 `ctx.credentials` 中（ref 如
 > `CODEARTS_ACCESS_TOKEN` / `BUDDY_CN_ACCOUNT_XXX`）。这些**都是代码标识符，改名时刻意
 > 保持原样** —— 变的只有包名与界面文案，所以重装后账号池、登录状态与显示列表设置
 > 直接续用，无需重新登录。
@@ -109,6 +110,51 @@ dsh plugin --profile <name> add "https://github.com/gurio-wine/dsh-account-hub.g
 > 上面这条说的是**包名**改名（`dsh-codearts-auth` → `dsh-account-hub`）。
 > 2026-09-18 的 **provider** 改名是另一回事，它是一次**破坏性变更**，落在持久化
 > 数据上，因此插件启动时**自动迁移**（见「provider 改名与数据迁移」一节）。
+> 2026-09-22 的**持久层搬迁**（settings → storage）同样自动迁移，见「存储与通路」。
+
+### 存储与通路（storage 为主，settings 回退，内存兜底）
+
+账号池的持久层是 **`ctx.storage` 的 storage 域**，不是 settings：
+
+| 项 | 值 |
+|---|---|
+| 域名 | `dsh_account_hub`（⚠️ storage 只接受 `^[a-z][a-z0-9_]*$`，**连字符不合法**，故与插件 id 形态不同） |
+| 布局 | `single` + 一个 global 单例文档（无表）—— 账号池数据量小且整体读写 |
+| 落盘 | `$DSH_HOME/storages/dsh_account_hub.json` |
+| 字段 | `accounts` / `disabledModels` / `contextBudgets` / `schemaVersion`（**四件套**） |
+
+**为什么搬**：DSH v0.1.7-alpha.1 删除了 `ctx.settings.register(ns, schema) → owner scope`
+整套 seam。插件走的是优雅降级分支，因此**不抛错、静默全空** —— 用户看到「所有账号
+消失」。更根本的是语义：账号列表是**动态数据**（会增删、含限流时间戳），而 0.1.7 的
+settings 写入目标是 profile 的 `cordis.patch.yml`（配置）。storage 三件套
+（`dsh-storage` / `dsh-storage-json` root=`dshHomePath('storages')` / `dsh-storage-domain`）
+在 0.1.6 与 0.1.7 的 base patch 里**逐字一致**，故两版通吃。
+
+**降级矩阵**（四条都有单测钉死）：
+
+| 运行环境 | storage | `settings.register` | 行为 |
+|---|---|---|---|
+| 0.1.6（现役） | ✓ | ✓ | storage 为主；首次启动做一次性迁移 |
+| 0.1.7 | ✓ | ✗ | storage 为主；首次启动做一次性迁移 |
+| 旧环境 / 缺 storage | ✗ | ✓ | 回退旧 settings 路径（`jet-hub` namespace） |
+| 两者都缺 | ✗ | ✗ | 纯内存降级 |
+
+**一次性迁移**（`src/account-hub-migration.ts`）：storage 里**没有账号数据**且能读到旧
+来源时执行，把 `jet-hub` 段四字段原样搬入。来源优先级
+`settings.yaml.imported` → `settings.yaml` → 旧 settings scope；判据是**节本身可迁移**
+（`accounts` 非空），不是「文件存在」—— 否则一个空壳 `.imported` 会挡住真正有数据的
+`settings.yaml`。
+
+安全语义：**只读来源**（不修改、不删除、不重命名，用户降级回 0.1.6 仍能用）；**幂等**
+（storage 已有账号即跳过；空表不算「已有数据」，故来源无账号时不写空表把闸门关死）；
+**不半途覆盖**（只有落盘成功才算完成，失败返回 `failed` 并保持原状，下次启动重试）。
+`settings.yaml` 是含注释的 YAML，本插件**不引 YAML 依赖**，用 `src/simple-yaml.ts`
+的极简子集解析器只取目标一节（其余 section 连碰都不碰）；不支持的构造（锚点、别名、
+块标量）**显式抛错而不是猜** —— 迁移面对的是用户唯一的账号数据。
+
+> ⚠️ `'jet-hub'` 这个字面量仍然存在（`AccountPool.JET_HUB_NS`），但它的角色**只剩两件**：
+> ① 回退路径继续读写它；② 迁移模块用它定位旧数据。**新写入一律走 storage**，
+> 别按旧 namespace 命名新存储位置。
 
 ### provider 改名与数据迁移（2026-09-18）
 

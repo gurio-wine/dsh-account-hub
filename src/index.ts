@@ -261,35 +261,53 @@ export function apply(ctx: Context): void {
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
 
-  // 一次性数据迁移：把历史 provider 名（buddy = 中国版 / workbuddy = 国际版）、
-  // 旧凭据 ref（BUDDY_* / WORKBUDDY_*）与旧 disabledModels 键搬到新命名
-  // （buddy-cn / buddy）。**必须早于下面所有池查询** —— 池的每次读取都按
-  // provider 过滤，带着旧 id 的账号在新体系里等同于不存在。
+  // 持久层接管：打开 storage 域，并在 storage 为空时把旧 settings 位置
+  // （settings.yaml.imported → settings.yaml → 旧 scope）的数据一次性搬进来。
   //
-  // ⚠️ **下面的域名清理必须挂在本 Promise 之后，不能与它并行**：
-  // `pruneAccountsWithForeignDomain(BUDDY)` 按 `entry.provider === 'buddy'` 选账号，
-  // 而迁移**之前**的 `buddy` 正是中国版（域名 copilot.tencent.com）。若两者
-  // 并行，清理会把这批中国版账号判成「域名失配」并连凭据一起删掉 —— 迁移还
-  // 没来得及给它们改成 `buddy-cn`。迁移自身是 fire-and-forget（内部自吞异常
-  // 并打日志，绝不阻断启动），故这里用 `.then()` 串联而不是 `await`。
-  void migrateProviderNames(pool, ctx).then(() => {
-    // Buddy（国际版）provider 早年是中国版（copilot.tencent.com）实现，
-    // 后来改造为国际版（www.workbuddy.ai）。期间登录的账号其 token.domain
-    // 仍指向中国版端点，用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理。
-    // 判据是「凭据 domain ≠ 产品 apiDomain」，只清真正失配的条目。
-    // 两个产品各清一次：中国版（buddy-cn）历史上也踩过同类坑（凭据里写着国际版域名），
-    // 只清一边会漏掉另一半。
-    for (const product of [BUDDY_CN, BUDDY]) {
-      void pool.pruneAccountsWithForeignDomain(product).then((removed) => {
-        if (removed.length > 0) {
-          ctx.logger.info(
-            `[jet-hub] 已清理 ${removed.length} 个 ${product.displayName} 域名失配账号，请重新登录：${removed.join(', ')}`,
-          )
-        }
-      }).catch((error: unknown) => {
-        ctx.logger.warn(`[jet-hub] 清理 ${product.displayName} 域名失配账号失败：${String(error)}`)
-      })
-    }
+  // ⚠️ **必须早于下面的改名迁移**，且顺序不可颠倒。改名迁移会「读池 → 改 id / 凭据
+  // ref → 整体写回」，若它先跑：① 它读到的是旧路径的数据、写回的也是旧路径；
+  // 随后 storage 迁移虽然拿到了数据，但版本号已被改名迁移推进，语义就乱了；
+  // ② 更糟的是 `migrateProviderNames` 内部只在版本号 <1 时动手，两次迁移谁先谁后
+  // 会决定「搬到 storage 的是改名前的还是改名后的账号」。
+  //
+  // 本函数是同步签名（宿主按同步 apply 调用），故这里用 `.then()` 串起来：
+  // 池的读路径在 storage 接管前走旧路（可用），接管后再切到 storage ——
+  // `openStorage()` 内部会重置载入标记，切换点不会留下两套数据分叉。
+  void pool.openStorage().then(() => {
+    // 一次性数据迁移：把历史 provider 名（buddy = 中国版 / workbuddy = 国际版）、
+    // 旧凭据 ref（BUDDY_* / WORKBUDDY_*）与旧 disabledModels 键搬到新命名
+    // （buddy-cn / buddy）。**必须早于下面所有池查询** —— 池的每次读取都按
+    // provider 过滤，带着旧 id 的账号在新体系里等同于不存在。
+    //
+    // ⚠️ **下面的域名清理必须挂在本 Promise 之后，不能与它并行**：
+    // `pruneAccountsWithForeignDomain(BUDDY)` 按 `entry.provider === 'buddy'` 选账号，
+    // 而迁移**之前**的 `buddy` 正是中国版（域名 copilot.tencent.com）。若两者
+    // 并行，清理会把这批中国版账号判成「域名失配」并连凭据一起删掉 —— 迁移还
+    // 没来得及给它们改成 `buddy-cn`。迁移自身是 fire-and-forget（内部自吞异常
+    // 并打日志，绝不阻断启动），故这里用 `.then()` 串联而不是 `await`。
+    void migrateProviderNames(pool, ctx).then(() => {
+      // Buddy（国际版）provider 早年是中国版（copilot.tencent.com）实现，
+      // 后来改造为国际版（www.workbuddy.ai）。期间登录的账号其 token.domain
+      // 仍指向中国版端点，用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理。
+      // 判据是「凭据 domain ≠ 产品 apiDomain」，只清真正失配的条目。
+      // 两个产品各清一次：中国版（buddy-cn）历史上也踩过同类坑（凭据里写着国际版域名），
+      // 只清一边会漏掉另一半。
+      for (const product of [BUDDY_CN, BUDDY]) {
+        void pool.pruneAccountsWithForeignDomain(product).then((removed) => {
+          if (removed.length > 0) {
+            ctx.logger.info(
+              `[jet-hub] 已清理 ${removed.length} 个 ${product.displayName} 域名失配账号，请重新登录：${removed.join(', ')}`,
+            )
+          }
+        }).catch((error: unknown) => {
+          ctx.logger.warn(`[jet-hub] 清理 ${product.displayName} 域名失配账号失败：${String(error)}`)
+        })
+      }
+    })
+  }).catch((error: unknown) => {
+    // openStorage 自身已把可预期的失败吞掉并降级；这里只兜住意外异常，
+    // 绝不让持久层的问题阻断插件加载。
+    ctx.logger.warn(`[jet-hub] storage 接管失败，账号池以当前通路继续：${String(error)}`)
   })
 
   ctx.commands.register({

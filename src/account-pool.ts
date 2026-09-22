@@ -1,6 +1,12 @@
 import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
+import {
+  emptyAccountHubDocument,
+  openAccountHubStorage,
+  type AccountHubStorage,
+} from './account-hub-storage.js'
+import { migrateAccountHubIntoStorage } from './account-hub-migration.js'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
 import type {
@@ -12,10 +18,19 @@ import type {
 declare module '@deepseek-ai/cordis' {
   interface Context {
     accountPool: AccountPool
+    /** 宿主解析的 `$DSH_HOME`（`@deepseek-ai/dsh-home-paths` 的 `dshHomePath`）。 */
+    dshHomePath?: (...segments: string[]) => string
   }
 }
 
-/** Account Hub schema namespace（必须在 ctx.settings 中注册后才能读写） */
+/**
+ * Account Hub 旧 settings namespace。
+ *
+ * ⚠️ **历史兼容读取，勿改** —— 这个字面量是 0.1.6 的 settings namespace，
+ * 也是老用户数据真正所在的键。新写入一律走 storage 域（见
+ * `src/account-hub-storage.ts` 的 `ACCOUNT_HUB_DOMAIN`），这里只在**回退路径**
+ * （storage 不可用）下继续读写它，以及被迁移模块用于定位旧数据。
+ */
 export const JET_HUB_NS = 'jet-hub'
 
 /**
@@ -71,6 +86,20 @@ export const JET_HUB_SCHEMA_VERSION = 1
 interface SettingsScopeLike {
   get(): unknown
   replace(section: object): Promise<void>
+}
+
+/**
+ * 一次整体写入的载荷形状。
+ *
+ * 与 storage 域的 `AccountHubDocument` **刻意同形**（四件套齐全）：两条写路径
+ * （storage 的 `global.set` 与 settings 的 `replace`）都是整体替换，用同一个形状
+ * 可以让 `persist()` 成为唯一写落点，杜绝「某条路径漏带某个字段」。
+ */
+interface AccountHubDocumentLike {
+  accounts: ProviderAccountEntry[]
+  disabledModels: ModelDisableMap
+  contextBudgets: ContextBudgetMap
+  schemaVersion: number
 }
 
 /** ctx.settings 服务的最小接口。schema 必须是 schemastery schema。 */
@@ -175,56 +204,80 @@ function sanitizeContextBudgets(raw: unknown): ContextBudgetMap {
  * AccountPool —— 多账号管理核心
  *
  * 职责：
- * - 账号列表 CRUD（索引存于 ctx.settings namespace jet-hub
- *   → 配置文件，凭据存于 ctx.credentials，各自独立）
+ * - 账号列表 CRUD（索引存于 **storage 域** `dsh_account_hub`
+ *   → `$DSH_HOME/storages/dsh_account_hub.json`，凭据存于 `ctx.credentials`，各自独立）
  * - 获取指定 provider + 模型的下一个可用账号
  *   算法：enabled=true 且模型不在重置期内 → 取第一个
  * - 更新模型重置时间（收到限流错误后调用）
  *
- * 注意：DSH 的 settings 服务要求 namespace 先注册再读写，
- * 因此构造时调用 ctx.settings.register(JET_HUB_NS, schema)。
- * 注册失败（服务缺失）时退化为内存态，保证不抛错。
+ * ## 持久层的三条通路（storage 优先，settings 回退，内存兜底）
+ *
+ * | 运行环境 | storage | `settings.register` | 行为 |
+ * |---|---|---|---|
+ * | 0.1.6（现役） | ✓ | ✓ | storage 为主；首次启动做一次性迁移 |
+ * | 0.1.7 | ✓ | ✗ | storage 为主；首次启动做一次性迁移 |
+ * | 旧环境 / 测试缺 storage | ✗ | ✓ | 回退旧 settings 路径 |
+ * | 两者都缺 | ✗ | ✗ | 纯内存降级 |
+ *
+ * 为什么不再以 settings 为主：0.1.7 删除了 `ctx.settings.register(ns, schema) → scope`
+ * 整套 seam，插件在新版下走优雅降级分支、**不抛错、静默全空** —— 用户看到
+ * 「所有账号消失」。storage 三件套在两版的 base patch 里逐字一致，两版通吃。
+ *
+ * ⚠️ 构造**同步**完成，`openStorage()` 才是异步的：storage 域的打开要走后端 IO，
+ * 而本类的所有读方法都是同步的（适配器在 `resolveModel` 里同步读窗口预算）。
+ * 故由 `src/index.ts` 的 `apply()` 显式 `await pool.openStorage()` —— 在那之前
+ * 写入仍走旧 settings/内存路径，不会「先写内存再被 storage 覆盖」。
  */
 export class AccountPool {
-  /** 已注册的 settings scope；未注册成功时为 undefined。 */
+  /** 已注册的 settings scope（**回退路径**；storage 可用时它是死路径）。 */
   private scope: SettingsScopeLike | undefined
+  /** 已打开的 storage 域句柄；不可用时为 undefined（回退 settings / 内存）。 */
+  private storage: AccountHubStorage | undefined
+  /** 是否已尝试打开 storage（`openStorage` 幂等闸门）。 */
+  private storageOpened = false
   /**
    * 账号列表的**权威进程内副本**。
    *
-   * 不直接依赖 `scope.get()`：settings 服务的 resolved 快照在 replace() 后
-   * 未必立即更新，而本类的每次写入都是「读 → 改 → 整体 replace」。
-   * 若以滞后快照为读源，并发/连续的 updateModelRateLimit 会互相覆盖
-   * （典型表现：多个账号触发限流后，settings.yaml 里一条 modelRateLimits
-   * 都没有）。因此首次从 scope 载入后，这份副本即为唯一读源。
+   * 不直接每次读持久层：settings 的 resolved 快照在 `replace()` 后未必立即更新，
+   * 而本类的每次写入都是「读 → 改 → 整体 replace」。若以滞后快照为读源，
+   * 并发/连续的 updateModelRateLimit 会互相覆盖（典型表现：多个账号触发限流后，
+   * 一条 modelRateLimits 都没有）。因此首次载入后，这份副本即为唯一读源。
    */
   private cache: ProviderAccountEntry[] = []
   /**
-   * 模型黑名单的**权威进程内副本**（与 {@link cache} 同理：settings 的
-   * resolved 快照在 replace() 后未必立即更新，因此加载一次后即以本副本为准）。
+   * 模型黑名单的**权威进程内副本**（与 {@link cache} 同理）。
    */
   private modelCache: ModelDisableMap = {}
   /**
-   * 逐模型上下文窗口预算的**权威进程内副本**（同 {@link cache} / {@link modelCache}）。
+   * 逐模型上下文窗口预算的**权威进程内副本**（同 {@link cache}）。
    *
-   * ⚠️ 它与账号、黑名单、版本号是**同一个 namespace 的四件套**：任何一次写入都是
-   * 整体 replace，四者必须互相携带，漏一个就会在下次别的写入里被清空。
+   * ⚠️ 它与账号、黑名单、版本号是**同一份文档的四件套**：任何一次写入都是整体
+   * replace，四者必须互相携带，漏一个就会在下次别的写入里被清空。
    */
   private budgetCache: ContextBudgetMap = {}
   /**
-   * 数据版本号的**权威进程内副本**（同 {@link cache} / {@link modelCache}）。
+   * 数据版本号的**权威进程内副本**（同 {@link cache}）。
    *
    * 一次性迁移（provider 改名）靠它 short-circuit，因此它必须与账号、黑名单
    * 一起参与「读 → 改 → 整体 replace」，漏带就会在下次写入时被重置为 0，
    * 让迁移在每次启动时重跑。
    */
   private versionCache = 0
-  /** 是否已从 settings scope 完成首次载入。 */
+  /** 是否已从持久层完成首次载入。 */
   private loaded = false
 
   constructor(private readonly ctx: Context) {
     const settings = this.ctx.get('settings') as SettingsServiceLike | undefined
     if (!settings || typeof settings.register !== 'function') {
-      this.ctx.logger?.warn?.('[jet-hub] settings 服务不可用，账号列表仅存在于内存中')
+      // ⚠️ 措辞必须准确：0.1.7 下 settings 服务仍在、只是没有 `register`，
+      // 而 storage 主路径正常 —— 此时说「仅存在于内存中」是**假警报**，
+      // 当初排查 0.1.7 报障的人正是被这类日志引偏的。存储服务在时这里就不吭声，
+      // 最终降级状态由 `openStorage()` 统一判定并播报。
+      if (this.ctx.get('storageDomain') === undefined) {
+        this.ctx.logger?.warn?.(
+          '[jet-hub] settings.register 与 storage 均不可用，账号列表将仅存在于内存中',
+        )
+      }
       return
     }
     try {
@@ -235,10 +288,77 @@ export class AccountPool {
     }
   }
 
-  /** 首次访问时从 settings scope 载入账号列表。 */
+  /**
+   * 打开 storage 域并（首次时）执行一次性迁移。
+   *
+   * **幂等**：重复调用只打开一次。storage 不可用时静默返回 false，账号池继续用
+   * settings（回退路径）或纯内存 —— 绝不抛错、绝不阻断插件启动。
+   *
+   * @returns 是否成功接管（true = storage 为主路径）。
+   */
+  async openStorage(): Promise<boolean> {
+    if (this.storageOpened) return this.storage !== undefined
+    this.storageOpened = true
+    const storage = await openAccountHubStorage(this.ctx)
+    if (storage === undefined) {
+      // storage 缺席：只有连 settings 回退路径也没有时，才是真正的「仅内存」。
+      if (this.scope === undefined) {
+        this.ctx.logger?.warn?.('[jet-hub] settings 与 storage 均不可用，账号列表仅存在于内存中')
+      } else {
+        this.ctx.logger?.warn?.('[jet-hub] storage 不可用，账号池回退 settings 路径')
+      }
+      return false
+    }
+    this.storage = storage
+    // ⚠️ **接管时必须让首次载入重新发生**：若此前已有任何读路径跑过（`ensureLoaded`
+    // 把 `loaded` 置 true 并缓存了旧 settings 快照），继续用它会让接管后的读
+    // 返回旧路径的数据，而写入却落到 storage —— 两边数据分叉。
+    // 顺序也不可颠倒：先迁移**再**交给读路径，否则首次读取拿到空表。
+    this.loaded = false
+    await this.runLegacyMigration()
+    // 迁移可能刚把数据写进 storage，而 `ensureLoaded` 尚未跑过（`loaded` 仍为 false）
+    // ⇒ 下次读会自然取到新数据。但若此前已载入过一次，上面那句 reset 就是关键。
+    return true
+  }
+
+  /** 把旧 settings 位置的数据一次性搬进 storage（失败只记日志，不阻断）。 */
+  private async runLegacyMigration(): Promise<void> {
+    const storage = this.storage
+    if (storage === undefined) return
+    const resolveHome = this.ctx.dshHomePath
+    if (typeof resolveHome !== 'function') {
+      // 没有 home 解析服务就不猜路径：宁可这轮不迁移，也不能读错目录或写坏别处。
+      this.ctx.logger?.warn?.('[jet-hub] 宿主未提供 dshHomePath，跳过账号数据一次性迁移')
+      return
+    }
+    try {
+      const result = await migrateAccountHubIntoStorage({ home: resolveHome(), storage })
+      if (result.outcome === 'migrated') {
+        this.ctx.logger?.info?.(
+          `[jet-hub] 账号池已迁入 storage 域（来源 ${result.origin}，${result.accountCount} 个账号）`,
+        )
+      } else if (result.outcome === 'failed') {
+        this.ctx.logger?.warn?.(
+          `[jet-hub] 账号数据一次性迁移失败，本轮以现有数据继续（下次启动重试）：${result.error}`,
+        )
+      }
+    } catch (error) {
+      this.ctx.logger?.warn?.(`[jet-hub] 账号数据一次性迁移异常，本轮跳过：${String(error)}`)
+    }
+  }
+
+  /** 首次访问时从**主路径**载入四件套。 */
   private ensureLoaded(): void {
     if (this.loaded) return
     this.loaded = true
+    if (this.storage !== undefined) {
+      const doc = this.storage.read()
+      this.cache = doc.accounts
+      this.modelCache = doc.disabledModels
+      this.budgetCache = doc.contextBudgets
+      this.versionCache = doc.schemaVersion
+      return
+    }
     if (!this.scope) return
     const value = this.scope.get() as JetHubSettingsValue | undefined
     const accounts = value?.accounts
@@ -259,6 +379,32 @@ export class AccountPool {
     // 即「迁移尚未执行」。
     const version = value?.schemaVersion
     this.versionCache = typeof version === 'number' && Number.isFinite(version) ? version : 0
+  }
+
+  /**
+   * 持久化四件套。
+   *
+   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，四件套一起带上。
+   * 主路径是 storage 域的 `global.set`（整体替换那份单例文档）；回退路径是
+   * settings scope 的 `replace`（同样是整体替换，漏带即清空）。
+   */
+  private async persist(document: AccountHubDocumentLike, warning: string): Promise<void> {
+    if (this.storage !== undefined) {
+      // storage 写盘失败会**向上抛**：调用方据此知道「没落盘」，而进程内副本
+      // 已经更新（读路径是同步的）—— 这与既有的 settings 路径行为一致。
+      await this.storage.write({
+        accounts: document.accounts,
+        disabledModels: document.disabledModels,
+        contextBudgets: document.contextBudgets,
+        schemaVersion: document.schemaVersion,
+      })
+      return
+    }
+    if (!this.scope) {
+      this.ctx.logger?.warn?.(`[jet-hub] ${warning}`)
+      return
+    }
+    await this.scope.replace(document)
   }
 
   /** 读取账号列表（进程内权威副本）。 */
@@ -321,16 +467,16 @@ export class AccountPool {
     this.modelCache = disabledModels
     this.versionCache = schemaVersion
     this.loaded = true
-    if (!this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，数据迁移结果未持久化')
+    if (this.storage === undefined && !this.scope) {
+      this.ctx.logger?.warn?.('[jet-hub] 无 storage 域与 settings scope，数据迁移结果未持久化')
       return
     }
-    await this.scope.replace({
+    await this.persist({
       accounts,
       disabledModels,
       contextBudgets: this.budgetCache,
       schemaVersion,
-    })
+    }, '无 settings scope，数据迁移结果未持久化')
   }
 
   /**
@@ -343,16 +489,16 @@ export class AccountPool {
   private async writeAccounts(accounts: ProviderAccountEntry[]): Promise<void> {
     this.cache = accounts
     this.loaded = true
-    if (!this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，账号变更未持久化')
+    if (this.storage === undefined && !this.scope) {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化通路，账号变更未持久化')
       return
     }
-    await this.scope.replace({
+    await this.persist({
       accounts,
       disabledModels: this.modelCache,
       contextBudgets: this.budgetCache,
       schemaVersion: this.versionCache,
-    })
+    }, '无 settings scope，账号变更未持久化')
   }
 
   /**
@@ -407,17 +553,17 @@ export class AccountPool {
   private async writeModels(disabledModels: ModelDisableMap): Promise<void> {
     this.modelCache = disabledModels
     this.loaded = true
-    if (!this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，模型黑名单变更未持久化')
+    if (this.storage === undefined && !this.scope) {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化通路，模型黑名单变更未持久化')
       return
     }
     // 与 writeAccounts 对称：整体 replace 必须携带账号列表、上下文预算与版本号，否则会被清空。
-    await this.scope.replace({
+    await this.persist({
       accounts: this.cache,
       disabledModels,
       contextBudgets: this.budgetCache,
       schemaVersion: this.versionCache,
-    })
+    }, '无 settings scope，模型黑名单变更未持久化')
   }
 
   /**
@@ -462,17 +608,17 @@ export class AccountPool {
   private async writeBudgets(contextBudgets: ContextBudgetMap): Promise<void> {
     this.budgetCache = contextBudgets
     this.loaded = true
-    if (!this.scope) {
-      this.ctx.logger?.warn?.('[jet-hub] 无 settings scope，上下文窗口预算变更未持久化')
+    if (this.storage === undefined && !this.scope) {
+      this.ctx.logger?.warn?.('[jet-hub] 无持久化通路，上下文窗口预算变更未持久化')
       return
     }
     // 与 writeAccounts / writeModels 对称：整体 replace 必须携带另外三件套，否则会被清空。
-    await this.scope.replace({
+    await this.persist({
       accounts: this.cache,
       disabledModels: this.modelCache,
       contextBudgets,
       schemaVersion: this.versionCache,
-    })
+    }, '无 settings scope，上下文窗口预算变更未持久化')
   }
 
   /** 列出某个 provider 的所有账号（含状态信息） */

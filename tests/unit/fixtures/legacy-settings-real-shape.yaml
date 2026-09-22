@@ -1,0 +1,289 @@
+ui-theme:
+  mode: dark
+llm-pi-ai:
+  serverPresets: |
+    多行块标量内容
+    第二行
+  anchored: &anchor 1
+  aliased: *anchor
+locale:
+  language: zh-CN
+jet-hub:
+  accounts:
+    - id: acct-0000
+      provider: buddy-cn
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789455550997
+      expiresAt: 1792684142000
+      modelRateLimits:
+        deepseek-v4.1-flash: 1790073210000
+        glm-5.3: 1790151758462
+    - id: acct-0000
+      provider: buddy-cn
+      nickname: "00000000000"
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789459491122
+      expiresAt: 1792684142000
+      modelRateLimits:
+        deepseek-v4.1-flash: 1790031916000
+        glm-5.3: 1789988065330
+    - id: acct-0000
+      provider: buddy
+      nickname: "00000000000"
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789584606614
+      expiresAt: 1821120571000
+      modelRateLimits:
+        glm-5.3: 1789924869364
+        deepseek-v4.1-flash: 1790068826318
+    - id: acct-0000
+      provider: buddy
+      nickname: "00000000000"
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789585059450
+      expiresAt: 1821121013000
+      modelRateLimits:
+        glm-5.3: 1789766055000
+        deepseek-v4.1-flash: 1790029940000
+    - id: acct-0000
+      provider: lobsterai
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      createdAt: 1789655964942
+      expiresAt: 1792560255000
+      refreshable: true
+    - id: acct-0000
+      provider: codearts
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789705307136
+      expiresAt: 1790099342389
+    - id: acct-0000
+      provider: buddy
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789710028672
+      expiresAt: 1821241839000
+      modelRateLimits:
+        glm-5.3: 1789923625495
+        deepseek-v4.1-flash: 1790067169255
+    - id: acct-0000
+      provider: trae-cn
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789849028641
+      expiresAt: 1791301746000
+      modelRateLimits:
+        glm-5.3: 1790054199892
+    - id: acct-0000
+      provider: lobsterai
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789849749784
+      expiresAt: 1792684146000
+    - id: acct-0000
+      provider: trae-cn
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789948028992
+      expiresAt: 1791301746000
+      modelRateLimits:
+        glm-5.3: 1790053896896
+    - id: acct-0000
+      provider: qoder
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789978220653
+    - id: acct-0000
+      provider: qoder-cn
+      nickname: redacted-user
+      enabled: true
+      credentialRef: PROVIDER_ACCOUNT_REDACTED
+      refreshable: true
+      createdAt: 1789978233268
+  disabledModels:
+    {
+      buddy:
+        {
+          hy3: true,
+          glm-5.2: true,
+          kimi-k2.6: true,
+          default-model: true,
+          fast-model: true,
+          balanced-model: true,
+          primary-model: true,
+          deep-model: true,
+          hy4-preview-f: true,
+          gpt-6-astra: true,
+          gpt-5.6-sol: true,
+          gpt-5.6-terra: true,
+          gpt-5.6-luna: true,
+          gpt-5.5: true,
+          gpt-5.4: true,
+          gpt-5.3-codex: true,
+          gemini-3.5-flash: true,
+          kimi-k3: true
+        },
+      codearts:
+        {
+          GLM-5.2: true,
+          GLM-5.1: true,
+          GLM-5: true,
+          openpangu-2.0-flash: true,
+          openpangu-2.0-pro: true,
+          deepseek-v4-flash: true,
+          deepseek-v4-pro: true
+        },
+      lobsterai:
+        {
+          MiniMax-M3: true,
+          MiniMax-M2.7: true,
+          qwen3.7-max: true,
+          qwen3.7-plus: true,
+          qwen3.6-plus: true,
+          qwen3.5-plus-2026-04-20: true,
+          kimi-k2.7-code: true,
+          kimi-k2.7-code-highspeed: true,
+          kimi-k2.6: true,
+          kimi-k2.5: true,
+          doubao-seed-2-1-pro-260628: true,
+          doubao-seed-2-1-turbo-260628: true,
+          doubao-seed-2-0-code-preview-260215: true,
+          glm-5.2: true,
+          glm-5v-turbo: true,
+          glm-5: true,
+          glm-5.1: true,
+          deepseek-v4-flash: true,
+          deepseek-v4-pro: true,
+          qwen3.8-max: true,
+          qwen3.8-flash: true,
+          qwen3.8-omni-flash: true,
+          doubao-seed-2-1-pro-260915: true,
+          deepseek-v4-flash-vision-exp: true,
+          glm-5.3-flashx: true,
+          kimi-k2.8-preview: true
+        },
+      trae-cn:
+        {
+          qwen-3.7-plus: true,
+          minimax-m3: true,
+          Doubao-Seed-2.1-Pro: true,
+          Doubao-Seed-Evolving: true,
+          qwen3.8-max: true,
+          DeepSeek-V4-Pro-Official: true,
+          glm-5.2: true,
+          kimi-k3: true,
+          Doubao-Seed-2.1-Turbo: true,
+          kimi-k2.7-code: true,
+          kimi-k2.6: true,
+          step-5-preview: true
+        },
+      buddy-cn:
+        {
+          hy4-preview: true,
+          hy3: true,
+          hy3-x: true,
+          glm-5.2: true,
+          glm-5.1: true,
+          glm-5v-turbo: true,
+          kimi-k2.7: true,
+          kimi-k2.6: true,
+          minimax-m3: true,
+          kimi-k3-1: true,
+          deepseek-v4-pro: true
+        },
+      trae-cn-work:
+        {
+          Doubao-Seed-Evolving: true,
+          Doubao-Seed-2.1-Pro: true,
+          Doubao-Seed-2.1-Turbo: true,
+          Doubao-Seed-Code: true,
+          glm-5.2: true,
+          DeepSeek-V4-Flash-Official: true,
+          DeepSeek-V4-Pro-Official: true,
+          kimi-k3: true,
+          kimi-k2.7-code: true,
+          kimi-k2.6: true,
+          minimax-m3: true,
+          qwen3.8-max: true,
+          qwen-3.7-plus: true,
+          deepseek-chat: true,
+          deepseek-reasoner: true,
+          glm-5.3: true
+        },
+      qoder-cn:
+        {
+          auto: true,
+          qmodel_38max: true,
+          qfmodel: true,
+          qmodel_latest: true,
+          qmodel: true,
+          q37fmodel: true,
+          dmodel: true,
+          gm51model: true,
+          kmodel_latest: true,
+          kmodel: true,
+          mmodel: true,
+          dfmodel: true
+        },
+      qoder:
+        {
+          qmodel_38max: true,
+          qfmodel: true,
+          lite: true,
+          auto: true,
+          ultimate: true,
+          performance: true,
+          efficient: true,
+          smodel: true,
+          qmodel_latest: true,
+          qmodel: true,
+          kmodel_latest: true,
+          cmodel: true,
+          kmodel: true,
+          dmodel: true,
+          dfmodel: true,
+          mmodel: true
+        }
+    }
+  schemaVersion: 1
+  contextBudgets:
+    {
+      buddy-cn:
+        {
+          glm-5.3: 300000,
+          hy4-preview: 300000,
+          glm-5.2: 300000,
+          minimax-m3: 300000,
+          kimi-k3-1: 300000,
+          deepseek-v4-pro: 300000
+        },
+      buddy: { hy4-preview-f: 300000, gpt-6-astra: 400000 },
+      trae-cn: { DeepSeek-V4-Flash-Official: 1000000 },
+      qoder: { gfmodel: 1000000 },
+      qoder-cn: { gfmodel: 1000000 }
+    }
+agent-presets:
+  enabled: true
