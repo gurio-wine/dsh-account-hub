@@ -31,6 +31,8 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { sanitizeConsumption, sanitizeConsumptionCursors } from './account-consumption.js'
+import type { ConsumptionCursorMap, ConsumptionMap } from './account-consumption.js'
 import type { ProviderAccountEntry } from './types.js'
 
 declare module '@deepseek-ai/cordis' {
@@ -84,18 +86,32 @@ export type ContextBudgetMap = Record<string, Record<string, number>>
 export type CheckinsMap = Record<string, number>
 
 /**
+ * 账号**消耗顺序 / 切换粒度**与**遍历游标**的类型。
+ *
+ * 语义与取值域见 `src/account-consumption.ts`（唯一真相源）—— 这里**重导出**它的
+ * 类型而不是另写一份同形接口：两份定义一旦漂移，落盘形态与选号读取的形态就会
+ * 静默错位（存了却永远不生效）。等于默认值的条目不留，因此文件里出现的键一定是
+ * 用户真的改过的。旧文档（无这两个字段）读入时补空对象。
+ */
+export type { ConsumptionCursorMap, ConsumptionMap } from './account-consumption.js'
+
+/**
  * storage 里那份单例文档的结构。
  *
- * ⚠️ **五件套是一个整体**：`AccountPool` 的每次写入都是「读 → 改 → 整体 replace」，
+ * ⚠️ **七件套是一个整体**：`AccountPool` 的每次写入都是「读 → 改 → 整体 replace」，
  * 漏带任何一个字段就会在下次别的写入里被清空（`schemaVersion` 丢失会让改名迁移
- * 在每次启动重跑）。这五件与旧 settings namespace 里的字段**逐字段对应**，
- * 迁移就是原样搬运。
+ * 在每次启动重跑）。前五件与旧 settings namespace 里的字段**逐字段对应**，
+ * 迁移就是原样搬运；末两件是「消耗顺序 / 切换粒度」带来的新字段。
  */
 export interface AccountHubDocument {
   accounts: ProviderAccountEntry[]
   disabledModels: ModelDisableMap
   contextBudgets: ContextBudgetMap
   checkins: CheckinsMap
+  /** 消耗顺序 / 切换粒度（见 {@link ConsumptionMap}）。 */
+  consumption: ConsumptionMap
+  /** 遍历游标（见 {@link ConsumptionCursorMap}）。 */
+  consumptionCursors: ConsumptionCursorMap
   schemaVersion: number
 }
 
@@ -106,6 +122,8 @@ export function emptyAccountHubDocument(): AccountHubDocument {
     disabledModels: {},
     contextBudgets: {},
     checkins: {},
+    consumption: {},
+    consumptionCursors: {},
     schemaVersion: 0,
   }
 }
@@ -154,12 +172,12 @@ export function sanitizeCheckins(raw: unknown): CheckinsMap {
 }
 
 /**
- * 把存储里读到的原始值归一化为 {@link AccountHubDocument}。
+ * 把任意外部值归一化为 {@link AccountHubDocument}。
  *
  * 存储文件可能被手工编辑过，也可能残留旧格式，因此逐层校验：任何一层形状不符就
  * 丢弃那一层，**不抛错** —— 存储被外部改坏不该让整个账号管理功能不可用
  * （既有 settings 路径的 `sanitizeDisabledModels` 同一取舍）。
- * 旧文档（无 `checkins` 字段）读入时补空对象。
+ * 旧文档（无 `checkins` / `consumption` / `consumptionCursors` 字段）读入时补空对象。
  */
 export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
   const empty = emptyAccountHubDocument()
@@ -174,6 +192,8 @@ export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
     disabledModels: sanitizeDisabledModels(value.disabledModels),
     contextBudgets: sanitizeContextBudgets(value.contextBudgets),
     checkins: sanitizeCheckins(value.checkins),
+    consumption: sanitizeConsumption(value.consumption),
+    consumptionCursors: sanitizeConsumptionCursors(value.consumptionCursors),
     schemaVersion: typeof version === 'number' && Number.isFinite(version) ? version : 0,
   }
 }
@@ -235,7 +255,7 @@ export interface AccountHubStorage {
   readonly domain: OpenedDomainLike
   /** 同步读取归一化后的文档（读自 storage 域的权威内存态）。 */
   read(): AccountHubDocument
-  /** 整体写入四件套；落盘失败时向调用方抛出。 */
+  /** 整体写入七件套；落盘失败时向调用方抛出。 */
   write(doc: AccountHubDocument): Promise<void>
   /** 存储里是否已有账号数据（一次性迁移的幂等闸门）。 */
   hasAccounts(): boolean

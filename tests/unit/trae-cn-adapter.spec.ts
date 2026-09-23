@@ -1926,14 +1926,19 @@ describe('TraeCnAdapter 凭据处理', () => {
     expect(error?.code).toBe('MISSING_CREDENTIAL')
   })
 
-  it('**stream 把 options.model 传给 resolveCredential 与 refresh**', async () => {
-    // 这是硬约定：账号池的限流过滤是**逐模型**的，传空串会让每次请求都先白跑
-    // 一遍已限额的账号；refresh 用不同口径选号还会导致「解析到 B、却刷新了 A」。
+  it('**stream 把 options.model 与轮次标识传给 resolveCredential 与 refresh**', async () => {
+    // 两条硬约定，一起验：
+    // 1. model —— 账号池的限流过滤是**逐模型**的，传空串会让每次请求都先白跑
+    //    一遍已限额的账号；refresh 用不同口径选号还会导致「解析到 B、却刷新了 A」。
+    // 2. 第二个实参（`options.signal`）—— 它是账号池实现「切换粒度 = 按轮次」的
+    //    唯一依据（DSH 的 GenerateOptions 里没有 turn 级字段，signal 是唯一
+    //    「同轮恒定、跨轮必变」的标识）。漏传会让「按轮次」档静默退化成每步换号。
     const resolveCredential = vi.fn(async () => makeCredential())
     const refresh = vi.fn(async () => {})
     const { adapter } = makeAdapter(() => sseResponse(textStream('ok')), { resolveCredential, refresh })
-    await collect(adapter, generateOptions({ model: 'kimi-k3' }))
-    expect(resolveCredential).toHaveBeenCalledWith('kimi-k3')
+    const options = generateOptions({ model: 'kimi-k3' })
+    await collect(adapter, options)
+    expect(resolveCredential).toHaveBeenCalledWith('kimi-k3', options.signal)
   })
 
   it('凭据过期时先续期再发请求，且续期也用同一个 model', async () => {

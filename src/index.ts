@@ -13,9 +13,16 @@ import { LobsteraiAuth } from './lobsterai-auth.js'
 import { TraeCnAuth } from './trae-cn-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
+import { TurnKeyTracker } from './account-consumption.js'
 import { createContextTierRegistry } from './context-tiers.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
-import { registerAccountHubRpc, performCheckinSweep, type ModelCatalogSource } from './account-hub-rpc.js'
+import {
+  registerAccountHubRpc,
+  performCheckinSweep,
+  refreshConsumptionBalances,
+  type ModelCatalogSource,
+  type ProviderBalancesDeps,
+} from './account-hub-rpc.js'
 import { BUDDY_CN, BUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE_CN } from './trae-cn-product.js'
@@ -160,6 +167,16 @@ export function makeReadImage(ctx: Context) {
 }
 
 /**
+ * 进程级的**轮次标识 → 轮次键**换算器。
+ *
+ * 模块级单例，**必须**是单例：`makeCredentialResolver` 与 `makeAccountRefresher`
+ * 各自调用一次 `makeAccountPicker`，若各持一个换算器，同一个 `signal` 会在两处
+ * 得到不同的键 —— 于是「续期刷新的就是解析凭据时用的那个账号」这条不变量
+ * （见 {@link makeAccountRefresher}）在「按轮次」档下被破坏，而且没有任何报错。
+ */
+const turnKeys = new TurnKeyTracker()
+
+/**
  * 账号池选号器：按目标模型挑选一个可用账号。
  *
  * 抽成独立函数是**必需的**，不是为了复用：`resolveCredential` 与 LobsterAI 的
@@ -174,21 +191,36 @@ export function makeReadImage(ctx: Context) {
  * 1. 先按目标模型过滤，跳过仍在该模型冷却期内的账号；
  * 2. 全被过滤掉时退回不过滤的查询。原因见 {@link makeCredentialResolver}。
  *
+ * ## `turnIdentity`：消耗顺序 / 切换粒度的第二个可选实参
+ *
+ * 适配器把 `options.signal` 原样传进来（它是**唯一**的轮次标识 —— DSH 的
+ * `GenerateOptions` 里没有 turn 级字段，`sessionId` 是会话级、跨轮稳定，详见
+ * `src/account-consumption.ts` 的 `TurnKeyTracker`）。池据此按该 provider 配置的
+ * 档位选号，并在「按轮次」粒度下锁住同一轮的账号。
+ *
+ * ⚠️ **不传第二个实参时行为与改动前逐字相同**（恒取第一个可用账号）——
+ * 拉模型目录、探测等非请求路径必须走这一条。
+ *
  * @param pool - 账号池；未提供时返回 null（调用方自行回退单凭据）。
  * @param provider - provider id（`this.product.id`，不要写死字面量）。
  */
 export function makeAccountPicker(
   pool: AccountPool | undefined,
   provider: string,
-): (model?: string) => Promise<Awaited<ReturnType<AccountPool['getAvailableAccount']>>> {
-  return async (model?: string) => {
+): (model?: string, turnIdentity?: unknown) => Promise<Awaited<ReturnType<AccountPool['getAvailableAccount']>>> {
+  return async (model?: string, turnIdentity?: unknown) => {
     if (!pool) return null
     const target = model ?? ''
-    const filtered = await pool.getAvailableAccount(provider, target)
+    // ⚠️ `turnIdentity === undefined`（调用方没传第二个实参）与「传了但换算不出键」
+    // 是两种语义，不要合并：
+    // - `undefined` = **完全按历史行为选号**，不看配置（拉目录 / 探测路径）；
+    // - 换算出空串 = 按配置选号、但不锁轮次（等价「按请求」）。
+    const pick = turnIdentity === undefined ? undefined : { turnKey: turnKeys.keyFor(turnIdentity) }
+    const filtered = await pool.getAvailableAccount(provider, target, undefined, pick)
     if (filtered) return filtered
     if (target.length === 0) return null
     // 退化：所有账号都在冷却期 → 取一个让调用方去实测（见 makeCredentialResolver）。
-    return pool.getAvailableAccount(provider, '')
+    return pool.getAvailableAccount(provider, '', undefined, pick)
   }
 }
 
@@ -218,6 +250,12 @@ export function makeAccountPicker(
  * 2. **`model` 缺省（`fetchModels` 拉模型目录）时仍不做限流过滤**。目录对
  *    所有模型一致，按某个模型的限流状态裁剪反而会凭空缺号。
  *
+ * ⚠️ **`turnIdentity` 必须与 `model` 一起原样透传**（第二个参数位）：它是
+ * 「切换粒度 = 按轮次」锁定账号的依据（见 `makeAccountPicker` 与
+ * `src/account-consumption.ts`）。适配器传了 `options.signal` 而 resolver 在这里
+ * 丢掉它，会让「同轮锁同一账号」静默失效 —— 用户看到的是「配了按轮次，但每步
+ * 都换号」，而且没有任何报错。
+ *
  * @param ctx - 宿主上下文（只用到 `credentials.resolve`）。
  * @param pool - 账号池；未提供时只用单凭据回退 ref。
  * @param provider - provider id（`this.product.id`，不要写死字面量）。
@@ -228,10 +266,10 @@ export function makeCredentialResolver<T>(
   pool: AccountPool | undefined,
   provider: string,
   fallbackRef: string,
-): (model?: string) => Promise<T | undefined> {
+): (model?: string, turnIdentity?: unknown) => Promise<T | undefined> {
   const pick = makeAccountPicker(pool, provider)
-  return async (model?: string) => {
-    const available = await pick(model)
+  return async (model?: string, turnIdentity?: unknown) => {
+    const available = await pick(model, turnIdentity)
     if (available) return available.credential as unknown as T
     // 回退到单凭据 ref（池为空 / 未配置账号池时）。
     const resolved = await ctx.credentials.resolve(credentialRef(fallbackRef))
@@ -283,10 +321,15 @@ export function makeAccountRefresher(
     refresh: () => Promise<void>
     refreshAccountCredential: (refName: string) => Promise<void>
   },
-): (model?: string) => Promise<void> {
+): (model?: string, turnIdentity?: unknown) => Promise<void> {
   const pick = makeAccountPicker(pool, provider)
-  return async (model?: string) => {
-    const available = await pick(model)
+  return async (model?: string, turnIdentity?: unknown) => {
+    // ⚠️ `turnIdentity` 与 `model` 必须**用同一组实参**调同一个 pick（这里与
+    // `makeCredentialResolver` 是同一个 `makeAccountPicker`、同一个**
+    // 模块级**换算器）。丢掉它会让「按轮次」档在续期路径上挑到另一个账号，
+    // 从而刷新错凭据 —— 正是本函数存在理由所针对的那条错配，只是触发条件
+    // 换成了粒度档。
+    const available = await pick(model, turnIdentity)
     if (available) {
       await service.refreshAccountCredential(available.entry.credentialRef)
       return
@@ -951,4 +994,34 @@ export function apply(ctx: Context): void {
   ctx.effect(() => () => {
     clearInterval(checkinTimer)
   }, 'account-hub: auto check-in scheduler')
+
+  // ===== 消耗顺序 · 余额缓存刷新层 =====
+  //
+  // 「最高优先」档要在**请求热路径**上按余额排序，而余额查询是纯拉取、只活在 UI 里
+  // （见 `src/account-consumption.ts` 的 `BalanceCache`）。故宿主侧维持一份内存缓存：
+  // 启动后刷一次 + 每 4 小时刷一次，与签到 sweep 同节奏、同款定时器形态。
+  //
+  // ⚠️ **只刷配置了「最高优先」档的 provider**：刷新是逐账号一次网络请求，
+  // 为没开那一档的 provider 白打请求纯属浪费与风控风险。过滤收在
+  // `refreshConsumptionBalances` 内部（唯一实现），这里不重复判一次 ——
+  // 两处判据迟早会漂移。
+  //
+  // 时序：必须在 `openStorage()` 之后（那之前读到的 `consumption` 是旧 settings
+  // 快照或空表 ⇒ 一个 provider 都筛不出来，缓存永远是空的）。与签到 sweep 同一条
+  // 约束，故同样挂在那个 Promise 上。
+  const balanceDeps: ProviderBalancesDeps = { ctx, pool, qoder, qoderCn }
+  const REFRESH_BALANCES_INTERVAL_MS = 4 * 60 * 60 * 1000
+  const runBalanceRefresh = (): void => {
+    // fire-and-forget：`refreshConsumptionBalances` 内部逐 provider 自吞异常，
+    // 这里只兜住意外抛出，绝不让它冒泡成 unhandledRejection。
+    void refreshConsumptionBalances(balanceDeps).catch((error: unknown) => {
+      ctx.logger.warn(`[account-hub] 余额缓存刷新异常（最高优先档本次降级回顺序）：${String(error)}`)
+    })
+  }
+  void pool.openStorage().then(() => queueMicrotask(runBalanceRefresh))
+  const balanceTimer = setInterval(runBalanceRefresh, REFRESH_BALANCES_INTERVAL_MS)
+  balanceTimer.unref?.()
+  ctx.effect(() => () => {
+    clearInterval(balanceTimer)
+  }, 'account-hub: consumption balance cache scheduler')
 }

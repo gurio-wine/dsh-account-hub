@@ -905,6 +905,110 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
   return dialog;
 }
 
+/**
+ * 消耗顺序的三档（**值与宿主 `src/account-consumption.ts` 的联合类型逐字一致**）。
+ *
+ * `hint` 是给用户看的一句话语义说明：三档的差别是「这次用哪个账号」，光看名字
+ * （顺序 / 遍历 / 最高优先）不足以判断实际行为，尤其「顺序」= 现状行为这一点。
+ */
+const CONSUMPTION_ORDER_OPTIONS = [
+  { value: 'sequential', label: '顺序', hint: '总是用排序里的第一个可用账号（默认，即原有行为）' },
+  { value: 'round-robin', label: '遍历', hint: '每次请求轮转下一个账号，用完一轮再从头开始' },
+  { value: 'highest-balance', label: '最高优先', hint: '每次请求用积分余额最高的账号；余额未知时按顺序' },
+];
+
+/** 切换粒度的两档（含义见 `docs/agents/account-hub-storage.md`）。 */
+const CONSUMPTION_SWITCH_OPTIONS = [
+  { value: 'per-request', label: '按请求', hint: '每一次请求都重新选号' },
+  { value: 'per-turn', label: '按轮次', hint: '一轮对话内固定用同一个账号，下一轮才换（默认，上下文更连贯）' },
+];
+
+/** 宿主的默认配置（与 `DEFAULT_CONSUMPTION` 同值）：拉取失败时退回它。 */
+const CONSUMPTION_DEFAULTS = { order: 'sequential', switch: 'per-turn' };
+
+/**
+ * 一个选择器（一组 radio）。
+ *
+ * 形态**照抄 `ModelTierPicker`**：原生 `input[type=radio]` + `role="radiogroup"`
+ * + `aria-label` + `disabled: busy`。**不用 `<select>`**：全仓没有任何 select
+ * 惯例，而原生 radio 组在这套面板的样式表里已有现成规则（`.dim-ah-tierOption`）。
+ *
+ * 同一个组内的 radio 必须**同名**（`name`），否则浏览器不会把它们当成互斥的一组；
+ * 两组之间必须**不同名**，否则两个选择器会跨组互斥。
+ */
+function ConsumptionRadioGroup({ name, label, hint, options, value, busy, onSelect }) {
+  return React.createElement('div', {
+    className: 'dim-ah-consumptionGroup',
+    role: 'radiogroup',
+    'aria-label': label,
+  },
+  React.createElement('div', { className: 'dim-ah-consumptionHead' },
+    React.createElement('strong', { className: 'dim-ah-consumptionLabel' }, label),
+    React.createElement('span', { className: 'dim-ah-consumptionHint' },
+      // 提示文案取**当前选中档**的那一句：三档语义不同，把三句都铺开会挤爆
+      // 这一行；悬停任意一档能看到它自己的说明（见下面的 title）。
+      options.find(o => o.value === value)?.hint ?? '')),
+  React.createElement('div', { className: 'dim-ah-consumptionOptions' },
+    options.map(option => React.createElement('label', {
+      className: 'dim-ah-tierOption',
+      key: `dim-ah-consumption-${name}-${option.value}`,
+      title: option.hint,
+    },
+    React.createElement('input', {
+      type: 'radio',
+      name: `dim-ah-consumption-${name}`,
+      checked: value === option.value,
+      disabled: busy,
+      onChange: () => onSelect(option.value),
+    }),
+    React.createElement('span', null, option.label)))));
+}
+
+/**
+ * 账号消耗顺序 + 切换粒度：两个**并排**的选择器。
+ *
+ * ## 版面
+ *
+ * 与账号卡片同宽、各占一半（`flex: 1 1 50%` 见 `account-hub-styles.js`），
+ * 由 `ProviderPanel` 放在账号卡片列表**之前** —— 那个位置是一个无 class 的裸
+ * `<div>`，宽度天然与卡片一致，故这里不需要任何宽度计算。
+ *
+ * ## 为什么是受控组件 + 不做乐观更新
+ *
+ * 选中态完全由 `value`（宿主权威值）决定，点击只回调 `onChange`。这与
+ * `ModelToggle` / `ModelTierPicker` 同一条取舍：写入是否被接受由宿主校验决定
+ * （非法档位会被拒绝），本地先翻会让「被拒绝」看起来像成功了。
+ *
+ * ⚠️ 配置用 `value` **对象**传入而不是两个平铺 prop：`switch` 是 JS 保留字，
+ * 平铺就要在解构处写 `{ switch: switchMode }` 这种别名，而别名一旦漏写会静默
+ * 拿到 `undefined`（Studio 里表现为「粒度选择器永远不勾任何一档」）。放进对象里
+ * 没有这个问题，也让「两个设置是一组」这件事在签名上可见。
+ *
+ * ⚠️ `disabled` 绑 `busy`：写入在途时禁用，避免连点产生两个并发写（它们的
+ * 响应到达顺序不确定，界面会闪回旧值）。
+ */
+function ConsumptionSelectors({ value, busy, onChange }) {
+  const order = value?.order || CONSUMPTION_DEFAULTS.order;
+  const switchMode = value?.switch || CONSUMPTION_DEFAULTS.switch;
+  return React.createElement('div', { className: 'dim-ah-consumption' },
+    React.createElement(ConsumptionRadioGroup, {
+      name: 'order',
+      label: '消耗顺序',
+      options: CONSUMPTION_ORDER_OPTIONS,
+      value: order,
+      busy,
+      onSelect: (next) => onChange({ order: next }),
+    }),
+    React.createElement(ConsumptionRadioGroup, {
+      name: 'switch',
+      label: '切换粒度',
+      options: CONSUMPTION_SWITCH_OPTIONS,
+      value: switchMode,
+      busy,
+      onSelect: (next) => onChange({ switch: next }),
+    }));
+}
+
 function ProviderPanel({ provider, rpcCall }) {
   const [accounts, setAccounts] = React.useState([]);
   const [phase, setPhase] = React.useState('loading');
@@ -950,6 +1054,16 @@ function ProviderPanel({ provider, rpcCall }) {
   // 本面板是否已执行过自动补签：每次面板挂载只补一次（对应需求「每次进入 Hub」）。
   // React.StrictMode 在 dev 会双执行挂载 effect，ref 挡住第二发。
   const autoCheckinRanRef = React.useRef(false);
+  /**
+   * 消耗顺序 / 切换粒度（宿主权威值）。
+   *
+   * 初始为宿主的默认档（顺序 + 按轮次）—— 与 `consumption.get` 未返回时的兜底
+   * 同一个值。挂载后由 RPC 覆盖。**刻意不从本地存储猜**：配置存在宿主的 storage
+   * 域里，客户端猜错会让界面显示一个与真实选号行为不符的档位。
+   */
+  const [consumption, setConsumption] = React.useState(CONSUMPTION_DEFAULTS);
+  // 消耗配置写入在途（禁用两个选择器，防连点产生并发写）。
+  const [consumptionBusy, setConsumptionBusy] = React.useState(false);
 
   const loadAccounts = React.useCallback(async () => {
     setPhase('loading');
@@ -1093,9 +1207,55 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   }, [provider, rpcCall, supportsCredits]);
 
+  /**
+   * 拉取本 provider 的消耗顺序 / 切换粒度（纯内存读、零网络）。
+   *
+   * 失败**静默**：选择器退回默认档而不是把面板变成错误页 —— 一份读不到的配置
+   * 不该让整个账号管理界面不可用（与 `loadCheckinStatus` 同一条取舍）。
+   * 退默认档是安全的：它与宿主的默认行为一致（顺序 = 现状行为）。
+   */
+  const loadConsumption = React.useCallback(async () => {
+    try {
+      const res = await rpcCall('consumption.get', { provider });
+      if (!mounted.current) return;
+      setConsumption({
+        order: res?.consumption?.order || CONSUMPTION_DEFAULTS.order,
+        switch: res?.consumption?.switch || CONSUMPTION_DEFAULTS.switch,
+      });
+    } catch (caught) {
+      console.warn('[account-hub] load consumption setting failed:', caught);
+    }
+  }, [provider, rpcCall]);
+
+  /**
+   * 写回消耗配置（**部分更新**：只发被点的那一个字段）。
+   *
+   * 成功后用**宿主返回的**配置覆盖本地状态（而不是用自己刚才点的值）：宿主的
+   * 响应是写入后的权威值，本地猜可能与它不一致（例如值被归一化成默认档）。
+   * 失败时只记控制台 + 保留原选中态 —— 与模型开关同理，不做乐观更新。
+   */
+  const updateConsumption = async (patch) => {
+    setConsumptionBusy(true);
+    try {
+      const res = await rpcCall('consumption.set', { provider, ...patch });
+      if (!mounted.current) return;
+      setConsumption({
+        order: res?.consumption?.order || CONSUMPTION_DEFAULTS.order,
+        switch: res?.consumption?.switch || CONSUMPTION_DEFAULTS.switch,
+      });
+    } catch (caught) {
+      console.error('[account-hub] update consumption setting failed:', caught);
+    } finally {
+      if (mounted.current) setConsumptionBusy(false);
+    }
+  };
+
   React.useEffect(() => {
     mounted.current = true;
     void loadAccounts();
+    // 消耗配置与账号列表并发拉取：它是零网络的内存读（与签到状态同理），
+    // 不必等账号列表就绪。
+    void loadConsumption();
     // 只有支持余额查询的 provider 才在挂载时拉积分；CodeArts 不会走到这里
     // （loadCredits 内部也有一道门控，这里提前判掉是为了连 loading 状态都不翻）。
     if (canLoadCredits) void loadCredits();
@@ -1551,6 +1711,19 @@ function ProviderPanel({ provider, rpcCall }) {
             rel: 'noreferrer noopener',
           }, '打开登录页面'))
       : null,
+    // ── 消耗顺序 / 切换粒度 ──
+    //
+    // 位置：**账号卡片列表之前**（需求明确要求「面板顶部」）。两个选择器并排、
+    // 各占一半宽，由样式表的 flex 决定；这里不需要任何宽度计算 —— 本节点与下面
+    // 的账号区同处一个容器，宽度天然与卡片一致。
+    //
+    // 与账号列表的加载态无关：即使还没读到账号（loading / error / 空态），
+    // 选择器也必须渲染出来（它是 provider 级配置，不依赖任何账号存在）。
+    React.createElement(ConsumptionSelectors, {
+      value: consumption,
+      busy: consumptionBusy,
+      onChange: (patch) => void updateConsumption(patch),
+    }),
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-ah-empty' }, '正在读取账号列表…')
       : phase === 'error'

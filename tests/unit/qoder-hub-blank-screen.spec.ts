@@ -457,8 +457,16 @@ describe('「登录账号」点击后 Hub 白屏（真机首跑暴露的自由�
           client.hooks,
         )
         const nodes = flatten(after).filter(isElement)
-        expect(nodes.filter((el) => el.type === 'input'), `${provider} 出现了输入框（PAT 表单残留？）`)
-          .toHaveLength(0)
+        // ⚠️ 判据是「没有**文本录入**控件」，不能写成「一个 input 都没有」：
+        // 面板后来新增了消耗顺序 / 切换粒度两个选择器，它们的原生
+        // `input[type=radio]` 同样是 input —— 用「数量为 0」会把那两个**正当**
+        // 控件误报成 PAT 表单残留（这条断言当初的意图也只是「粘贴式表单没了」）。
+        // 真正要排除的是能承载 PAT 文本的那些类型。
+        const TEXT_ENTRY_TYPES = ['text', 'password', 'search', 'url', 'email', 'tel', 'number', 'textarea']
+        const textInputs = nodes.filter((el) => el.type === 'input'
+          && TEXT_ENTRY_TYPES.includes(String(el.props.type)))
+        expect(textInputs, `${provider} 出现了文本录入框（PAT 表单残留？）`).toHaveLength(0)
+        expect(nodes.filter((el) => el.type === 'textarea'), `${provider} 出现了多行输入框`).toHaveLength(0)
         expect(textsOf(after).join(''), `${provider} 文案里仍有 PAT`)
           .not.toContain('PAT')
       }

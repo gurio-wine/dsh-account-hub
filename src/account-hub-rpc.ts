@@ -9,12 +9,14 @@
  *           account.reset / account.resetAll / login.poll /
  *           credits.status / credits.claimAll / credits.balances /
  *           credits.checkinStatus / checkin.perform / checkin.sweep /
+ *           consumption.get / consumption.set /
  *           model.list / model.setDisabled / model.setContextBudget
  */
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, isCredentialRefName, type CredentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool, todayDayNumber } from './account-pool.js'
+import type { ConsumptionOrder, ConsumptionSwitch } from './account-consumption.js'
 import type { CodeArtsAuth } from './service.js'
 import type { BuddyAuth } from './buddy-auth.js'
 import type { LobsteraiAuth } from './lobsterai-auth.js'
@@ -172,6 +174,36 @@ export type CheckinAccountResult = RpcCreditsClaimAccountResult
 /** RPC: `credits.checkinStatus` 请求。 */
 export interface RpcCheckinStatusRequest {
   provider: string
+}
+
+/** RPC: `consumption.get` 请求（读某 provider 的消耗顺序 / 切换粒度）。 */
+export interface RpcConsumptionGetRequest {
+  provider: string
+}
+
+/** RPC: `consumption.get` 响应。 */
+export interface RpcConsumptionGetResponse {
+  provider: string
+  /** 当前配置；未配置过时是默认值（顺序 + 按轮次），**不会是 undefined**。 */
+  consumption: { order: string; switch: string }
+}
+
+/**
+ * RPC: `consumption.set` 请求（**部分更新**）。
+ *
+ * 两个字段都可选：界面上的两个选择器彼此独立，各自只发自己那一个。
+ * `order` / `switch` 的取值域与默认值见 `src/account-consumption.ts`。
+ */
+export interface RpcConsumptionSetRequest {
+  provider: string
+  order?: string
+  switch?: string
+}
+
+/** RPC: `consumption.set` 响应（回传写入后的**权威**配置，供客户端对齐选中态）。 */
+export interface RpcConsumptionSetResponse {
+  provider: string
+  consumption: { order: string; switch: string }
 }
 /** RPC: `credits.checkinStatus` 响应（纯内存读，不发网络请求）。 */
 export interface RpcCheckinStatusResponse {
@@ -779,6 +811,165 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
 }
 
 /**
+ * 查询某 provider 全部账号余额所需的宿主依赖。
+ *
+ * 抽出来是因为它有**两个调用方**：RPC `credits.balances`（面板打开 / 手动刷新）
+ * 与宿主的**余额缓存刷新**（最高优先档的依赖，见 `src/index.ts`）。两处各写一份
+ * 分派必然漂移 —— 而漂移的形态很隐蔽：面板显示的数字与选号用的数字来自两套
+ * 口径，用户看到「余额最高的那个」并不是实际被选中的那个。
+ */
+export interface ProviderBalancesDeps {
+  /** 账号池（读账号列表 + 回写余额缓存）。 */
+  pool: AccountPool
+  ctx: Context
+  qoder: QoderAuth
+  qoderCn: QoderAuth
+}
+
+/**
+ * 逐账号查询某 provider 的余额（`credits.balances` 与余额缓存刷新**共用**的唯一实现）。
+ *
+ * ⚠️ **`provider` 是面板 id**，池键映射（{@link poolProviderFor}）在本函数内部完成
+ * —— 两个调用方都不该各自映射一次。
+ *
+ * @returns 每个账号的余额条目（含失败原因）；provider 无法识别时返回 `undefined`
+ *          （调用方决定是回 RPC 错误还是跳过）。
+ */
+export async function collectProviderBalances(
+  deps: ProviderBalancesDeps,
+  provider: string,
+): Promise<RpcCreditsBalancesResponse['accounts'] | undefined> {
+  const { pool, ctx, qoder, qoderCn } = deps
+  const poolKey = poolProviderFor(provider)
+  const accounts = await pool.listAccounts(poolKey)
+  const resolve = (ref: ReturnType<typeof credentialRef>) => ctx.credentials.resolve(ref)
+  const warn = (msg: string) => ctx.logger?.warn?.(msg)
+  if (poolKey === 'codearts') {
+    // 余额来自 `statistics/plugin`（与账户类型检测**同一个响应**），
+    // 故用带原因的钩子：非积分账户要显示「Token 计费账户」而不是
+    // 误导性的「余额查询失败」——账户类型差异不是故障。
+    return collectCreditBalances<CodeArtsCredential, undefined>(accounts, undefined, {
+      resolve,
+      fetchBalanceDetailed: async (credential) => {
+        // 用带原因的版本：`fetchCodeArtsAccountInfo` 只回 null，会把
+        // 「AK 限流」「签名失败」「凭据过期」压成同一句笼统文案，
+        // 用户与排查者都拿不到线索（本端点就因此把一次 401 显示成了
+        // 无信息量的「账户信息查询失败」）。
+        const result = await fetchCodeArtsAccountInfoDetailed(credential)
+        if (!result.ok) return { balance: null, error: `账户信息查询失败：${result.message}` }
+        const info = result.info
+        if (!info.isCreditPackage) {
+          return {
+            balance: null,
+            error: info.isTokenPackage
+              ? 'Token 计费账户，无积分余额'
+              : '非积分计费账户，无积分余额',
+          }
+        }
+        // 积分账户但没有 credit metric：如实报「未返回积分数据」，
+        // 不显示成 0 —— 0 会让用户以为自己把积分用光了。
+        if (info.credit === undefined) return { balance: null, error: '未返回积分数据' }
+        return { balance: info.credit }
+      },
+      warn,
+    })
+  }
+  if (poolKey === LOBSTERAI.id) {
+    return collectCreditBalances(accounts, LOBSTERAI, {
+      resolve,
+      fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
+      warn,
+    })
+  }
+  if (poolKey === TRAE_CN.id) {
+    // Trae CN 面板显示**通用池**（`available_endpoint === 0`）—— IDE 对话
+    // 扣的就是它，即本 provider 实际能花的钱。
+    // ⚠️ 池是**路径属性**，与账号无关（账号池那条链路见上面的
+    // {@link poolProviderFor}）：将来若再出现别的 Trae 路径，在这里按
+    // `provider` 分支选池，而不是把池并进账号映射。
+    return collectCreditBalances<TraeCnCredential, TraeCnProduct>(accounts, TRAE_CN, {
+      resolve,
+      fetchBalance: (credential, product) =>
+        fetchTraeCnCreditBalance(credential, product, TRAE_CN_POOL_UNIVERSAL, { onDebug: (msg) => ctx.logger?.info?.(msg) }),
+      warn,
+    })
+  }
+  if (poolKey === QODER.id || poolKey === QODER_CN.id) {
+    // Qoder **只有一个池**（三池结构里另外两个本账号缺席，且它们同属这一个
+    // 端点的同一个数字口径），故没有任何选池分支，不要为「形态对称」凭空造一个。
+    // CN 同样如此：实测 CN 的 quota 响应只有 `userQuota` + `addOnQuota`，
+    // `orgResourcePackage` 键**整个不存在** —— 而三池解析本来就是容缺的
+    // （每个池独立解析，缺席 = 该池不存在），故**无需任何 CN 专属分支**。
+    //
+    // 第二个实参是本 region 的 auth 实例：额度端点**只认 `jt-`**
+    // （PAT 打它回 401 `TOKEN_EXPIRE`），由 auth 负责换取与缓存；
+    // 而 jt 缓存是**实例字段**，用错实例换来的是另一区的 jt。
+    //
+    // ⚠️ **第三个实参必须是本 region 的产品配置**（`region.product`）：
+    // 它决定 `openapiBase`（额度端点 host）。传错会让请求打到另一区，
+    // 表现为「凭据失效」而不是任何配置错误。
+    const region = qoderRegionFor(provider, qoder, qoderCn)
+    if (region === undefined) return undefined
+    return collectCreditBalances<QoderCredential, QoderProduct>(accounts, region.product, {
+      resolve,
+      fetchBalance: (credential, product) =>
+        fetchQoderCreditBalance(credential, region.auth, {
+          product,
+          onDebug: (msg) => ctx.logger?.info?.(msg),
+        }),
+      warn,
+    })
+  }
+  const product = productById(poolKey)
+  if (product === undefined) return undefined
+  return collectCreditBalances(accounts, product, { resolve, warn })
+}
+
+/**
+ * 余额缓存刷新：只刷**配置了「最高优先」档**的 provider。
+ *
+ * ## 为什么必须按档位过滤（而不是刷全部）
+ *
+ * 余额刷新是**逐账号一次网络请求**。七个 provider × 每人数个账号 = 每次刷新十几到
+ * 几十个请求；而只有开了「最高优先」档的 provider 才**真的会读**这些数字
+ * （见 `AccountPool.applyConsumptionOrder`）。为没开那一档的 provider 白打请求
+ * 是纯粹的浪费与风控风险。
+ *
+ * ## 失败一律静默
+ *
+ * 它跑在定时器里，没有用户可操作的上下文；抛错只会变成一个 unhandledRejection。
+ * 单个 provider 失败也不影响其余 —— 最高优先档在余额未知时自动降级回顺序模式。
+ *
+ * @returns 实际刷新的 provider 列表（供调用方记日志与测试断言）。
+ */
+export async function refreshConsumptionBalances(deps: ProviderBalancesDeps): Promise<string[]> {
+  const { pool } = deps
+  const targets: string[] = []
+  for (const [provider, setting] of Object.entries(pool.allConsumption())) {
+    if (setting.order !== 'highest-balance') continue
+    try {
+      const values = await collectProviderBalances(deps, provider)
+      if (values === undefined) continue
+      const entries: Array<{ accountId: string; total: number }> = []
+      for (const item of values) {
+        // 只记**查到的**余额：查不到（凭据失效 / 网络失败 / 非积分账户）时保留
+        // 缓存里已有的值 —— 把它当成「0 余额」会让那个账号被永久排到最后并
+        // 因此再也刷不到余额（自锁），详见 `orderByBalance` 的说明。
+        if (item.balance === null) continue
+        entries.push({ accountId: item.accountId, total: item.balance.total })
+      }
+      pool.recordBalances(provider, entries)
+      targets.push(provider)
+    } catch (error) {
+      deps.ctx.logger?.warn?.(
+        `[account-hub] ${provider} 余额缓存刷新失败（该 provider 的「最高优先」档本次降级回顺序）：${String(error)}`,
+      )
+    }
+  }
+  return targets
+}
+
+/**
  * 读取 `ctx.llm` 用于枚举 provider 的模型目录。
  *
  * 用 `ctx.get` 而不是 `inject`：Account Hub 的账号管理是主要职责，模型开关只是
@@ -1157,6 +1348,12 @@ function registerAccountHubEndpoints(
   // `runCreditsClaim` / `performCheckinOnTargets` / `performCheckinSweep` 已提升到
   // 模块级，宿主（`src/index.ts`）用同一份 deps 调用，绝不复制第二份。
   const checkinDeps: CheckinSweepDeps = { ctx, pool, lobsterai, qoder, qoderCn }
+
+  /**
+   * 余额查询所需的宿主依赖（`credits.balances` 与宿主余额缓存刷新共用，见
+   * {@link collectProviderBalances}）。
+   */
+  const balanceDeps: ProviderBalancesDeps = { ctx, pool, qoder, qoderCn }
 
   /**
    * 执行自动签到（`checkin.perform` / `checkin.sweep` 共用）。
@@ -1919,99 +2116,10 @@ function registerAccountHubEndpoints(
       // 网络耗时拖慢，且一次查询失败会让整份列表都取不到。
       case 'credits.balances': {
         const req = payload as RpcCreditsBalancesRequest
-        // provider → 池键（见 {@link poolProviderFor}）。
-        const provider = poolProviderFor(req.provider)
-        const accounts = await pool.listAccounts(provider)
-        if (provider === 'codearts') {
-          // 余额来自 `statistics/plugin`（与账户类型检测**同一个响应**），
-          // 故用带原因的钩子：非积分账户要显示「Token 计费账户」而不是
-          // 误导性的「余额查询失败」——账户类型差异不是故障。
-          const values = await collectCreditBalances<CodeArtsCredential, undefined>(accounts, undefined, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalanceDetailed: async (credential) => {
-              // 用带原因的版本：`fetchCodeArtsAccountInfo` 只回 null，会把
-              // 「AK 限流」「签名失败」「凭据过期」压成同一句笼统文案，
-              // 用户与排查者都拿不到线索（本端点就因此把一次 401 显示成了
-              // 无信息量的「账户信息查询失败」）。
-              const result = await fetchCodeArtsAccountInfoDetailed(credential)
-              if (!result.ok) return { balance: null, error: `账户信息查询失败：${result.message}` }
-              const info = result.info
-              if (!info.isCreditPackage) {
-                return {
-                  balance: null,
-                  error: info.isTokenPackage
-                    ? 'Token 计费账户，无积分余额'
-                    : '非积分计费账户，无积分余额',
-                }
-              }
-              // 积分账户但没有 credit metric：如实报「未返回积分数据」，
-              // 不显示成 0 —— 0 会让用户以为自己把积分用光了。
-              if (info.credit === undefined) return { balance: null, error: '未返回积分数据' }
-              return { balance: info.credit }
-            },
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        if (provider === LOBSTERAI.id) {
-          const values = await collectCreditBalances(accounts, LOBSTERAI, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        if (provider === TRAE_CN.id) {
-          // Trae CN 面板显示**通用池**（`available_endpoint === 0`）—— IDE 对话
-          // 扣的就是它，即本 provider 实际能花的钱。
-          // ⚠️ 池是**路径属性**，与账号无关（账号池那条链路见上面的
-          // {@link poolProviderFor}）：将来若再出现别的 Trae 路径，在这里按
-          // `req.provider` 分支选池，而不是把池并进账号映射。
-          const values = await collectCreditBalances<TraeCnCredential, TraeCnProduct>(accounts, TRAE_CN, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential, product) =>
-              fetchTraeCnCreditBalance(credential, product, TRAE_CN_POOL_UNIVERSAL, { onDebug: (msg) => ctx.logger?.info?.(msg) }),
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        if (provider === QODER.id || provider === QODER_CN.id) {
-          // Qoder **只有一个池**（三池结构里另外两个本账号缺席，且它们同属这一个
-          // 端点的同一个数字口径），故没有任何选池分支，不要为「形态对称」凭空造一个。
-          // CN 同样如此：实测 CN 的 quota 响应只有 `userQuota` + `addOnQuota`，
-          // `orgResourcePackage` 键**整个不存在** —— 而三池解析本来就是容缺的
-          // （每个池独立解析，缺席 = 该池不存在），故**无需任何 CN 专属分支**。
-          //
-          // 第二个实参是本 region 的 auth 实例：额度端点**只认 `jt-`**
-          // （PAT 打它回 401 `TOKEN_EXPIRE`），由 auth 负责换取与缓存；
-          // 而 jt 缓存是**实例字段**，用错实例换来的是另一区的 jt。
-          //
-          // ⚠️ **第三个实参必须是本 region 的产品配置**（`region.product`）：
-          // 它决定 `openapiBase`（额度端点 host）。传错会让请求打到另一区，
-          // 表现为「凭据失效」而不是任何配置错误。
-          const region = qoderRegionFor(req.provider, qoder, qoderCn)
-          if (region === undefined) {
-            return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
-          }
-          const values = await collectCreditBalances<QoderCredential, QoderProduct>(accounts, region.product, {
-            resolve: (ref) => ctx.credentials.resolve(ref),
-            fetchBalance: (credential, product) =>
-              fetchQoderCreditBalance(credential, region.auth, {
-                product,
-                onDebug: (msg) => ctx.logger?.info?.(msg),
-              }),
-            warn: (msg) => ctx.logger?.warn?.(msg),
-          })
-          return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
-        }
-        const product = productById(provider)
-        if (product === undefined) {
+        const values = await collectProviderBalances(balanceDeps, req.provider)
+        if (values === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
-        const values = await collectCreditBalances(accounts, product, {
-          resolve: (ref) => ctx.credentials.resolve(ref),
-          warn: (msg) => ctx.logger?.warn?.(msg),
-        })
         return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
       }
 
@@ -2185,6 +2293,65 @@ function registerAccountHubEndpoints(
               ctx.logger?.warn?.(`[account-hub] 清理 ${req.provider} 垃圾模型键失败: ${String(error)}`)
             }
           }
+        }
+        return { ok: true, value }
+      }
+
+      // 读某 provider 的**消耗顺序 / 切换粒度**（面板打开时拉一次）。
+      //
+      // 与 `model.list` 同一条取舍：这两个配置按 **provider id** 存，**刻意不经过
+      // `poolProviderFor()`**（映射会把一个 provider 的设置写进另一个）。今天该映射
+      // 是恒等的，但把「按 provider 存的东西」统一走 provider id 是一条更稳的约定。
+      case 'consumption.get': {
+        const req = payload as RpcConsumptionGetRequest
+        if (typeof req.provider !== 'string' || req.provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 必填' } }
+        }
+        const value: RpcConsumptionGetResponse = {
+          provider: req.provider,
+          consumption: pool.consumptionSetting(req.provider),
+        }
+        return { ok: true, value }
+      }
+
+      // 写某 provider 的消耗顺序 / 切换粒度。**部分更新**：只改传进来的字段
+      // （界面是两个彼此独立的选择器，整体覆盖会让一个标签页的过期状态
+      // 把另一个标签页刚改的字段冲掉）。
+      //
+      // 写入后**不需要任何重建**：选号时每次都实时读池里的配置
+      // （`AccountPool.getAvailableAccount` 的 `pick` 分支），因此下一次请求即生效。
+      case 'consumption.set': {
+        const req = payload as RpcConsumptionSetRequest
+        if (typeof req.provider !== 'string' || req.provider.length === 0) {
+          return { ok: false, error: { code: 'bad-request', message: 'provider 必填' } }
+        }
+        try {
+          // 类型层面放宽成 `string` 是刻意的：这是**来自客户端的不可信输入**，
+          // 取值域校验的唯一权威在 `AccountPool.writeConsumption`（它抛出的
+          // 那句错误带着可选值，直接回给用户）。在这里先断言成联合类型只会
+          // 把「校验」伪装成「类型安全」—— 客户端照样可以发任意字符串。
+          await pool.writeConsumption(req.provider, {
+            order: req.order as ConsumptionOrder | undefined,
+            switch: req.switch as ConsumptionSwitch | undefined,
+          })
+        } catch (error) {
+          // 非法档位：把池那句带可选值的原文回给客户端 —— 那是用户唯一能据以
+          // 改正的信息（与 `model.setContextBudget` 的取舍一致）。
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          }
+        }
+        ctx.logger.info(
+          `[account-hub] ${req.provider} 消耗配置更新：`
+          + `顺序 ${req.order ?? '(不变)'}，粒度 ${req.switch ?? '(不变)'}`,
+        )
+        const value: RpcConsumptionSetResponse = {
+          provider: req.provider,
+          consumption: pool.consumptionSetting(req.provider),
         }
         return { ok: true, value }
       }

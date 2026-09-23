@@ -1272,8 +1272,12 @@ export interface QoderAdapterOptions {
    * `model` 是**本次请求的目标模型**，由 `stream()` 从 `options.model` 透传，
    * 供多账号池跳过「对该模型仍有限流/额度标记」的账号。无目标模型的场景
    * （拉模型目录）省略该参数。
+   *
+   * `turnIdentity` 是本次请求所属**轮次**的标识对象（`options.signal`），供账号池
+   * 实现「切换粒度 = 按轮次」—— 同轮锁同一账号。见 `src/account-consumption.ts`
+   * 的 `TurnKeyTracker`（DSH 的 `GenerateOptions` 里没有 turn 级字段）。
    */
-  resolveCredential: (model?: string) => Promise<QoderCredential | undefined>
+  resolveCredential: (model?: string, turnIdentity?: unknown) => Promise<QoderCredential | undefined>
   /**
    * 静默续期凭据（对 Qoder 而言就是**重打 exchange**）。
    *
@@ -1281,8 +1285,10 @@ export interface QoderAdapterOptions {
    * model 选号**：`refresh` 是「按账号池选号再续期该账号」，若它与解析时用的过滤
    * 口径不同（例如这里漏传 model），就会出现「解析到 B、却刷新了 A」—— B 的过期
    * token 永不更新，用户看到「刚登录好却一直认证失败」而日志全绿。
+   *
+   * `turnIdentity` 同理必须一起透传（形状与 `resolveCredential` 一致）。
    */
-  refresh: (model?: string) => Promise<void>
+  refresh: (model?: string, turnIdentity?: unknown) => Promise<void>
    // ⚠️ 死接线登记（2026-09-23 核对）：本适配器声明了 `options.refresh` 但消费循环
    // 从不调用它——Qoder 的 401 由「重换 jt 一次」闭环处理（getJobToken /
    // invalidateJobToken），PAT 本身不过期，续期语义与其余四家适配器（各 2 处调用）
@@ -1733,7 +1739,9 @@ export class QoderAdapter extends LlmAdapter {
     // 1. 获取凭据（PAT 本体在 access_token）。
     // 传 options.model：让账号池在**发请求之前**就跳过对该模型已记为额度耗尽的
     // 账号（否则每次请求都要先白跑一遍这些账号再换号）。
-    const credential = await this.options.resolveCredential(options.model)
+    // 第二个实参是本轮的标识对象（`options.signal`）：账号池据此实现
+    // 「切换粒度 = 按轮次」（同轮锁同一账号）。
+    const credential = await this.options.resolveCredential(options.model, options.signal)
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError(
         `${this.product.id}: no usable credential; paste a personal access token first`,

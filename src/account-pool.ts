@@ -7,6 +7,21 @@ import {
   sanitizeCheckins,
   type AccountHubStorage,
 } from './account-hub-storage.js'
+import {
+  BalanceCache,
+  CONSUMPTION_ORDERS,
+  CONSUMPTION_SWITCHES,
+  TurnAccountLock,
+  consumptionFor,
+  nextCursorAfter,
+  orderByBalance,
+  rotateToCursor,
+  sanitizeConsumption,
+  sanitizeConsumptionCursors,
+  type ConsumptionCursorMap,
+  type ConsumptionMap,
+  type ConsumptionSetting,
+} from './account-consumption.js'
 import { migrateAccountHubIntoStorage } from './account-hub-migration.js'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
@@ -70,6 +85,10 @@ interface AccountHubSettingsValue {
   contextBudgets?: ContextBudgetMap
   /** 自动签到记录（`provider:accountId` → 本地纪元日数，见 `CheckinsMap`）。 */
   checkins?: Record<string, number>
+  /** 消耗顺序 / 切换粒度（见 `ConsumptionMap`）。 */
+  consumption?: ConsumptionMap
+  /** 遍历游标（见 `ConsumptionCursorMap`）。 */
+  consumptionCursors?: ConsumptionCursorMap
   /** 数据版本号，供一次性迁移 short-circuit（见 provider-rename-migration.ts）。 */
   schemaVersion?: number
 }
@@ -80,13 +99,18 @@ interface AccountHubSettingsValue {
  * - `0`（或字段缺失）= 旧命名：provider 为 `buddy`（中国版）/ `workbuddy`（国际版）；
  * - `1` = 新命名（`buddy-cn` / `buddy`），已由
  *   `src/provider-rename-migration.ts` 迁移完毕；
- * - `2` = 文档新增第五字段 `checkins`（自动签到记录）。该迁移只是**补字段**
- *   （旧文档读入时为空对象，无需搬动任何既有数据），由 `src/account-hub-storage.ts`
- *   的 `sanitizeAccountHubDocument` 在读路径兜底，不改变既有数据的含义。
+ * - `2` = 文档新增第五字段 `checkins`（自动签到记录）。
+ * - `3` = 文档新增第六、第七字段 `consumption` / `consumptionCursors`
+ *   （消耗顺序 / 切换粒度 / 遍历游标）。
  *
- * 迁移函数在版本号 ≥1 时整体 short-circuit，因此这个数字只会前进。
+ * ⚠️ **2 与 3 两次提升都只是「补字段」，不搬动任何既有数据**：旧文档读入时
+ * 由 `sanitizeAccountHubDocument` 补空对象（等价于「顺序 + 按轮次」的默认配置）。
+ * 提升版本号的实际效果是让 `migrateProviderNames` 对旧文档**多跑一次无操作迁移**
+ * 并把版本号落定，从而「文档已含该字段」这件事在存储里有个可判定的标记。
+ *
+ * 迁移函数在版本号 ≥ 本常量时整体 short-circuit，因此这个数字只会前进。
  */
-export const ACCOUNT_HUB_SCHEMA_VERSION = 2
+export const ACCOUNT_HUB_SCHEMA_VERSION = 3
 
 /** ctx.settings.register() 返回的 owner scope（只用到 get/replace）。 */
 interface SettingsScopeLike {
@@ -106,6 +130,8 @@ interface AccountHubDocumentLike {
   disabledModels: ModelDisableMap
   contextBudgets: ContextBudgetMap
   checkins: Record<string, number>
+  consumption: ConsumptionMap
+  consumptionCursors: ConsumptionCursorMap
   schemaVersion: number
 }
 
@@ -149,6 +175,13 @@ const accountHubSchema = Schema.object({
   // 用 dict 承接，单项由 AccountPool 自身在读写时保证。
   // **必须带 `.default({})`**：老配置里没有该字段（见 schemaVersion 同理）。
   checkins: Schema.dict(Schema.any()).default({}),
+  // 消耗顺序 / 切换粒度（provider id → `{ order, switch }`）。与黑名单同理用
+  // `Schema.dict(Schema.any())`：key 是动态的 provider id，值由 AccountPool 校验。
+  // **必须带 `.default({})`**：老配置里没有该字段。
+  consumption: Schema.dict(Schema.any()).default({}),
+  // 遍历游标（provider id → 下一个该用的 accountId）。同上，键值都动态。
+  // **必须带 `.default({})`**：老配置里没有该字段。
+  consumptionCursors: Schema.dict(Schema.any()).default({}),
   // 数据版本号。`0` = 旧命名（buddy=中国版 / workbuddy=国际版）尚未迁移；
   // 见 {@link ACCOUNT_HUB_SCHEMA_VERSION}。**必须带 default**：老配置文件里没有
   // 这个字段，缺失时按 0 处理才等价于「迁移尚未执行」。
@@ -288,6 +321,21 @@ export class AccountPool {
    */
   private checkinCache: Record<string, number> = {}
   /**
+   * 消耗顺序 / 切换粒度的**权威进程内副本**（同 {@link cache}）。
+   *
+   * ⚠️ 与账号、黑名单、预算、签到、游标、版本号是**同一份文档的七件套**：任何一次
+   * 写入都是整体 replace，七者必须互相携带，漏一个就会在下次别的写入里被清空。
+   */
+  private consumptionCache: ConsumptionMap = {}
+  /**
+   * 遍历游标的**权威进程内副本**（同 {@link cache}）。
+   *
+   * ⚠️ 同属七件套（理由见 {@link consumptionCache}）。它只有 `round-robin` 档会写，
+   * 但**任何**写入路径都必须带上它 —— 否则一次无关的“改个模型开关”就会把游标清零，
+   * 表现是「轮转突然从第一个重新开始」。
+   */
+  private cursorCache: ConsumptionCursorMap = {}
+  /**
    * 数据版本号的**权威进程内副本**（同 {@link cache}）。
    *
    * 一次性迁移（provider 改名）靠它 short-circuit，因此它必须与账号、黑名单
@@ -297,6 +345,21 @@ export class AccountPool {
   private versionCache = 0
   /** 是否已从持久层完成首次载入。 */
   private loaded = false
+  /**
+   * 宿主侧**内存级余额缓存**（最高优先档的依赖）。
+   *
+   * 刻意不落盘（理由见 `src/account-consumption.ts` 的 `BalanceCache` 说明）：
+   * 余额是秒级可变的远端事实，落盘只会让一份几小时前的数字看起来像权威数据。
+   */
+  private readonly balances = new BalanceCache()
+  /**
+   * 轮次锁：轮次键 → 该轮锁定的 accountId（`per-turn` 粒度用）。
+   *
+   * 轮次键由调用方（宿主的选号器）给出 —— 它把 `options.signal` 的身份换算成一个
+   * 稳定字符串（见 `src/index.ts` 的 `makeTurnKey`）。池这一层不认识 signal，
+   * 只认「同一个键 = 同一轮」，从而保持可单测。
+   */
+  private readonly turnLocks = new TurnAccountLock()
 
   constructor(private readonly ctx: Context) {
     const settings = this.ctx.get('settings') as SettingsServiceLike | undefined
@@ -399,6 +462,8 @@ export class AccountPool {
       this.modelCache = doc.disabledModels
       this.budgetCache = doc.contextBudgets
       this.checkinCache = doc.checkins
+      this.consumptionCache = doc.consumption
+      this.cursorCache = doc.consumptionCursors
       this.versionCache = doc.schemaVersion
       return
     }
@@ -420,6 +485,10 @@ export class AccountPool {
     this.budgetCache = sanitizeContextBudgets(value?.contextBudgets)
     // 签到记录同理（比预算更晚加入）：缺失时保持空表（等价于"全部未签到"）。
     this.checkinCache = sanitizeCheckins(value?.checkins)
+    // 消耗顺序 / 游标同理（比签到更晚加入）：缺失时保持空表
+    // —— 等价于「顺序 + 按轮次」的默认配置，即**改动前的行为**。
+    this.consumptionCache = sanitizeConsumption(value?.consumption)
+    this.cursorCache = sanitizeConsumptionCursors(value?.consumptionCursors)
     // 版本号同理：老配置文件（或首次安装）没有该字段 → 按 0 处理，
     // 即「迁移尚未执行」。
     const version = value?.schemaVersion
@@ -427,9 +496,9 @@ export class AccountPool {
   }
 
   /**
-   * 持久化五件套。
+   * 持久化七件套。
    *
-   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，五件套一起带上。
+   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，七件套一起带上。
    * 主路径是 storage 域的 `global.set`（整体替换那份单例文档）；回退路径是
    * settings scope 的 `replace`（同样是整体替换，漏带即清空）。
    */
@@ -442,6 +511,8 @@ export class AccountPool {
         disabledModels: document.disabledModels,
         contextBudgets: document.contextBudgets,
         checkins: document.checkins,
+        consumption: document.consumption,
+        consumptionCursors: document.consumptionCursors,
         schemaVersion: document.schemaVersion,
       })
       return
@@ -525,6 +596,8 @@ export class AccountPool {
       disabledModels,
       contextBudgets: this.budgetCache,
       checkins: checkins ?? this.checkinCache,
+      consumption: this.consumptionCache,
+      consumptionCursors: this.cursorCache,
       schemaVersion,
     }, '无 settings scope，数据迁移结果未持久化')
   }
@@ -548,6 +621,8 @@ export class AccountPool {
       disabledModels: this.modelCache,
       contextBudgets: this.budgetCache,
       checkins: this.checkinCache,
+      consumption: this.consumptionCache,
+      consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
     }, '无 settings scope，账号变更未持久化')
   }
@@ -614,6 +689,8 @@ export class AccountPool {
       disabledModels,
       contextBudgets: this.budgetCache,
       checkins: this.checkinCache,
+      consumption: this.consumptionCache,
+      consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
     }, '无 settings scope，模型黑名单变更未持久化')
   }
@@ -670,6 +747,8 @@ export class AccountPool {
       disabledModels: this.modelCache,
       contextBudgets,
       checkins: this.checkinCache,
+      consumption: this.consumptionCache,
+      consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
     }, '无 settings scope，上下文窗口预算变更未持久化')
   }
@@ -724,6 +803,8 @@ export class AccountPool {
       disabledModels: this.modelCache,
       contextBudgets: this.budgetCache,
       checkins,
+      consumption: this.consumptionCache,
+      consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
     }, '无 settings scope，签到记录变更未持久化')
   }
@@ -757,6 +838,142 @@ export class AccountPool {
   }
 
   /** 列出某个 provider 的所有账号（含状态信息） */
+  /**
+   * 读某 provider 的**消耗顺序 / 切换粒度**配置。
+   *
+   * 未配置时返回默认值（`sequential` + `per-turn`），**永不抛错** —— 它是选号
+   * 热路径上的同步读，一次配置读取失败绝不能让请求发不出去。
+   */
+  consumptionSetting(provider: string): ConsumptionSetting {
+    this.ensureLoaded()
+    return consumptionFor(this.consumptionCache, provider)
+  }
+
+  /**
+   * 列出**全部** provider 的消耗配置（浅拷贝快照）。
+   *
+   * 供 RPC 一次性回传整页状态，以及宿主判定「哪些 provider 开了最高优先档」
+   * （后者决定余额刷新要不要为它发请求，见 `src/index.ts` 的余额刷新接线）。
+   */
+  allConsumption(): ConsumptionMap {
+    this.ensureLoaded()
+    const snapshot: ConsumptionMap = {}
+    for (const [provider, setting] of Object.entries(this.consumptionCache)) {
+      snapshot[provider] = { ...setting }
+    }
+    return snapshot
+  }
+
+  /**
+   * 写某 provider 的消耗配置（**部分更新**）。
+   *
+   * ## 为什么是部分更新而不是整体覆盖
+   *
+   * 界面是两个**彼此独立**的选择器（消耗顺序 / 切换粒度），各自只改一个字段。
+   * 若做成整体覆盖，客户端每次都要把另一半也回传 —— 一旦它手上的另一半是过期的
+   * （另一个标签页刚改过），用户改顺序会顺手把粒度改回去。
+   *
+   * ## 校验在写入侧（RPC 也要再判一次）
+   *
+   * 非法档位**抛错拒绝**，而不是「尽力而为」地写一个永不生效的值：
+   * 后者在界面上的表现是「选了没反应」，比一句明确的报错难排查得多。
+   *
+   * @param provider - provider id。
+   * @param patch - 只含要改的字段；两个字段都不给时是无操作（不写盘）。
+   */
+  async writeConsumption(provider: string, patch: Partial<ConsumptionSetting>): Promise<void> {
+    // 必须先 ensureLoaded()：`writeConsumptionAll` 会把 `loaded` 置 true 并整表写回，
+    // 若此时七件套还是构造初值，这次写入会把它们全部覆盖成空（同 `setModelDisabled`）。
+    this.ensureLoaded()
+    if (patch.order !== undefined && !CONSUMPTION_ORDERS.includes(patch.order)) {
+      throw new Error(`不支持的消耗顺序：${String(patch.order)}（可选 ${CONSUMPTION_ORDERS.join(' / ')}）`)
+    }
+    if (patch.switch !== undefined && !CONSUMPTION_SWITCHES.includes(patch.switch)) {
+      throw new Error(`不支持的切换粒度：${String(patch.switch)}（可选 ${CONSUMPTION_SWITCHES.join(' / ')}）`)
+    }
+    if (patch.order === undefined && patch.switch === undefined) return
+    const current = consumptionFor(this.consumptionCache, provider)
+    const merged: ConsumptionMap = { ...this.consumptionCache }
+    // 经 `sanitizeConsumption` 落位：**等于默认值的条目会被剔除**，因此「改回默认」
+    // 就是删除键，文件里不留 `{ provider: {默认值} }` 这类无意义噪音。
+    // 复用同一个归一化函数而不是自己判等 —— 判据只有一份，不会与读路径漂移。
+    const normalized = sanitizeConsumption({
+      [provider]: {
+        order: patch.order ?? current.order,
+        switch: patch.switch ?? current.switch,
+      },
+    })
+    if (normalized[provider] === undefined) delete merged[provider]
+    else merged[provider] = normalized[provider]
+    await this.writeConsumptionAll(merged)
+  }
+
+  /** 持久化消耗配置（同时更新进程内权威副本）。 */
+  private async writeConsumptionAll(consumption: ConsumptionMap): Promise<void> {
+    this.consumptionCache = consumption
+    this.loaded = true
+    if (this.storage === undefined && !this.scope) {
+      this.ctx.logger?.warn?.('[account-hub] 无持久化通路，消耗配置变更未持久化')
+      return
+    }
+    // 与其余各 writeXxx 对称：整体 replace 必须携带另外六件套，否则会被清空。
+    await this.persist({
+      accounts: this.cache,
+      disabledModels: this.modelCache,
+      contextBudgets: this.budgetCache,
+      checkins: this.checkinCache,
+      consumption,
+      consumptionCursors: this.cursorCache,
+      schemaVersion: this.versionCache,
+    }, '无 settings scope，消耗配置变更未持久化')
+  }
+
+  /**
+   * 记下遍历游标（`round-robin` 档「下一个该用的账号」）。
+   *
+   * **游标没变时不写盘**：单账号 provider 每次请求的游标都是它自己，若照写不误，
+   * 每个请求都会触发一次整体 replace（含全部账号与配置）——纯属浪费，且在
+   * storage 上是真实的 IO。
+   */
+  private async writeConsumptionCursor(provider: string, accountId: string): Promise<void> {
+    this.ensureLoaded()
+    if (this.cursorCache[provider] === accountId) return
+    const next: ConsumptionCursorMap = { ...this.cursorCache, [provider]: accountId }
+    this.cursorCache = next
+    this.loaded = true
+    if (this.storage === undefined && !this.scope) return
+    await this.persist({
+      accounts: this.cache,
+      disabledModels: this.modelCache,
+      contextBudgets: this.budgetCache,
+      checkins: this.checkinCache,
+      consumption: this.consumptionCache,
+      consumptionCursors: next,
+      schemaVersion: this.versionCache,
+    }, '无 settings scope，遍历游标变更未持久化')
+  }
+
+  /**
+   * 整批记录余额（供宿主侧的余额刷新调用，见 `src/account-hub-rpc.ts` 的
+   * `collectProviderBalances`）。**只进内存缓存，不落盘**。
+   *
+   * @param provider - provider id。
+   * @param entries - 每个账号的余额；查不到的账号不在数组里（保持缓存原值）。
+   * @param now - 记录时刻（缺省为当前时间；便于测试注入）。
+   */
+  recordBalances(
+    provider: string,
+    entries: readonly { accountId: string; total: number }[],
+    now: number = Date.now(),
+  ): void {
+    this.balances.recordMany(provider, entries, now)
+  }
+
+  /** 读该 provider 当前**未过期**的余额快照（最高优先档的排序依据）。 */
+  balanceSnapshot(provider: string, now: number = Date.now()): Map<string, number> {
+    return this.balances.snapshot(provider, now)
+  }
+
   async listAccounts(provider: string): Promise<ProviderAccountStatus[]> {
     const filtered = this.readAccounts().filter(a => a.provider === provider)
     const results: ProviderAccountStatus[] = []
@@ -1121,11 +1338,45 @@ export class AccountPool {
    *
    * 在池这一层排除（而非让调用方自己跳过）是必要的：调用方只能拿到
    * 「池认为最优的一个」，无法枚举候选自己去重。
+   *
+   * ## `pick`：消耗顺序 / 切换粒度（可选，**不传即历史行为**）
+   *
+   * 见 `src/account-consumption.ts`。四种调用形态的语义：
+   *
+   * | `pick` | 行为 |
+   * |---|---|
+   * | 不传 | **与改动前逐字段一致**（顺序档：永远取第一个可用账号） |
+   * | `{ turnKey }` | 按该 provider 配置的档位选号，`per-turn` 时同轮锁同一账号 |
+   * | `{ turnKey: '' }` / 省略 `turnKey` | 按档位选号但**不锁**（等价 `per-request`） |
+   *
+   * ⚠️ **不传 `pick` 与「传了但没配过」必须都是历史行为** —— auth 的单发路径
+   * （`buddy-auth.fetchModels` / `lobsterai-auth.fetchModels`）与
+   * `makeAccountPicker` 都靠这条不被影响。
+   *
+   * ## 适配器的**换号重试循环刻意不传 `pick`**
+   *
+   * `buddy-adapter` / `lobsterai-adapter` / `trae-cn-adapter` / `qoder-adapter` /
+   * `llm-adapter` 在限流或额度耗尽后各自有一个「取下一个未试过的账号」循环，
+   * 那里的调用**刻意保持三个实参**（不传 `pick`）。理由是语义而非省事：
+   *
+   * - 消耗顺序的档位定义是「每次**请求**轮转下一个」。一次请求内部的换号重试
+   *   仍是**同一次请求**，让它再消耗一格轮转名额，会让「两个账号」的池在
+   *   一请求一失败后跳过整整一轮 —— 用户看到的是「轮转跳着走」；
+   * - 重试的目标只有一个：**换一个没试过的账号**。候选已被 `tried` 排除，
+   *   取数组顺序的下一个即可，与档位无关；
+   * - 它同时避开了「重试路径二次写游标」——那会让一次失败请求落盘两次。
+   *
+   * 换句话说：档位决定**请求开始时**用谁，重试只决定**这一个请求内**还试谁。
+   *
+   * @param pick.turnKey - 轮次键：同一个键 = 同一轮对话（`per-turn` 档据此锁号）。
+   *        宿主侧由 `options.signal` 的身份换算（见 `src/index.ts` 的
+   *        `TurnKeyTracker`）；空串 / 缺省表示「这不是一轮对话」（不锁）。
    */
   async getAvailableAccount(
     provider: string,
     modelId: string,
     excludeAccountIds?: ReadonlySet<string>,
+    pick?: { turnKey?: string },
   ): Promise<{ entry: ProviderAccountEntry; credential: CodeArtsCredential | BuddyCredential } | null> {
     const candidates = this.readAccounts()
       .filter(a => a.provider === provider && a.enabled)
@@ -1149,7 +1400,74 @@ export class AccountPool {
     // 注意 candidates 来自 readAccounts() 的 filter，而 filter 保持原数组
     // 顺序，故这里天然就是手动顺序，无需任何排序。
     //
-    // 逐个尝试解析凭据，跳过占位/损坏条目（并记录原因，避免静默失败）
+    // ── 消耗顺序 / 切换粒度（只在调用方传了 `pick` 时介入）──
+    //
+    // ⚠️ **不传 `pick` 时下面整段都不执行**，候选顺序与选中结果与改动前逐字段
+    // 相同。这是硬约束：`buddy-auth.fetchModels` / `lobsterai-auth.fetchModels`
+    // 与各适配器的换号重试循环都走那条路，它们拿到的必须是「第一个可用账号」。
+    const ordered = pick === undefined ? candidates : this.applyConsumptionOrder(provider, candidates, pick)
+    if (ordered.length === 0) return null
+    const selected = await this.resolveFirstUsable(provider, ordered)
+    // 选中的是**轮转序**里的某一个时，把游标推进到它的下一项（下次请求从下一个开始）。
+    // 顺序档与最高优先档不维护游标 —— 它们的「下一个」不由上次选中决定。
+    if (selected !== null && pick !== undefined) {
+      await this.advanceCursorIfNeeded(provider, selected.entry.id, pick)
+    }
+    return selected
+  }
+
+  /**
+   * 按配置的档位重排候选（消耗顺序 + 切换粒度）。
+   *
+   * 四步，顺序不可调换：
+   * 1. **轮次锁**命中 → 直接返回那一个（只锁**已启用且通过限流过滤**的账号：
+   *    锁里的账号可能已被停用/删除/限流，那种情况必须重新选，见第 4 步）；
+   * 2. **顺序档** → 原样返回（历史行为）；
+   * 3. **遍历档** → 按游标轮转；**最高优先档** → 按余额降序（余额未知即原样，
+   *    等价降级回顺序）；
+   * 4. 选完（并在调用方解析出真正可用的账号后）登记/更新轮次锁。
+   */
+  private applyConsumptionOrder(
+    provider: string,
+    candidates: readonly ProviderAccountEntry[],
+    pick: { turnKey?: string },
+  ): readonly ProviderAccountEntry[] {
+    const setting = this.consumptionSetting(provider)
+    const turnKey = pick.turnKey
+    // ① 轮次锁：`per-turn` 档 + 有轮次键时，同轮恒用同一个账号。
+    //
+    // ⚠️ 锁里的账号必须**仍在本次候选里**才算命中。候选已经过 `enabled` 与
+    // 逐模型限流过滤，因此「锁住的账号刚被停用 / 刚触发限流」时这里自然落空，
+    // 走下面的重新选号并把锁改写到新账号上 —— 这正是需求里「锁要自愈」那条，
+    // 而且不需要任何额外的失效判定。
+    if (setting.switch === 'per-turn' && turnKey !== undefined && turnKey.length > 0) {
+      const locked = this.turnLocks.get(`${provider}\u0000${turnKey}`)
+      if (locked !== undefined) {
+        const found = candidates.find(entry => entry.id === locked)
+        if (found !== undefined) return [found]
+      }
+    }
+    // ② 顺序档：现状行为。
+    if (setting.order === 'sequential') return candidates
+    // ③ 遍历档：把「下一个该用的」提到首位。
+    if (setting.order === 'round-robin') {
+      return rotateToCursor(candidates, this.cursorCache[provider])
+    }
+    // ④ 最高优先档：余额降序。余额全未知时 `orderByBalance` 原样返回 →
+    //    自动降级为顺序档（需求明示的降级，且不许抛错）。
+    return orderByBalance(candidates, this.balances.snapshot(provider, Date.now()))
+  }
+
+  /**
+   * 从（可能已被重排的）候选里解析出**第一个凭据可用**的账号。
+   *
+   * 与改动前的循环逐行等价，唯一区别是输入数组可能已被重排 —— 因此「跳过
+   * 凭据未配置 / 损坏的账号」这条既有语义完整保留（遍历档下它会顺延到下一个）。
+   */
+  private async resolveFirstUsable(
+    provider: string,
+    candidates: readonly ProviderAccountEntry[],
+  ): Promise<{ entry: ProviderAccountEntry; credential: CodeArtsCredential | BuddyCredential } | null> {
     const failures: string[] = []
     for (const entry of candidates) {
       let resolved
@@ -1182,6 +1500,42 @@ export class AccountPool {
       )
     }
     return null
+  }
+
+  /**
+   * 选号收尾：推进遍历游标、登记轮次锁。
+   *
+   * ## 为什么两件事都在这里（而不是在 `applyConsumptionOrder` 里）
+   *
+   * 它们都需要**最终真的被选中的那个账号**，而那只在凭据解析成功之后才知道
+   * （重排后的首位可能凭据损坏、被顺延到下一个）。在这里做，锁与游标记的就是
+   * 「本次实际用了谁」，不会出现「记了 A、实际用了 B」的分叉。
+   */
+  private async advanceCursorIfNeeded(
+    provider: string,
+    pickedId: string,
+    pick: { turnKey?: string },
+  ): Promise<void> {
+    const setting = this.consumptionSetting(provider)
+    // 轮次锁：登记/改写本次实际选中的账号。`per-request` 档**不写锁**，
+    // 免得一份永不被读的锁把真正开着的会话挤出 LRU。
+    const turnKey = pick.turnKey
+    if (setting.switch === 'per-turn' && turnKey !== undefined && turnKey.length > 0) {
+      this.turnLocks.set(`${provider}\u0000${turnKey}`, pickedId)
+    }
+    if (setting.order !== 'round-robin') return
+    // 游标取「候选里选中项的下一项」。用**未重排**的原始候选算 —— 重排后的
+    // 数组里选中项恒在首位，取它的下一项会退化成「第二个账号」而非「下一个轮到的」。
+    const ordered = this.readAccounts().filter(a => a.provider === provider && a.enabled)
+    const next = nextCursorAfter(ordered, pickedId)
+    if (next === undefined) return
+    try {
+      await this.writeConsumptionCursor(provider, next)
+    } catch (error) {
+      // 游标写失败（存储只读 / 落盘异常）**绝不能让请求失败**：它只是一个
+      // 「下次从谁开始」的提示，这一轮的凭据已经选好了。下次请求回落数组顺序即可。
+      this.ctx.logger?.warn?.(`[account-hub] ${provider} 遍历游标未持久化（不影响本次请求）：${String(error)}`)
+    }
   }
 
   /**

@@ -75,14 +75,44 @@ describe('账号池 storage 域的域名与版本', () => {
 })
 
 describe('emptyAccountHubDocument', () => {
-  it('空文档是五件套齐全的空表，而不是缺字段的部分对象', () => {
+  it('空文档是七件套齐全的空表，而不是缺字段的部分对象', () => {
     expect(emptyAccountHubDocument()).toEqual({
       accounts: [],
       disabledModels: {},
       contextBudgets: {},
       checkins: {},
+      // 「消耗顺序 / 切换粒度」及其遍历游标（比签到更晚加入的两个字段）。
+      consumption: {},
+      consumptionCursors: {},
       schemaVersion: 0,
     })
+  })
+
+  it('旧文档（无新字段）读入时补空表，而不是读成 undefined', () => {
+    // 升级路径：盘上那份文档是上一版写的，没有 consumption / consumptionCursors。
+    // 读成 `{}` 等价于「顺序 + 按轮次」的默认配置，即**改动前的行为**。
+    const doc = sanitizeAccountHubDocument({
+      accounts: [],
+      disabledModels: {},
+      contextBudgets: {},
+      checkins: {},
+      schemaVersion: 1,
+    })
+    expect(doc.consumption).toEqual({})
+    expect(doc.consumptionCursors).toEqual({})
+    expect(doc.schemaVersion).toBe(1)
+  })
+
+  it('新字段的脏值逐层丢弃，不影响既有字段', () => {
+    const doc = sanitizeAccountHubDocument({
+      accounts: [{ id: 'a' }],
+      consumption: { ok: { order: 'round-robin', switch: 'per-request' }, bad: 'x', empty: {} },
+      consumptionCursors: { ok: 'a', bad: 7, blank: '' },
+      schemaVersion: 3,
+    })
+    expect(doc.consumption).toEqual({ ok: { order: 'round-robin', switch: 'per-request' } })
+    expect(doc.consumptionCursors).toEqual({ ok: 'a' })
+    expect(doc.schemaVersion).toBe(3)
   })
 
   it('每次返回新对象（共享引用会被写入方就地改坏）', () => {

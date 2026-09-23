@@ -60,6 +60,10 @@ export interface LegacyAccountHubSection {
   contextBudgets: AccountHubDocument['contextBudgets']
   /** 签到记录：旧版段里不存在，可选（缺失 = 迁移时补空表）。 */
   checkins?: AccountHubDocument['checkins']
+  /** 消耗顺序 / 切换粒度：旧版段里不存在，可选（缺失 = 补空表 = 默认配置）。 */
+  consumption?: AccountHubDocument['consumption']
+  /** 遍历游标：同上，旧版段里不存在。 */
+  consumptionCursors?: AccountHubDocument['consumptionCursors']
   schemaVersion: number
 }
 
@@ -215,6 +219,10 @@ export async function migrateAccountHubIntoStorage(
     // 签到记录从 storage 全局文档首次迁移时**不存在**（旧 settings 没有该字段）
     // —— 补空表，与「旧文档读入补空对象」的口径一致。
     checkins: section.checkins ?? {},
+    // 消耗顺序 / 遍历游标同理：旧 settings 时代不存在这两个字段，补空表
+    // —— 等价于「顺序 + 按轮次」的默认配置，即迁移前的行为。
+    consumption: section.consumption ?? {},
+    consumptionCursors: section.consumptionCursors ?? {},
     schemaVersion: section.schemaVersion,
   }
 

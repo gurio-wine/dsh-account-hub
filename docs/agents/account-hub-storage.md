@@ -4,7 +4,7 @@
 
 ## 存储与通路
 
-**存储与通路**：账号池持久层是 **`ctx.storage` 的 storage 域**（`dsh_account_hub` → `$DSH_HOME/storages/dsh_account_hub.json`，single 布局 + 一个 global 单例文档，四件套 `accounts` / `disabledModels` / `contextBudgets` / `schemaVersion`）。`contextBudget` / `writeContextBudget` 读写第四件；`writeAccounts` / `writeModels` / `writeBudgets` / `replaceAll` **四件套互带**、都汇入唯一写落点 `persist()`，后三者都**先 `ensureLoaded()`**（它们不过读路径，漏了就整体写空）。**降级矩阵** = storage 为主 → 旧 settings（`jet-hub` namespace，**历史兼容读取，勿改**）回退 → 纯内存兜底；`apply()` 里 `await pool.openStorage()` **必须早于改名迁移**（它内部重置载入标记，切换点不留数据分叉）。**一次性迁移**（`account-hub-migration.ts`）：storage 无账号数据且能读到旧来源时把 `jet-hub` 段原样搬入，来源优先级 `settings.yaml.imported` → `settings.yaml` → 旧 scope；只读来源 / 幂等 / 空表不落 / 失败不半途覆盖。⚠️ **storage 域名只接受 `^[a-z][a-z0-9_]*$`（连字符不合法）**，故是 `dsh_account_hub` 而非插件 id；⚠️ 域打开后**必须 `ctx.effect` 登记 `domain.close`**（facility 按域名单开）；⚠️ **不引 YAML 依赖**：`simple-yaml.ts` 只取目标一节，不支持的构造（锚点/别名/块标量）显式抛错。⚠️ `LlmRuntime.listModels` 会重建条目、丢掉额外字段，`ctx` 也没有「按 provider 取适配器」的入口 ⇒ 由 `register*Llm` **返回适配器实例**经上述参数注入；省略时 `model.list` 不带窗口字段、`setContextBudget` 一律拒绝（headless / 测试的既定降级）。⚠️ **回填行（被关闭的模型）与目录行必须带同一组窗口字段**。⚠️ 客户端 `ModelToggle` 根节点是 `div`、`label` 只包「名称 + 显示开关」，**档位 radio 必须在 label 之外**（放进去会连带翻转显示开关）。
+**存储与通路**：账号池持久层是 **`ctx.storage` 的 storage 域**（`dsh_account_hub` → `$DSH_HOME/storages/dsh_account_hub.json`，single 布局 + 一个 global 单例文档，七件套 `accounts` / `disabledModels` / `contextBudgets` / `checkins` / `consumption` / `consumptionCursors` / `schemaVersion`，末两件见「账号消耗顺序与切换粒度」一节）。`contextBudget` / `writeContextBudget` 读写第四件；`writeAccounts` / `writeModels` / `writeBudgets` / `writeCheckins` / `writeConsumption` / `writeConsumptionCursor` / `replaceAll` **七件套互带**、都汇入唯一写落点 `persist()`，且都**先 `ensureLoaded()`**（它们不过读路径，漏了就整体写空）。**降级矩阵** = storage 为主 → 旧 settings（`jet-hub` namespace，**历史兼容读取，勿改**）回退 → 纯内存兜底；`apply()` 里 `await pool.openStorage()` **必须早于改名迁移**（它内部重置载入标记，切换点不留数据分叉）。**一次性迁移**（`account-hub-migration.ts`）：storage 无账号数据且能读到旧来源时把 `jet-hub` 段原样搬入，来源优先级 `settings.yaml.imported` → `settings.yaml` → 旧 scope；只读来源 / 幂等 / 空表不落 / 失败不半途覆盖。⚠️ **provider 改名迁移（`provider-rename-migration.ts`）不是「只搬账号与黑名单」**：它的 `replaceAll` 必须携带全部七件套，否则一次改名就会把用户配好的消耗顺序与轮转进度一并清零（有测试断言键集合）。⚠️ **storage 域名只接受 `^[a-z][a-z0-9_]*$`（连字符不合法）**，故是 `dsh_account_hub` 而非插件 id；⚠️ 域打开后**必须 `ctx.effect` 登记 `domain.close`**（facility 按域名单开）；⚠️ **不引 YAML 依赖**：`simple-yaml.ts` 只取目标一节，不支持的构造（锚点/别名/块标量）显式抛错。⚠️ `LlmRuntime.listModels` 会重建条目、丢掉额外字段，`ctx` 也没有「按 provider 取适配器」的入口 ⇒ 由 `register*Llm` **返回适配器实例**经上述参数注入；省略时 `model.list` 不带窗口字段、`setContextBudget` 一律拒绝（headless / 测试的既定降级）。⚠️ **回填行（被关闭的模型）与目录行必须带同一组窗口字段**。⚠️ 客户端 `ModelToggle` 根节点是 `div`、`label` 只包「名称 + 显示开关」，**档位 radio 必须在 label 之外**（放进去会连带翻转显示开关）。
 
 ⚠️ **`openStorage()` 返回被缓存的同一个 Promise，可安全重入**：早期实现只用布尔闸门（`if (storageOpened) return this.storage !== undefined`），于是**首次打开仍在途**时第二次调用会以 `false` **提前 resolve** —— 挂在它 `.then()` 上的启动逻辑（改名迁移、Qoder 资料回填、自动签到 sweep、续期调度判据）全都在 storage 真正接管**之前**跑，读到旧 settings/内存快照。**任何「读池前必须等 storage」的启动逻辑都必须挂在这个 Promise 上**，不要改回布尔闸门；也不要在 `apply()` 的**同步**执行期直接读池（那时 storage 一定还没接管）。
 
@@ -50,3 +50,31 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
 ⚠️ **「选显示哪个积分池」不走 `poolProviderFor()`**：`traeCnPoolFor()` 已随 Work 路径删除，trae-cn 面板显示哪个池见 docs/agents/providers-trae-cn.md「积分余额」一节。账号映射与选池**不可合并** —— 用池键查账号会让面板空白；`TRAE_CN_POOL_WORK` / `TraeCnPoolId` **仍保留**（服务上游 `available_endpoint` 分池字段与礼包归类，非 provider 专属）。
 
 ⚠️ **刻意不经过映射的两个入口**：**`account.create`**（它按 provider 解析产品配置决定「登录怎么做」，映射会给同一份凭据建出第二个占位账号，等于把一个账号建两遍）；**`model.list` / `model.setDisabled`**（黑名单按 provider id 存，映射会把一个 provider 的开关写进另一个的黑名单）。`credits-capabilities.spec.ts` 的「集合相等」断言已同步到七条，并断言**没有条目声明 `loginHint`**（每个面板都自带「登录账号」入口）。
+
+## 账号消耗顺序与切换粒度
+
+**两个 per-provider 选择器**（Account Hub 每个 provider 面板顶部、账号卡片列表之前，并排各占一半宽）。唯一真相源是 `src/account-consumption.ts`（纯逻辑、无 ctx/IO），它同时承载取值域、默认值、候选重排与两个有界状态。
+
+| 选择器 | 档位 | 语义 |
+|---|---|---|
+| 消耗顺序 | `sequential`（默认） | 永远取当前排序第一个可用账号 —— **即改动前的行为**，故升级不改变任何既有用户的选号结果 |
+| | `round-robin` | 每次请求按账号顺序轮转下一个（a→b→c→a） |
+| | `highest-balance` | 每次请求取可用账号里积分余额最高的；**余额未知/过期时降级回顺序** |
+| 切换粒度 | `per-request` | 每次请求都按消耗顺序重新选号 |
+| | `per-turn`（默认） | 一轮对话内锁定同一账号，新轮次才重选（用户拍板的保守档：上下文连贯，也避免部分后端按会话绑定凭据） |
+
+**存储七件套**：`AccountHubDocument` 新增 `consumption`（`provider → { order, switch }`）与 `consumptionCursors`（`provider → 下一个该用的 accountId`）。它们与既有五件套是**同一份文档**，故必须逐点串进 `emptyAccountHubDocument()` / `sanitizeAccountHubDocument()` / `persist()` 两条分支 / `writeAccounts` / `writeModels` / `writeBudgets` / `writeCheckins` / `writeConsumption` / `writeConsumptionCursor` / `replaceAll` / `ensureLoaded()` 两分支 —— **漏一处就被静默清空**。`ACCOUNT_HUB_SCHEMA_VERSION` bump 到 **3**；⚠️ `ACCOUNT_HUB_DOMAIN_VERSION`（文件格式版本）**保持 1**：storage 后端不校验字段集合，加字段不破坏既有文件。
+
+**等于默认值的条目不留**（读入与写入两侧同口径，复用同一个 `sanitizeConsumption`）：否则「用户从没配过」与「配成了默认值」在存储文件里长得一样。非法档位在 `AccountPool.writeConsumption` **抛错拒绝**（RPC 把它原文回给客户端，那句里带着可选值）。
+
+**选号落点**：`AccountPool.getAvailableAccount(provider, modelId, excludeAccountIds?, pick?)` 新增第四个**可选**参数。⚠️ **不传 `pick` 时行为与改动前逐字段相同**（恒取第一个可用账号）—— `buddy-auth` / `lobsterai-auth` 的 `fetchModels`（拉目录）与四个适配器的**换号重试循环**都靠这条不被影响。适配器路径传 `pick`，由宿主 `makeAccountPicker` 把 `options.signal` 经模块级 `TurnKeyTracker` 换算成轮次键。
+
+⚠️ **轮次 = `options.signal` 的身份**，不是 `sessionId`：DSH 的 `GenerateOptions` 里**没有任何 turn 级字段**，而 `sessionId` 是**会话级、跨轮稳定**（`packages/core/agent-loop/src/agent.ts` 的 `buildRequest` 恒传 `this.session.id`），拿它当轮次键会让「按轮次」退化成「按会话」（一个会话永远只用一个账号）。真正「同轮恒定、跨轮必变」的只有 signal：agent-loop 每开一个 turn 换一次 `AbortController`（`turn()` 末尾 `phase.abort = new AbortController()`），同轮内多个 step 共用一个。因此 `TurnKeyTracker` 用 WeakMap 按**对象身份**发号（不阻止 GC）。⚠️ 适配器的**每一处** `resolveCredential` / `refresh` 都必须带这个实参：漏传任何一处，那条路径就绕过轮次锁、按顺序挑回第一个账号（续期路径上表现为刷新了别的账号的凭据 —— S1 缺陷换个触发条件复现）。`tests/unit/account-consumption-rpc.spec.ts` 有静态断言钉死。
+
+**两个有界状态**（都在池内、**都不落盘**）：
+- **余额缓存**（`BalanceCache`，TTL 4h 与签到 sweep 同节奏）：宿主侧维持，启动后刷一次 + 每 4h 刷一次（`src/index.ts`，与签到 sweep 同款 `setInterval` + `unref` + `ctx.effect` 形态，时序必须挂在 `openStorage()` 之后）。⚠️ **只刷配置了 `highest-balance` 的 provider**（刷新是逐账号一次网络请求，为没开那一档的白打请求没有意义），过滤收在 `refreshConsumptionBalances` 内部（唯一实现）。余额是秒级可变的远端事实，故**不落盘**：过期即降级回顺序，代价只是一次保守选号。
+- **轮次锁**（`TurnAccountLock`，LRU 上限 100）：按会话累积而 DSH 不暴露「会话已结束」信号，不设上限就是确定的泄漏。`get` 命中时刷新最近使用次序（否则长会话每轮都被淘汰，粒度档形同虚设）；锁里的账号必须**仍在本次候选里**才算命中，因此「锁住的账号刚被停用/限流」自然走重新选号 —— 锁自愈不需要任何额外失效判定。
+
+**余额与选号共用同一条收集实现**（`collectProviderBalances`，模块级）：RPC `credits.balances` 与宿主余额刷新都调它 —— 各写一份分派必然漂移，而漂移的形态很隐蔽：面板显示的数字与选号用的数字来自两套口径。
+
+**RPC**：`consumption.get` / `consumption.set`（**部分更新**，只改传进来的字段）。⚠️ 与 `model.list` / `model.setDisabled` 同一取舍：这两个配置按 **provider id** 存，**刻意不经过 `poolProviderFor()`**。写入后**不重建任何东西**：选号每次都实时读池里的配置，下一次请求即生效。客户端 `ConsumptionSelectors`（`plugin-src/client/account-hub.js`）是**受控组件 + 不做乐观更新**（与 `ModelToggle` / `ModelTierPicker` 同款），形态照抄 `ModelTierPicker` 的原生 radio 组，**不用 `<select>`**（全仓无此惯例）；同一组内 radio 同名、两组之间不同名（否则会跨组互斥）。

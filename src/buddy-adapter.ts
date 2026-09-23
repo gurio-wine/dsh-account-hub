@@ -186,16 +186,22 @@ export interface BuddyAdapterOptions {
    * 多账号池据此跳过「对该模型仍有限流/积分耗尽标记」的账号，使不可用账号在
    * **发请求之前**就被排除，而不是先发一次必然失败的请求再换号。
    * 拉模型目录（`fetchModels`）等无目标模型的场景省略该参数。
+   *
+   * `turnIdentity` 是本次请求所属**轮次**的标识对象（`options.signal`），供账号池
+   * 实现「切换粒度 = 按轮次」—— 同轮锁同一账号。见 `src/account-consumption.ts`
+   * 的 `TurnKeyTracker`（DSH 的 `GenerateOptions` 里没有 turn 级字段）。
    */
-  resolveCredential: (model?: string) => Promise<BuddyCredential | undefined>
+  resolveCredential: (model?: string, turnIdentity?: unknown) => Promise<BuddyCredential | undefined>
   /**
    * 静默续期凭据。
    *
    * `model` 与 {@link BuddyAdapterOptions.resolveCredential} 同源（同样由
    * `stream()` 从 `options.model` 透传），供「按账号池选号再续期」的实现
    * （如 LobsterAI 的 `refresh`）保持与选号一致的口径。默认单凭据路径忽略它。
+   *
+   * `turnIdentity` 同理必须一起透传：续期与解析必须挑到**同一个**账号。
    */
-  refresh: (model?: string) => Promise<void>
+  refresh: (model?: string, turnIdentity?: unknown) => Promise<void>
   /** 动态拉取远端模型列表（含上下文窗口与能力，若远端下发）；失败时调用方回退到静态列表。 */
   fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
   /**
@@ -955,10 +961,15 @@ export class BuddyAdapter extends LlmAdapter {
     // 1. 获取凭据（过期则先静默续期）
     // 传 options.model：让账号池在**发请求之前**就跳过对该模型已记为
     // 限流/积分耗尽的账号（否则每次请求都要先白跑一遍这些账号再换号）。
-    let credential = await this.options.resolveCredential(options.model)
+    //
+    // 第二个实参传 `options.signal`：它是本轮的标识对象，账号池据此实现
+    // 「切换粒度 = 按轮次」（同轮锁同一账号）。**下面每一处 resolveCredential /
+    // refresh 都必须带上同一个实参** —— 漏传任何一处，那一处就绕过轮次锁、
+    // 按顺序挑回第一个账号（续期路径上表现为刷新了别的账号的凭据）。
+    let credential = await this.options.resolveCredential(options.model, options.signal)
     if (credential === undefined || isCredentialExpired(credential)) {
-      await this.options.refresh(options.model)
-      credential = await this.options.resolveCredential(options.model)
+      await this.options.refresh(options.model, options.signal)
+      credential = await this.options.resolveCredential(options.model, options.signal)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('buddy: no usable credential; log in first with /buddy-login', 'MISSING_CREDENTIAL')
@@ -1114,9 +1125,10 @@ export class BuddyAdapter extends LlmAdapter {
     // 4. 发送请求（401/403 时刷新一次凭据后重试）
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      await this.options.refresh(options.model)
-      // 同样传目标模型：刷新后重新选号时要继续跳过已限流的账号。
-      credential = await this.options.resolveCredential(options.model)
+      await this.options.refresh(options.model, options.signal)
+      // 同样传目标模型与轮次标识：刷新后重新选号时要继续跳过已限流的账号，
+      // 且「按轮次」档下仍锁在同一轮的账号上。
+      credential = await this.options.resolveCredential(options.model, options.signal)
       if (credential === undefined || credential.access_token.length === 0) {
         throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: response.status })
       }

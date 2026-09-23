@@ -123,7 +123,7 @@ dsh plugin --profile <name> add "https://github.com/gurio-wine/dsh-account-hub.g
 | 域名 | `dsh_account_hub`（⚠️ storage 只接受 `^[a-z][a-z0-9_]*$`，**连字符不合法**，故与插件 id 形态不同） |
 | 布局 | `single` + 一个 global 单例文档（无表）—— 账号池数据量小且整体读写 |
 | 落盘 | `$DSH_HOME/storages/dsh_account_hub.json` |
-| 字段 | `accounts` / `disabledModels` / `contextBudgets` / `schemaVersion`（**四件套**） |
+| 字段 | `accounts` / `disabledModels` / `contextBudgets` / `checkins` / `consumption` / `consumptionCursors` / `schemaVersion`（**七件套**） |
 
 **为什么搬**：DSH v0.1.7-alpha.1 删除了 `ctx.settings.register(ns, schema) → owner scope`
 整套 seam。插件走的是优雅降级分支，因此**不抛错、静默全空** —— 用户看到「所有账号
@@ -180,6 +180,35 @@ settings 写入目标是 profile 的 `cordis.patch.yml`（配置）。storage �
 - ⚠️ **UI 拖拽待接（第二阶段）**：客户端目前**不发**这个 RPC，入口已就位并有
   单测覆盖；落地 UI 时还需处理 before/after 落点判定与「移除源元素后下标前移」
   两个前端坑。
+
+### 账号消耗顺序 / 切换粒度（2026-09-24）
+
+账号中心每个 provider 面板**顶部**（账号卡片列表之前）并排两个选择器，per-provider 各存各的：
+
+| 消耗顺序 | 含义 |
+|---|---|
+| **顺序**（默认） | 总是取排序里的第一个可用账号 —— **即原有行为**，故升级不改变任何既有用户的选号结果 |
+| **遍历** | 每次请求轮转下一个账号，用完一轮再从头开始（游标持久化，重启后接着轮） |
+| **最高优先** | 每次请求用积分余额最高的账号；**余额未知/过期时自动降级回顺序** |
+
+| 切换粒度 | 含义 |
+|---|---|
+| **按请求** | 每一次请求都重新选号 |
+| **按轮次**（默认） | 一轮对话内固定用同一个账号，下一轮才换（上下文更连贯，也避免部分后端按会话绑定凭据） |
+
+两档的组合语义：**按轮次时「遍历 / 最高优先」只在每轮开头选一次号**；按请求时每次 LLM 调用都重新选。
+切换后**下一次请求即生效**，不需要重启或重新登录。改档位只影响后续选号，不会打断正在跑的对话。
+
+- **落点**：`AccountPool.getAvailableAccount` 的第四个可选参数（不传 = 完全按历史行为，
+  故拉模型目录与适配器的换号重试循环都不受影响）；配置与游标存在账号池文档的
+  `consumption` / `consumptionCursors` 两个字段里，RPC 是 `consumption.get` / `consumption.set`
+  （部分更新）。
+- **「一轮对话」的判据是请求的 `AbortSignal` 身份**，不是 `sessionId`（后者跨轮稳定，
+  拿它当轮次键会让「按轮次」退化成「按会话」）。
+- **余额缓存在宿主内存里**（TTL 4 小时，启动后与每 4 小时刷新），**且只为配了「最高优先」
+  的 provider 发查询请求** —— 没开那一档的 provider 一次网络请求都不会多打。
+- 细节（七件套串接、轮次键、锁上限、降级语义）见 `docs/agents/account-hub-storage.md`
+  的「账号消耗顺序与切换粒度」。
 
 ### provider 改名与数据迁移（2026-09-18）
 

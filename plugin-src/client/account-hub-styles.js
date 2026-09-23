@@ -204,6 +204,19 @@ const STYLES = `
 .dim-ah-tierOption input { margin: 0; accent-color: #1677ff; cursor: pointer; }
 .dim-ah-tierOption input:disabled { cursor: default; }
 .dim-ah-tierOption input:disabled + span { opacity: 0.5; }
+
+/* 消耗顺序 / 切换粒度：两个选择器**并排**、各占一半宽。
+   与账号卡片同宽：它与账号卡片列表同处一个容器，故宽度天然一致，
+   这里不需要任何宽度计算。
+   窄面板下（两列各半会挤成竖排文案）自动折成上下两行 —— 每档是一句
+   中文短语，横向挤不下时换行比缩字号可读。 */
+.dim-ah-consumption { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
+.dim-ah-consumptionGroup { flex: 1 1 45%; min-width: 0; display: flex; flex-direction: column; gap: 6px;
+  padding: 8px 10px; border: 1px solid var(--dsw-alias-border-secondary, #e5e6eb); border-radius: 8px; }
+.dim-ah-consumptionHead { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.dim-ah-consumptionLabel { font-size: 13px; line-height: 18px; }
+.dim-ah-consumptionHint { font-size: 12px; line-height: 16px; color: var(--dsw-alias-label-secondary, #4e5969); }
+.dim-ah-consumptionOptions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 `
 
 let injected = false

@@ -99,15 +99,23 @@ export interface CodeArtsAdapterOptions {
    * `model` 是**本次请求的目标模型**，由 `stream()` 从 `options.model` 透传，
    * 供多账号池跳过「对该模型仍有限流/积分耗尽标记」的账号（见 `buddy-adapter`
    * 的同类说明）。无目标模型的场景（拉模型目录）省略该参数。
+   *
+   * `turnIdentity` 是本次请求所属**轮次**的标识对象（`options.signal`），
+   * 供账号池实现「切换粒度 = 按轮次」—— 同轮锁同一账号。见
+   * `src/account-consumption.ts` 的 `TurnKeyTracker`（DSH 的 `GenerateOptions`
+   * 里没有 turn 级字段，signal 是唯一的轮次标识）。
    */
-  resolveCredential: (model?: string) => Promise<CodeArtsCredential | undefined>
+  resolveCredential: (model?: string, turnIdentity?: unknown) => Promise<CodeArtsCredential | undefined>
   /**
    * 静默续期凭据。
    *
    * `model` 与 {@link CodeArtsAdapterOptions.resolveCredential} 同源，供
    * 「按账号池选号再续期」的实现保持与选号一致的口径；默认单凭据路径忽略它。
+   *
+   * `turnIdentity` 同理必须一起透传：续期与解析必须挑到**同一个**账号，
+   * 否则会刷新另一个账号的凭据（详见 `src/index.ts` 的 `makeAccountRefresher`）。
    */
-  refresh: (model?: string) => Promise<void>
+  refresh: (model?: string, turnIdentity?: unknown) => Promise<void>
   /**
    * 动态拉取远端模型列表；失败时调用方回退到静态列表。
    *
@@ -938,17 +946,22 @@ export class CodeArtsAdapter extends LlmAdapter {
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     // 传 options.model：让账号池在**发请求之前**就跳过对该模型已记为
     // 限流/积分耗尽的账号（否则每次请求都要先白跑一遍这些账号再换号）。
-    let credential = await this.options.resolveCredential(options.model)
+    //
+    // 第二个实参传 `options.signal`：它是本轮的标识对象，账号池据此实现
+    // 「切换粒度 = 按轮次」（同轮锁同一账号）。**必须与下面每一处
+    // resolveCredential / refresh 用同一个实参** —— 漏传任何一处，那一处就会
+    // 绕过轮次锁、按顺序挑回第一个账号（续期路径上表现为刷新了别的账号）。
+    let credential = await this.options.resolveCredential(options.model, options.signal)
     if (credential === undefined || Date.parse(credential.expires_at) <= Date.now()) {
       // 续期失败**不得**顶掉原始鉴权错误：续期自身的问题（无 refresh_token、
       // 凭据缺失、网络抖动）如果直接冒泡，用户看到的是「请重新登录」这类
       // **误导性文案** —— 而真实原因可能是池里另一个账号、或一次瞬时网络故障。
       // 这里吞掉续期异常并继续走下面的凭据校验：仍是不可用时由统一出口抛
       // MISSING_CREDENTIAL，语义归一。
-      await this.options.refresh(options.model).catch((error: unknown) => {
+      await this.options.refresh(options.model, options.signal).catch((error: unknown) => {
         this.reportRefreshFailure(error)
       })
-      credential = await this.options.resolveCredential(options.model)
+      credential = await this.options.resolveCredential(options.model, options.signal)
     }
     if (credential === undefined || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
       throw new LlmError('codearts: no usable credential; log in first', 'MISSING_CREDENTIAL')
@@ -1107,7 +1120,7 @@ export class CodeArtsAdapter extends LlmAdapter {
           // 归一为：记一条警告 → 抛出**原本那个**鉴权错误（AUTH + 原始 status/detail），
           // 文案点明「续期失败」，让用户知道该看哪个方向。
           try {
-            await this.options.refresh(options.model)
+            await this.options.refresh(options.model, options.signal)
           } catch (error) {
             this.reportRefreshFailure(error)
             const detail = errorDetail(errorText)
@@ -1117,7 +1130,7 @@ export class CodeArtsAdapter extends LlmAdapter {
               { status: response.status, cause: error },
             )
           }
-          credential = await this.options.resolveCredential(options.model)
+          credential = await this.options.resolveCredential(options.model, options.signal)
           if (credential === undefined || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
             throw new LlmError('codearts: credential missing after refresh; log in again', 'MISSING_CREDENTIAL')
           }
