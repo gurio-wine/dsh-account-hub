@@ -26,6 +26,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   ALL_QODER_PRODUCTS,
   QODER,
+  QODER_CAMPAIGN_CLIENT_TYPE,
   QODER_CN,
   QODER_CN_CHAT_BASE,
   QODER_CN_MODELS_BASE,
@@ -33,6 +34,7 @@ import {
   QODER_CN_PAT_URL,
   QODER_CN_USER_AGENT,
   QODER_PAT_PREFIX,
+  qoderCampaignHeaders,
   qoderClientType,
   qoderJobTokenHeaders,
   qoderProductById,
@@ -536,6 +538,37 @@ describe('Cosy 头：CN 的签名路径由 wasm 给，REST 分支保留但不可
     const headers = qoderJobTokenHeaders('jt-x', QODER_CN, 'text/event-stream')
     expect(headers['User-Agent']).toBe(QODER_CN.userAgent)
     expect(Object.keys(headers).some((key) => key.toLowerCase().startsWith('cosy-'))).toBe(false)
+  })
+
+  it('qoderCampaignHeaders = job token 头 + `Cosy-ClientType: 10`（两区同值）', () => {
+    // 2026-09-24 真机定案：`/sash/` 活动端点缺这个头时服务端**恒回空列表**
+    // （缺头假象）。取值是**模块级常量**、两区同值 —— 与产品配置里的
+    // `clientType`（chat 请求体的 `'5'` / 缺省 `'qodercli'`）**不是同一个东西**。
+    expect(QODER_CAMPAIGN_CLIENT_TYPE).toBe(10)
+    for (const product of [QODER, QODER_CN]) {
+      const headers = qoderCampaignHeaders('jt-x', product)
+      expect(headers['Cosy-ClientType'], product.id).toBe('10')
+      // 基线头一个不少（Authorization / Accept / Content-Type / User-Agent）。
+      expect(headers).toMatchObject(qoderJobTokenHeaders('jt-x', product))
+    }
+  })
+
+  it('⚠️ qoderJobTokenHeaders **不带** `Cosy-ClientType`（作用域边界）', () => {
+    // quota / chat / userinfo 共用它 —— 加头会同时改掉它们的出站形态，而那种
+    // 影响**从未验证过**（出站协议值红线）。活动端点走上面那个独立函数。
+    for (const product of [QODER, QODER_CN]) {
+      const headers = qoderJobTokenHeaders('jt-x', product)
+      expect('Cosy-ClientType' in headers, product.id).toBe(false)
+      expect(Object.keys(headers).some((key) => key.toLowerCase().startsWith('cosy-'))).toBe(false)
+    }
+  })
+
+  it('活动头的取值**不随** chat 的 `clientType` 变化（两者不同义）', () => {
+    // 反证：把 chat 的 clientType 改掉（例如 CN 从 '5' 改成别的），活动头必须
+    // 纹丝不动 —— 若哪天有人「复用」了那个字段，这条立刻红。
+    const mutated = { ...QODER_CN, clientType: '99' }
+    expect(qoderCampaignHeaders('jt-x', mutated)['Cosy-ClientType']).toBe('10')
+    expect(qoderClientType(mutated)).toBe('99')
   })
 })
 

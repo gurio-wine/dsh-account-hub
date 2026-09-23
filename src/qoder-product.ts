@@ -1131,9 +1131,14 @@ export function qoderPatHeaders(
 }
 
 /**
- * 构造 job token 鉴权头（chat / quota 用；**步骤 2 / 4** 的消费者）。
+ * 构造 job token 鉴权头（chat / quota / userinfo 用；**步骤 2 / 4** 的消费者）。
  *
  * 传入的是 {@link QoderAuth.getJobToken} 的返回值（`jt-…`），**不是** PAT。
+ *
+ * ⚠️ **`/sash/` 活动端点（签到）刻意不走本函数** —— 它还需要
+ * `Cosy-ClientType`，见 {@link qoderCampaignHeaders}。本函数是那条约定的**基线**
+ * （「不带任何 Cosy 头」），把该头加进来会同时改掉 chat / quota / userinfo 的
+ * 出站形态（未验证过影响，属出站协议值红线）。
  */
 export function qoderJobTokenHeaders(
   jobToken: string,
@@ -1145,6 +1150,65 @@ export function qoderJobTokenHeaders(
     Accept: accept,
     'Content-Type': 'application/json',
     'User-Agent': product.userAgent,
+  }
+}
+
+/**
+ * `/sash/` 活动端点（签到）专用的 `Cosy-ClientType` 取值 —— **模块级常量，两区同值**。
+ *
+ * ## 为什么必须有它（2026-09-24 真机定案，缺它 ⇒ 空列表假象）
+ *
+ * 官方桌面端对 `GET /sash/api/v1/me/campaigns` 发的头里带
+ * `Cosy-ClientType: 10`（模块级常量 `yc = Object.freeze({ clientType: 10,
+ * businessProduct: "app", sessionType: "app" })`）。真机 A/B（同一账号、同一秒
+ * 交错重放）：
+ *
+ * | 请求头 | 结果 |
+ * |---|---|
+ * | 本插件现状头（无任何 `Cosy-*`） | `campaigns: []`（**缺头假象**） |
+ * | **仅加** `Cosy-ClientType: 10` | 列表非空，含 `CLAIM_BENEFIT/CLAIMED` |
+ * | 再加 `Cosy-MachineToken`/`Type`/`Code`/`Version` | 同上（**无额外增益**） |
+ *
+ * 取值空间扫描：`1–7、9、11、12、20、100、0、-1、app、qodercli、空串` 全部回空
+ * 列表，**只有 `8` 与 `10` 返回非空**（`8` 只见 `VIEW_DETAILS`）——`10` 是官方值。
+ *
+ * ## ⚠️ 与 {@link QoderProduct.clientType} 是**两回事**
+ *
+ * 产品配置里的 `clientType`（CN 为 `'5'`）是 **chat 请求体**的
+ * `metadata.context.client_type`，实测对活动端点**无效**（真机扫描里 `5` 回空列表）。
+ * 两者同名不同义、且**不同传输位置**（一个在请求头、一个在请求体），故**不复用**
+ * 那个字段：合并会让「改 chat 身份值」静默改掉签到头（或反之）。
+ */
+export const QODER_CAMPAIGN_CLIENT_TYPE = 10
+
+/**
+ * 构造 `/sash/` 活动端点（签到）的鉴权头 —— {@link qoderJobTokenHeaders} **加上**
+ * `Cosy-ClientType`。
+ *
+ * ## ⚠️ 作用域**只限** `/sash/` 的 campaigns 请求
+ *
+ * `qoderJobTokenHeaders` 被 quota / chat / userinfo / 目录等**多条**链路共用，
+ * 而「加 `Cosy-ClientType` 对它们的影响」**从未验证过** —— 按「出站协议值不随
+ * 实现方便而变化」的红线，**绝不能**把该头塞进 `qoderJobTokenHeaders`。
+ * 故签到线走本函数、其余线一律不动（两处各有单测钉死：`qoder-checkin-credits`
+ * 的「quota 请求不带该头」与 `qoder-cn-rpc-dispatch` 的「只有 `/sash/` 请求带」）。
+ *
+ * 消融证明 `Cosy-MachineToken` / `Cosy-MachineType` / `Cosy-MachineCode` /
+ * `Cosy-Version` / `User-Agent: Qoder` **全部非必需**，故一律不发 —— 与
+ * `QoderProduct.cosyVersion` 注释里「不猜机器身份」同一条纪律（缺头比错头安全）。
+ *
+ * @param jobToken - `jt-…`（由 `getJobToken` 换来）。
+ * @param product - 决定 `User-Agent`（其余字段与 region 无关）。
+ * @param accept - `Accept` 头取值。
+ */
+export function qoderCampaignHeaders(
+  jobToken: string,
+  product: QoderProduct,
+  accept = 'application/json',
+): Record<string, string> {
+  return {
+    ...qoderJobTokenHeaders(jobToken, product, accept),
+    'Cosy-ClientType': String(QODER_CAMPAIGN_CLIENT_TYPE),
   }
 }
 

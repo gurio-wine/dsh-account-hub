@@ -86,11 +86,17 @@
  * POST {openapiBase}/sash/api/v1/me/campaigns/{campaignId}/claim   ← body **空串**
  * ```
  *
+ * ⚠️ **必须带 `Cosy-ClientType: 10`**（2026-09-24 真机定案，见
+ * `qoderCampaignHeaders`）：缺这个头时服务端**恒回空列表** —— 那不是服务端事实，
+ * 而是缺头的产物。官方 47 条响应里空列表出现 **0** 次。作用域**只限本端点的
+ * 两个请求**（`/sash/` 前缀），quota / chat 等仍走不带 Cosy 头的
+ * `qoderJobTokenHeaders`（未验证过加头对它们的影响）。
+ *
  * 头只需 `Authorization: Bearer …`（与余额同源：经 jt 换取），**无需 wasm 签名**
  * —— 它挂在 `/sash/` 前缀下，不走 `algo` 签名路径。早期只按 `/api/` 前缀搜端点，
  * 因此误判「Qoder 无签到」（用户报障：「登录成功了，没有获取积分吗？」）。
  *
- * 四条硬约束（每条都有对应用例）：
+ * 五条硬约束（每条都有对应用例）：
  *
  * 1. **幂等判据是响应体的 `replayed`，不是 HTTP 状态码**。重复领取同样回
  *    **200**，但 `replayed:true`、**不含 `benefit`**，且 `claimedAt` 是**上一次
@@ -100,13 +106,16 @@
  * 2. **请求体必须是空串**（抓包实测 `content-length: 0`）。
  * 3. **只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'`** ——
  *    实测还有 `VIEW_DETAILS` 型活动（如「Pro 首月翻倍」），对它发 claim 是错的。
- * 4. **`campaigns` 为空数组不是「没有活动」**：活动**每日 10:00（UTC+8）刷新**，
- *    服务端在「今天已领」时会**清空 campaigns** 并回
- *    `{"showCampaign":false,"claimable":false,"campaigns":[]}`。故
+ * 4. **活动列表是唯一判据源，且判读只有一份**（{@link readQoderCampaignDayState}）：
+ *    `CLAIM_BENEFIT + CLAIMED` ⇒ **今天已领**（`already-claimed`）、
+ *    `CLAIM_BENEFIT + CLAIMABLE` ⇒ 未签（走领取）、空列表或仅 `VIEW_DETAILS`
+ *    ⇒ **判不了**（`undetermined`，**不写签到状态**，下轮 sweep 重试）。
  *    `CheckinStatus.active` **恒为 `true`**（拿到响应即活动开启），**不按列表是否
- *    为空判** —— 否则调用方会先命中「活动未开启」分支，把「今天已领」误报成
- *    「签到活动未开启」；而「无活动可领」归一为 `already-claimed`（保守判已领，
- *    比误报可领更不容易误导用户）。
+ *    为空判** —— 否则调用方会先命中「活动未开启」分支。
+ * 5. **⚠️ 定案更正（2026-09-24）**：「空列表 = 协议无法区分」这条 60f8127 的
+ *    前提**被真机推翻了一半** —— 缺 `Cosy-ClientType` 时看到的空列表是**缺头
+ *    假象**（本模块已补头）；补头后仍为空，才是真的判不了。故本模块的措辞一律是
+ *    「**带头仍空** ⇒ undetermined」，不要简写成「空列表 ⇒ undetermined」。
  *
  * ## 签到两区共用一份实现
  *
@@ -120,6 +129,7 @@ import {
   QODER,
   QODER_QUOTA_USAGE_PATH,
   QODER_REQUEST_TIMEOUT_MS,
+  qoderCampaignHeaders,
   qoderJobTokenHeaders,
 } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
@@ -833,16 +843,17 @@ export interface QoderCampaign {
 /**
  * 活动列表的一次解析结果。
  *
- * ⚠️ **`claimable:false` + `campaigns:[]` 不代表「没有活动」**：实测「今天已领」
- * 之后服务端正是这样回的（见模块头第 4 条）。故本类型只是**如实记录**，
- * 调用方不得据此判「活动未开启」。
+ * ⚠️ **`claimable:false` + `campaigns:[]` 不代表「没有活动」**：2026-09-24 真机
+ * 定案显示，**缺 `Cosy-ClientType` 时服务端恒回这种形态**（缺头假象，已修），
+ * 而补头后仍为空才是真判不了。故本类型只是**如实记录**，调用方不得据此判
+ * 「活动未开启」；判读统一走 {@link readQoderCampaignDayState}。
  */
 export interface QoderCampaigns {
   /** 服务端自报「是否展示活动入口」（仅记录，不参与判定）。 */
   showCampaign: boolean
   /** 服务端自报「是否有可领项」（仅记录，不参与判定）。 */
   claimable: boolean
-  /** 活动列表（**今天已领时服务端会清空它**）。 */
+  /** 活动列表（**带头仍空时判不了，不是「已领」也不是「无活动」**）。 */
   campaigns: QoderCampaign[]
 }
 
@@ -878,8 +889,9 @@ function parseQoderCampaign(value: unknown): QoderCampaign | undefined {
  *
  * - **顶层不是对象** → `undefined`（形态不认识 ⇒ 查不到，不是「无活动」）；
  * - **`campaigns` 不是数组**（缺失 / null / 其它类型）→ 按**空列表**归一：
- *   「今天已领」时服务端确实会回空数组，而字段整个缺失与空数组在语义上同向
- *   （都没有可领项），故不把它当成形态错误；
+ *   字段整个缺失与空数组在语义上同向（都没有可领项），故不把它当成形态错误
+ *   —— 否则查得到响应却判成「查不到」。⚠️ 归一成空列表 ≠ 判「已领」：判读见
+ *   {@link readQoderCampaignDayState}（空列表一律 `unknown`）；
  * - **单条缺 `campaignId`** → 跳过该条（拿不到 id 就发不出 claim，
  *   伪造一个只会打出一个 404）；
  * - `showCampaign` / `claimable` **只认显式 `true`**（缺失按 false），
@@ -916,6 +928,49 @@ export function claimableQoderCampaigns(parsed: QoderCampaigns): QoderCampaign[]
     (campaign) => campaign.actionType === QODER_CAMPAIGN_ACTION_CLAIM
       && campaign.claimStatus === QODER_CAMPAIGN_STATUS_CLAIMABLE,
   )
+}
+
+/**
+ * 从活动列表读出的**当日状态**——三态之一。
+ *
+ * - `'claimable'`：还有可领项 ⇒ 今天**未签**，走领取；
+ * - `'claimed'`：服务端明说 `CLAIM_BENEFIT/CLAIMED` ⇒ 今天**已领**；
+ * - `'unknown'`：空列表、或只有 `VIEW_DETAILS` 型 ⇒ **判不了**（不猜）。
+ */
+export type QoderCampaignDayState = 'claimable' | 'claimed' | 'unknown'
+
+/**
+ * **唯一的活动列表判读函数**（claim 与 status 两路共用）。
+ *
+ * ## 为什么必须收敛成一处
+ *
+ * 缺陷 2/3（2026-09-24 真机定案）的形态就是「同一份列表被两处用不同判据读」：
+ * `claimQoderDailyCheckin` 只留 `CLAIMABLE`、`fetchQoderCheckinStatus` 干脆恒报
+ * `todayCheckedIn:false`。结果是签到成功后活动变 `CLAIMED` ⇒ 两处都读成「没有
+ * 信息」⇒ 宿主白名单（只认 `claimed` / `already-claimed`）**不写状态** ⇒ 下一轮
+ * sweep 重试 ⇒ 又读成「没有信息」—— 用户永远看到「无法判定」，尽管积分已到账。
+ * 两处各写一份判据，这种漂移**必然**复发，故判读只留这一份。
+ *
+ * ## 判据（官方 47 条真机响应支持）
+ *
+ * `CLAIM_BENEFIT + CLAIMED` 是协议里**唯一明确的「已领」证据**（官方 main.log
+ * 里出现 27 次、横跨 5 个账号）；`CLAIM_BENEFIT + CLAIMABLE` 是唯一的「可领」；
+ * 其余（空列表、只有 `VIEW_DETAILS`）**什么都不证明**。
+ *
+ * ⚠️ **顺序**：先判「有可领项」再判「有已领项」—— 多活动账号可能一条已领、
+ * 另一条可领，那时今天显然还没领完，必须去领（`claimable` 优先）。
+ *
+ * ⚠️ **必须同时看 `actionType`**：`VIEW_DETAILS` 型活动（如「Pro 首月翻倍」）
+ * 的 `CLAIMED` 与积分签到无关，只按 `claimStatus` 判会把「看了个详情页」写成
+ * 「今天已签」（伪造签到，正是本函数要消灭的形态）。
+ */
+export function readQoderCampaignDayState(parsed: QoderCampaigns): QoderCampaignDayState {
+  if (claimableQoderCampaigns(parsed).length > 0) return 'claimable'
+  const hasClaimed = parsed.campaigns.some(
+    (campaign) => campaign.actionType === QODER_CAMPAIGN_ACTION_CLAIM
+      && campaign.claimStatus === QODER_CAMPAIGN_STATUS_CLAIMED,
+  )
+  return hasClaimed ? 'claimed' : 'unknown'
 }
 
 /**
@@ -959,7 +1014,7 @@ async function sendQoderCheckinRequest(
     const signal = options.signal === undefined ? timeout : AbortSignal.any([timeout, options.signal])
     let response: Response
     try {
-      response = await fetcher(url, { ...init, headers: { ...qoderJobTokenHeaders(jobToken, product), ...init.headers }, signal })
+      response = await fetcher(url, { ...init, headers: { ...qoderCampaignHeaders(jobToken, product), ...init.headers }, signal })
     } catch (error) {
       return { error: `Qoder 签到请求网络失败：${error instanceof Error ? error.message : String(error)}` }
     }
@@ -1056,13 +1111,14 @@ async function loadQoderCampaigns(
  *   服务端在「今天已领」时会把 `campaigns` 清空，据此判 `active:false` 会让
  *   `collectClaimResults` 先命中「活动未开启」分支，把「今天已领」误报成
  *   「签到活动未开启」。
- * - `todayCheckedIn`：**只在服务端明说已领时为 true**。⚠️ 2026-09-24 修正：
+ * - `todayCheckedIn`：**只在服务端明说已领时为 true**。⚠️ 2026-09-24 修正两轮：
  *   旧实现写的是「**没有可领活动即为 true**」，那等于把「活动还没开始 / 本账号
  *   暂无活动」也报成已签 —— 这正是「qoder 假签到」的形态（用户看到「已签」而
- *   实际一分没领，且宿主据此写下状态、整个周期不再重试）。空列表的两种含义在
- *   响应上无法区分，故**不猜**：`todayCheckedIn:false` 让界面显示未签，真正
- *   领没领由 {@link claimQoderDailyCheckin} 的 `undetermined` 与下一轮 sweep
- *   去收敛。
+ *   实际一分没领，且宿主据此写下状态、整个周期不再重试）。上一轮的修法是把该
+ *   字段**恒置 false**（「不猜」），但那只修了一半：签到成功后活动变 `CLAIMED`，
+ *   界面于是永远显示未签。现在由 {@link readQoderCampaignDayState} 三态判读给出
+ *   ——`claimed` ⇒ true、`claimable` ⇒ false、`unknown`（空列表 / 仅
+ *   `VIEW_DETAILS`）⇒ false（仍不猜：那两种含义在响应上无法区分）。
  * - `dailyCredit`：可领活动声明的 `benefit.amount`（实测 100）；没有可领项时
  *   回退到任一 `CLAIM_BENEFIT` 活动的声明值（供 UI 显示「每日 100」）。
  *
@@ -1070,7 +1126,7 @@ async function loadQoderCampaigns(
  *
  * `todayCheckedIn` 的唯一消费者是 `credits.status`（面板那一行）。宿主写不写
  * 签到状态走的是 claim 的 outcome（见 {@link claimQoderDailyCheckin}），
- * 与这里无关 —— 故把空列表如实报成「未签」不会造成重复领取（服务端幂等）。
+ * 与这里无关 —— 故 `unknown` 时如实报「未签」不会造成重复领取（服务端幂等）。
  */
 export async function fetchQoderCheckinStatus(
   credential: QoderCredential,
@@ -1084,13 +1140,11 @@ export async function fetchQoderCheckinStatus(
   const parsed = loaded.campaigns
 
   const claimable = claimableQoderCampaigns(parsed)
-  // ⚠️ 空列表 ⇒ **无法判定**（既可能是今天已领、服务端清空了列表，也可能是活动
-  // 还没开始）。`CheckinStatus` 只有布尔、无法表达第三态，故按「不猜」的方向取
-  // false（未签）：把不确定报成已签会让用户永远看不到真实情况，而报成未签最坏
-  // 只是多打一次幂等请求。
-  if (claimable.length === 0) {
+  // ⚠️ 判读与 claim 路径**共用同一个函数**（见 {@link readQoderCampaignDayState}）。
+  const dayState = readQoderCampaignDayState(parsed)
+  if (dayState === 'unknown') {
     options.onDebug?.(
-      '[qoder] 活动列表为空：无法区分「今天已领取」与「暂无活动」，'
+      '[qoder] 活动列表为空 / 无积分活动：无法区分「今天已领取」与「暂无活动」，'
       + '状态上报为**未签**（不伪造已签），由 claim 的 undetermined 与下轮 sweep 收敛',
     )
   }
@@ -1099,9 +1153,9 @@ export async function fetchQoderCheckinStatus(
   )
   return {
     active: true,
-    // 恒为 false：本端点在两种情况下都没有「已领」的证据 —— 有可领项时显然未领，
-    // 空列表时无法判定（见上）。**不要**改回「空列表即已签」。
-    todayCheckedIn: false,
+    // `claimed` 是服务端明说的「今天已领」；`claimable` 与 `unknown` 都不是证据
+    //（前者显然未领，后者判不了）。**不要**改回「空列表即已签」。
+    todayCheckedIn: dayState === 'claimed',
     streakDays: 0,
     dailyCredit: claimable[0]?.amount ?? benefitCampaigns[0]?.amount ?? 0,
     todayCredit: 0,
@@ -1156,7 +1210,7 @@ function describeQoderClaimFailure(status: number, text: string): string {
  * ## 请求体必须是空串
  *
  * 抓包实测 `content-length: 0`；源码里该请求无 payload。发 `{}` 属未经验证的
- * 形态，故照实发空串（`qoderJobTokenHeaders` 已带 `Content-Type: application/json`）。
+ * 形态，故照实发空串（`qoderCampaignHeaders` 已带 `Content-Type: application/json`）。
  */
 export async function claimQoderCampaign(
   credential: QoderCredential,
@@ -1218,11 +1272,33 @@ export async function claimQoderCampaign(
  * 汇总为**一条** {@link ClaimOutcome}（与另外四条签到线同构，前端摘要 UI 共用）：
  *
  * - 列表查不到 → `failed`（不是 `already-claimed`：查不到 ≠ 已领）；
- * - **无可领活动 → `undetermined`**（2026-09-24 修正，见下）；
+ * - **`CLAIM_BENEFIT + CLAIMED` → `already-claimed`**（2026-09-24 补齐，见下）；
+ * - **带头仍空 / 仅 `VIEW_DETAILS` → `undetermined`**（2026-09-24 修正，见下）；
  * - 至少一个成功 → `claimed`（`credit` 为累计值）；
  * - 全部失败 → `failed`（带第一条错误原因）。
  *
- * ## ⚠️ 空列表为什么不能归一成 `already-claimed`（旧实现的缺陷）
+ * ## ⚠️ 三态判读（判据只有一份，见 {@link readQoderCampaignDayState}）
+ *
+ * | 响应形态 | 判定 | 依据 |
+ * |---|---|---|
+ * | `[{CLAIM_BENEFIT, CLAIMABLE}]` | 正常走领取 | 有可领项 ⇒ 未签 |
+ * | `[{CLAIM_BENEFIT, CLAIMED}]` | **`already-claimed`** | 服务端明说今天已领 |
+ * | `[]`（**带头仍空**） | `undetermined` | 真判不了 |
+ * | `[{VIEW_DETAILS, …}]` | `undetermined` | 积分活动信息为零 |
+ *
+ * ## ⚠️ 为什么 `CLAIMED` 必须单独判（缺陷 2 的正面修复）
+ *
+ * 真机后果链：签到成功 → 活动变 `CLAIMED` → 旧实现把它与空列表一起压进
+ * `undetermined` → 宿主白名单（`src/account-hub-rpc.ts`，只认 `claimed` /
+ * `already-claimed`）**不写状态** → 下一轮 sweep 重试 → 又判不了 —— 用户永远
+ * 看到「无法判定」，尽管积分已到账（实测落 `addOnQuota` 加量包、三池合计可见、
+ * **无结算延迟**）。判 `already-claimed` 才能让白名单写状态、终止这个死循环。
+ *
+ * ⚠️ 判读**必须同时看 `actionType`**：`VIEW_DETAILS` 型活动的 `CLAIMED` 与积分
+ * 签到无关，只按 `claimStatus` 判会把「看了个详情页」写成「今天已签」——
+ * 那正是 60f8127 之前「空列表即已签」的同款伪造签到，只是换了个入口。
+ *
+ * ## ⚠️ 为什么「带头仍空」才归 `undetermined`（旧缺陷的另一半）
  *
  * 旧实现写的是「服务端在『今天已领』时清空 campaigns ⇒ 无目标即已领」，把空列表
  * 归一成 `already-claimed`。真机调查（2026-09-24）确认那条推理**只覆盖了两种
@@ -1234,6 +1310,10 @@ export async function claimQoderCampaign(
  * 下一轮 sweep 自然重试（届时活动若已开始就会真的领到；若确实已领，服务端会回
  * `replayed:true` ⇒ `already-claimed` ⇒ 那时才写状态）。不确定的代价从「永久
  * 少领」降级为「多打一次幂等请求」。
+ *
+ * ⚠️ **限定语「带头仍空」是 2026-09-24 的定案补正**：缺 `Cosy-ClientType: 10`
+ * 时服务端恒回空列表（**缺头假象**，已由 {@link qoderCampaignHeaders} 修掉）。
+ * 补头后仍为空，才是真正的「判不了」。
  *
  * ## 为什么不选「already-claimed 也比对积分」那条路
  *
@@ -1258,15 +1338,28 @@ export async function claimQoderDailyCheckin(
 
   const targets = claimableQoderCampaigns(parsed)
   if (targets.length === 0) {
-    // 空列表 = 无法判定（见函数注释）。**不写状态**是重点：这条 return 让宿主的
-    // 白名单（只认 claimed / already-claimed）天然不命中，下一轮 sweep 会重试。
+    // ⚠️ 先判「服务端是否**明说**今天已领」（2026-09-24 真机定案，缺陷 2）：
+    // `CLAIM_BENEFIT + CLAIMED` 是协议里唯一明确的「已领」证据。旧实现把它与
+    // 「空列表」一起压进下面那条 `undetermined`，于是**签到成功后**的每一轮都
+    // 判不了 ⇒ 宿主白名单（只认 claimed / already-claimed）不写状态 ⇒ sweep
+    // 永久重试 ⇒ 用户永远看到「无法判定」，尽管积分已到账。
+    //
+    // 判读与 `fetchQoderCheckinStatus` **共用同一个函数**（见
+    // {@link readQoderCampaignDayState}）—— 两处各写一份判据必然漂移。
+    if (readQoderCampaignDayState(parsed) === 'claimed') {
+      options.onDebug?.('[qoder] 活动列表含 CLAIM_BENEFIT/CLAIMED：服务端明说今天已领')
+      return { kind: 'already-claimed', message: '今天已领取' }
+    }
+    // 空列表 / 仅 `VIEW_DETAILS` = 无法判定（见函数注释）。**不写状态**是重点：
+    // 这条 return 让宿主的白名单（只认 claimed / already-claimed）天然不命中，
+    // 下一轮 sweep 会重试。
     options.onDebug?.(
-      '[qoder] 活动列表为空：无法区分「今天已领取」与「暂无活动」，'
+      '[qoder] 活动列表为空 / 无积分活动：无法区分「今天已领取」与「暂无活动」，'
       + '判为 undetermined（不写签到状态，下轮 sweep 重试）',
     )
     return {
       kind: 'undetermined',
-      message: '活动列表为空，无法判定今天是否已领取（将在下一轮自动重试）',
+      message: '活动列表为空或无可领积分活动，无法判定今天是否已领取（将在下一轮自动重试）',
     }
   }
 

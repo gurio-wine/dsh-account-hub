@@ -8,6 +8,8 @@ lib/
 .e2e-run*.cjs
 .e2e-run*.mjs
 .tmp-*.mjs
+tests/e2e/*.mjs
+tests/e2e/*-evidence.json
 .atomcode/
 .deveco/
 -1

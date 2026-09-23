@@ -1388,9 +1388,12 @@ async function runCreditsClaim(
  * 失败（旧口径下是「当天永久」，新口径下更是要等到下一个重置点）。下面的 `if`
  * 只认 `claimed` / `already-claimed` 两种，故 `unavailable` 天然不命中 ——
  * 这是刻意的白名单形态，不要改成黑名单（新增 kind 时会静默写错状态）。
- * `abnormal`（余额未变）与 `undetermined`（Qoder 空活动列表）走的是同一条
- * 「不写」规则，理由见 `src/credits.ts` 各自的说明 —— 后者的代价最大：
+ * `abnormal`（余额未变）与 `undetermined`（Qoder **带头仍空**的活动列表）走的是
+ * 同一条「不写」规则，理由见 `src/credits.ts` 各自的说明 —— 后者的代价最大：
  * 写成已签会让一个**可能一分没领**的账号在整个周期内不再被尝试。
+ * ⚠️ 反过来说，Qoder 的 `already-claimed`（含服务端明说的 `CLAIM_BENEFIT/CLAIMED`）
+ * **必须命中白名单**：判成 `undetermined` 就等于让签到成功的账号永远重试下去
+ * （2026-09-24 真机定案的缺陷 2，判读收敛在 `readQoderCampaignDayState`）。
  *
  * ⚠️ **换号重试那一发不改变本规则**：它是 claim **内部**的一次重试，outcome 仍是
  * `unavailable`（只是凭据里的设备号已经被换成新号，见 `runCreditsClaim` 的

@@ -75,6 +75,8 @@ interface CapturedCall {
   authorization: string
   /** 请求体原文（字符串 body 原样记录，其它形态记空串）。 */
   body: string
+  /** 全部请求头（小写键）—— 用来钉 `Cosy-ClientType` 的**作用域**。 */
+  headers: Record<string, string>
 }
 
 /** 判定一个 URL 是否属于 CN 的某个端点（host 含 `.com.cn`）。 */
@@ -155,11 +157,15 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
   tempHomes.push(homeDir)
 
   const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
+    const raw = new Headers(init?.headers)
+    const headers: Record<string, string> = {}
+    raw.forEach((value, key) => { headers[key.toLowerCase()] = value })
     const call: CapturedCall = {
       url: String(url),
       method: String(init?.method ?? 'GET'),
       authorization: new Headers(init?.headers).get('authorization') ?? '',
       body: typeof init?.body === 'string' ? init.body : '',
+      headers,
     }
     calls.push(call)
     const response = responds(call)
@@ -716,6 +722,10 @@ describe('credits.status / credits.claimAll —— qoder-cn 走 CN host 正常�
     // 「活动还没开始」。旧实现归一 `already-claimed` ⇒ 宿主写下签到状态 ⇒ 该账号
     // 整个周期不再被尝试，而它可能一分没领（真机调查确认的「qoder 假签到」）。
     // 现在报 `undetermined`：**不写状态** ⇒ 下一轮 sweep 自然重试。
+    //
+    // ⚠️ 限定语「**带头仍空**」（2026-09-24 真机定案）：缺 `Cosy-ClientType: 10`
+    // 时服务端恒回空列表 —— 那是**缺头假象**，已由请求头修掉。这里的空列表
+    // 是头齐之后服务端真的没给条目，才是真「判不了」。
     const h = createHarness(responder({
       campaigns: () => new Response(JSON.stringify({ showCampaign: false, claimable: false, campaigns: [] }), { status: 200 }),
     }))
@@ -734,6 +744,74 @@ describe('credits.status / credits.claimAll —— qoder-cn 走 CN host 正常�
     })
     // 无可领活动 ⇒ 一次 claim 都不发。
     expect(h.calls.some((c) => c.method === 'POST' && c.url.includes('/claim'))).toBe(false)
+  })
+
+  it('`CLAIM_BENEFIT + CLAIMED` ⇒ **already-claimed**（签到成功后不再落 undetermined）', async () => {
+    // ⚠️ 缺陷 2 的端到端形态（真机复现 `qoder-minimal-fix-e2e.mjs` 两区 MISJUDGED）：
+    // 签到成功 → 活动变 `CLAIMED` → 旧实现压进空目标分支 ⇒ `undetermined` ⇒
+    // 宿主白名单（只认 claimed / already-claimed）**不写状态** ⇒ sweep 永久重试
+    // ⇒ 用户永远看到「无法判定」，尽管积分已到账。
+    const h = createHarness(responder({
+      campaigns: () => new Response(JSON.stringify({
+        showCampaign: true, claimable: false,
+        campaigns: [{ ...claimableCampaign(), claimStatus: 'CLAIMED' }],
+      }), { status: 200 }),
+    }))
+    await withCnAccount(h)
+
+    const result = await h.call<{
+      results: Array<{ outcome: { kind: string; message: string } }>
+      summary: Record<string, number>
+    }>('credits.claimAll', { provider: 'qoder-cn' })
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    expect(result.value.results[0]!.outcome.kind).toBe('already-claimed')
+    expect(result.value.summary).toMatchObject({
+      alreadyClaimed: 1, undetermined: 0, claimed: 0, failed: 0,
+    })
+    // 已领 ⇒ 不发 claim。
+    expect(h.calls.some((c) => c.method === 'POST' && c.url.includes('/claim'))).toBe(false)
+  })
+
+  it('`credits.status` 对 `CLAIMED` 报 todayCheckedIn:true（缺陷 3：不再恒 false）', async () => {
+    const h = createHarness(responder({
+      campaigns: () => new Response(JSON.stringify({
+        showCampaign: true, claimable: false,
+        campaigns: [{ ...claimableCampaign(), claimStatus: 'CLAIMED' }],
+      }), { status: 200 }),
+    }))
+    await withCnAccount(h)
+
+    const result = await h.call<{
+      accounts: Array<{ status: { active: boolean; todayCheckedIn: boolean; dailyCredit: number } | null }>
+    }>('credits.status', { provider: 'qoder-cn' })
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    if (!result.ok) return
+    expect(result.value.accounts[0]!.status).toMatchObject({
+      active: true, todayCheckedIn: true, dailyCredit: 100,
+    })
+  })
+
+  it('`Cosy-ClientType: 10` 只出现在 `/sash/` 活动请求上（quota / exchange 不带）', async () => {
+    // 出站协议值红线：`qoderJobTokenHeaders` 被 quota / exchange / chat / userinfo
+    // 共用，加头对它们的影响**未经验证**，故绝不能污染。这条在**真实分派链路**
+    // 上守那个边界 —— 单测（`qoder-checkin-credits.spec.ts`）守的是纯函数层。
+    const h = createHarness(responder())
+    await withCnAccount(h)
+
+    const claimed = await h.call('credits.claimAll', { provider: 'qoder-cn' })
+    expect(claimed.ok, JSON.stringify(claimed)).toBe(true)
+
+    const campaigns = h.calls.filter((c) => c.url.includes('/sash/api/v1/me/campaigns'))
+    expect(campaigns.length).toBeGreaterThan(0)
+    for (const call of campaigns) {
+      expect(call.headers['cosy-clienttype'], call.url).toBe('10')
+    }
+    const others = h.calls.filter((c) => !c.url.includes('/sash/api/v1/me/campaigns'))
+    expect(others.length).toBeGreaterThan(0)
+    for (const call of others) {
+      expect(call.headers['cosy-clienttype'], call.url).toBeUndefined()
+    }
   })
 
   const METHODS = ['credits.status', 'credits.claimAll'] as const

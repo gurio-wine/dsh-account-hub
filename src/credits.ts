@@ -94,7 +94,7 @@ export type ClaimOutcome =
   /**
    * **无法判定**：服务端响应正常，但**不足以判定今天到底领没领**（2026-09-24 新增）。
    *
-   * ## 唯一的产生者：Qoder 系的「空活动列表」
+   * ## 唯一的产生者：Qoder 系「**带头仍空**的活动列表」
    *
    * Qoder 的签到判据是「活动列表里还有没有可领项」（`campaigns[]`）。而
    * **空列表有两种完全相反的含义**，响应上无法区分：
@@ -110,10 +110,17 @@ export type ClaimOutcome =
    * 「qoder 假签到」的形态）。反方向的误判（把已领报成未领）代价小得多 ——
    * 只是多打一次幂等请求。故正确取舍是**不猜**。
    *
+   * ⚠️ **「带头」是 2026-09-24 的定案补正**：活动端点缺 `Cosy-ClientType: 10`
+   * 时服务端**恒回空列表**（那是缺头假象，不是服务端事实），该缺陷已在请求层修掉
+   * （`src/qoder-product.ts` 的 `qoderCampaignHeaders`）。故本 kind 现在的含义
+   * 收窄为「**头齐了、服务端真的没给条目**」—— 措辞里不要省掉那个限定语。
+   * 同理，「服务端明说 `CLAIM_BENEFIT + CLAIMED`」是**已领的确证**（不归本 kind）。
+   *
    * ## 与其余 kind 的边界
    *
-   * - 与 `already-claimed`：那个是**服务端明确说已领**（Qoder 的 `replayed:true`、
-   *   Buddy 的 `10001`、Trae CN 的 `9095`）。本 kind 是「服务端什么都没说」。
+   * - 与 `already-claimed`：那个是**服务端明确说已领**（Qoder 的 `replayed:true`
+   *   与 `CLAIM_BENEFIT/CLAIMED`、Buddy 的 `10001`、Trae CN 的 `9095`）。
+   *   本 kind 是「服务端什么都没说」。
    * - 与 `failed`：没有失败可报（HTTP 200、信封合法、没有错误码），用户也**无
    *   事可做**。归 failed 会让用户去排查凭据，而凭据是好的。
    * - 与 `inactive`：`inactive` 是「活动未开启」这个**服务端明说的持续状态」。
@@ -130,7 +137,8 @@ export type ClaimOutcome =
    * ## UI
    *
    * 面板显示「无法判定」而不是「已签」（`src/qoder-credits.ts` 的
-   * `fetchQoderCheckinStatus` 也不再把空列表映射成 `todayCheckedIn: true`）。
+   * `fetchQoderCheckinStatus` 也不再把空列表映射成 `todayCheckedIn: true`；
+   * 2026-09-24 起该字段只在服务端明说 `CLAIM_BENEFIT/CLAIMED` 时为 true）。
    */
   | {
     kind: 'undetermined'

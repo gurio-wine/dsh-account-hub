@@ -631,11 +631,15 @@ describe('签到前后余额比对（abnormal）', () => {
   })
 })
 
-// ── undetermined（2026-09-24：Qoder 空活动列表）──────────────────────────────
+// ── undetermined（2026-09-24：Qoder 带头仍空的活动列表）──────────────────────
 //
-// 「假签到」的另一半：Qoder 的活动列表为空时**既可能已领、也可能暂无活动**，
-// 旧实现一律归一 `already-claimed` ⇒ 宿主写下签到状态 ⇒ 该账号整个周期不再被
-// 尝试，而它可能一分没领。
+// 「假签到」的另一半：Qoder 的活动列表**带头仍为空**时**既可能已领、也可能暂无
+// 活动**，旧实现一律归一 `already-claimed` ⇒ 宿主写下签到状态 ⇒ 该账号整个周期
+// 不再被尝试，而它可能一分没领。
+//
+// ⚠️ 限定语「带头」是 2026-09-24 真机定案的补正：缺 `Cosy-ClientType: 10` 时
+// 服务端**恒回空列表**（缺头假象，已在请求层修掉）。本组用的是「头齐之后仍空」
+// 的形态 —— 那才是真判不了。
 //
 // 本组守的是**状态写入**：`undetermined` 必须与 `failed` / `unavailable` /
 // `abnormal` 同待遇（**不写**），下一轮 sweep 才有机会把它变成确定。
@@ -647,7 +651,7 @@ describe('undetermined 不写签到状态（否则一次不确定变成永久少
     credentialRef: `QODER_CN_ACCOUNT_${id.toUpperCase()}`,
   })
 
-  /** 空活动列表的响应（真机形态：`campaigns: []`）。 */
+  /** **带头仍空**的活动列表响应（缺头时的空列表是假象，这里要的是补头后的真空）。 */
   const emptyCampaigns = () => new Response(
     JSON.stringify({ showCampaign: false, claimable: false, campaigns: [] }), { status: 200 },
   )
@@ -720,6 +724,57 @@ describe('undetermined 不写签到状态（否则一次不确定变成永久少
     await h.call<any>('checkin.perform', { provider: 'qoder-cn', accountId: 'q1' })
 
     expect(h.fetcher.calls.filter((u) => u.includes('/api/v2/quota/usage'))).toHaveLength(1)
+  })
+})
+
+// ── CLAIMED ⇒ already-claimed ⇒ **写**状态（缺陷链的终点，2026-09-24 真机定案）──
+//
+// 真机后果链：签到成功 → 活动变 `CLAIMED` → 旧实现判 `undetermined` → 宿主白名单
+// （只认 claimed / already-claimed）不写状态 → sweep 永久重试 → 用户永远看到
+// 「无法判定」，尽管积分已到账。本组守的是**链路的终点**：`CLAIMED` 必须让状态
+// 真的被写下去，否则「不写状态」这条正确的机制会被错误的判读喂成死循环。
+
+describe('`CLAIM_BENEFIT + CLAIMED` 判 already-claimed 并写下签到状态', () => {
+  const qoderEntry = (id: string): ProviderAccountEntry => makeEntry(id, {
+    provider: 'qoder-cn',
+    credentialRef: `QODER_CN_ACCOUNT_${id.toUpperCase()}`,
+  })
+
+  /** 今天已领的响应（真机形态：`CLAIM_BENEFIT` + `CLAIMED` + `claimable:false`）。 */
+  const claimedCampaigns = () => new Response(JSON.stringify({
+    showCampaign: true,
+    claimable: false,
+    campaigns: [{
+      campaignId: 'c1',
+      campaignKey: 'act-20260923-076',
+      actionType: 'CLAIM_BENEFIT',
+      claimStatus: 'CLAIMED',
+      benefit: { amount: 100 },
+    }],
+  }), { status: 200 })
+
+  it('outcome 为 already-claimed，且 checkins 里**写下**了该账号', async () => {
+    const h = createHarness([qoderEntry('q1')], qoderCampaignsOnly(claimedCampaigns))
+
+    const result = await h.call<any>('checkin.perform', { provider: 'qoder-cn', accountId: 'q1' })
+
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    const value = (result as { value: { results: Array<{ outcome: { kind: string } }> } }).value
+    expect(value.results[0]!.outcome.kind, JSON.stringify(value.results[0]!.outcome)).toBe('already-claimed')
+    // ✅ 核心断言：状态**写下去了**（白名单认 already-claimed）。不写就是死循环。
+    expect(h.pool.checkinNextEligible('qoder-cn', 'q1')).toBe(nextEligibleAt(Date.now(), 'qoder-cn'))
+    expect(h.pool.isCheckinDue('qoder-cn', 'q1')).toBe(false)
+  })
+
+  it('计入 alreadyClaimed 栏，undetermined 栏为 0', async () => {
+    const h = createHarness([qoderEntry('q1')], qoderCampaignsOnly(claimedCampaigns))
+
+    const result = await h.call<any>('checkin.perform', { provider: 'qoder-cn', accountId: 'q1' })
+
+    const summary = (result as { value: { summary: Record<string, number> } }).value.summary
+    expect(summary.alreadyClaimed).toBe(1)
+    expect(summary.undetermined).toBe(0)
+    expect(summary.failed).toBe(0)
   })
 })
 

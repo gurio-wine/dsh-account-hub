@@ -53,10 +53,11 @@
  *
  *   1. `qoder`（**国际版**）—— **`true`**：端点
  *      `GET {openapiBase}/sash/api/v1/me/campaigns` 已于 **2026-09-23 真机探测
- *      HTTP 200**、响应与 CN 逐字节同构（`{"uid":…,"showCampaign":false,
- *      "claimable":false,"campaignUrl":"","campaigns":[]}`）。旧定性
- *      「国际版无此活动」不成立 —— 两区同协议，国际版活动以**服务端下发为准**，
- *      空列表归 `already-claimed`（判据 4 既有语义）。
+ *      HTTP 200**、响应与 CN 逐字节同构。旧定性「国际版无此活动」不成立 ——
+ *      两区同协议。⚠️ 2026-09-24 真机定案：该端点**必须带
+ *      `Cosy-ClientType: 10`**（缺头 ⇒ 空列表假象），判读为三态
+ *      （`CLAIMED` ⇒ 已领、`CLAIMABLE` ⇒ 未签、**带头仍空** ⇒ `undetermined`），
+ *      详见 `docs/agents/providers-qoder.md`。
  *
  *   2. `qoder-cn`（**国内版**）—— **`true`**：端点已由 keylog 解密抓包解出并
  *      真机验收（2026-09-21），宿主侧 `credits.status` / `credits.claimAll`
@@ -114,8 +115,10 @@ export const CREDITS_CAPABILITIES = Object.freeze({
   // `dailyCheckin: true` —— **两区同协议**（宿主按传入 `product` 现算 host，
   //   见 `src/qoder-credits.ts`）。国际版端点 `GET {openapiBase}/sash/api/v1/me/campaigns`
   //   已于 **2026-09-23 真机探测 HTTP 200**、响应与 CN 逐字节同构 —— 旧定性
-  //   「国际版无此活动」已推翻，活动以**服务端下发为准**、空列表归
-  //   `already-claimed`（判据 4 既有语义）。
+  //   「国际版无此活动」已推翻，国际版活动以**服务端下发为准**。
+  //   ⚠️ 2026-09-24 真机定案：该端点**必须带 `Cosy-ClientType: 10`**
+  //   （缺头 ⇒ 空列表假象，不是服务端事实），判读为三态（`CLAIMED` ⇒ 已领、
+  //   `CLAIMABLE` ⇒ 未签、**带头仍空** ⇒ `undetermined`）。
   //   ⚠️ 它与 `buddy`（`dailyCheckin:false`）**不同**：Buddy 国际版**后端没有
   //   签到接口**，是矩阵里唯一 `dailyCheckin` 为 false 的条目 —— 不要因为
   //   `balance` 是 true 就顺手把 Buddy 也写成 true。单测有断言钉死六条签到面板。
