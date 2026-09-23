@@ -191,7 +191,28 @@ const IMPORT_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
     /^import \{ supportsCreditBalance, supportsDailyCheckin \} from '\.\/credits-capabilities\.js';$/m,
     "const { supportsCreditBalance, supportsDailyCheckin } = require('./credits-capabilities.js');",
   ],
+  [
+    /^import \{ orderAfterDrop, dropPositionFromPointer \} from '\.\/account-order\.js';$/m,
+    "const { orderAfterDrop, dropPositionFromPointer } = require('./account-order.js');",
+  ],
 ]
+
+/**
+ * 把 `./account-order.js` 按与 `toCjs` 同一套规则转成 CJS 写进临时目录。
+ *
+ * `account-hub.js` 现在 import 了它（拖拽排序）：**新增 import 必须同时改
+ * `IMPORT_REWRITES` 和这里**。只改前者的话改写规则会命中、而 `require` 在临时
+ * 目录里找不到文件，本文件以 `Cannot find module` **整体加载失败** ——
+ * 白屏闸门直接失效（不是变红，是不再守护任何东西）。
+ *
+ * 放**真件**：本文件会真的渲染 `ProviderPanel`，而它的拖拽属性构造里用到
+ * `orderAfterDrop`；换成空占位就会掩盖「渲染路径上真的调了它」这件事。
+ */
+function writeOrderModule(dir: string): void {
+  const source = readFileSync(resolve(here, '../../plugin-src/client/account-order.js'), 'utf8')
+  writeFileSync(join(dir, 'account-order.js'),
+    source.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, ''))
+}
 
 function toCjs(source: string): string {
   let out = source
@@ -278,6 +299,7 @@ function loadClientModule(): {
     JSON.stringify({ name: 'react', version: '0.0.0-stub', main: 'index.js' }))
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
+  writeOrderModule(dir)
   writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)

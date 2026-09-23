@@ -1792,8 +1792,10 @@ function registerAccountHubEndpoints(
       case 'account.reorder': {
         // 拖拽排序：重写该 provider 账号在池中的顺序。
         // 该顺序是自动选号与限流换号的候选优先级（见 `AccountPool.reorderAccounts`），
-        // 因此不是纯 UI 操作。⚠️ 客户端暂未发这个 RPC（UI 拖拽是第二阶段），
-        // 入口先就位并单测，避免「后端语义有了但没接线」。
+        // 因此不是纯 UI 操作。
+        // 客户端入口在 `plugin-src/client/account-hub.js`（`ProviderPanel.commitOrder`，
+        // 拖拽落点计算走 `plugin-src/client/account-order.js`）：本地乐观更新后发本
+        // RPC，失败则回滚并提示 —— 下方 bad-request 分支正是那条回滚路径的触发源。
         const req = payload as RpcReorderAccountsRequest
         if (typeof req.provider !== 'string' || req.provider.length === 0) {
           return { ok: false, error: { code: 'bad-request', message: 'provider 必填' } }

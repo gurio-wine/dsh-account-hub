@@ -1707,8 +1707,10 @@ describe('积分端点的 provider 能力边界', () => {
  * 就只剩「调用了某方法」这种无信息量的断言，无法发现「集合校验被绕过」
  * 「顺序没持久化」这类真实问题。
  *
- * ⚠️ 客户端**暂不发**这个 RPC（UI 拖拽属第二阶段），但入口必须能单测 ——
- * 否则「后端语义有了、接线坏了」要等到 UI 落地才暴露。
+ * 客户端入口在 `plugin-src/client/account-hub.js`（`ProviderPanel.commitOrder`）：
+ * 拖拽落点由 `plugin-src/client/account-order.js` 算出后发这个 RPC，失败即回滚
+ * —— 本文件守宿主这一端的参数校验与转交，客户端那一端由
+ * `tests/unit/account-order.spec.ts` 与 `tests/unit/account-order-panel.spec.ts` 守。
  */
 describe('account.reorder 端点', () => {
   type Handler = (request: Request) => Promise<Response>

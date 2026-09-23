@@ -13,7 +13,7 @@
 `AccountPool`（`src/account-pool.ts`）在 **storage 域** `dsh_account_hub` 里保存账号索引（旧 settings 的 `jet-hub` namespace 仅作回退路径，见「存储与通路」），凭据本体存于 `ctx.credentials`：
 
 - 账号条目以 `provider` 字段区分归属，`getAvailableAccount` / `listAccounts` 均按该字段过滤；**适配器必须以 `this.product.id` 作为 provider 实参查询账号池**（写死 `'buddy-cn'` 会让 Buddy 永远匹配不到账号）
-- 限流后按池中「已启用且不在重置时间内」的下一个账号自动重试；全部耗尽才抛 `QUOTA_EXCEEDED`；**数组顺序即候选优先级**（`reorderAccounts` / RPC `account.reorder`），勿加按限流重置时间重排候选的 sort
+- 限流后按池中「已启用且不在重置时间内」的**下一个账号**自动重试；全部耗尽才抛 `QUOTA_EXCEEDED`；**数组顺序即候选优先级**（`reorderAccounts` / RPC `account.reorder`），勿加按限流重置时间重排候选的 sort。**客户端拖拽排序已接线**（`plugin-src/client/account-order.js` 出落点、`account-hub.js` 的 `ProviderPanel.commitOrder` 发 RPC）：本地乐观更新 → 发 RPC → 失败回滚并提示；`orderedIds` 必须是该 provider 全部 id 的排列，否则本端点回 `bad-request`（那条错误正是客户端回滚路径的触发源）。顺序与「消耗顺序」档位是**两个维度**：档位决定在这个顺序上怎么取号（取第一个 / 轮转 / 按余额优先），拖拽决定顺序本身
 - **凭据必须在发请求前按目标模型挑选**：`resolveCredential` / `refresh` 都接受可选 `model` 参数，适配器的 `stream()` 必须把 `options.model` 传下去（`src/index.ts` 的 `makeCredentialResolver` / `makeAccountPicker` 是**各 provider 共用的唯一接线**，新增 provider 一律走它们，不要再写一份）。`getAvailableAccount` 的限流过滤是**逐模型**的，传空串时按设计不过滤 —— 传空串会让每次请求都先白跑一遍已限额/积分耗尽的账号。**仅 `fetchModels` 拉模型目录**（目录对所有模型一致）与「全部账号都在冷却期」的退化路径用空串，两者都刻意保留，不要改成「一并过滤」
 
 ## 模型黑名单（Account Hub「模型列表」开关）

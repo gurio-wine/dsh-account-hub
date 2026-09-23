@@ -67,7 +67,24 @@ const IMPORT_REWRITES: ReadonlyArray<readonly [RegExp, string]> = [
     /^import \{ supportsCreditBalance, supportsDailyCheckin \} from '\.\/credits-capabilities\.js';$/m,
     "const { supportsCreditBalance, supportsDailyCheckin } = require('./credits-capabilities.js');",
   ],
+  [
+    /^import \{ orderAfterDrop, dropPositionFromPointer \} from '\.\/account-order\.js';$/m,
+    "const { orderAfterDrop, dropPositionFromPointer } = require('./account-order.js');",
+  ],
 ]
+
+/**
+ * 把 `./account-order.js` 按与 `toCjs` 同一套规则转成 CJS 写进临时目录。
+ *
+ * `account-hub.js` 现在 import 了它（拖拽排序）；不写这个文件，`require` 会以
+ * `Cannot find module './account-order.js'` 让本文件**整体加载失败**
+ * —— 不是某条用例红，而是「什么都没测到」（那种失败还会伪装成组件问题）。
+ */
+function writeOrderModule(dir: string): void {
+  const source = readFileSync(resolve(here, '../../plugin-src/client/account-order.js'), 'utf8')
+  writeFileSync(join(dir, 'account-order.js'),
+    source.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, ''))
+}
 
 function toCjs(source: string): string {
   let out = source
@@ -92,6 +109,7 @@ function loadClientModule(): Record<string, unknown> {
     JSON.stringify({ name: 'react', version: '0.0.0-stub', main: 'index.js' }))
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
+  writeOrderModule(dir)
   writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)

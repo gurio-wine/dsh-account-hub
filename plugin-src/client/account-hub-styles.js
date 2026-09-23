@@ -71,10 +71,28 @@ const STYLES = `
 .dim-ah-empty { text-align: center; padding: 40px; color: var(--dsw-alias-label-tertiary, #888); }
 .dim-ah-empty p { margin: 8px 0; font-size: 14px; }
 
-/* 账号卡片 */
-.dim-ah-accountCard { border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; padding: 14px 16px; margin-bottom: 10px; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); transition: border-color .16s ease, box-shadow .16s ease; }
+/* 账号卡片
+   position: relative 是拖拽插入线的定位基准（见下方 data-dropBefore/After 的
+   ::before / ::after），opacity 进 transition 让「拿起」的淡出有过渡。 */
+.dim-ah-accountCard { position: relative; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; padding: 14px 16px; margin-bottom: 10px; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); transition: border-color .16s ease, box-shadow .16s ease, opacity .16s ease; }
 .dim-ah-accountCard:hover { border-color: color-mix(in srgb, #1677ff 22%, var(--dsw-alias-border-l2, #eef0f3)); box-shadow: 0 5px 16px rgb(31 35 41 / 5%); }
 .dim-ah-accountCard[data-enabled="false"] { opacity: 0.62; }
+
+/* 拖拽排序 */
+/* 抓取柄：独立的小区域，避免与卡片内的按钮/文本选择冲突 */
+.dim-ah-dragHandle { flex: none; width: 16px; height: 20px; display: flex; align-items: center; justify-content: center; cursor: grab; color: var(--dsw-alias-label-tertiary, #9aa0a6); font-size: 12px; line-height: 1; letter-spacing: -1px; user-select: none; border-radius: 4px; }
+.dim-ah-dragHandle:hover { color: var(--dsw-alias-label-secondary, #5f6672); background: rgb(31 35 41 / 5%); }
+.dim-ah-dragHandle:active { cursor: grabbing; }
+/* 正在被拖动的卡片：淡出以表明它已被「拿起」 */
+.dim-ah-accountCard[data-dragging="true"] { opacity: 0.4; border-style: dashed; }
+/* 拖拽悬停的落点：插入线。上方=插到该卡片之前，下方=之后 —— 必须与
+   dropPositionFromPointer 的判定同向，否则用户按线拖放却落在相反位置。 */
+.dim-ah-accountCard[data-dropBefore="true"]::before { content: ''; position: absolute; left: 0; right: 0; top: -6px; height: 3px; border-radius: 2px; background: #1677ff; }
+.dim-ah-accountCard[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -6px; height: 3px; border-radius: 2px; background: #1677ff; }
+/* 序号徽标：让当前优先级一目了然（顺序即选号优先级） */
+.dim-ah-accountOrder { flex: none; min-width: 18px; padding: 0 5px; border-radius: 6px; font-size: 11px; line-height: 17px; font-weight: 600; text-align: center; color: var(--dsw-alias-label-secondary, #5f6672); background: rgb(31 35 41 / 6%); }
+/* 排序提示行：解释「拖了有什么用」，只在两个以上账号时出现 */
+.dim-ah-orderHint { margin: 0 0 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 顶部一行：状态点 + 名称 + 状态标签 */
 .dim-ah-accountTop { display: flex; align-items: center; gap: 8px; }
