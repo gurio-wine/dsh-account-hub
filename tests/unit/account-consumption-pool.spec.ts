@@ -4,10 +4,10 @@
  * 纯逻辑（取值域 / 轮转 / 排序 / 缓存 / 锁）由 `account-consumption.spec.ts` 单独守着；
  * 本文件只验**池怎么用它**，以及四件最容易静默出错的接线：
  *
- * 1. **默认值 = 现状行为**：不传新的可选参数、也没配过任何东西时，
- *    `getAvailableAccount` 的返回必须与改动前逐字段一致（永远取第一个可用账号）。
- *    这是「不破坏既有调用点」（`buddy-auth` / `lobsterai-auth` 拉目录、
- *    `makeAccountPicker`）的判据。
+ * 1. **默认值**：没配过任何东西时读回「遍历 + 按轮次」（宿主 `DEFAULT_CONSUMPTION`）。
+ *    ⚠️ 与「不传新的可选参数」是**两件事**：不传 `pick` 的调用点（`buddy-auth` /
+ *    `lobsterai-auth` 拉目录、适配器换号重试）在任何档位下都必须拿到第一个可用
+ *    账号 —— 那条由「不传 pick 时整段重排都不执行」保证，与默认档位无关。
  * 2. **持久化七件套互带**：新增两个字段与既有五件套同属一份文档，任何一次
  *    整体 replace 漏带即被清空。
  * 3. **遍历游标持久化 + 自愈**：跨请求记忆下一个轮到谁；账号被删除 / 停用后
@@ -178,27 +178,26 @@ const PER_REQUEST: { turnKey?: string } = {}
 const turn = (key: string): { turnKey?: string } => ({ turnKey: key })
 
 describe('默认值与既有调用点（红线：不传新参数时行为逐字不变）', () => {
-  it('未配置任何东西时读回「顺序 + 按轮次」', async () => {
+  it('未配置任何东西时读回「遍历 + 按轮次」（用户拍板的默认）', async () => {
     const h = makeHarness()
     const pool = await makePool(h, [])
-    expect(pool.consumptionSetting('buddy-cn')).toEqual({ order: 'sequential', switch: 'per-turn' })
+    expect(pool.consumptionSetting('buddy-cn')).toEqual({ order: 'round-robin', switch: 'per-turn' })
     // 未知 provider 同样回默认值，不抛错。
-    expect(pool.consumptionSetting('nobody')).toEqual({ order: 'sequential', switch: 'per-turn' })
+    expect(pool.consumptionSetting('nobody')).toEqual({ order: 'round-robin', switch: 'per-turn' })
     expect(pool.allConsumption()).toEqual({})
   })
 
-  it('顺序档 + 不传 pick：恒取数组第一个可用账号（= 改动前行为）', async () => {
+  it('不传 pick：恒取数组第一个可用账号（与档位无关，遍历档也不轮转）', async () => {
     const h = makeHarness()
     const pool = await makePool(h, [])
     await seed(pool, [account('b1'), account('b2'), account('b3')])
+    // 默认档现在是遍历，但**不传 pick 的调用点一条都不受影响**（红线）。
     for (let i = 0; i < 3; i++) {
       const picked = await pool.getAvailableAccount('buddy-cn', '')
       expect(picked?.entry.id).toBe('b1')
     }
     // 空 modelId 的既有语义（不过滤限流）也没变。
     expect((await pool.getAvailableAccount('buddy-cn', 'glm-5.2'))?.entry.id).toBe('b1')
-    // 传了 pick 但没配过任何档位 → 与不传完全一致。
-    expect((await pool.getAvailableAccount('buddy-cn', '', undefined, { turnKey: 't1' }))?.entry.id).toBe('b1')
   })
 
   it('账号被停用 / 凭据不可解析时的既有过滤不变', async () => {
@@ -427,7 +426,7 @@ describe('配置持久化：七件套互带（漏一个就被静默清空）', (
     await pool.writeConsumption('buddy-cn', { order: 'round-robin' })
     await pool.setModelDisabled('buddy-cn', 'x', true)
     await pool.writeContextBudget('buddy-cn', 'x', 1000)
-    await pool.writeCheckinDay('buddy-cn', 'a', 1)
+    await pool.writeCheckinNextEligible('buddy-cn', 'a', Date.now() + 60_000)
     await pool.replaceAll([account('a')], pool.allDisabledModels(), 3)
     expect(h.storageWrites.length).toBeGreaterThanOrEqual(5)
     for (const write of h.storageWrites) {
@@ -443,28 +442,30 @@ describe('配置持久化：七件套互带（漏一个就被静默清空）', (
     await pool.getAvailableAccount('buddy-cn', '', undefined, PER_REQUEST)
     await pool.setModelDisabled('buddy-cn', 'x', true)
     await pool.writeContextBudget('buddy-cn', 'x', 1000)
-    await pool.writeCheckinDay('buddy-cn', 'a', 7)
+    const nextEligible = Date.now() + 7_000
+    await pool.writeCheckinNextEligible('buddy-cn', 'a', nextEligible)
     await pool.removeAccount('b')
     const last = h.storageCurrent()!
     expect(last.consumption).toEqual({ 'buddy-cn': { order: 'round-robin', switch: 'per-request' } })
     expect(last.consumptionCursors).toEqual({ 'buddy-cn': 'b' })
     expect(last.disabledModels).toEqual({ 'buddy-cn': { x: true } })
     expect(last.contextBudgets).toEqual({ 'buddy-cn': { x: 1000 } })
-    expect(last.checkins).toEqual({ 'buddy-cn:a': 7 })
+    expect(last.checkins).toEqual({ 'buddy-cn:a': nextEligible })
   })
 
   it('写消耗配置本身是「读 → 改单键 → 整体 replace」，不动其它 provider 与其它字段', async () => {
     const h = makeHarness()
     const pool = await makePool(h, [])
     await seed(pool, [account('a')])
-    await pool.writeConsumption('buddy-cn', { order: 'round-robin' })
+    // ⚠️ 这里必须用**非默认档**：默认档（遍历）写入即被剔除，验不出「保留」语义。
+    await pool.writeConsumption('buddy-cn', { order: 'sequential' })
     await pool.writeConsumption('qoder', { order: 'highest-balance' })
     expect(pool.allConsumption()).toEqual({
-      'buddy-cn': { order: 'round-robin', switch: 'per-turn' },
+      'buddy-cn': { order: 'sequential', switch: 'per-turn' },
       qoder: { order: 'highest-balance', switch: 'per-turn' },
     })
-    // 改回默认 → 该 provider 的键被删除，不留 `{ provider: {默认值} }` 噪音。
-    await pool.writeConsumption('buddy-cn', { order: 'sequential' })
+    // 改回默认（遍历）→ 该 provider 的键被删除，不留 `{ provider: {默认值} }` 噪音。
+    await pool.writeConsumption('buddy-cn', { order: 'round-robin' })
     expect(pool.allConsumption()).toEqual({ qoder: { order: 'highest-balance', switch: 'per-turn' } })
     expect((h.storageCurrent()!.consumption as Record<string, unknown>).buddy_cn).toBeUndefined()
   })
@@ -472,19 +473,21 @@ describe('配置持久化：七件套互带（漏一个就被静默清空）', (
   it('脏值 / 半截配置在读取侧被归一化，不让整条配置失效', async () => {
     const h = makeHarness({
       accounts: [],
-      consumption: { 'buddy-cn': { order: 'round-robin' }, qoder: { order: 5 }, 'trae-cn': 'x' },
+      consumption: { 'buddy-cn': { order: 'sequential' }, qoder: { order: 5 }, 'trae-cn': 'x' },
       consumptionCursors: { 'buddy-cn': 'a', qoder: 9 },
     })
     const pool = await makePool(h, [])
-    expect(pool.allConsumption()).toEqual({ 'buddy-cn': { order: 'round-robin', switch: 'per-turn' } })
-    expect(pool.consumptionSetting('qoder')).toEqual({ order: 'sequential', switch: 'per-turn' })
+    // 半截条目补默认的 switch；非法档位（`5` / `'x'`）回退**默认档遍历**，
+    // 于是那两条等于默认值 → 整条被剔除（不留噪音键）。
+    expect(pool.allConsumption()).toEqual({ 'buddy-cn': { order: 'sequential', switch: 'per-turn' } })
+    expect(pool.consumptionSetting('qoder')).toEqual({ order: 'round-robin', switch: 'per-turn' })
   })
 
   it('settings 回退路径同样读得到两个新字段（并归一化）', async () => {
-    const h = makeHarness({ withStorage: false, consumption: { 'buddy-cn': { order: 'round-robin' } } })
+    const h = makeHarness({ withStorage: false, consumption: { 'buddy-cn': { order: 'sequential' } } })
     const pool = new AccountPool(h.ctx as never)
     expect(await pool.openStorage()).toBe(false)
-    expect(pool.consumptionSetting('buddy-cn')).toEqual({ order: 'round-robin', switch: 'per-turn' })
+    expect(pool.consumptionSetting('buddy-cn')).toEqual({ order: 'sequential', switch: 'per-turn' })
   })
 
   it('回退路径写入两个新字段，且仍带上既有五件套', async () => {
@@ -494,7 +497,8 @@ describe('配置持久化：七件套互带（漏一个就被静默清空）', (
     await pool.writeConsumption('buddy-cn', { switch: 'per-request' })
     const last = h.settingsWrites.at(-1)!
     expect(Object.keys(last).sort()).toEqual(ACCOUNT_KEYS)
-    expect(last.consumption).toEqual({ 'buddy-cn': { order: 'sequential', switch: 'per-request' } })
+    // 只改了 switch ⇒ order 落的是**默认档遍历**。
+    expect(last.consumption).toEqual({ 'buddy-cn': { order: 'round-robin', switch: 'per-request' } })
     expect(last.accounts).toEqual([])
   })
 

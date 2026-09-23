@@ -255,6 +255,25 @@ export interface RpcCreditsClaimSummary {
    * 「失败」，用户只会白折腾一轮。
    */
   unavailable: number
+  /**
+   * **签到异常**的账号数（`ClaimOutcome` 的 `abnormal`：服务端响应成功，但签到前后
+   * 余额没有变多）。
+   *
+   * **独立计数而不并入 `claimed`，也不并入 `failed`**：
+   * - 并进 `claimed` 就是本次改动要修的那个缺陷 —— 界面报「领取成功 +0」而用户
+   *   永远查不出为什么（余额数字与「成功」二字互相矛盾）；
+   * - 并进 `failed` 会让用户去排查凭据/设备，而这三种东西都是好的（服务端回了
+   *   code:0）；它的正确动作与 `unavailable` 同款：**什么都不做，等自动重试**。
+   */
+  abnormal: number
+  /**
+   * **无法判定**的账号数（`ClaimOutcome` 的 `undetermined`：Qoder 系空活动列表）。
+   *
+   * 既不能并进 `already-claimed`（那会**伪造一次签到** —— 宿主据此写状态、整个
+   * 周期不再重试，而该账号可能一分没领），也不能并进 `failed`（没有失败可报、
+   * 用户无事可做）。独立计数 + **不写状态** ⇒ 下一轮 sweep 自动重试。
+   */
+  undetermined: number
   failed: number
 }
 /** RPC: 一键领取积分响应 */

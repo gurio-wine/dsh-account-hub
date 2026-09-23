@@ -94,7 +94,10 @@ function toCjs(source: string): string {
   // 暴露本次要测的纯函数。它们都是模块作用域的声明，故此处必然可见。
   return out.concat(
     '\nmodule.exports.__testExports = { ClaimNotice: ClaimNotice, buildClaimNotice: buildClaimNotice,'
-    + ' claimUnavailableLines: claimUnavailableLines, formatClaimUnavailableLine: formatClaimUnavailableLine };\n',
+    + ' claimUnavailableLines: claimUnavailableLines, formatClaimUnavailableLine: formatClaimUnavailableLine,'
+    + ' claimAbnormalLines: claimAbnormalLines, formatClaimAbnormalLine: formatClaimAbnormalLine,'
+    + ' claimUndeterminedLines: claimUndeterminedLines,'
+    + ' formatClaimUndeterminedLine: formatClaimUndeterminedLine };\n',
   )
 }
 
@@ -121,16 +124,26 @@ afterAll(() => {
   if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true })
 })
 
-const { ClaimNotice, buildClaimNotice, claimUnavailableLines, formatClaimUnavailableLine } = loadClientModule() as {
+const {
+  ClaimNotice, buildClaimNotice, claimUnavailableLines, formatClaimUnavailableLine,
+  claimAbnormalLines, formatClaimAbnormalLine,
+  claimUndeterminedLines, formatClaimUndeterminedLine,
+} = loadClientModule() as {
   ClaimNotice: (props: Record<string, unknown>) => TreeNode
   buildClaimNotice: (res: unknown) => {
     tone: string
     text: string
     details: string[]
     unavailableDetails: string[]
+    abnormalDetails: string[]
+    undeterminedDetails: string[]
   }
   claimUnavailableLines: (res: unknown) => string[]
   formatClaimUnavailableLine: (result: unknown) => string
+  claimAbnormalLines: (res: unknown) => string[]
+  formatClaimAbnormalLine: (result: unknown) => string
+  claimUndeterminedLines: (res: unknown) => string[]
+  formatClaimUndeterminedLine: (result: unknown) => string
 }
 
 /** `createElement` 占位的产物形态。 */
@@ -563,6 +576,254 @@ describe('unavailable（暂不可签）既不并进失败明detail，也不报�
 
   it('旧宿主不返回 summary.unavailable 时摘要行不出现「NaN 个暂不可签」', () => {
     // 兼容性护栏：`unavailable` 是本次新增字段，旧宿主响应里没有它。
+    const notice = buildClaimNotice({
+      results: [{ accountId: 'a', nickname: 'A', outcome: { kind: 'claimed', credit: 5, streakDays: 1, isStreakDay: false } }],
+      summary: { claimed: 1, totalCredit: 5, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0 },
+    })
+    expect(notice.text).toBe('1 个账号领取成功（+5 积分）')
+    expect(notice.text).not.toContain('NaN')
+  })
+})
+
+/**
+ * `abnormal`（**签到异常**：响应成功但积分未增加）的通知渲染。
+ *
+ * ## 为什么它不是「又一种失败」
+ *
+ * 服务端**没有错误**（它回了成功码），出问题的是「这次成功没有产生积分」——
+ * 这正是用户报障「领取成功 +0，无从追查」的形态。故本档必须：
+ * 1. **独立成段**（并进 claimed 会让缺陷再次隐形，并进 failed 会让用户去排查
+ *    凭据/设备/网络 —— 而这三样在本次请求里都是好的）；
+ * 2. **显示前后两个余额数字** —— 没有它们，用户既判断不出是没发还是发少了，
+ *    也没法拿去跟服务端核对。
+ */
+describe('abnormal（签到异常）独立成段且带前后余额数字', () => {
+  const abnormalResponse = () => ({
+    results: [{
+      accountId: 'acc-1',
+      nickname: '我的账号',
+      outcome: {
+        kind: 'abnormal',
+        balanceBefore: 100,
+        balanceAfter: 100,
+        message: '签到响应成功但积分未增加，视为未签到',
+      },
+    }],
+    summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, abnormal: 1, failed: 0 },
+  })
+
+  it('摘要行说「1 个签到异常」，色调**仍是 ok**（不是失败）', () => {
+    const tree = render(abnormalResponse())
+    expect(textOf(tree)[0]).toBe('1 个签到异常')
+    // 关键：`failed` 为 0 ⇒ 色调不变 warn。报成 warn 等于把「等自动重试」
+    // 渲染成「出问题了」。
+    expect(tree.props['data-tone']).toBe('ok')
+    expect(tree.props.role).toBe('status')
+  })
+
+  it('明细行独立成段（data-kind="abnormal"），且**带前后两个余额数字**', () => {
+    const tree = render(abnormalResponse())
+    const children = childrenOf(tree)
+    expect(children).toHaveLength(2)
+    const list = children[1] as TreeNode
+    expect(list.type).toBe('ul')
+    expect(list.props['data-kind']).toBe('abnormal')
+    // ⚠️ 两个数字是这一档的**全部信息量**：服务端没给 code / logid 可转述。
+    expect(textOf(children[1])[0]).toContain('签到前 100')
+    expect(textOf(children[1])[0]).toContain('签到后 100')
+  })
+
+  it('**不显示**「（code 未知）」这类噪音（本档没有错误码可报）', () => {
+    const tree = render(abnormalResponse())
+    const all = textOf(tree).join('\n')
+    expect(all).not.toContain('code')
+    expect(all).not.toContain('logid')
+  })
+
+  it('前后数字缺失时不显示那一段，但文案本身仍成立', () => {
+    // 旧宿主 / 异常响应可能不带这两个字段；此时**不**渲染
+    // 「（签到前 undefined → 签到后 undefined）」。
+    const line = formatClaimAbnormalLine({
+      accountId: 'acc-9',
+      nickname: '',
+      outcome: { kind: 'abnormal', message: '签到响应成功但积分未增加' },
+    })
+    expect(line).toBe('acc-9：签到响应成功但积分未增加')
+    expect(line).not.toContain('undefined')
+  })
+
+  it('两个数字的展示形态：0 是有效数字（不是「没拿到」）', () => {
+    const line = formatClaimAbnormalLine({
+      accountId: 'a',
+      nickname: 'A',
+      outcome: { kind: 'abnormal', balanceBefore: 0, balanceAfter: 0, message: 'x' },
+    })
+    expect(line).toBe('A：x（签到前 0 → 签到后 0）')
+  })
+
+  it('message 缺失时回退文案是「签到响应成功但积分未增加」，**不是**「领取失败」', () => {
+    const line = formatClaimAbnormalLine({
+      accountId: 'acc-9',
+      nickname: '',
+      outcome: { kind: 'abnormal', balanceBefore: 1, balanceAfter: 1, message: '' },
+    })
+    expect(line).toContain('签到响应成功但积分未增加')
+    expect(line).not.toContain('领取失败')
+  })
+
+  it('成功 / 已领 / 活动未开启都不产生 abnormal 行', () => {
+    const res = {
+      results: [
+        { accountId: 'a', nickname: 'A', outcome: { kind: 'claimed', credit: 1, streakDays: 1, isStreakDay: false } },
+        { accountId: 'b', nickname: 'B', outcome: { kind: 'already-claimed', message: '今天已签到' } },
+        { accountId: 'c', nickname: 'C', outcome: { kind: 'inactive', message: '签到未开启' } },
+      ],
+      summary: { claimed: 1, totalCredit: 1, alreadyClaimed: 1, inactive: 1, unavailable: 0, abnormal: 0, failed: 0 },
+    }
+    expect(claimAbnormalLines(res)).toEqual([])
+    expect(buildClaimNotice(res).text).toBe('1 个账号领取成功（+1 积分），1 个今日已领取，1 个活动未开启')
+  })
+
+  it('results 缺失或不是数组时不抛错：abnormal 明细为空', () => {
+    for (const results of [undefined, null, 'oops', 42]) {
+      expect(claimAbnormalLines({ results }), String(results)).toEqual([])
+    }
+  })
+
+  it('旧宿主不返回 summary.abnormal 时摘要行不出现「NaN 个签到异常」', () => {
+    const notice = buildClaimNotice({
+      results: [{ accountId: 'a', nickname: 'A', outcome: { kind: 'claimed', credit: 5, streakDays: 1, isStreakDay: false } }],
+      summary: { claimed: 1, totalCredit: 5, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0 },
+    })
+    expect(notice.text).toBe('1 个账号领取成功（+5 积分）')
+    expect(notice.text).not.toContain('NaN')
+  })
+
+  it('failed 与 abnormal 同时存在时各走各的段，摘要分别计数', () => {
+    const tree = render({
+      results: [
+        { accountId: 'a', nickname: 'A', outcome: { kind: 'abnormal', balanceBefore: 1, balanceAfter: 1, message: '未增加' } },
+        { accountId: 'b', nickname: 'B', outcome: { kind: 'failed', code: 1001, message: '凭据已失效，请重新登录' } },
+      ],
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, abnormal: 1, failed: 1 },
+    })
+    expect(textOf(tree)[0]).toBe('1 个签到异常，1 个失败')
+    // 有真失败 ⇒ 色调这才切 warn。
+    expect(tree.props['data-tone']).toBe('warn')
+    const children = childrenOf(tree)
+    // 摘要 + 失败明细 + 异常明细 = 3 个。
+    expect(children).toHaveLength(3)
+    expect((children[1] as TreeNode).props['data-kind']).toBeUndefined()
+    expect((children[2] as TreeNode).props['data-kind']).toBe('abnormal')
+  })
+})
+
+/**
+ * `undetermined`（**无法判定**：Qoder 空活动列表）的通知渲染。
+ *
+ * ## 为什么它是本次改动里最不能出错的一档
+ *
+ * 旧实现把空活动列表归一成 `already-claimed`，界面因此显示「今天已领取」——
+ * 而那个账号**可能一分没领**（活动还没开始时的空列表长得一模一样）。这就是
+ * 「qoder 假签到」在界面上的形态。故本档必须：
+ * 1. **既不算已领、也不算失败**（各自都是错的答案）；
+ * 2. 文案说清「会自动重试」—— 那是用户唯一可执行的结论（他什么都不用做）。
+ */
+describe('undetermined（无法判定）既不报已领也不报失败', () => {
+  const undeterminedResponse = () => ({
+    results: [{
+      accountId: 'q1',
+      nickname: '我的 Qoder 账号',
+      outcome: {
+        kind: 'undetermined',
+        message: '活动列表为空，无法判定今天是否已领取（将在下一轮自动重试）',
+      },
+    }],
+    summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, abnormal: 0, undetermined: 1, failed: 0 },
+  })
+
+  it('摘要行说「1 个无法判定」，色调**仍是 ok**', () => {
+    const tree = render(undeterminedResponse())
+    expect(textOf(tree)[0]).toBe('1 个无法判定')
+    expect(tree.props['data-tone']).toBe('ok')
+    expect(tree.props.role).toBe('status')
+  })
+
+  it('⚠️ **绝不**显示成「今天已领取」（那正是「假签到」的界面形态）', () => {
+    const tree = render(undeterminedResponse())
+    const all = textOf(tree).join('\n')
+    // ⚠️ 判据是**断言式**的那两句（`already-claimed` 的实际文案），不是「已领取」
+    // 这个子串 —— 本档的文案本身写着「无法判定今天**是否**已领取」，它是个疑问句，
+    // 恰恰是正确表述。用子串断言会把正确文案判成违规。
+    expect(all).not.toContain('今天已领取')
+    expect(all).not.toContain('今天已签到')
+    // 也不许并进失败档（用户会去排查好的凭据）。
+    expect(all).not.toContain('失败')
+  })
+
+  it('明细行独立成段（data-kind="undetermined"）', () => {
+    const tree = render(undeterminedResponse())
+    const children = childrenOf(tree)
+    expect(children).toHaveLength(2)
+    const list = children[1] as TreeNode
+    expect(list.type).toBe('ul')
+    expect(list.props['data-kind']).toBe('undetermined')
+    expect(textOf(children[1])[0]).toBe(
+      '我的 Qoder 账号：活动列表为空，无法判定今天是否已领取（将在下一轮自动重试）',
+    )
+  })
+
+  it('message 缺失时回退文案是「无法判定今天是否已领取」，不是「已领」也不是「失败」', () => {
+    const line = formatClaimUndeterminedLine({
+      accountId: 'q9',
+      nickname: '',
+      outcome: { kind: 'undetermined' },
+    })
+    expect(line).toBe('q9：无法判定今天是否已领取')
+    // 疑问句（「是否」）而不是断言（「今天已领取」）—— 后者会让用户以为领到了。
+    expect(line).toContain('是否')
+    expect(line).not.toContain('今天已领取')
+    expect(line).not.toContain('失败')
+  })
+
+  it('纯函数契约：三个明细通道互不污染', () => {
+    const notice = buildClaimNotice(undeterminedResponse())
+    expect(notice.details).toEqual([])
+    expect(notice.unavailableDetails).toEqual([])
+    expect(notice.abnormalDetails).toEqual([])
+    expect(notice.undeterminedDetails).toHaveLength(1)
+  })
+
+  it('与 failed / unavailable / abnormal 四档同时存在时各走各的段', () => {
+    const tree = render({
+      results: [
+        { accountId: 'a', nickname: 'A', outcome: { kind: 'undetermined', message: '判不了' } },
+        { accountId: 'b', nickname: 'B', outcome: { kind: 'unavailable', code: 9074, message: '暂不可签' } },
+        { accountId: 'c', nickname: 'C', outcome: { kind: 'abnormal', balanceBefore: 1, balanceAfter: 1, message: '未增加' } },
+        { accountId: 'd', nickname: 'D', outcome: { kind: 'failed', code: 1001, message: '凭据已失效' } },
+      ],
+      summary: {
+        claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0,
+        unavailable: 1, abnormal: 1, undetermined: 1, failed: 1,
+      },
+    })
+    expect(textOf(tree)[0]).toBe('1 个暂不可签，1 个签到异常，1 个无法判定，1 个失败')
+    const children = childrenOf(tree)
+    // 摘要 + failed + unavailable + abnormal + undetermined = 5 个。
+    expect(children).toHaveLength(5)
+    expect((children[1] as TreeNode).props['data-kind']).toBeUndefined()
+    expect((children[2] as TreeNode).props['data-kind']).toBe('unavailable')
+    expect((children[3] as TreeNode).props['data-kind']).toBe('abnormal')
+    expect((children[4] as TreeNode).props['data-kind']).toBe('undetermined')
+  })
+
+  it('results 缺失或不是数组时不抛错：undetermined 明细为空', () => {
+    for (const results of [undefined, null, 'oops', 42]) {
+      expect(claimUndeterminedLines({ results }), String(results)).toEqual([])
+    }
+  })
+
+  it('旧宿主不返回 summary.undetermined 时摘要行不出现「NaN 个无法判定」', () => {
     const notice = buildClaimNotice({
       results: [{ accountId: 'a', nickname: 'A', outcome: { kind: 'claimed', credit: 5, streakDays: 1, isStreakDay: false } }],
       summary: { claimed: 1, totalCredit: 5, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0 },

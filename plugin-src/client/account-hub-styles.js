@@ -223,18 +223,30 @@ const STYLES = `
 .dim-ah-tierOption input:disabled { cursor: default; }
 .dim-ah-tierOption input:disabled + span { opacity: 0.5; }
 
-/* 消耗顺序 / 切换粒度：两个选择器**并排**、各占一半宽。
+/* 消耗顺序 / 切换粒度：两个下拉**同一排**、各占一半宽。
    与账号卡片同宽：它与账号卡片列表同处一个容器，故宽度天然一致，
    这里不需要任何宽度计算。
-   窄面板下（两列各半会挤成竖排文案）自动折成上下两行 —— 每档是一句
-   中文短语，横向挤不下时换行比缩字号可读。 */
-.dim-ah-consumption { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
-.dim-ah-consumptionGroup { flex: 1 1 45%; min-width: 0; display: flex; flex-direction: column; gap: 6px;
+
+   ⚠️ 容器**刻意不换行**（没有 flex-wrap）：需求是「同一排」。窄面板下两块会一起
+   变窄，而 select 收起时只显示当前档、内容自带省略，比折成上下两行更贴近需求。
+   ⚠️ 两块各占一半靠「flex: 1 1 0」+「min-width: 0」两条共同成立：
+   flex-basis 为 0 才是**等分**（写成 1 1 45% 时两块会留出 10% 空档、
+   不再等于卡片宽）；而 min-width 默认 auto 会让长 option 文案把这一块撑宽，
+   于是两块不等宽 —— 那正是「各占一半」的反面。 */
+.dim-ah-consumption { display: flex; gap: 12px; margin-bottom: 12px; }
+.dim-ah-consumptionGroup { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 6px;
   padding: 8px 10px; border: 1px solid var(--dsw-alias-border-secondary, #e5e6eb); border-radius: 8px; }
 .dim-ah-consumptionHead { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .dim-ah-consumptionLabel { font-size: 13px; line-height: 18px; }
 .dim-ah-consumptionHint { font-size: 12px; line-height: 16px; color: var(--dsw-alias-label-secondary, #4e5969); }
-.dim-ah-consumptionOptions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* 下拉本体：视觉对齐 .dim-ah-btn（同样的边框色与圆角），字号取 12px 与档位文案一致。
+   width:100% 是「总宽 = 卡片宽」在控件这一层的落点：块是等分的，控件再吃满块。
+   appearance:none 之外的箭头不自己画 —— 原生箭头在各平台都已可读，自绘要处理
+   高对比度模式与 RTL，收益不成比例。 */
+.dim-ah-consumptionSelect { box-sizing: border-box; width: 100%; min-width: 0; padding: 4px 8px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; background: var(--dsw-alias-bg-layer-3, #fff); color: var(--dsw-alias-label-primary, #1f2329); font: inherit; font-size: 12px; line-height: 18px; cursor: pointer; }
+.dim-ah-consumptionSelect:hover:not(:disabled) { border-color: color-mix(in srgb, #1677ff 40%, var(--dsw-alias-border-l2, #dfe1e5)); }
+.dim-ah-consumptionSelect:focus-visible { outline: none; border-color: color-mix(in srgb, #1677ff 72%, var(--dsw-alias-border-l2, #dfe1e5)); box-shadow: 0 0 0 2px color-mix(in srgb, #1677ff 24%, transparent); }
+.dim-ah-consumptionSelect:disabled { opacity: 0.5; cursor: default; }
 `
 
 let injected = false

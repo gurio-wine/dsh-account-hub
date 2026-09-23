@@ -4,10 +4,10 @@
  * ## 为什么必须真渲染，而不是源码级正则断言
  *
  * 本仓库既有的前端测试多为「读源码、正则断言」（react 不在依赖里），但那**恰好
- * 证不了本次要证的东西**。本次的命题是「面板顶部出现两个并排选择器，点击后发出
+ * 证不了本次要证的东西**。本次的命题是「面板顶部出现两个并排下拉，改变后发出
  * 正确的 RPC，且选中态跟随宿主返回」—— 这是**渲染结构 + 事件流的输出差异**，
- * 正则只能证明某个字符串被提到过，证明不了组件真的渲染了它、更证明不了点击会
- * 走到哪个 `rpcCall` 上。
+ * 正则只能证明某个字符串被提到过，证明不了组件真的渲染了它、更证明不了 change
+ * 会走到哪个 `rpcCall` 上。
  *
  * 因此这里沿用 `qoder-hub-blank-screen.spec.ts` 的路子：把插件源码的 import 换成
  * 占位模块加载，配一个**带 hooks 的 react 占位**，真的渲染 `ProviderPanel`、
@@ -290,7 +290,22 @@ function makeRpc(consumption: { order: string; switch: string } = { order: 'sequ
 
 const client = loadClientModule()
 
-describe('ConsumptionSelectors：两个并排的单选组', () => {
+/** 树里两个消耗配置下拉（判据是 `select` + `aria-label`，见 `ConsumptionSelect`）。 */
+function consumptionSelects(node: unknown): ElementNode[] {
+  return flatten(node)
+    .filter(isElement)
+    .filter((el) => el.type === 'select' && typeof el.props['aria-label'] === 'string')
+}
+
+/** 某个 select 下的 `<option>` 节点（按 DOM 顺序）。 */
+function optionsOf(select: ElementNode): ElementNode[] {
+  return flatten(select).filter(isElement).filter((el) => el.type === 'option')
+}
+
+/** 造一个只带 `target.value` 的 change 事件替身（被测代码只读这一个字段）。 */
+const changeTo = (value: string) => ({ target: { value } })
+
+describe('ConsumptionSelectors：两个并排的原生下拉', () => {
   it('渲染三档消耗顺序与两档切换粒度，文案与需求一致', () => {
     const { rpcCall } = makeRpc()
     client.hooks.__reset()
@@ -304,23 +319,32 @@ describe('ConsumptionSelectors：两个并排的单选组', () => {
       }),
       client.hooks,
     )
+    const selects = consumptionSelects(tree)
+    expect(selects, '应当恰好两个下拉（消耗顺序 / 切换粒度）').toHaveLength(2)
+
+    // 三档消耗顺序：文案在 option 上（select 收起时只显示被选中的那一档）。
+    const orderLabels = optionsOf(selects[0]!).map((el) => textsOf(el).join(''))
+    expect(orderLabels).toEqual(['顺序', '遍历', '最高优先'])
+    // 两档切换粒度（第二档是用户没改的默认值）。
+    const switchLabels = optionsOf(selects[1]!).map((el) => textsOf(el).join(''))
+    expect(switchLabels).toEqual(['按请求', '按轮次'])
+
     const text = textsOf(tree).join('')
-    // 三档消耗顺序。
+    // 两个下拉的标题文案（分组的可见标签，不是 aria-label 的替代品）。
     expect(text).toContain('消耗顺序')
-    expect(text).toContain('顺序')
-    expect(text).toContain('遍历')
-    expect(text).toContain('最高优先')
-    // 两档切换粒度（第二档是用户拍板的默认值）。
     expect(text).toContain('切换粒度')
-    expect(text).toContain('按请求')
-    expect(text).toContain('按轮次')
+    // option 的取值必须与宿主联合类型逐字一致（改名等于让用户配置失效）。
+    expect(optionsOf(selects[0]!).map((el) => el.props.value))
+      .toEqual(['sequential', 'round-robin', 'highest-balance'])
+    expect(optionsOf(selects[1]!).map((el) => el.props.value))
+      .toEqual(['per-request', 'per-turn'])
     // 不得出现旧名「轮次」被当成消耗顺序那一档（改名是用户明确要求的）。
     expect(text).not.toMatch(/消耗顺序[\s\S]{0,40}轮次档/)
   })
 
-  it('两个选择器各自是一个 radiogroup，且 radio 数量分别是 3 与 2', () => {
+  it('两个下拉都是原生 select，各带 aria-label，且不再有任何 radio', () => {
     const { rpcCall } = makeRpc()
-    client.hooks.__reset();
+    client.hooks.__reset()
     const tree = expandTree(
       client.hooks.__renderComponent(client.ConsumptionSelectors, {
         provider: 'buddy-cn', rpcCall, value: { order: 'sequential', switch: 'per-turn' },
@@ -328,47 +352,62 @@ describe('ConsumptionSelectors：两个并排的单选组', () => {
       }),
       client.hooks,
     )
-    const nodes = flatten(tree).filter(isElement)
-    const groups = nodes.filter((el) => el.props.role === 'radiogroup')
-    expect(groups, '应当恰好有两个单选组（消耗顺序 / 切换粒度）').toHaveLength(2)
-
-    const radiosOf = (group: ElementNode) => flatten(group)
+    const selects = consumptionSelects(tree)
+    expect(selects.map((el) => el.props['aria-label'])).toEqual(['消耗顺序', '切换粒度'])
+    // 无障碍：两个下拉都得有可读名（aria-label 是唯一来源，分组是裸 div）。
+    for (const select of selects) {
+      expect(String(select.props['aria-label']).length).toBeGreaterThan(0)
+      // 不再声明 radiogroup 角色（radio 形态已整体替换）。
+      expect(select.props.role).toBeUndefined()
+    }
+    // 反向锚点：radio 一个都不剩（否则「改了但只改了一半」也会绿）。
+    const radios = flatten(tree)
       .filter(isElement)
       .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    // 三档顺序 + 两档粒度。
-    expect(radiosOf(groups[0]!)).toHaveLength(3)
-    expect(radiosOf(groups[1]!)).toHaveLength(2)
-    // 每组内的 radio 必须同名（否则浏览器会把四五个 radio 当成一组互斥）。
-    const namesOf = (group: ElementNode) => new Set(radiosOf(group).map((el) => el.props.name))
-    expect(namesOf(groups[0]!).size).toBe(1)
-    expect(namesOf(groups[1]!).size).toBe(1)
-    // 两组的 name 必须不同，否则跨组互斥。
-    expect([...namesOf(groups[0]!)][0]).not.toBe([...namesOf(groups[1]!)][0])
+    expect(radios, '消耗配置已改为下拉，不应再有 radio').toHaveLength(0)
+    const groups = flatten(tree).filter(isElement).filter((el) => el.props.role === 'radiogroup')
+    expect(groups, '不再有 radiogroup 容器').toHaveLength(0)
   })
 
-  it('选中态跟随 value（顺序 + 按轮次时各自勾中默认档）', () => {
+  it('选中态跟随 value（受控 select）', () => {
     const { rpcCall } = makeRpc()
-    client.hooks.__reset();
+    client.hooks.__reset()
     const tree = expandTree(
       client.hooks.__renderComponent(client.ConsumptionSelectors, {
-        provider: 'buddy-cn', rpcCall, value: { order: 'sequential', switch: 'per-turn' },
+        provider: 'buddy-cn', rpcCall, value: { order: 'round-robin', switch: 'per-request' },
         busy: false, onChange: () => {},
       }),
       client.hooks,
     )
-    const checked = flatten(tree)
+    const selects = consumptionSelects(tree)
+    expect(selects[0]!.props.value).toBe('round-robin')
+    expect(selects[1]!.props.value).toBe('per-request')
+    // 受控而非「option 上挂 selected」：后者在 react 里会与 value 打架。
+    const selectedOptions = flatten(tree)
       .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.checked === true)
-    expect(checked).toHaveLength(2)
-    // 每个组恰好一个勾中。
-    const byName = new Map<unknown, number>()
-    for (const el of checked) byName.set(el.props.name, (byName.get(el.props.name) ?? 0) + 1)
-    expect([...byName.values()].every((count) => count === 1)).toBe(true)
+      .filter((el) => el.type === 'option' && el.props.selected === true)
+    expect(selectedOptions).toHaveLength(0)
   })
 
-  it('busy 期间全部 radio 禁用（照 ModelTierPicker 的 disabled 语义）', () => {
+  it('value 缺席 / 非法档位时下拉退回默认档（遍历），不留空白下拉', () => {
     const { rpcCall } = makeRpc()
-    client.hooks.__reset();
+    client.hooks.__reset()
+    const tree = expandTree(
+      client.hooks.__renderComponent(client.ConsumptionSelectors, {
+        // `value` 整个缺席（消费方漏传）时不能渲染出「没有任何选中项」的下拉。
+        provider: 'buddy-cn', rpcCall, value: undefined,
+        busy: false, onChange: () => {},
+      }),
+      client.hooks,
+    )
+    const selects = consumptionSelects(tree)
+    expect(selects[0]!.props.value).toBe('round-robin')
+    expect(selects[1]!.props.value).toBe('per-turn')
+  })
+
+  it('busy 期间两个下拉都禁用（写入在途时不许连点）', () => {
+    const { rpcCall } = makeRpc()
+    client.hooks.__reset()
     const tree = expandTree(
       client.hooks.__renderComponent(client.ConsumptionSelectors, {
         provider: 'buddy-cn', rpcCall, value: { order: 'sequential', switch: 'per-turn' },
@@ -376,17 +415,15 @@ describe('ConsumptionSelectors：两个并排的单选组', () => {
       }),
       client.hooks,
     )
-    const inputs = flatten(tree)
-      .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    expect(inputs.length).toBe(5)
-    expect(inputs.every((el) => el.props.disabled === true)).toBe(true)
+    const selects = consumptionSelects(tree)
+    expect(selects).toHaveLength(2)
+    expect(selects.every((el) => el.props.disabled === true)).toBe(true)
   })
 
-  it('点击某一档只回调 onChange 一次，且带上该档的值（不做本地乐观更新）', () => {
+  it('改变某一档只回调 onChange 一次，且只带该档的字段（不做本地乐观更新）', () => {
     const { rpcCall } = makeRpc()
     const changes: Array<Record<string, unknown>> = []
-    client.hooks.__reset();
+    client.hooks.__reset()
     const tree = expandTree(
       client.hooks.__renderComponent(client.ConsumptionSelectors, {
         provider: 'buddy-cn', rpcCall, value: { order: 'sequential', switch: 'per-turn' },
@@ -394,38 +431,72 @@ describe('ConsumptionSelectors：两个并排的单选组', () => {
       }),
       client.hooks,
     )
-    const radios = flatten(tree)
-      .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    // 第 2 个 radio = 消耗顺序的第二档（遍历）。
-    ;(radios[1]!.props.onChange as () => void)()
+    const selects = consumptionSelects(tree)
+    // 第一个下拉 = 消耗顺序 → 只发 order。
+    ;(selects[0]!.props.onChange as (event: unknown) => void)(changeTo('round-robin'))
     expect(changes).toEqual([{ order: 'round-robin' }])
-    // 第 5 个 radio = 切换粒度的第二档（按轮次）。
-    ;(radios[4]!.props.onChange as () => void)()
-    expect(changes[1]).toEqual({ switch: 'per-turn' })
+    // 第二个下拉 = 切换粒度 → 只发 switch（两个下拉彼此独立，整体覆盖会冲掉另一半）。
+    ;(selects[1]!.props.onChange as (event: unknown) => void)(changeTo('per-request'))
+    expect(changes[1]).toEqual({ switch: 'per-request' })
+  })
+})
+
+describe('ConsumptionSelectors：版面（两个下拉同排、各占一半宽）', () => {
+  const styles = readFileSync(
+    resolve(here, '../../plugin-src/client/account-hub-styles.js'),
+    'utf8',
+  )
+
+  /** 取某条选择器的声明块（首个匹配）。 */
+  const ruleOf = (selector: string): string => {
+    const at = styles.indexOf(selector + ' {')
+    expect(at, `account-hub-styles.js 里找不到规则 ${selector}`).toBeGreaterThan(-1)
+    return styles.slice(at, styles.indexOf('}', at))
+  }
+
+  it('两个下拉同排：容器是 flex 且不换行，两块各占一半', () => {
+    // 不换行是「同一排」的可执行判据：容器一旦 wrap，窄面板下会折成上下两行。
+    expect(ruleOf('.dim-ah-consumption')).toContain('display: flex')
+    expect(ruleOf('.dim-ah-consumption')).not.toContain('flex-wrap: wrap')
+    // 各占一半：`flex: 1 1 0` 让两块等分容器（减去 gap），即「总宽 = 卡片宽」。
+    const group = ruleOf('.dim-ah-consumptionGroup')
+    expect(group).toContain('flex: 1 1 0')
+    // min-width: 0 不是装饰：默认 min-width:auto 会让长 option 文案把这一块撑宽，
+    // 于是两块不再等宽（「各占一半」失效）。
+    expect(group).toContain('min-width: 0')
+  })
+
+  it('下拉本体对齐现有控件视觉（边框 / 圆角 / focus 态），且有禁用态', () => {
+    const select = ruleOf('.dim-ah-consumptionSelect')
+    expect(select).toContain('width: 100%')
+    expect(select).toContain('border-radius')
+    expect(select).toContain('border: 1px solid')
+    // 与 .dim-ah-btn 同款的 focus 环：键盘用户要能看出焦点在哪。
+    expect(styles).toContain('.dim-ah-consumptionSelect:focus-visible {')
+    expect(styles).toContain('.dim-ah-consumptionSelect:disabled {')
   })
 })
 
 describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC', () => {
   it('挂载时拉一次 consumption.get（与 account.list 并发）', async () => {
-    const { calls, rpcCall } = makeRpc({ order: 'round-robin', switch: 'per-request' })
+    const { calls, rpcCall } = makeRpc({ order: 'sequential', switch: 'per-request' })
     const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
     const get = calls.find((c) => c.method === 'consumption.get')
     expect(get, '挂载时应当拉取消耗配置').toBeDefined()
     expect(get!.payload).toEqual({ provider: 'buddy-cn' })
-    // 宿主返回的值必须被渲染出来（否则选择器永远显示默认档）。
-    const text = textsOf(tree).join('')
-    expect(text).toContain('消耗顺序')
-    expect(text).toContain('切换粒度')
+    // 宿主返回的值必须被渲染出来（否则下拉永远显示默认档）。
+    const selects = consumptionSelects(tree)
+    expect(selects[0]!.props.value).toBe('sequential')
+    expect(selects[1]!.props.value).toBe('per-request')
   })
 
   it('选择器在账号卡片列表**之前**（面板顶部，与卡片同宽）', async () => {
     const { rpcCall } = makeRpc()
     const full = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
     const nodes = flatten(full).filter(isElement)
-    const groupIndex = nodes.findIndex((el) => el.props.role === 'radiogroup')
-    expect(groupIndex, '面板里找不到选择器').toBeGreaterThan(-1)
-    // 账号区（空态提示）必须排在选择器之后 —— 两个选择器在账号卡片列表
+    const selectIndex = nodes.findIndex((el) => el.type === 'select')
+    expect(selectIndex, '面板里找不到选择器').toBeGreaterThan(-1)
+    // 账号区（空态提示）必须排在选择器之后 —— 两个下拉在账号卡片列表
     // **之前**，这正是需求要求的版面位置。
     //
     // ⚠️ 判据必须用「节点自身的直接文本」而不是 `textsOf`（整棵子树）：外层容器
@@ -436,30 +507,26 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
       .join('');
     const emptyIndex = nodes.findIndex((el) => ownTextOf(el) === '尚未配置账号')
     expect(emptyIndex, '找不到账号区空态节点').toBeGreaterThan(-1)
-    expect(groupIndex).toBeLessThan(emptyIndex)
+    expect(selectIndex).toBeLessThan(emptyIndex)
   })
 
-  it('点击轨道后发出 consumption.set，且是**部分更新**（只带一个字段）', async () => {
+  it('改变下拉后发出 consumption.set，且是**部分更新**（只带一个字段）', async () => {
     const { calls, rpcCall } = makeRpc()
     let tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    let radios = flatten(tree)
-      .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    ;(radios[1]!.props.onChange as () => void)()
+    let selects = consumptionSelects(tree)
+    ;(selects[0]!.props.onChange as (event: unknown) => void)(changeTo('sequential'))
     // 让 RPC 的 promise 结算（onChange 是 async 处理器）。
     for (let i = 0; i < 10; i++) await Promise.resolve()
     const set = calls.find((c) => c.method === 'consumption.set')
-    expect(set, '点击轨道后应当写回配置').toBeDefined()
-    // **只带 order，不带 switch** —— 两个选择器彼此独立，整体覆盖会让另一个
+    expect(set, '改变下拉后应当写回配置').toBeDefined()
+    // **只带 order，不带 switch** —— 两个下拉彼此独立，整体覆盖会让另一个
     // 标签页的过期状态把用户刚改的字段冲掉。
-    expect(set!.payload).toEqual({ provider: 'buddy-cn', order: 'round-robin' })
+    expect(set!.payload).toEqual({ provider: 'buddy-cn', order: 'sequential' })
 
     // 宿主接受后再渲染：选中态必须跟着宿主返回的值走。
     tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    radios = flatten(tree)
-      .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    expect(radios[1]!.props.checked, '宿主已接受 round-robin，界面应当勾中它').toBe(true)
+    selects = consumptionSelects(tree)
+    expect(selects[0]!.props.value, '宿主已接受 sequential，下拉应当显示它').toBe('sequential')
   })
 
   it('写回失败时不得把选中态改掉（不做乐观更新，与模型开关同理）', async () => {
@@ -467,30 +534,24 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
     const rpcCall = async (method: string, payload: Record<string, unknown>) => {
       calls.push({ method })
       if (method === 'account.list') return { accounts: [] }
-      if (method === 'consumption.get') return { provider: payload.provider, consumption: { order: 'sequential', switch: 'per-turn' } }
+      if (method === 'consumption.get') return { provider: payload.provider, consumption: { order: 'round-robin', switch: 'per-turn' } }
       if (method === 'consumption.set') throw new Error('宿主拒绝了这次写入')
       return {}
     }
     const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    const radios = flatten(tree)
-      .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    ;(radios[1]!.props.onChange as () => void)()
+    const selects = consumptionSelects(tree)
+    ;(selects[0]!.props.onChange as (event: unknown) => void)(changeTo('highest-balance'))
     for (let i = 0; i < 10; i++) await Promise.resolve()
     expect(calls.some((c) => c.method === 'consumption.set')).toBe(true)
-    // 重新渲染：仍是「顺序」被勾中（失败没有污染本地状态）。
+    // 重新渲染：仍是宿主给的「遍历」（失败没有污染本地状态）。
     const after = expandTree(
       client.hooks.__renderComponent(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }),
       client.hooks,
     )
-    const afterRadios = flatten(after)
-      .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    expect(afterRadios[0]!.props.checked).toBe(true)
-    expect(afterRadios[1]!.props.checked).toBe(false)
+    expect(consumptionSelects(after)[0]!.props.value).toBe('round-robin')
   })
 
-  it('consumption.get 失败时面板仍完整可用（选择器退回默认档，不白屏）', async () => {
+  it('consumption.get 失败时面板仍完整可用（下拉退回默认档，不白屏）', async () => {
     const rpcCall = async (method: string) => {
       if (method === 'account.list') return { accounts: [] }
       if (method === 'consumption.get') throw new Error('端点未注册')
@@ -501,21 +562,18 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
     // 面板骨架与选择器都还在（配置读取失败不该让整个面板消失）。
     expect(text).toContain('消耗顺序')
     expect(text).toContain('切换粒度')
-    const radios = flatten(tree)
-      .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    expect(radios).toHaveLength(5)
-    // 退回默认档：顺序 + 按轮次。
-    expect(radios[0]!.props.checked).toBe(true)
-    expect(radios[4]!.props.checked).toBe(true)
+    const selects = consumptionSelects(tree)
+    expect(selects).toHaveLength(2)
+    // 退回默认档：遍历 + 按轮次。
+    expect(selects[0]!.props.value).toBe('round-robin')
+    expect(selects[1]!.props.value).toBe('per-turn')
   })
 
-  it('七个 provider 都能渲染出这两个选择器（新增 provider 不会漏接线）', async () => {
+  it('七个 provider 都能渲染出这两个下拉（新增 provider 不会漏接线）', async () => {
     for (const provider of ['codearts', 'buddy-cn', 'buddy', 'lobsterai', 'trae-cn', 'qoder', 'qoder-cn']) {
       const { rpcCall } = makeRpc()
       const tree = await renderStable(client.ProviderPanel, { provider, rpcCall }, client.hooks)
-      const groups = flatten(tree).filter(isElement).filter((el) => el.props.role === 'radiogroup')
-      expect(groups.length, `${provider} 缺少消耗顺序 / 切换粒度选择器`).toBe(2)
+      expect(consumptionSelects(tree).length, `${provider} 缺少消耗顺序 / 切换粒度下拉`).toBe(2)
     }
   })
 })

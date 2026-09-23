@@ -87,24 +87,28 @@
  * 天然更容易撞上拉黑 —— 这正是「河童重登无效」之谜：那些账号的
  * `checkin_device_id` 是 exchange 绑定的稳定号，重登并不换号）。
  *
- * ## 9074 的处置：换一个干净设备号重试一次（用户 2026-09-23 拍板）
+ * ## 9074 的处置：换一个干净设备号重试，最多三次（用户 2026-09-24 拍板）
  *
  * 既然 9074 是「这个号被拉黑了」，正确动作就是**换号**（而不是退避或等 sweep）：
- * 见 {@link rotateTraeCnCheckinDeviceId}。重试**硬编码一次**，不做循环 ——
- * 一个刚生成的全新号不该再被拉黑，若它仍回 9074，说明本次拒绝另有原因，
- * 继续换号只是把随机号当骰子摇。
+ * 见 {@link rotateTraeCnCheckinDeviceId}。**次数由
+ * {@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 定，当前 3**（2026-09-23 首次拍板为
+ * 1，2026-09-24 用户提高上限），且**每次重试用一个全新生成的号** —— 服务端拉黑
+ * 的是号，重发同一个新号必然拿到同一个 9074。
+ *
+ * ⚠️ **它不是「多试几次同样的请求」，而是「多换几个身份」**：这正是它不能并进
+ * 退避重试的原因（见下）。
  *
  * ⚠️ **它不走** {@link TRAE_CN_CLAIM_RETRY_CODES}（那张表是「等几秒再问同一个请求」
- * 的软限流退避）：退避再久也不会让一个被拉黑的号变得可用，换号则一次就够。
- * 两条路径的**动作**与**次数**都不同，故刻意分开而不是把 9074 加回那张表。
+ * 的软限流退避）：退避再久也不会让一个被拉黑的号变得可用，换号才是对症的动作。
+ * 两条路径的**动作**与**节奏**都不同，故刻意分开而不是把 9074 加回那张表。
  *
  * ## claim 段的请求内重试（2026-09-23 收窄）
  *
  * `9074` 已**退出**请求内退避表（见 {@link TRAE_CN_CLAIM_RETRY_CODES}）：它既不是
  * 「等几秒就好」，在旧定性（名额/风控）下重试同一个请求也只是让用户对着转圈多等
- * 4 秒。**它的重试是换号那一次**（见上节）；若换号后仍是 9074，才归 `unavailable`
- * outcome —— **不写今日状态**，故宿主 4 小时的 sweep（`src/account-hub-rpc.ts`）
- * 下一个周期仍会重新尝试（届时凭据里已是那个新号，不是被拉黑的旧号）。
+ * 4 秒。**它的重试是换号那一组**（见上节）；若换号用尽仍是 9074，才归 `unavailable`
+ * outcome —— **不写状态**，故宿主 4 小时的 sweep（`src/account-hub-rpc.ts`）
+ * 下一个周期仍会重新尝试（届时凭据里已是**最后一发用的那个新号**，不是被拉黑的旧号）。
  *
  * 退避表因此只剩 `4007` / `3004` 这类真正的**瞬时软限流**；**status 段不重试**
  * （读接口没有名额问题，重试只是重复请求），`9004`（设备头）与 `1001`（凭据失效）
@@ -278,9 +282,9 @@ export const TRAE_CN_CODE_DEVICE_ALREADY_CLAIMED = 9095
  * 9074 = **这个设备号此前在失败的 claim 里出现过**（换一个干净号即可，见
  * {@link rotateTraeCnCheckinDeviceId}）。
  *
- * 处置：**换号重试一次**；仍是 9074 则归 `unavailable` —— **不写**签到状态
- * （下次 sweep 重试，届时用的是已落盘的新号）、不标已签。用户文案见
- * {@link describeFailureCode}。
+ * 处置：**换号重试（最多 {@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 次，每次全新号）**；
+ * 用尽仍是 9074 则归 `unavailable` —— **不写**签到状态（下次 sweep 重试，届时用的是
+ * 已落盘的**最后一发**新号）、不标已签。用户文案见 {@link describeFailureCode}。
  */
 export const TRAE_CN_CODE_TOO_MANY_USERS = 9074
 
@@ -294,9 +298,10 @@ const CODE_TRANSPORT_FAILED = -1
  *
  * ⚠️ **`9074` 已于 2026-09-23 移出本表**（原为 `[9074, 4007, 3004]`）：它既不是
  * 「等几秒就好」（第五次定性：设备号被拉黑，等多久都不会变），也不是靠退避能
- * 解决的事 —— **它的重试是换设备号那一次**（{@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT}
- * 次，见 {@link claimTraeCnWithDeviceRotation}）。若换号后仍是 9074，才归
- * `unavailable`、不写今日状态，由宿主 4 小时的 sweep 下个周期再试。
+ * 解决的事 —— **它的重试是换设备号那一组**（最多
+ * {@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 次、每次全新号，见
+ * {@link claimTraeCnWithDeviceRotation}）。若换号用尽仍是 9074，才归
+ * `unavailable`、不写状态，由宿主 4 小时的 sweep 下个周期再试。
  *
  * 留下的两个码在签到语境下都是真正的**瞬时软限流**：服务端明确要求稍后再来，
  * 秒级重试有实际意义。`3003`（`MODEL_FAIL`，`all models failed`）**刻意不在**
@@ -332,17 +337,30 @@ export function isTraeCnClaimRetryable(code: number | undefined): boolean {
   return TRAE_CN_CLAIM_RETRY_CODES.includes(code) && TRAE_CN_BACKOFF_CODES.includes(code)
 }
 
-// ── 9074 换号重试（2026-09-23 用户拍板；整段可单独 revert） ──
+// ── 9074 换号重试（2026-09-23 首次拍板；2026-09-24 上限升到 3） ──
 
 /**
- * 9074 换号重试的**次数上限**（硬编码 1，不做循环）。
+ * 9074 换号重试的**次数上限**（硬编码，不做配置项）。
  *
  * 一个刚生成的全新 16 位号**不该**再被拉黑（真机矩阵：全新号首次 claim 即
  * `code:0`）。若换了号仍是 9074，说明这次拒绝另有原因，继续摇随机号没有依据 ——
  * 故不设可配置项、不写循环：改这个数字就等于改「换几次号」这条策略本身，
  * 应当是一次显式改动而不是一个旋钮。
+ *
+ * ## ⚠️ 2026-09-24 由 1 提升到 3（用户拍板）
+ *
+ * 用户规则原文：「每个账号单独一个设备id，签到成功就存起来先不变，防止被风控；
+ * 出现『人太多』这种限制（9074 类）再生成一个新的设备号重新签到，**最多重试三次**」。
+ *
+ * 提升的实际含义：首发 9074 之后，最多再发 **3** 次 claim，每次带一个**全新生成**
+ * 的号（不是同一个新号重发三遍 —— 服务端拉黑的是**号**，重发同一个号必然同结果）。
+ * 故单次签到的 claim 请求上界是 `1 + 本常量`。
+ *
+ * ⚠️ **不要把它读成「4 次机会」而顺手加退避**：这三次是**立刻**连发（换身份而不是
+ * 等窗口），与 `TRAE_CN_CLAIM_RETRY_DELAYS_MS` 那条「等几秒再问同一个请求」的
+ * 退避路径**刻意分开**（见 `claimTraeCnWithDeviceRotation` 的边界 2）。
  */
-export const TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT = 1
+export const TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT = 3
 
 /**
  * 换一个全新的签到设备号（**9074 的唯一处置**，2026-09-23）。
@@ -761,8 +779,8 @@ function describeFailureCode(code: number, message: string): string {
     // 只是真因（第五次定性，2026-09-23）是**这个设备号在失败的 claim 里出现过、
     // 被服务端拉黑了**，而不是「参与的人真的多」。
     //
-    // 这条文案只在**换号重试之后仍是 9074** 时出现（首发 9074 已经换过号了），
-    // 故它描述的确实是「换了干净号也不行」的现场。
+    // 这条文案只在**换号用尽之后仍是 9074** 时出现（首发 9074 已经换过号了），
+    // 故它描述的确实是「连换几个干净号也不行」的现场。
     //
     // ⚠️ 这里**刻意不给**任何「重新登录 / 登记设备身份」的指引：那个旧文案指向的
     // 动作**治不了**它（账号级已签时任意设备号都回 code:0 —— 服务端认的是
@@ -951,43 +969,72 @@ async function claimTraeCnWithRetry(
 }
 
 /**
- * 9074 的处置：**换一个全新设备号，重试一次 claim**（2026-09-23 用户拍板）。
+ * 9074 的处置：**换一个全新设备号重试，最多 {@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT}
+ * 次**（2026-09-23 首次拍板为 1 次，2026-09-24 用户拍板提升到 3 次）。
  *
  * 真机单变量矩阵（见文件头）定案 `9074` = 该设备号已被服务端拉黑，故这里的动作
- * 是**换号**而不是退避。返回的是「重试结果 + 重试用的凭据」——调用方两者都要：
- * 结果决定 outcome，凭据决定写回什么（`checkin_device_id` 必须是**重试实际用的**
- * 那个号，否则下一轮拿旧号起步，每次都要先撞一次 9074）。
+ * 是**换号**而不是退避。返回的是「最终结果 + 最后一次实际使用的凭据」——调用方
+ * 两者都要：结果决定 outcome，凭据决定写回什么（`checkin_device_id` 必须是
+ * **最后一次尝试实际用的**那个号，否则下一轮拿旧号起步，每次都要先撞一次 9074）。
  *
- * ## 三条刻意的边界
+ * ## 四条刻意的边界
  *
- * 1. **只重试一次**（{@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT}），不做循环：
- *    全新号不该再被拉黑；仍是 9074 说明另有原因，继续摇号没有依据。
- * 2. **不进** {@link TRAE_CN_CLAIM_RETRY_CODES} 的退避路径：那张表是「等几秒再问
+ * 1. **最多 `TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT` 次（3）**，到点即止：全新号不该
+ *    再被拉黑；连摇三次仍是 9074 说明另有原因，继续摇号没有依据。
+ * 2. **每次重试用一个全新生成的号**（不是同一个新号重发三次）：服务端拉黑的是
+ *    **号**，重发同一个号必然拿到同一个 9074，那三次就退化成白烧两个往返。
+ *    每次进循环都重新调 `rotateTraeCnCheckinDeviceId`，且**成功即返回**、不再摇。
+ * 3. **不进** {@link TRAE_CN_CLAIM_RETRY_CODES} 的退避路径：那张表是「等几秒再问
  *    同一个请求」，与「换身份立刻重问」是两种动作，混在一起会让 9074 白等 4 秒。
- * 3. **写回是尽力而为**：{@link TraeCnCreditsOptions.persistCredential} 抛错只记
+ * 4. **写回是尽力而为**：{@link TraeCnCreditsOptions.persistCredential} 抛错只记
  *    一条调试行，重试照常返回 —— 写回只决定下一轮起点，与本次领取成败无关。
  *
- * ⚠️ **两个结果分支都要写回**（成功、以及仍是 9074 的 `unavailable` 都一样）：
- * 失败分支尤其不能漏 —— 那正是「这个号被拉黑了，下轮别再拿它去撞」这件事的
- * 唯一落点。漏掉它，4h sweep 的每一次重试都会先烧一发注定 9074 的请求。
+ * ## ⚠️ 写回的时机与内容（两条都不能错）
+ *
+ * - **写回发生在重试循环之后，只写一次**，写的是**最后一次尝试用的号**：中途某次
+ *   用了某个号但随后又换了，那个中间号没有被服务端「验收」过（它也是被拒的），
+ *   写它没有意义。循环用 `attemptCredential` 记住「这一发实际用的凭据」，
+ *   结束时一次性落盘。
+ * - **成功与失败两条路都要写回**：失败分支尤其不能漏 —— 那正是「这个号被拉黑了，
+ *   下轮别再拿它去撞」这件事的唯一落点。漏掉它，4h sweep 的每一次重试都会先烧
+ *   一发注定 9074 的请求。
+ * - ⚠️ **首发成功不写回**：那条路根本不进本函数（成功的号就是凭据里那个，
+ *   "成功即固化"由「不轮换」本身保证）。
  */
 async function claimTraeCnWithDeviceRotation(
   credential: TraeCnCredential,
   product: TraeCnProduct,
   options: TraeCnCreditsOptions,
 ): Promise<{ result: CreditsCallResult; credential: TraeCnCredential }> {
-  const rotated = rotateTraeCnCheckinDeviceId(credential)
   options.onDebug?.(
     `[trae-cn] claim 返回 ${TRAE_CN_CODE_TOO_MANY_USERS}（设备号被拉黑），`
-    + `换成新的 16 位设备号重试一次（共 ${TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 次）`,
+    + `最多换 ${TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 个全新设备号重试`,
   )
-  const result = await postJson(
-    TRAE_CN_CHECKIN_CLAIM_PATH, rotated, product, options,
-    JSON.stringify({ req_source: TRAE_CN_CHECKIN_REQ_SOURCE }),
-  )
-  // 写回**先于**结果分流：成功/失败两条路都要落盘（见函数注释的 ⚠️）。
-  await persistRotatedDeviceId(rotated, options)
-  return { result, credential: rotated }
+  // 本轮实际使用的凭据：每次换号都更新，结束时它是「最后一发用的那个号」。
+  let attemptCredential = credential
+  let result!: CreditsCallResult
+  for (let attempt = 1; attempt <= TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT; attempt++) {
+    // ⚠️ 每次**重新生成**：同一个新号重发三次没有意义（见边界 2）。
+    attemptCredential = rotateTraeCnCheckinDeviceId(credential)
+    result = await postJson(
+      TRAE_CN_CHECKIN_CLAIM_PATH, attemptCredential, product, options,
+      JSON.stringify({ req_source: TRAE_CN_CHECKIN_REQ_SOURCE }),
+    )
+    if (result.ok) break
+    // 只有 9074 才继续换号 —— 其余失败码（9095 / 1001 / 9004 …）换号没有依据，
+    // 交由调用方按码分流。这一条与「首发只在 9074 时进本函数」是同一条规则的
+    // 后半段：中间某一发撞上别的码，同样不该继续摇号。
+    if (result.code !== TRAE_CN_CODE_TOO_MANY_USERS) break
+    if (attempt < TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT) {
+      options.onDebug?.(
+        `[trae-cn] 换号后仍是 ${TRAE_CN_CODE_TOO_MANY_USERS}，`
+        + `再换一个全新号（第 ${attempt + 1}/${TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 次）`,
+      )
+    }
+  }
+  // 写回**在循环之后、只写一次**（见函数注释的 ⚠️）：写的是最后一发实际用的号。
+  await persistRotatedDeviceId(attemptCredential, options)
+  return { result, credential: attemptCredential }
 }
 
 /**
@@ -1027,8 +1074,10 @@ async function persistRotatedDeviceId(
  * 3. 服务端显式 `enable:false` → `inactive`；
  * 4. 领取请求返回失败码，按码分流（**四种，0 不等于「只有一种失败」**）：
  *    - `9095`（设备今日已签）→ `already-claimed`（今天这份已经到手）；
- *    - `9074`（**设备号被拉黑**）→ 换一个全新 16 位号**重试一次**，结果**按重试
- *      自己的码**再走一遍本分流（成功 → `claimed`；仍 9074 → `unavailable`）；
+ *    - `9074`（**设备号被拉黑**）→ 换一个全新 16 位号**重试**，最多
+ *      {@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 次（每次都是全新号），结果
+ *      **按最后一次尝试自己的码**再走一遍本分流（成功 → `claimed`；仍 9074 →
+ *      `unavailable`）；
  *    - 其余（`1001` 凭据失效 / `9004` 设备头 / …）→ `failed`；
  * 5. 成功 → **补查一次 status 取 `credits`**（见下），然后 `claimed`。
  *
@@ -1057,10 +1106,11 @@ async function persistRotatedDeviceId(
  * 用户看到的是最近一次现场，而不是第一次的（logid 尤其如此：它标识单次请求）。
  *
  * ⚠️ `9074` **不在这张重试表里**（2026-09-23 收窄）：它既不是「等几秒就好」，
- * 在处理上也不是退避 —— **它的重试是换设备号那一次**（见
- * {@link claimTraeCnWithDeviceRotation}）。若换号后仍是 9074，才归 `unavailable`、
- * 不写今日状态，故宿主 4 小时的 sweep 下个周期仍会被重新尝试（届时凭据里已是
- * 那个新号，不是被拉黑的旧号）。
+ * 在处理上也不是退避 —— **它的重试是换设备号那一组**（见
+ * {@link claimTraeCnWithDeviceRotation}，最多
+ * {@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 次、每次全新号）。若换号用尽仍是
+ * 9074，才归 `unavailable`、不写状态，故宿主 4 小时的 sweep 下个周期仍会被重新
+ * 尝试（届时凭据里已是**最后一发用的那个新号**，不是被拉黑的旧号）。
  *
  * ⚠️ 第 5 步的补查**不重试**：它是读接口，且它的失败不会改变 outcome 的 kind，
  * 重试只会拖长一次已经成功的领取。它的 `onDebug` 出口与上面共用。
@@ -1099,9 +1149,9 @@ export async function claimTraeCnDailyCheckin(
 
   const claimResult = await claimTraeCnWithRetry(credential, product, options)
   if (claimResult.ok) return await finishTraeCnClaim(claimResult, credential, product, options)
-  // `9074` = **设备号被拉黑**（第五次定性，见文件头）：先换一个全新号重试一次
-  // （真机矩阵：全新号首次 claim 即 `code:0`）。这是**唯一**会改写凭据的路径，
-  // 也是本改动相对既有行为的全部差异 —— 其余失败码直接走下面的分流。
+  // `9074` = **设备号被拉黑**（第五次定性，见文件头）：换全新号重试，最多
+  // `TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT` 次（真机矩阵：全新号首次 claim 即 `code:0`）。
+  // 这是**唯一**会改写凭据的路径，其余失败码直接走下面的分流。
   if (claimResult.code === TRAE_CN_CODE_TOO_MANY_USERS) {
     const rotated = await claimTraeCnWithDeviceRotation(credential, product, options)
     // 重试成功 → 走与首发成功**同一个**收尾（否则这条路径会少一个积分数字）。
@@ -1123,8 +1173,8 @@ export async function claimTraeCnDailyCheckin(
  * 各写一份必然漂移。
  *
  * ⚠️ **调用方必须先处理 9074 的换号重试**：本函数对 9074 直接返回 `unavailable`，
- * 它是「换了号仍被拒」的落点，不负责触发轮换 —— 混在一起会让「是否已经换过号」
- * 变成一个隐式状态。
+ * 它是「换号次数用尽后仍被拒」的落点，不负责触发轮换 —— 混在一起会让「已经换过
+ * 几次号」变成一个隐式状态。
  */
 function traeCnClaimFailureOutcome(
   result: Extract<CreditsCallResult, { ok: false }>,

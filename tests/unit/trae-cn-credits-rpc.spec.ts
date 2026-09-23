@@ -18,6 +18,7 @@ import { registerAccountHubRpc } from '../../src/account-hub-rpc.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 import type { TraeCnCredential } from '../../src/trae-cn-oauth.js'
 import { TRAE_CN_DEVICE_SOURCE_ROTATED } from '../../src/trae-cn-product.js'
+import { TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT } from '../../src/trae-cn-credits.js'
 
 /** 16 位十进制设备号（两个账号刻意不同，用于验证设备号取自各自的凭据）。 */
 const DEVICE_A = '7212345678901234'
@@ -55,12 +56,56 @@ interface CapturedCall {
   body: unknown
 }
 
+/**
+ * 余额端点路径（**与 `credits.balances` 的 trae-cn 分支打的是同一个端点**）。
+ *
+ * ⚠️ 夹具必须把它与 status 分开路由。签到前后余额比对（`compareBalanceAroundClaim`）
+ * 会在每次 claim 前后各查一次余额，而本文件原先按「URL 不含 `/claim` ⇒ 就是
+ * status」粗暴分流 —— 于是余额探测会**吃掉**夹具里按设备号计数的 status 序号，
+ * 让「领取后的补查」提前发生：一次真实成功的领取被报成 `already-claimed`
+ * （预检那次读到 `checked_in: true` ⇒ 连 claim 都不发）。
+ *
+ * 三个落点（status / claim / balance）必须逐个显式分流，不能靠「不是 A 就是 B」
+ * —— 这正是新增端点时最容易复发的一类夹具缺陷。
+ */
+const TRAE_CN_BALANCE_PATH = '/trae/api/v2/pay/web_user_ent_usage'
+
+/** 请求落点（断言顺序用）：**三种**，余额探测是比对新引入的第三种。 */
+function kindOf(url: string): 'claim' | 'status' | 'balance' {
+  if (url.includes('/claim')) return 'claim'
+  return url.includes(TRAE_CN_BALANCE_PATH) ? 'balance' : 'status'
+}
+
+/**
+ * 余额端点的**默认**脚本：第 n 次请求返回 `100 × n`。
+ *
+ * 递增是刻意的：签到前后各取一次 ⇒ 判「余额变多」⇒ outcome 与改动前**逐字段
+ * 一致**，于是本文件里与比对无关的用例（顺序性、异常隔离、换号重试……）不会被
+ * 这条新路径意外改写成 `abnormal`。需要「余额不变 / 查不到」形态的用例
+ * （见 `credits.balances` 组）各自显式传 `balance` 脚本。
+ *
+ * 礼包形态与 `credits.balances` 组同一个：`available_endpoint: 0` = **通用池**
+ * （签到发的就是通用积分，比对也必须走同一个池）。
+ */
+function defaultBalanceResponse(callIndex: number): Response {
+  return new Response(JSON.stringify({
+    code: 0,
+    data: { packages: [{ available_endpoint: 0, name: '通用礼包', remain_amount: 100 * (callIndex + 1) }] },
+  }), { status: 200 })
+}
+
 /** 构造 ctx / pool / 全局 fetch 替身并注册端点，返回调用器。 */
 function harness(options: {
   accounts: ProviderAccountEntry[]
   /** 按账号 id 给凭据；返回 undefined 表示该账号凭据缺失。 */
   credentials: Record<string, TraeCnCredential | undefined>
   responds: (url: string, call: CapturedCall) => Response
+  /**
+   * 余额端点（{@link TRAE_CN_BALANCE_PATH}）的脚本；缺省 = 递增总额
+   * （见 {@link defaultBalanceResponse}）。只有**以余额端点本身为被测对象**的
+   * 用例才需要它。
+   */
+  balance?: (call: CapturedCall) => Response
   /** 让某个账号的 credentials.resolve 抛错（验证异常隔离）。 */
   throwOnRef?: string
 }) {
@@ -74,6 +119,8 @@ function harness(options: {
    */
   const writes: Array<{ refName: string; credential: TraeCnCredential }> = []
   let handler: ((request: Request) => Promise<Response>) | undefined
+  /** 余额端点被请求的次数（缺省脚本按它递增）。 */
+  let balanceCalls = 0
 
   const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
     const headers = new Headers(init?.headers)
@@ -83,6 +130,12 @@ function harness(options: {
       body: init?.body === undefined ? undefined : JSON.parse(String(init.body)) as unknown,
     }
     calls.push(call)
+    // 余额端点**先**分流：`responds` 只负责 status / claim 两个落点。
+    if (call.url.includes(TRAE_CN_BALANCE_PATH)) {
+      const index = balanceCalls
+      balanceCalls += 1
+      return options.balance === undefined ? defaultBalanceResponse(index) : options.balance(call)
+    }
     return options.responds(call.url, call)
   })
   vi.stubGlobal('fetch', fetcher)
@@ -223,6 +276,11 @@ describe('credits.claimAll 的 trae-cn 分派', () => {
    * `checkedInDevice` **必须显式给**：它是「这个账号本来就已签到」这一业务
    * 状态，不同用例要的是不同状态（顺序性用例要 B 已签，凭据缺失用例要两个
    * 账号都未签）。写死一个默认值会让后者静默变成「已领」而不是「已领取」。
+   *
+   * ⚠️ 本脚本只需处理 status 与 claim 两个落点：**余额端点已在
+   * {@link harness} 里提前分流**（见 `TRAE_CN_BALANCE_PATH`）。这一点不是可有可无
+   * ——余额探测会按账号各发一次，混进下面的 `statusCalls` 计数就会把预检顶成
+   * 「补查」、让真实领取被报成 `already-claimed`。
    */
   const claimFlow = (options: { credits?: number; checkedInDevice?: string } = {}) => {
     const statusCalls = new Map<string, number>()
@@ -262,9 +320,16 @@ describe('credits.claimAll 的 trae-cn 分派', () => {
     expect(value.summary).toMatchObject({ claimed: 1, totalCredit: 150, alreadyClaimed: 1, failed: 0 })
     // 顺序性 + 幂等短路：A 的 status（预检）/claim/status（补查）各一次，
     // B 只有 status 一次（已签到 ⇒ 既不发 claim、也不补查）。
-    expect(h.calls.map((c) => (c.url.includes('/claim') ? 'claim' : 'status')))
+    // ⚠️ 只看 status / claim 两个落点（余额探测另列，见下）——本断言管的是
+    // 「发了几发领取请求、按什么顺序」。
+    const protocol = h.calls.filter((c) => kindOf(c.url) !== 'balance')
+    expect(protocol.map((c) => kindOf(c.url)))
       .toEqual(['status', 'claim', 'status', 'status'])
-    expect(h.calls.map((c) => c.deviceId)).toEqual([DEVICE_A, DEVICE_A, DEVICE_A, DEVICE_B])
+    expect(protocol.map((c) => c.deviceId)).toEqual([DEVICE_A, DEVICE_A, DEVICE_A, DEVICE_B])
+    // 签到前后余额比对：claimed 的 A 前后各一次（同一设备号 = 同一账号的凭据），
+    // 已签的 B 只有「签到前」那一发（比对只在 claimed 时收尾，见 collectClaimResults）。
+    expect(h.calls.filter((c) => kindOf(c.url) === 'balance').map((c) => c.deviceId))
+      .toEqual([DEVICE_A, DEVICE_A, DEVICE_B])
   })
 
   it('包含已停用账号（签到与账号池自动选择无关）', async () => {
@@ -333,11 +398,13 @@ describe('credits.claimAll 的 trae-cn 分派', () => {
   /**
    * `9074`：**设备号被服务端拉黑**（2026-09-23 第五次定性，旧「名额/风控」已作废）。
    *
-   * 归一 `unavailable`（既不是 failed 也不是已领），且走**换号重试一次** ——
-   * 真机矩阵：全新 16 位号首次 claim 即 `code:0`。本夹具恒定回 9074，故首发与
-   * 换号重试**两次都失败** ⇒ `unavailable`，共 2 次 claim。
+   * 归一 `unavailable`（既不是 failed 也不是已领），且走**换设备号重试** ——
+   * 真机矩阵：全新 16 位号首次 claim 即 `code:0`。次数上限由
+   * `TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT` 定（2026-09-24 用户拍板提到 3），且**每次
+   * 换一个全新生成的号**。本夹具恒定回 9074，故首发与每一次换号都失败 ⇒
+   * `unavailable`，共 `1 + 上限` 次 claim。
    */
-  it('claim 返回 9074 → 换号重试一次后仍拒 → unavailable', async () => {
+  it('claim 返回 9074 → 换号重试用尽（1 + 上限）仍拒 → unavailable', async () => {
     const h = harness({
       accounts: [entry('a')],
       credentials: creds(['A', credentialOf(DEVICE_A, 'A')]),
@@ -357,13 +424,20 @@ describe('credits.claimAll 的 trae-cn 分派', () => {
     expect(value.results[0]!.outcome.message).not.toContain('重新登录')
     // 独立计数，不并入 failed。
     expect(value.summary).toMatchObject({ unavailable: 1, failed: 0, claimed: 0 })
-    // ⚠️ 共两次 claim（首发 + 换号重试一次）；**第二次带的是全新设备号** ——
-    // 这正是本改动在 RPC 分派层的落点（凭据由宿主写入）。
+    // ⚠️ 共 `1 + TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT` 次 claim（首发 + 每次换一个
+    // **全新**号）；**首发之外的每一发都带全新设备号** —— 这正是本改动在 RPC
+    // 分派层的落点（凭据由宿主写入）。次数不写死：上限是策略，改了它不该让这里
+    // 变成一条需要跟着改的常量（`trae-cn-credits.spec.ts` 从同一常量取值）。
     const claims = h.calls.filter((c) => c.url.includes('/claim'))
-    expect(claims).toHaveLength(2)
+    expect(claims).toHaveLength(1 + TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT)
     expect(claims[0]!.deviceId).toBe(DEVICE_A)
-    expect(claims[1]!.deviceId).toMatch(/^\d{16}$/)
-    expect(claims[1]!.deviceId).not.toBe(DEVICE_A)
+    for (const claim of claims.slice(1)) {
+      expect(claim.deviceId).toMatch(/^\d{16}$/)
+      expect(claim.deviceId).not.toBe(DEVICE_A)
+    }
+    // ⚠️ **每次换的是不同的新号**：服务端拉黑的是号，重发同一个新号必然得到同一个
+    // 9074，那三次机会就退化成白烧两个往返。
+    expect(new Set(claims.map((c) => c.deviceId)).size).toBe(claims.length)
   })
 
   /**
@@ -429,8 +503,11 @@ describe('credits.balances 的 trae-cn 分派（按 provider 选池）', () => {
     const h = harness({
       accounts: [entry('a')],
       credentials: creds(['A', credentialOf(DEVICE_A, 'A')]),
-      responds: (url, call) => {
-        expect(url).toContain('/trae/api/v2/pay/web_user_ent_usage')
+      // 余额端点是本用例的**被测对象**，故走它自己的 `balance` 脚本 —— 混在
+      // `responds` 里会落进「不是 /claim 就是 status」那道分流而**静默不执行**。
+      responds: () => new Response('{}', { status: 200 }),
+      balance: (call) => {
+        expect(call.url).toContain(TRAE_CN_BALANCE_PATH)
         expect(call.body).toEqual({ require_usage: true })
         return dualPoolResponse()
       },
@@ -458,7 +535,9 @@ describe('credits.balances 的 trae-cn 分派（按 provider 选池）', () => {
     const h = harness({
       accounts: [entry('a')],
       credentials: creds(['A', credentialOf(DEVICE_A, 'A')]),
-      responds: () => new Response(JSON.stringify({ code: 0, data: { unrelated: true } }), { status: 200 }),
+      responds: () => new Response('{}', { status: 200 }),
+      // 余额端点回了 200，但响应里**没有礼包数组** ⇒ 「查不到」，不是 0 积分。
+      balance: () => new Response(JSON.stringify({ code: 0, data: { unrelated: true } }), { status: 200 }),
     })
     const result = await h.call('credits.balances', { provider: 'trae-cn' })
     expect(result.ok).toBe(true)

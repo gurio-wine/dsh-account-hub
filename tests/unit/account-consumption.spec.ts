@@ -6,9 +6,11 @@
  * `src/account-consumption.ts` 是本功能的唯一真相源，它同时承载三件彼此独立的事：
  *
  * 1. **两个配置项的取值域与默认值**（消耗顺序三档 / 切换粒度两档，默认
- *    `sequential` + `per-turn`）。默认值不是随手定的：`sequential` 是**现状行为**
- *    （永远取排序第一个可用账号），`per-turn` 是用户拍板的「风险小一点」那一档 ——
- *    同轮对话锁同一账号，上下文连贯、也避免部分后端按会话绑定凭据。
+ *    `round-robin` + `per-turn`）。默认值不是随手定的，两项都是**用户拍板**的：
+ *    `round-robin` 是「默认遍历」—— 每次请求轮转下一个账号，多个账号的积分被
+ *    均匀消耗（`sequential` 因此**降级为普通档位**，只在用户显式选择时生效）；
+ *    `per-turn` 是「风险小一点」那一档 —— 同轮对话锁同一账号，上下文连贯、
+ *    也避免部分后端按会话绑定凭据。
  * 2. **候选重排**（遍历游标轮转 / 余额降序 + 未知余额降级）。
  * 3. **两个有界状态**：余额缓存（TTL 4h）与轮次锁（LRU 上限 100）。
  *
@@ -49,18 +51,21 @@ describe('消耗顺序 / 切换粒度的取值域与默认值', () => {
     expect([...CONSUMPTION_SWITCHES]).toEqual(['per-request', 'per-turn'])
   })
 
-  it('默认值是「顺序 + 按轮次」——顺序档 = 现状行为，按轮次是用户拍板的保守档', () => {
-    expect(DEFAULT_CONSUMPTION).toEqual({ order: 'sequential', switch: 'per-turn' })
+  it('默认值是「遍历 + 按轮次」——两项都是用户拍板的档位', () => {
+    expect(DEFAULT_CONSUMPTION).toEqual({ order: 'round-robin', switch: 'per-turn' })
     // 冻结：它是共享只读实例，任何就地改写都会污染所有 provider 的缺省值。
     expect(Object.isFrozen(DEFAULT_CONSUMPTION)).toBe(true)
   })
 
   it('缺省 / 脏值 / 半截对象一律补默认值，而不是丢弃整条配置', () => {
     // 缺 order 只补 order，缺 switch 只补 switch —— 用户改了一半的配置不能被整条丢掉。
-    expect(sanitizeConsumptionSetting({ order: 'round-robin' }))
-      .toEqual({ order: 'round-robin', switch: 'per-turn' })
+    // ⚠️ 现在**两边的缺省都是遍历**：`sequential` 已是普通档位，只有显式写下才生效。
+    expect(sanitizeConsumptionSetting({ order: 'sequential' }))
+      .toEqual({ order: 'sequential', switch: 'per-turn' })
     expect(sanitizeConsumptionSetting({ switch: 'per-request' }))
-      .toEqual({ order: 'sequential', switch: 'per-request' })
+      .toEqual({ order: 'round-robin', switch: 'per-request' })
+    // 非法档位回退的是**默认档**（遍历），不是「第一个合法值」（顺序）。
+    expect(sanitizeConsumptionSetting({ order: 7 }).order).toBe('round-robin')
     expect(sanitizeConsumptionSetting({ order: '轮次', switch: true })).toEqual(DEFAULT_CONSUMPTION)
     expect(sanitizeConsumptionSetting(undefined)).toEqual(DEFAULT_CONSUMPTION)
     expect(sanitizeConsumptionSetting(null)).toEqual(DEFAULT_CONSUMPTION)
@@ -71,13 +76,23 @@ describe('消耗顺序 / 切换粒度的取值域与默认值', () => {
   it('sanitizeConsumption 只保留「与默认值不同」的 provider 条目（不留噪音键）', () => {
     // 与 `disabledModels` 同一取舍：整条等于默认值的条目不该落盘，
     // 否则「用户从没配过」与「配成了默认值」在文件里长得一样。
+    //
+    // ⚠️ 默认档改成遍历后，**「遍历 + 按轮次」才是那个被剔除的噪音键**；
+    // `sequential` 反过来成了必须保留的真实配置（它已不是默认值）。
     const map = sanitizeConsumption({
       'buddy-cn': { order: 'round-robin', switch: 'per-request' },
-      qoder: { order: 'sequential', switch: 'per-turn' },
+      qoder: { order: 'round-robin', switch: 'per-turn' },
       'trae-cn': { order: 'bogus', switch: 'per-turn' },
       garbage: 'x',
     })
     expect(map).toEqual({ 'buddy-cn': { order: 'round-robin', switch: 'per-request' } })
+  })
+
+  it('显式写下的「顺序」不再是默认值，必须落盘（否则用户的选择被静默丢弃）', () => {
+    // 这条是默认值翻转的**反向锚点**：若 sanitize 仍把 sequential 当默认剔除，
+    // 用户把档位改成「顺序」后重启会悄悄变回遍历 —— 界面显示与实际行为分叉。
+    const map = sanitizeConsumption({ 'buddy-cn': { order: 'sequential', switch: 'per-turn' } })
+    expect(map).toEqual({ 'buddy-cn': { order: 'sequential', switch: 'per-turn' } })
   })
 
   it('未知 provider 读回默认值（读路径永不抛错）', () => {

@@ -53,15 +53,17 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
 
 ## 账号消耗顺序与切换粒度
 
-**两个 per-provider 选择器**（Account Hub 每个 provider 面板顶部、账号卡片列表之前，并排各占一半宽）。唯一真相源是 `src/account-consumption.ts`（纯逻辑、无 ctx/IO），它同时承载取值域、默认值、候选重排与两个有界状态。
+**两个 per-provider 选择器**（Account Hub 每个 provider 面板顶部、账号卡片列表之前，并排两个原生 `<select>`、各占一半宽）。唯一真相源是 `src/account-consumption.ts`（纯逻辑、无 ctx/IO），它同时承载取值域、默认值、候选重排与两个有界状态。
 
 | 选择器 | 档位 | 语义 |
 |---|---|---|
-| 消耗顺序 | `sequential`（默认） | 永远取当前排序第一个可用账号 —— **即改动前的行为**，故升级不改变任何既有用户的选号结果 |
-| | `round-robin` | 每次请求按账号顺序轮转下一个（a→b→c→a） |
+| 消耗顺序 | `sequential` | 永远取当前排序第一个可用账号 |
+| | `round-robin`（默认） | 每次请求按账号顺序轮转下一个（a→b→c→a） |
 | | `highest-balance` | 每次请求取可用账号里积分余额最高的；**余额未知/过期时降级回顺序** |
 | 切换粒度 | `per-request` | 每次请求都按消耗顺序重新选号 |
 | | `per-turn`（默认） | 一轮对话内锁定同一账号，新轮次才重选（用户拍板的保守档：上下文连贯，也避免部分后端按会话绑定凭据） |
+
+⚠️ **默认档从 `sequential` 翻成 `round-robin`（用户拍板）**：存量用户没动过配置的会从「固定第一个账号」变为「逐请求轮转」。**不提升 `ACCOUNT_HUB_SCHEMA_VERSION`、不做数据迁移** —— 版本号表达的是**字段集合**而非取值语义，而这次只动了 `DEFAULT_CONSUMPTION` 的取值：旧文档里没有 `consumption` 条目，读出来即新默认值；显式写着 `sequential` 的旧条目现在是一份**真实配置**（`sanitizeConsumption` 的「等于默认值不留」判等用的是 `DEFAULT_CONSUMPTION` 本身，剔除的键自动跟着翻转，没有第二份需要同步的名单）。
 
 **存储七件套**：`AccountHubDocument` 新增 `consumption`（`provider → { order, switch }`）与 `consumptionCursors`（`provider → 下一个该用的 accountId`）。它们与既有五件套是**同一份文档**，故必须逐点串进 `emptyAccountHubDocument()` / `sanitizeAccountHubDocument()` / `persist()` 两条分支 / `writeAccounts` / `writeModels` / `writeBudgets` / `writeCheckins` / `writeConsumption` / `writeConsumptionCursor` / `replaceAll` / `ensureLoaded()` 两分支 —— **漏一处就被静默清空**。`ACCOUNT_HUB_SCHEMA_VERSION` bump 到 **3**；⚠️ `ACCOUNT_HUB_DOMAIN_VERSION`（文件格式版本）**保持 1**：storage 后端不校验字段集合，加字段不破坏既有文件。
 
@@ -77,4 +79,4 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
 
 **余额与选号共用同一条收集实现**（`collectProviderBalances`，模块级）：RPC `credits.balances` 与宿主余额刷新都调它 —— 各写一份分派必然漂移，而漂移的形态很隐蔽：面板显示的数字与选号用的数字来自两套口径。
 
-**RPC**：`consumption.get` / `consumption.set`（**部分更新**，只改传进来的字段）。⚠️ 与 `model.list` / `model.setDisabled` 同一取舍：这两个配置按 **provider id** 存，**刻意不经过 `poolProviderFor()`**。写入后**不重建任何东西**：选号每次都实时读池里的配置，下一次请求即生效。客户端 `ConsumptionSelectors`（`plugin-src/client/account-hub.js`）是**受控组件 + 不做乐观更新**（与 `ModelToggle` / `ModelTierPicker` 同款），形态照抄 `ModelTierPicker` 的原生 radio 组，**不用 `<select>`**（全仓无此惯例）；同一组内 radio 同名、两组之间不同名（否则会跨组互斥）。
+**RPC**：`consumption.get` / `consumption.set`（**部分更新**，只改传进来的字段）。⚠️ 与 `model.list` / `model.setDisabled` 同一取舍：这两个配置按 **provider id** 存，**刻意不经过 `poolProviderFor()`**。写入后**不重建任何东西**：选号每次都实时读池里的配置，下一次请求即生效。客户端 `ConsumptionSelectors`（`plugin-src/client/account-hub.js`）是**受控组件 + 不做乐观更新**（与 `ModelToggle` / `ModelTierPicker` 同款），形态是**两个原生 `<select>`**（用户要求的形态；radio 组已整体替换）：值经 `value=` 受控（不在 option 上挂 `selected`）、可读名只能靠 `aria-label`（分组是裸 `<div>`，标题那个 `<strong>` 不构成 label）、`disabled` 绑 `busy`。⚠️ 客户端 `CONSUMPTION_DEFAULTS` 必须与宿主 `DEFAULT_CONSUMPTION` 逐字一致（`order: 'round-robin'`）—— 它是 `consumption.get` 失败时的兜底显示值，写错会让「读不到配置」看起来像「用户选了另一档」。版面：两个块 `flex: 1 1 0` + `min-width: 0` 等分容器（总宽 = 卡片宽）、容器**不换行**（需求是「同一排」）。

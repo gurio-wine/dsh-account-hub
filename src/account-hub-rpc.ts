@@ -15,7 +15,8 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef, isCredentialRefName, type CredentialRef } from '@deepseek-ai/dsh-credentials'
-import { AccountPool, todayDayNumber } from './account-pool.js'
+import { AccountPool } from './account-pool.js'
+import { comparesBalanceAroundClaim, nextEligibleAt } from './checkin-schedule.js'
 import type { ConsumptionOrder, ConsumptionSwitch } from './account-consumption.js'
 import type { CodeArtsAuth } from './service.js'
 import type { BuddyAuth } from './buddy-auth.js'
@@ -29,9 +30,12 @@ import { decorateLoginUrl, fetchAuthState, runBuddyLoginFlow } from './buddy-oau
 import { credentialExpiresAtMs } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
 import {
+  CHECKIN_ABNORMAL_MESSAGE,
   claimDailyCheckin,
+  compareBalanceAroundClaim,
   fetchCheckinStatus,
   fetchCreditBalance,
+  type BalanceProbe,
   type CheckinStatus,
   type ClaimOutcome,
   type CreditBalance,
@@ -208,9 +212,15 @@ export interface RpcConsumptionSetResponse {
 /** RPC: `credits.checkinStatus` 响应（纯内存读，不发网络请求）。 */
 export interface RpcCheckinStatusResponse {
   provider: string
-  /** 今日本地纪元日数（`todayDayNumber()` 口径）。 */
-  today: number
-  /** accountId → 今日是否已签（checkinDay === today）。无账号时为空对象。 */
+  /**
+   * 该 provider 的**下一次重置时刻**（本地时间毫秒时间戳）。
+   *
+   * 客户端只用它做展示（「明天 10:00 后可再签」），**不参与判定** —— 判定是
+   * `checkedIn` 那一格，由宿主按 `Date.now()` 算好。放在响应里是为了让界面
+   * 不用自己算重置钟点（那会变成客户端第二份 `CHECKIN_RESET_HOURS`）。
+   */
+  nextReset: number
+  /** accountId → 此刻是否**已签**（记录的下一次可签时刻还没到）。无账号时为空对象。 */
   checkedIn: Record<string, boolean>
 }
 
@@ -222,7 +232,15 @@ export interface RpcCheckinPerformRequest {
 /** RPC: `checkin.perform` 响应。 */
 export interface RpcCheckinPerformResponse {
   provider: string
-  today: number
+  /**
+   * 该 provider 的**下一次重置时刻**（本地毫秒时间戳）。
+   *
+   * ⚠️ 字段名历史上的含义是「今天的日数」（`today: number`），新口径下那个值
+   * 已经不存在于本域（判定不再需要「今天是几号」）。保留同一位置但改语义会
+   * 让旧客户端读到 1.7e12 这样的数字并当成日数显示 —— 故**改名**，
+   * 旧客户端读 `today` 拿到 `undefined` 即自然降级（它只用于展示，不参与判定）。
+   */
+  nextReset: number
   results: CheckinAccountResult[]
   summary: RpcCreditsClaimSummary
 }
@@ -370,7 +388,8 @@ function parseBuddyCredential(raw: string): BuddyCredential | undefined {
  */
 export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCreditsClaimSummary {
   const summary: RpcCreditsClaimSummary = {
-    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
+    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0,
+    unavailable: 0, abnormal: 0, undetermined: 0, failed: 0,
   }
   for (const outcome of outcomes) {
     switch (outcome.kind) {
@@ -390,6 +409,22 @@ export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCredi
         // 并进 failed 会让界面报出「1 个失败」，而用户照着一个不需要行动的数字
         // 去排查凭据/设备，最后什么也修不了。
         summary.unavailable += 1
+        break
+      case 'abnormal':
+        // 同样独立计数（2026-09-24），理由见 `RpcCreditsClaimSummary.abnormal`：
+        // 并进 claimed 就是本次改动要修的缺陷（「成功 +0」），并进 failed 会让
+        // 用户去排查三种都是好的东西。
+        //
+        // ⚠️ **totalCredit 不加它**：本 kind 的定义就是「没有积分进账」，
+        // 加进去会凭空报出一个不存在的数额。
+        summary.abnormal += 1
+        break
+      case 'undetermined':
+        // **无法判定**（2026-09-24）：Qoder 系空活动列表 —— 既可能是今天已领，
+        // 也可能是暂无活动。并进 `already-claimed` 会**伪造一次签到**（宿主据此
+        // 写状态、整个周期不再重试，而它可能一分没领），并进 `failed` 会让用户
+        // 去排查凭据（凭据是好的）。故独立计数，且**不写状态**（下一次 sweep 重试）。
+        summary.undetermined += 1
         break
       case 'failed':
         summary.failed += 1
@@ -608,6 +643,21 @@ export interface CreditsEndpointDeps<
    * 故它传 `false` 跳过预检，直接交给 `claim`。
    */
   precheckStatus?: boolean
+  /**
+   * 本批账号所属的 **provider id**（**签到前后余额比对**的开关与口径来源）。
+   *
+   * ## 为什么由调用方传，而不是从 `product` 反推
+   *
+   * 比对要做两个按 provider 的判定：① 该 provider 是否登记为参与比对
+   * （`comparesBalanceAroundClaim`）；② 它是不是 Qoder 系（那个 provider id 决定
+   * 拿哪个 region 的实例，而 product 里没有 id 之外的信息）。本模块对泛型
+   * `TProduct` 一无所知，**只有调用方知道手里这个是哪个 provider**。
+   *
+   * ⚠️ **省略 = 不做比对**（既有调用点与单测的既定降级）：那时 outcome 逐字段
+   * 与改动前一致。新增调用点若忘了传，最坏是少一道防线，而**不会**让请求凭空
+   * 多出两次余额查询。
+   */
+  provider?: string
 }
 
 /**
@@ -702,9 +752,13 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
   product: TProduct,
   deps: CreditsEndpointDeps<TCredential, TProduct>,
 ): Promise<RpcCreditsClaimAllResponse> {
-  const { fetchStatus, claim } = resolveCreditsDeps(deps)
+  const { fetchStatus, claim, fetchBalance } = resolveCreditsDeps(deps)
   // 默认保留预检（Buddy 系需要）；LobsterAI 显式传 false 跳过。
   const precheck = deps.precheckStatus !== false
+  // 签到前后余额比对：只有调用方给出了 provider、且该 provider 未登记豁免时才做。
+  // 两个条件都收在这里，逐分支（五个 provider）各处判一次必然漂移。
+  const compareBalance = deps.provider !== undefined
+    && comparesBalanceAroundClaim(deps.provider)
   const results: RpcCreditsClaimAllResponse['results'] = []
   const outcomes: ClaimOutcome[] = []
   for (const entry of accounts) {
@@ -722,9 +776,40 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
         const persistCredential = deps.persistCredential === undefined
           ? undefined
           : (next: TCredential) => deps.persistCredential!(entry.credentialRef, next)
+        /**
+         * 「签到前余额」的**惰性**探测（只在真的要发 claim 时才查）。
+         *
+         * ⚠️ **不要提到 `if` 外面无条件查**：预检式（Buddy 系）路径在
+         * `todayCheckedIn` / `!active` 时**根本不发 claim**，那种情况下「签到前」
+         * 没有意义（奖励不是本次领的），白打一次余额请求纯属浪费与风控风险。
+         * 懒探测让「已领」路径的余额请求数为 **0**（有用例钉死）。
+         */
+        const beforeProbe = () => compareBalance
+          ? probeBalance(fetchBalance, credential, product)
+          : Promise.resolve<BalanceProbe | undefined>(undefined)
+        /**
+         * 发一次 claim 并在需要时用前后余额复核它。
+         *
+         * ⚠️ **只有 `claimed` 才比对**：`already-claimed` 的奖励不是本次领到的，
+         * 余额当然可能没变（它可能在别处已入账、或本来就还没结算）—— 对它比对
+         * 会把每一天的正常幂等响应报成异常。
+         *
+         * 各分支都经这一个闭包发 claim，故「比对」不会在某个分支上被漏掉
+         * （那是这类横切逻辑最容易发生的漂移）。
+         */
+        const claimAndJudge = async (): Promise<ClaimOutcome> => {
+          const before = await beforeProbe()
+          const claimed = await claim(credential, product, persistCredential)
+          if (!compareBalance || claimed.kind !== 'claimed') return claimed
+          const after = await probeBalance(fetchBalance, credential, product)
+          return judgeClaimByBalance(claimed, before, after)
+        }
         if (!precheck) {
           // 领取流程自带状态判断（LobsterAI 的 slot/context 检查在 claim 内部）。
-          outcome = await claim(credential, product, persistCredential)
+          // ⚠️ 这里**必须**先探测：「自带预检」意味着我们事先不知道会不会真的领 ——
+          // 已领的账号会白花一次余额请求，这是该路径已知的代价（换来的是比对仍然
+          // 覆盖了真正领到的那一次）。
+          outcome = await claimAndJudge()
         } else {
           // 先查状态：活动未开启或今日已领则跳过领取请求，减少无效调用
           const status = await fetchStatus(credential, product)
@@ -735,7 +820,7 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
           } else {
             // 状态查询失败（status 为 null）时仍然尝试领取：
             // 无法确认不代表不能领，交给领取接口以响应体 code 定夺。
-            outcome = await claim(credential, product, persistCredential)
+            outcome = await claimAndJudge()
           }
         }
       }
@@ -750,6 +835,69 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
     results.push({ accountId: entry.id, nickname: entry.nickname, outcome })
   }
   return { results, summary: computeClaimSummary(outcomes) }
+}
+
+/**
+ * 查一次余额并归一成 {@link BalanceProbe}。
+ *
+ * **任何失败都吞成 `total: undefined`**（网络错 / 凭据异常 / 非积分账户 / 响应
+ * 不可解析）：这是比对路径，不是余额展示路径 —— 余额查询故障绝不能让整次签到
+ * 报错（那会把一次真实成功变成 `failed`，比不比对坏得多）。故这里刻意**不**调
+ * `deps.warn`：查不到不是异常，裁决那边会如实记「跳过比对」。
+ *
+ * @param fetchBalance - 已解析好的余额查询（默认实现或注入实现）。
+ * @param credential - 该账号的凭据。
+ * @param product - 该 provider 的产品配置。
+ */
+async function probeBalance<TCredential, TProduct>(
+  fetchBalance: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>,
+  credential: TCredential,
+  product: TProduct,
+): Promise<BalanceProbe> {
+  try {
+    const balance = await fetchBalance(credential, product)
+    return { total: balance === null ? undefined : balance.total }
+  } catch {
+    return { total: undefined }
+  }
+}
+
+/**
+ * 用**签到前后余额**复核一次 `claimed`：账没动就降级成 {@link ClaimOutcome} 的
+ * `abnormal`（2026-09-24 新增）。
+ *
+ * ## 为什么是「降级」而不是「标记」
+ *
+ * 响应说成功、余额没动 —— 这两件事里必然有一件是假的，而**唯一能证伪的客观
+ * 证据是余额**（响应码只是服务端对自己受理动作的陈述）。既然无法确认积分到手，
+ * 就不能报成 `claimed`（那正是用户报障的形态：「领取成功 +0」，无从追查）。
+ *
+ * ## 三种裁决各自的去向
+ *
+ * - `increased` → 原样返回 `claimed`（**逐字段不变**，包括 credit / streakDays /
+ *   delayedMessage）：余额涨了就说明奖励确实到账，回填的数字仍是 claim 自己报的。
+ * - `unchanged` → 返回 `abnormal`，带上前后两个数字。
+ * - `skipped` → 原样返回 `claimed`：**任一侧余额没拿到**就按原判定走。这是本改动
+ *   最重要的一条边界 —— 余额查询故障（网络抖动、凭据受限）不该把真实成功判成
+ *   异常，那会让用户追一个不存在的问题、并且下一次 sweep 还得再签一遍。
+ *
+ * ⚠️ **本函数不写任何状态**：写状态的白名单在 `performCheckinOnTargets`，它只认
+ * `claimed` / `already-claimed`；`abnormal` 天然不命中 ⇒ 下一次 sweep 会重试。
+ * 若后端只是延迟入账，那次重试会拿到 `already-claimed` 并自然收敛。
+ */
+function judgeClaimByBalance(
+  claimed: Extract<ClaimOutcome, { kind: 'claimed' }>,
+  before: BalanceProbe | undefined,
+  after: BalanceProbe,
+): ClaimOutcome {
+  const verdict = compareBalanceAroundClaim(before ?? { total: undefined }, after, false)
+  if (verdict.kind !== 'unchanged') return claimed
+  return {
+    kind: 'abnormal',
+    balanceBefore: verdict.before,
+    balanceAfter: verdict.after,
+    message: CHECKIN_ABNORMAL_MESSAGE,
+  }
 }
 
 /**
@@ -1076,6 +1224,13 @@ function isKnownCheckinProvider(provider: string): boolean {
  * `credits.claimAll` 与 `checkin.perform` / `checkin.sweep` 共用这一份实现，
  * 因此签到领取的分派不会漂移。
  *
+ * ## 每个分支都要带 `provider`（签到前后余额比对的开关）
+ *
+ * `collectClaimResults` 靠 `deps.provider` 决定三件事：查不查余额、豁免与否、
+ * 以及 Qoder 两区该用哪个 region 的客户端。**漏传即静默关闭该 provider 的比对**
+ * （不报错），故它是每个分支的必填项 —— 与 `precheckStatus` 那种有语义默认值的
+ * 开关不同。
+ *
  * 未知 provider 抛 {@link UnsupportedProviderError}，由调用点决定如何呈现。
  *
  * @returns 与 claimAll 同构的逐账号结果数组（含 nickname）。
@@ -1094,10 +1249,16 @@ async function runCreditsClaim(
     // 用 fetchCheckinStatus 打华为端点既发错请求又必然失败。
     // 第二、三个实参是 `undefined`：CodeArts 没有 BuddyProduct，
     // 而下钻函数只吃凭据（product 对华为协议无意义）。
+    //
+    // ⚠️ **不注入 `fetchBalance`**：codearts 登记在
+    // `BALANCE_COMPARISON_EXEMPT_PROVIDERS` 里（积分口径来自 `statistics/plugin`
+    // 的用量统计，签到奖励是否实时反映**没有真机证据**），故比对天然不启动。
+    // 登记理由与解除条件见 `src/checkin-schedule.ts`。
     const value = await collectClaimResults<CodeArtsCredential, undefined>(accounts, undefined, {
       resolve: (ref) => ctx.credentials.resolve(ref),
       claim: (credential) => claimCodeArtsDailyCheckin(credential),
       precheckStatus: false,
+      provider,
       warn: (msg) => ctx.logger?.warn?.(msg),
     })
     return value.results
@@ -1111,6 +1272,10 @@ async function runCreditsClaim(
         claimLobsteraiDailyCheckin(credential, product, clientVersion),
       // 领取流程内部已做 slot/context 预检，不需要外部再查一次状态。
       precheckStatus: false,
+      // 余额比对用的端点与 `credits.balances` 的 lobsterai 分支**同一个函数**
+      // —— 两处各写一份解析必然在某个字段上漂移。
+      fetchBalance: (credential, product) => fetchLobsteraiCreditBalance(credential, product),
+      provider,
       warn: (msg) => ctx.logger?.warn?.(msg),
     })
     return value.results
@@ -1132,7 +1297,15 @@ async function runCreditsClaim(
       // refName 闭包进去了（本回调只需负责序列化与落盘）。
       persistCredential: (refName, credential) =>
         ctx.credentials.set(credentialRef(refName), serializeTraeCnCredential(credential)),
+      // ⚠️ 必须与 `credits.balances` 的 trae-cn 分支**选同一个池**
+      // （`TRAE_CN_POOL_UNIVERSAL`）：签到发的就是通用积分，拿 Work 池比对
+      // 会永远读到「没变」而把每一次成功都判成异常。
+      fetchBalance: (credential, product) =>
+        fetchTraeCnCreditBalance(credential, product, TRAE_CN_POOL_UNIVERSAL, {
+          onDebug: (msg) => ctx.logger?.info?.(msg),
+        }),
       precheckStatus: false,
+      provider,
       warn: (msg) => ctx.logger?.warn?.(msg),
     })
     return value.results
@@ -1151,38 +1324,61 @@ async function runCreditsClaim(
           product,
           onDebug: (msg) => ctx.logger?.info?.(msg),
         }),
+      // 余额同样走本 region 的实例与配置（与 `credits.balances` 的 qoder 分支
+      // 逐字同款）：额度端点只认 `jt-`，而 jt 缓存是**实例字段**，用错实例
+      // 换来的是另一区的 jt，表现为假的「凭据失效」。
+      fetchBalance: (credential, product) =>
+        fetchQoderCreditBalance(credential, region.auth, {
+          product,
+          onDebug: (msg) => ctx.logger?.info?.(msg),
+        }),
       precheckStatus: false,
+      provider,
       warn: (msg) => ctx.logger?.warn?.(msg),
     })
     return value.results
   }
   const product = productById(provider)
   if (product === undefined) throw new UnsupportedProviderError(provider)
+  // Buddy 系（buddy-cn / buddy）：`fetchBalance` 省略即用 `resolveCreditsDeps` 的
+  // 默认实现（真实 `fetchCreditBalance`，带正确送进第三参的 fetcher），与
+  // `credits.balances` 的 buddy 分支同源 —— 这里刻意不另写一份包装。
   const value = await collectClaimResults(accounts, product, {
     resolve: (ref) => ctx.credentials.resolve(ref),
+    provider,
     warn: (msg) => ctx.logger?.warn?.(msg),
   })
   return value.results
 }
 
 /**
- * 对**给定账号数组**执行一次自动签到：成功或已领都写今日，其余一律不写。
+ * 对**给定账号数组**执行一次自动签到：成功或已领都写「下一次可签时刻」，其余一律不写。
  *
  * 与 `credits.claimAll` 的核心差异只在写状态这一步。inactive / unavailable /
- * failed **不写**（失败不写，下次 sweep 重试）——见设计文档 §2/§9。
+ * abnormal / failed **不写**（失败不写，下次 sweep 重试）——见设计文档 §2/§9。
  *
  * ⚠️ **`unavailable` 也必须不写**（2026-09-23 新增该 kind 时同步钉死）：
- * 它是「服务端此刻暂不受理」（Trae CN 的 `9074`，**换了设备号重试一次之后仍被拒**），
- * 唯一的重试机会就是下一次 4h sweep 的「今日未签」筛选。一旦这里写了今日，
- * `performCheckinSweep` 的 `checkinDay !== today` 判据当天就会短路跳过该账号，
- * 把一次**瞬时**拒绝变成**当天永久**失败。下面的 `if` 只认
- * `claimed` / `already-claimed` 两种，故 `unavailable` 天然不命中 ——
+ * 它是「服务端此刻暂不受理」（Trae CN 的 `9074`，**换了设备号重试之后仍被拒**），
+ * 唯一的重试机会就是下一次 4h sweep 的「可签」筛选。一旦这里写了状态，
+ * `performCheckinSweep` 当天就会短路跳过该账号，把一次**瞬时**拒绝变成**永久**
+ * 失败（旧口径下是「当天永久」，新口径下更是要等到下一个重置点）。下面的 `if`
+ * 只认 `claimed` / `already-claimed` 两种，故 `unavailable` 天然不命中 ——
  * 这是刻意的白名单形态，不要改成黑名单（新增 kind 时会静默写错状态）。
+ * `abnormal`（余额未变）与 `undetermined`（Qoder 空活动列表）走的是同一条
+ * 「不写」规则，理由见 `src/credits.ts` 各自的说明 —— 后者的代价最大：
+ * 写成已签会让一个**可能一分没领**的账号在整个周期内不再被尝试。
  *
  * ⚠️ **换号重试那一发不改变本规则**：它是 claim **内部**的一次重试，outcome 仍是
  * `unavailable`（只是凭据里的设备号已经被换成新号，见 `runCreditsClaim` 的
- * trae-cn 分支）。故「下轮 sweep 会重试」这条承诺同时靠两件事成立：不写今日状态
+ * trae-cn 分支）。故「下轮 sweep 会重试」这条承诺同时靠两件事成立：不写状态
  * **且**新号已落盘 —— 少了后者，每轮都会先拿旧号白撞一次 9074。
+ *
+ * ## 写的是「下一次可签时刻」，不是「现在」
+ *
+ * `nextEligibleAt(Date.now(), provider)` 给出的是**下一次可签时刻**（如 qoder-cn 的
+ * 明天 10:00），不是 `Date.now()` —— 后者等于把「刚签完」记成「此刻可签」，下一个
+ * tick 就会再签一次。边界语义（签到时刻早于当日重置点 → 下次=当日重置点）见
+ * `src/checkin-schedule.ts` 的 `nextEligibleAt`。
  *
  * @param targets - 本次实际要签的账号；空数组 = 无操作（不发起任何请求）。
  */
@@ -1190,7 +1386,6 @@ async function performCheckinOnTargets(
   deps: CheckinSweepDeps,
   provider: string,
   targets: ProviderAccountEntry[],
-  today: number,
 ): Promise<{ results: CheckinAccountResult[]; summary: RpcCreditsClaimSummary }> {
   if (targets.length === 0) {
     return { results: [], summary: computeClaimSummary([]) }
@@ -1199,7 +1394,11 @@ async function performCheckinOnTargets(
   const results: CheckinAccountResult[] = []
   for (const r of claimResults) {
     if (r.outcome.kind === 'claimed' || r.outcome.kind === 'already-claimed') {
-      await deps.pool.writeCheckinDay(provider, r.accountId, today)
+      // ⚠️ 记录时刻取**此刻**（领取刚返回），不是循环开始前的时刻：一轮里各账号
+      // 依次 await，逐个取时刻才能让边界语义（「签到时刻 < 当日重置点」）对每个
+      // 账号都成立。一个账号的领取耗时横跨重置点属于极端情形，此处不做特殊处理
+      // —— 它最多让该账号多等一个周期，而不会多签一次。
+      await deps.pool.writeCheckinNextEligible(provider, r.accountId, nextEligibleAt(Date.now(), provider))
     }
     // outcome 保留 runCreditsClaim 产出的完整 ClaimOutcome 对象（不拍扁成字符串），
     // 并带上 nickname —— 与 `credits.claimAll` 同构，客户端通知 UI 直接可用。
@@ -1213,7 +1412,8 @@ async function performCheckinOnTargets(
  *
  * - 只遍历 {@link CHECKIN_ELIGIBLE_PROVIDERS}（六条）；
  * - 无账号 provider 跳过；
- * - 每个 provider 只签「今日未签」（`checkinDay !== todayDayNumber()`）的账号；
+ * - 每个 provider 只签**此刻可签**的账号（`pool.isCheckinDue`：无记录、或记录的
+ *   下一次可签时刻已过）；
  * - 模块级互斥 {@link sweepRunning}：已有一趟在跑就**直接返回进行中快照**，
  *   不排队不重入（设计文档 §9 并发防重）。
  */
@@ -1222,14 +1422,13 @@ export async function performCheckinSweep(deps: CheckinSweepDeps): Promise<RpcCh
   if (sweepRunning) return { running: false, providers: [] }
   sweepRunning = true
   try {
-    const today = todayDayNumber()
     const providers: RpcCheckinSweepProviderResult[] = []
     for (const provider of CHECKIN_ELIGIBLE_PROVIDERS) {
       const accounts = await pool.listAccounts(provider)
       if (accounts.length === 0) continue
-      // 只签「今日未签」：checkinDay === today 直接短路，不发任何请求。
-      const due = accounts.filter((a) => pool.checkinDay(provider, a.id) !== today)
-      const { results, summary } = await performCheckinOnTargets(deps, provider, due, today)
+      // 只签**此刻可签**的账号：记录的下一次可签时刻还没到 → 直接短路，不发任何请求。
+      const due = accounts.filter((a) => pool.isCheckinDue(provider, a.id))
+      const { results, summary } = await performCheckinOnTargets(deps, provider, due)
       providers.push({ provider, results, summary })
     }
     return { running: true, providers }
@@ -1370,10 +1569,9 @@ function registerAccountHubEndpoints(
     const targets = accountId !== undefined && accountId.length > 0
       ? accounts.filter((a) => a.id === accountId)
       : accounts
-    const today = todayDayNumber()
     if (!isKnownCheckinProvider(provider)) throw new UnsupportedProviderError(provider)
-    const { results, summary } = await performCheckinOnTargets(checkinDeps, provider, targets, today)
-    return { provider, today, results, summary }
+    const { results, summary } = await performCheckinOnTargets(checkinDeps, provider, targets)
+    return { provider, nextReset: nextEligibleAt(Date.now(), provider), results, summary }
   }
 
   /** 分发端点方法到对应的处理器 */
@@ -2067,25 +2265,33 @@ function registerAccountHubEndpoints(
       //
       // 三个端点与 claimAll 的关系：
       //   - `credits.checkinStatus`：**纯内存读**进程内 `checkins`，**不发任何网络
-      //     请求**。供面板挂载时渲染「哪些账号今日已签」。未知/无签到能力 provider
+      //     请求**。供面板挂载时渲染「哪些账号已签」。未知/无签到能力 provider
       //     返回空 checkedIn（能力门控在客户端）。
       //   - `checkin.perform`：单账号（或 provider 全量）自动签到。**复用
       //     `credits.claimAll` 的同一份分派逻辑**（{@link runCreditsClaim}），差异仅
-      //     在写 `writeCheckinDay`：成功或 already-claimed 都写今日，inactive /
-      //     unavailable / failed 不写（下次 sweep 重试）——`unavailable` 的完整
-      //     理由见 {@link performCheckinOnTargets}。
+      //     在写状态：成功或 already-claimed 都写「下一次可签时刻」，inactive /
+      //     unavailable / abnormal / failed 不写（下次 sweep 重试）——`unavailable`
+      //     的完整理由见 {@link performCheckinOnTargets}。
       //   - `checkin.sweep`：全量 sweep，遍历 {@link CHECKIN_ELIGIBLE_PROVIDERS}，
-      //     每 provider 只签「今日未签」的账号。模块级互斥防 4h 定时器与页面触发并发。
+      //     每 provider 只签**此刻可签**的账号。模块级互斥防 4h 定时器与页面触发并发。
       case 'credits.checkinStatus': {
         const req = payload as RpcCheckinStatusRequest
         const provider = poolProviderFor(req.provider)
-        const today = todayDayNumber()
+        const now = Date.now()
         const accounts = await pool.listAccounts(provider)
         const checkedIn: Record<string, boolean> = {}
         for (const entry of accounts) {
-          checkedIn[entry.id] = pool.checkinDay(provider, entry.id) === today
+          // 「已签」= 记录的下一次可签时刻**还没到**（见 `src/checkin-schedule.ts`）。
+          checkedIn[entry.id] = !pool.isCheckinDue(provider, entry.id, now)
         }
-        return { ok: true, value: { provider, today, checkedIn } satisfies RpcCheckinStatusResponse }
+        return {
+          ok: true,
+          value: {
+            provider,
+            nextReset: nextEligibleAt(now, provider),
+            checkedIn,
+          } satisfies RpcCheckinStatusResponse,
+        }
       }
 
       case 'checkin.perform': {

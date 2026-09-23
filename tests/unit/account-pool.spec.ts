@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { AccountPool, todayDayNumber, pruneOrphanCheckins } from '../../src/account-pool.js'
+import { migrateLegacyCheckinDay } from '../../src/checkin-schedule.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 /**
@@ -1081,77 +1082,119 @@ describe('AccountPool 签到存储（checkins 第五件套）', () => {
     pool = new AccountPool(ctx as any)
   })
 
-  it('写签到日经整体 replace 落盘，读回一致（读经 ensureLoaded 从进程内副本）', async () => {
-    const day = 20_831
-    await pool.writeCheckinDay('trae-cn', 'trae-cn-a1b2', day)
-    expect(pool.checkinDay('trae-cn', 'trae-cn-a1b2')).toBe(day)
-    // 写账号操作不得抹掉已写入的签到日（五件套互带）
+  it('写下一次可签时刻经整体 replace 落盘，读回一致（读经 ensureLoaded 从进程内副本）', async () => {
+    // ⚠️ 值必须是**毫秒时间戳**（本次改动后）：日数那种量级的数字会被
+    // `isCheckinDue` 判成「1970 年就可以再签了」，每轮 sweep 都重签。
+    const nextEligible = Date.now() + 3_600_000
+    await pool.writeCheckinNextEligible('trae-cn', 'trae-cn-a1b2', nextEligible)
+    expect(pool.checkinNextEligible('trae-cn', 'trae-cn-a1b2')).toBe(nextEligible)
+    // 写账号操作不得抹掉已写入的时刻（八件套互带）
     await pool.addAccount(makeMockAccount({ id: 'trae-cn-x', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_X' }))
-    expect(pool.checkinDay('trae-cn', 'trae-cn-a1b2')).toBe(day)
-    // 未写入的键读不到（undefined = 今日尚未签）
-    expect(pool.checkinDay('trae-cn', 'never')).toBeUndefined()
+    expect(pool.checkinNextEligible('trae-cn', 'trae-cn-a1b2')).toBe(nextEligible)
+    // 未写入的键读不到（undefined = 从未签过 ⇒ 可签）
+    expect(pool.checkinNextEligible('trae-cn', 'never')).toBeUndefined()
+    expect(pool.isCheckinDue('trae-cn', 'never')).toBe(true)
   })
 
-  it('回退路径下 checkins 照常读写（settings 整体 replace 同样携带第五件套）', async () => {
-    await pool.writeCheckinDay('codearts', 'codearts-c1', 42)
-    expect(pool.checkinDay('codearts', 'codearts-c1')).toBe(42)
+  it('isCheckinDue：未来时刻 = 已签，过去/无记录 = 可签', async () => {
+    const now = Date.now()
+    await pool.writeCheckinNextEligible('buddy-cn', 'future', now + 60_000)
+    await pool.writeCheckinNextEligible('buddy-cn', 'past', now - 60_000)
+    expect(pool.isCheckinDue('buddy-cn', 'future', now)).toBe(false)
+    expect(pool.isCheckinDue('buddy-cn', 'past', now)).toBe(true)
+    expect(pool.isCheckinDue('buddy-cn', 'absent', now)).toBe(true)
+  })
+
+  it('回退路径下 checkins 照常读写（settings 整体 replace 同样携带该件套）', async () => {
+    const nextEligible = Date.now() + 7_200_000
+    await pool.writeCheckinNextEligible('codearts', 'codearts-c1', nextEligible)
+    expect(pool.checkinNextEligible('codearts', 'codearts-c1')).toBe(nextEligible)
     const last = ctx.replacePayloads.at(-1)!
-    expect(last.checkins).toEqual({ 'codearts:codearts-c1': 42 })
+    expect(last.checkins).toEqual({ 'codearts:codearts-c1': nextEligible })
   })
 
-  it('从已有配置载入签到日（重启后不丢，键格式 provider:accountId）', () => {
+  it('从已有配置载入（重启后不丢，键格式 provider:accountId，新口径原样读回）', () => {
+    const stored = Date.now() + 3_600_000
+    const seeded = createMockContext([], { initialCheckins: { 'trae-cn:trae-cn-a1b2': stored } })
+    const p = new AccountPool(seeded as never)
+    expect(p.checkinNextEligible('trae-cn', 'trae-cn-a1b2')).toBe(stored)
+    // 其他键读不到，不串
+    expect(p.checkinNextEligible('trae-cn', 'other')).toBeUndefined()
+    expect(p.checkinNextEligible('buddy', 'trae-cn-a1b2')).toBeUndefined()
+  })
+
+  it('旧 dayNumber 值在**读盘那一层**就地迁移成时间戳（不是原样读成一个小数字）', () => {
+    // 旧口径的 20_831 = 2027-01-26 前后的日数；迁移后必须是**毫秒时间戳**量级。
     const seeded = createMockContext([], { initialCheckins: { 'trae-cn:trae-cn-a1b2': 20_831 } })
     const p = new AccountPool(seeded as never)
-    expect(p.checkinDay('trae-cn', 'trae-cn-a1b2')).toBe(20_831)
-    // 其他键读不到，不串
-    expect(p.checkinDay('trae-cn', 'other')).toBeUndefined()
-    expect(p.checkinDay('buddy', 'trae-cn-a1b2')).toBeUndefined()
+    const migrated = p.checkinNextEligible('trae-cn', 'trae-cn-a1b2')!
+    expect(migrated).toBeGreaterThan(1_000_000_000_000)
+    // 迁移结果与纯函数同值（不是另一套算法）。
+    expect(migrated).toBe(migrateLegacyCheckinDay(20_831, 'trae-cn'))
+  })
+
+  it('旧 dayNumber 迁移到 qoder-cn 时按 10 点算（不是按 0 点）', () => {
+    const seeded = createMockContext([], { initialCheckins: { 'qoder-cn:q1': 20_831 } })
+    const p = new AccountPool(seeded as never)
+    const migrated = p.checkinNextEligible('qoder-cn', 'q1')!
+    expect(migrated).toBe(migrateLegacyCheckinDay(20_831, 'qoder-cn'))
+    // 落在本地 10 点整。
+    expect(new Date(migrated).getHours()).toBe(10)
   })
 
   it('旧文档（无 checkins 字段）读入时补空对象，不抛错、不崩', async () => {
     // 手工构造缺 checkins 的 settings 值（0.1.x 老配置没有第五字段）。
     const p = new AccountPool(createMockContext([makeMockAccount()], { initialSchemaVersion: 1 }) as never)
-    expect(p.checkinDay('buddy-cn', 'buddy-001')).toBeUndefined()
+    expect(p.checkinNextEligible('buddy-cn', 'buddy-001')).toBeUndefined()
     // 老配置（没有任何 checkins 键）读写新字段后，再次读仍是同一份权威副本。
-    await p.writeCheckinDay('buddy-cn', 'buddy-001', 7)
-    expect(p.checkinDay('buddy-cn', 'buddy-001')).toBe(7)
+    const nextEligible = Date.now() + 1000
+    await p.writeCheckinNextEligible('buddy-cn', 'buddy-001', nextEligible)
+    expect(p.checkinNextEligible('buddy-cn', 'buddy-001')).toBe(nextEligible)
   })
 
   it('removeAccount 顺带清掉该账号的孤儿 checkins 键（provider:accountId 精确键）', async () => {
-    await pool.writeCheckinDay('trae-cn', 'trae-cn-x', 10)
-    await pool.writeCheckinDay('trae-cn', 'trae-cn-y', 20)
+    const a = Date.now() + 10_000
+    const b = Date.now() + 20_000
+    await pool.writeCheckinNextEligible('trae-cn', 'trae-cn-x', a)
+    await pool.writeCheckinNextEligible('trae-cn', 'trae-cn-y', b)
     await pool.addAccount(makeMockAccount({ id: 'trae-cn-x', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_X' }))
     await pool.addAccount(makeMockAccount({ id: 'trae-cn-y', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_Y' }))
     await pool.removeAccount('trae-cn-x')
-    expect(pool.checkinDay('trae-cn', 'trae-cn-x')).toBeUndefined()
-    expect(pool.checkinDay('trae-cn', 'trae-cn-y')).toBe(20)
-    // 删除的键真的不复存在（而不是被覆盖成空表丢了 y —— 五件套互带不允许丢）
-    expect(pool.checkinDay('trae-cn', 'trae-cn-y')).toBe(20)
+    expect(pool.checkinNextEligible('trae-cn', 'trae-cn-x')).toBeUndefined()
+    expect(pool.checkinNextEligible('trae-cn', 'trae-cn-y')).toBe(b)
+    // 删除的键真的不复存在（而不是被覆盖成空表丢了 y —— 互带不允许丢）
+    expect(pool.checkinNextEligible('trae-cn', 'trae-cn-y')).toBe(b)
   })
 
   it('pruneOrphanCheckins 按 provider 前缀清除不在账号列表里的孤儿键', async () => {
     await pool.addAccount(makeMockAccount({ id: 'a', provider: 'buddy-cn', credentialRef: 'B1' }))
-    await pool.writeCheckinDay('buddy-cn', 'a', 1)
-    await pool.writeCheckinDay('buddy-cn', 'gone', 2)   // 孤儿
-    await pool.writeCheckinDay('codearts', 'c-keep', 3) // 别的 provider，不该被清
+    const keep = Date.now() + 10_000
+    await pool.writeCheckinNextEligible('buddy-cn', 'a', keep)
+    await pool.writeCheckinNextEligible('buddy-cn', 'gone', Date.now() + 20_000)   // 孤儿
+    const other = Date.now() + 30_000
+    await pool.writeCheckinNextEligible('codearts', 'c-keep', other) // 别的 provider，不该被清
     await pruneOrphanCheckins(pool, 'buddy-cn')
-    expect(pool.checkinDay('buddy-cn', 'a')).toBe(1)
-    expect(pool.checkinDay('buddy-cn', 'gone')).toBeUndefined()
-    expect(pool.checkinDay('codearts', 'c-keep')).toBe(3)
+    expect(pool.checkinNextEligible('buddy-cn', 'a')).toBe(keep)
+    expect(pool.checkinNextEligible('buddy-cn', 'gone')).toBeUndefined()
+    expect(pool.checkinNextEligible('codearts', 'c-keep')).toBe(other)
   })
 
   /** 无账号 provider：prune 返回不炸，且一个键都不清（无账号跳过）。 */
   it('无账号时 pruneOrphanCheckins 跳过（不清任何键）', async () => {
-    await pool.writeCheckinDay('buddy-cn', 'a', 1)
-    await pool.writeCheckinDay('buddy-cn', 'gone', 2)
+    const a = Date.now() + 10_000
+    const gone = Date.now() + 20_000
+    await pool.writeCheckinNextEligible('buddy-cn', 'a', a)
+    await pool.writeCheckinNextEligible('buddy-cn', 'gone', gone)
     await pruneOrphanCheckins(pool, 'buddy-cn')
-    expect(pool.checkinDay('buddy-cn', 'a')).toBe(1)
-    expect(pool.checkinDay('buddy-cn', 'gone')).toBe(2)
+    expect(pool.checkinNextEligible('buddy-cn', 'a')).toBe(a)
+    expect(pool.checkinNextEligible('buddy-cn', 'gone')).toBe(gone)
   })
 
   it('配置文件里的脏 checkins 值被忽略而不是抛错', () => {
     const seeded = createMockContext([], {
       initialCheckins: {
+        // `12` 是旧口径的日数 ⇒ 会被**迁移**（不是原样读回），故这里断言它落在
+        // 时间戳量级；下面三个脏值应整个消失。
         'trae-cn:ok': 12,
         'trae-cn:str': '12',
         'trae-cn:nan': Number.NaN,
@@ -1159,22 +1202,23 @@ describe('AccountPool 签到存储（checkins 第五件套）', () => {
       } as never,
     })
     const p = new AccountPool(seeded as never)
-    expect(p.checkinDay('trae-cn', 'ok')).toBe(12)
-    expect(p.checkinDay('trae-cn', 'str')).toBeUndefined()
-    expect(p.checkinDay('trae-cn', 'nan')).toBeUndefined()
-    expect(p.checkinDay('trae-cn', 'obj')).toBeUndefined()
+    expect(p.checkinNextEligible('trae-cn', 'ok')).toBe(migrateLegacyCheckinDay(12, 'trae-cn'))
+    expect(p.checkinNextEligible('trae-cn', 'str')).toBeUndefined()
+    expect(p.checkinNextEligible('trae-cn', 'nan')).toBeUndefined()
+    expect(p.checkinNextEligible('trae-cn', 'obj')).toBeUndefined()
   })
 
-  it('五件套互带：写账号只带第五件套 checkins，不抹黑名单 / 预算 / 版本号', async () => {
+  it('八件套互带：写账号只带 checkins，不抹黑名单 / 预算 / 版本号', async () => {
     await pool.setModelDisabled('buddy-cn', 'glm-5.2', true)
     await pool.writeContextBudget('buddy-cn', 'glm-5.2', 200_000)
-    await pool.writeCheckinDay('buddy-cn', 'buddy-001', 9)
+    const nextEligible = Date.now() + 9_000
+    await pool.writeCheckinNextEligible('buddy-cn', 'buddy-001', nextEligible)
     await pool.addAccount(makeMockAccount())
     const last = ctx.replacePayloads.at(-1)!
     expect(last.accounts).toBeDefined()
     expect(last.disabledModels).toEqual({ 'buddy-cn': { 'glm-5.2': true } })
     expect(last.contextBudgets).toEqual({ 'buddy-cn': { 'glm-5.2': 200_000 } })
     expect(last.schemaVersion).toBe(0)
-    expect(last.checkins).toEqual({ 'buddy-cn:buddy-001': 9 })
+    expect(last.checkins).toEqual({ 'buddy-cn:buddy-001': nextEligible })
   })
 })

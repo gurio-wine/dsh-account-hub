@@ -33,6 +33,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { sanitizeConsumption, sanitizeConsumptionCursors } from './account-consumption.js'
 import type { ConsumptionCursorMap, ConsumptionMap } from './account-consumption.js'
+import { normalizeCheckinValue } from './checkin-schedule.js'
 import type { ProviderAccountEntry } from './types.js'
 
 declare module '@deepseek-ai/cordis' {
@@ -75,13 +76,24 @@ export type ModelDisableMap = Record<string, Record<string, boolean>>
 export type ContextBudgetMap = Record<string, Record<string, number>>
 
 /**
- * 自动签到记录：`provider:accountId` → **本地时区的纪元日数**。
+ * 自动签到记录：`provider:accountId` → **下一次可签时刻（毫秒时间戳）**。
  *
  * - 键格式 `${provider}:${accountId}`（accountId 已含 provider 前缀，但显式带
- *   provider 让键自解释、且孤儿清理时可按 provider 前缀批量删）。
- * - 值 = 本地时区当天（「本地年月日」口径）的纪元日数，`number`。与今日日数做
- *   整数相等即可判「今日已签」，无需字符串解析 / 时区口径函数。
- * - 不在表里的键 = 尚未签到（读不到即「今日未签」）。
+ *   provider 让键自解释、且孤儿清理时可按 provider 前缀批量删，**也是旧值迁移时
+ *   查重置钟点的依据**）。
+ * - 值 = 「下一次可签」的**本地时间**毫秒时间戳。判定退化为一次比较：
+ *   `Date.now() < 值` = 已签（等窗口翻页）、`>= 值` = 可签。
+ * - 不在表里的键 = 从未签过（读不到即「可签」）。
+ *
+ * ## ⚠️ 值口径已经变过一次（旧数据仍是纪元日数）
+ *
+ * 旧口径是「本地纪元日数」（`checkinDay === today` 判已签），**它隐含所有
+ * provider 都在本地零点重置**；`qoder-cn` 实测在**本地 10 点**才翻页，用日数
+ * 表达会在窗口边界两侧各错一次（详见 `src/checkin-schedule.ts` 的模块头）。
+ *
+ * 旧值**不会被读成新值**：两个口径差约 7 个数量级，`sanitizeCheckins` 按
+ * `LEGACY_DAY_NUMBER_MAX` 分流并把旧值就地换成新口径（`dayNumber` → 次日重置点）。
+ * 因此本类型的**运行时值恒为新口径**，迁移只发生在读盘那一层。
  */
 export type CheckinsMap = Record<string, number>
 
@@ -159,16 +171,46 @@ function sanitizeContextBudgets(raw: unknown): ContextBudgetMap {
   return result
 }
 
-/** 把任意外部值归一化为签到表（同既有 `sanitizeDisabledModels` 的口径）。 */
+/**
+ * 把任意外部值归一化为签到表（同既有 `sanitizeDisabledModels` 的口径）。
+ *
+ * ## 双口径读入（旧 dayNumber 就地迁移）
+ *
+ * 值可能是两种口径：**旧**的本地纪元日数（几百到五位数）与**新**的下一次可签
+ * 毫秒时间戳（十三位）。两者差约 7 个数量级，故按 `LEGACY_DAY_NUMBER_MAX`
+ * 分流：小值按旧口径换算成新口径（见 `migrateLegacyCheckinDay`），大值原样保留。
+ *
+ * ⚠️ **provider 从键里解出来**（`provider:accountId`，按**第一个**冒号切）：
+ * 换算要按该 provider 的重置钟点算，而钟点对 `qoder-cn` 与其余五家不同。
+ * 键里没有冒号（外部手写的脏键）时按缺省钟点 0 处理 —— 不为了一个畸形键
+ * 抛错，也不丢掉它（它仍是一个合法的 `provider:accountId` 之外的字符串，
+ * 孤儿清理会按前缀规则处理）。
+ *
+ * ⚠️ **只在读盘这一层迁移**：返回的表是新口径，调用方（`AccountPool`）拿到后
+ * 若发生写入，落盘的自然是新口径；若一直不写，下次启动重跑一次同样的迁移
+ * —— 换算纯函数、幂等（新口径值不会再落入小值区间）。
+ */
 export function sanitizeCheckins(raw: unknown): CheckinsMap {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}
   const result: CheckinsMap = {}
-  for (const [key, day] of Object.entries(raw as Record<string, unknown>)) {
-    // 只收「有限整数日数」：脏值（字符串 / NaN / 小数 / 非法结构）一律丢弃，不抛错。
-    if (typeof day !== 'number' || !Number.isFinite(day) || day < 0 || !Number.isInteger(day)) continue
-    result[key] = day
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const normalized = normalizeCheckinValue(value, providerOfCheckinKey(key))
+    // 脏值（字符串 / NaN / 小数 / 非法结构）一律丢弃，不抛错。
+    if (normalized === undefined) continue
+    result[key] = normalized
   }
   return result
+}
+
+/**
+ * 从 `checkins` 的键解出 provider（换算重置钟点用）。
+ *
+ * 按**第一个**冒号切：accountId 自身可能含冒号（外部手写的键），而 provider id
+ * 的形态里没有冒号。无冒号时返回空串 —— `checkinResetHour('')` 落到缺省的 0。
+ */
+function providerOfCheckinKey(key: string): string {
+  const index = key.indexOf(':')
+  return index <= 0 ? '' : key.slice(0, index)
 }
 
 /**

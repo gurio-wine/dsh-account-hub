@@ -5,8 +5,8 @@
  *
  * | 选择器 | 档位 | 语义 |
  * |---|---|---|
- * | 消耗顺序 | `sequential`（默认） | 永远取当前排序第一个可用账号 —— **即历史行为** |
- * | | `round-robin` | 每次按账号顺序轮转下一个（a→b→c→a），游标持久化 |
+ * | 消耗顺序 | `sequential` | 永远取当前排序第一个可用账号 |
+ * | | `round-robin`（默认） | 每次按账号顺序轮转下一个（a→b→c→a），游标持久化 |
  * | | `highest-balance` | 每次取可用账号里积分余额最高的 |
  * | 切换粒度 | `per-request` | 每次请求都按消耗顺序重新选号 |
  * | | `per-turn`（默认） | 一轮对话（同一会话）内锁定同一账号，新轮次才重选 |
@@ -69,15 +69,22 @@ export const CONSUMPTION_SWITCHES: readonly ConsumptionSwitch[] = Object.freeze(
 /**
  * 默认配置。
  *
- * - `sequential` = **现状行为**（永远取排序第一个可用账号），故升级到本版不会
- *   改变任何既有用户的选号结果；
+ * - `round-robin` = **用户拍板的默认档**：多个账号的积分被均匀消耗，而不是
+ *   永远压在排序第一个账号上（`sequential` 因此降级为**普通档位**，只在用户
+ *   显式选择时生效）。
+ *
+ *   ⚠️ **这是相对上一版的行为变化**：本档位是 `fdae868` 随三档一起落地的，
+ *   当时的默认是 `sequential`（等价于改动前的历史行为）。改成遍历后，
+ *   **从没动过配置的存量用户**重启即从「固定用第一个账号」变为「逐请求轮转」。
+ *   这正是用户要求的默认，故**不做任何数据迁移**：旧文档里没有 `consumption`
+ *   条目（或条目等于新默认值）读到的就是遍历，与「显式配成遍历」表现一致。
  * - `per-turn` = 用户明确的取舍（「风险小一点」）：同轮对话上下文连贯，
- *   也避免部分后端按会话绑定凭据。
+ *   也避免部分后端按会话绑定凭据。**这一档没有变**。
  *
  * 冻结：它是被所有 provider 共享的缺省值，任何就地改写都会污染全局。
  */
 export const DEFAULT_CONSUMPTION: ConsumptionSetting = Object.freeze({
-  order: 'sequential',
+  order: 'round-robin',
   switch: 'per-turn',
 })
 
@@ -131,6 +138,11 @@ function isDefaultSetting(setting: ConsumptionSetting): boolean {
  * 额外一条：**等于默认值的条目不留**（读入与写入两侧同口径，见
  * `AccountPool.writeConsumption`）—— 否则「用户从没配过」与「配成了默认值」
  * 在存储文件里长得一模一样，排查时分不清是哪种。
+ *
+ * ⚠️ 判等用的是 {@link DEFAULT_CONSUMPTION}，因此默认档从 `sequential` 翻成
+ * `round-robin` 后**剔除的键也跟着翻**：旧文档里显式写着的 `sequential` 现在是
+ * 一份真实配置（必须保留），而 `round-robin` 变成了那个「不留噪音」的默认值。
+ * 两件事都由这一处判等自动跟随，不存在第二份需要同步的名单。
  */
 export function sanitizeConsumption(raw: unknown): ConsumptionMap {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return {}

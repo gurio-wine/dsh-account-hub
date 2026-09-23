@@ -76,8 +76,13 @@ describe('积分领取结果汇总', () => {
       { kind: 'already-claimed', message: '今天已签到' },
       { kind: 'failed', code: 500, message: 'boom' },
     ]
+    // ⚠️ 精确形状（`toEqual` 而非 `toMatchObject`）是刻意的：新增一个 kind 时
+    // **必须**在这里多写一格，否则一个「有产生者、却没人计数」的 kind 会静默漏计。
+    // `abnormal`（签到前后余额没变）与 `undetermined`（Qoder 空活动列表）是
+    // 2026-09-24 新增的两个独立计数栏，本用例不产它们 ⇒ 都是 0。
     expect(computeClaimSummary(outcomes)).toEqual({
-      claimed: 2, totalCredit: 150, alreadyClaimed: 1, inactive: 0, unavailable: 0, failed: 1,
+      claimed: 2, totalCredit: 150, alreadyClaimed: 1, inactive: 0,
+      unavailable: 0, abnormal: 0, undetermined: 0, failed: 1,
     })
   })
 
@@ -113,13 +118,15 @@ describe('积分领取结果汇总', () => {
       { kind: 'claimed', credit: 10, streakDays: 1, isStreakDay: false },
     ]
     expect(computeClaimSummary(outcomes)).toEqual({
-      claimed: 1, totalCredit: 10, alreadyClaimed: 0, inactive: 0, unavailable: 1, failed: 1,
+      claimed: 1, totalCredit: 10, alreadyClaimed: 0, inactive: 0,
+      unavailable: 1, abnormal: 0, undetermined: 0, failed: 1,
     })
   })
 
   it('空数组返回全 0', () => {
     expect(computeClaimSummary([])).toEqual({
-      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
+      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0,
+      unavailable: 0, abnormal: 0, undetermined: 0, failed: 0,
     })
   })
 
@@ -297,7 +304,8 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(response.results.map(r => r.accountId)).toEqual(['enabled-1', 'disabled-1', 'disabled-2'])
     expect(response.results.every(r => r.outcome.kind === 'claimed')).toBe(true)
     expect(response.summary).toEqual({
-      claimed: 3, totalCredit: 300, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
+      claimed: 3, totalCredit: 300, alreadyClaimed: 0, inactive: 0,
+      unavailable: 0, abnormal: 0, undetermined: 0, failed: 0,
     })
   })
 
@@ -325,7 +333,8 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     // 坏账号没有阻止后两个账号真正发起领取
     expect(claimed).toHaveLength(2)
     expect(response.summary).toEqual({
-      claimed: 2, totalCredit: 200, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1,
+      claimed: 2, totalCredit: 200, alreadyClaimed: 0, inactive: 0,
+      unavailable: 0, abnormal: 0, undetermined: 0, failed: 1,
     })
   })
 
@@ -1694,7 +1703,8 @@ describe('积分端点的 provider 能力边界', () => {
     const call = registerCreditsEndpoints()
     const result = await call('credits.claimAll', { provider: 'codearts' })
     expect((result.value as { summary: unknown }).summary).toEqual({
-      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
+      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0,
+      unavailable: 0, abnormal: 0, undetermined: 0, failed: 0,
     })
   })
 })

@@ -107,28 +107,38 @@ function makeEndpointHarness(options: { consumption?: Record<string, unknown> } 
 }
 
 describe('consumption.get / consumption.set 端点', () => {
-  it('未配置过时 get 返回默认值（顺序 + 按轮次），而不是 undefined', async () => {
+  it('未配置过时 get 返回默认值（遍历 + 按轮次），而不是 undefined', async () => {
     const h = makeEndpointHarness()
     const result = await h.call('consumption.get', { provider: 'buddy-cn' })
     expect(result.ok).toBe(true)
     expect(result.value).toEqual({
       provider: 'buddy-cn',
-      consumption: { order: 'sequential', switch: 'per-turn' },
+      consumption: { order: 'round-robin', switch: 'per-turn' },
     })
   })
 
   it('set 写入后 get 读回同一个值（往返一致）', async () => {
     const h = makeEndpointHarness()
-    const written = await h.call('consumption.set', { provider: 'buddy-cn', order: 'round-robin' })
+    // 用**非默认档**（顺序）：写默认档等于删键，验不出往返。
+    const written = await h.call('consumption.set', { provider: 'buddy-cn', order: 'sequential' })
     expect(written.ok).toBe(true)
     // 响应里回传**写入后的权威配置**，客户端据此对齐选中态（不做乐观更新）。
     expect(written.value).toEqual({
       provider: 'buddy-cn',
-      consumption: { order: 'round-robin', switch: 'per-turn' },
+      consumption: { order: 'sequential', switch: 'per-turn' },
     })
     const read = await h.call('consumption.get', { provider: 'buddy-cn' })
     expect((read.value as { consumption: unknown }).consumption)
-      .toEqual({ order: 'round-robin', switch: 'per-turn' })
+      .toEqual({ order: 'sequential', switch: 'per-turn' })
+  })
+
+  it('把档位改回默认（遍历）时读到默认值 —— 与「从没配过」表现一致但却是真实写入', async () => {
+    const h = makeEndpointHarness()
+    const written = await h.call('consumption.set', { provider: 'buddy-cn', order: 'round-robin' })
+    expect(written.value).toEqual({
+      provider: 'buddy-cn',
+      consumption: { order: 'round-robin', switch: 'per-turn' },
+    })
   })
 
   it('**部分更新**：只传 switch 不会把 order 重置回默认', async () => {
@@ -170,14 +180,15 @@ describe('consumption.get / consumption.set 端点', () => {
 
   it('两个新字段随任意一次写入一起落盘（不被别的写路径清空）', async () => {
     const h = makeEndpointHarness()
-    await h.call('consumption.set', { provider: 'buddy-cn', order: 'round-robin' })
+    // 写**非默认档**（顺序）才落键；默认档会被剔除（等于「没配过」）。
+    await h.call('consumption.set', { provider: 'buddy-cn', order: 'sequential' })
     const last = h.storedValue()
     // 七件套齐全。
     expect(Object.keys(last).sort()).toEqual([
       'accounts', 'checkins', 'consumption', 'consumptionCursors',
       'contextBudgets', 'disabledModels', 'schemaVersion',
     ])
-    expect(last.consumption).toEqual({ 'buddy-cn': { order: 'round-robin', switch: 'per-turn' } })
+    expect(last.consumption).toEqual({ 'buddy-cn': { order: 'sequential', switch: 'per-turn' } })
   })
 
   it('未知方法仍然报 bad-request（default 分支未被新 case 破坏）', async () => {

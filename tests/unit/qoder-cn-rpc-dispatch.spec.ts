@@ -668,14 +668,19 @@ describe('credits.status / credits.claimAll —— qoder-cn 走 CN host 正常�
 
     const result = await h.call<{
       results: Array<{ accountId: string; outcome: { kind: string; credit?: number } }>
-      summary: { claimed: number; totalCredit: number; alreadyClaimed: number; inactive: number; unavailable: number; failed: number }
+      summary: {
+        claimed: number; totalCredit: number; alreadyClaimed: number; inactive: number
+        unavailable: number; abnormal: number; undetermined: number; failed: number
+      }
     }>('credits.claimAll', { provider: 'qoder-cn' })
 
     expect(result.ok, JSON.stringify(result)).toBe(true)
     if (!result.ok) return
     expect(result.value.results[0]!.outcome).toMatchObject({ kind: 'claimed', credit: 100 })
+    // 七栏齐全（含 2026-09-24 新增的 abnormal / undetermined）。
     expect(result.value.summary).toEqual({
-      claimed: 1, totalCredit: 100, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
+      claimed: 1, totalCredit: 100, alreadyClaimed: 0, inactive: 0,
+      unavailable: 0, abnormal: 0, undetermined: 0, failed: 0,
     })
 
     const claim = h.calls.find((c) => c.method === 'POST' && c.url.includes('/claim'))
@@ -695,28 +700,38 @@ describe('credits.status / credits.claimAll —— qoder-cn 走 CN host 正常�
     }))
     await withCnAccount(h)
 
-    const result = await h.call<{ summary: { claimed: number; totalCredit: number; alreadyClaimed: number; unavailable: number; failed: number } }>(
+    const result = await h.call<{ summary: Record<string, number> }>(
       'credits.claimAll', { provider: 'qoder-cn' },
     )
     expect(result.ok, JSON.stringify(result)).toBe(true)
     if (!result.ok) return
     expect(result.value.summary).toEqual({
-      claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, unavailable: 0, failed: 0,
+      claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0,
+      unavailable: 0, abnormal: 0, undetermined: 0, failed: 0,
     })
   })
 
-  it('活动列表清空（今天已领）也是 already-claimed，**不是** failed', async () => {
+  it('活动列表清空 ⇒ **undetermined**（不是 already-claimed、也不是 failed）', async () => {
+    // ⚠️ 2026-09-24 修正：空列表既可能是「今天已领」（服务端清空了列表），也可能是
+    // 「活动还没开始」。旧实现归一 `already-claimed` ⇒ 宿主写下签到状态 ⇒ 该账号
+    // 整个周期不再被尝试，而它可能一分没领（真机调查确认的「qoder 假签到」）。
+    // 现在报 `undetermined`：**不写状态** ⇒ 下一轮 sweep 自然重试。
     const h = createHarness(responder({
       campaigns: () => new Response(JSON.stringify({ showCampaign: false, claimable: false, campaigns: [] }), { status: 200 }),
     }))
     await withCnAccount(h)
 
-    const result = await h.call<{ summary: { alreadyClaimed: number; failed: number } }>(
-      'credits.claimAll', { provider: 'qoder-cn' },
-    )
+    const result = await h.call<{
+      results: Array<{ outcome: { kind: string; message: string } }>
+      summary: Record<string, number>
+    }>('credits.claimAll', { provider: 'qoder-cn' })
     expect(result.ok).toBe(true)
     if (!result.ok) return
-    expect(result.value.summary).toMatchObject({ alreadyClaimed: 1, failed: 0 })
+    expect(result.value.results[0]!.outcome.kind).toBe('undetermined')
+    // 三栏都不能收留它：既不是已领（会伪造签到），也不是失败（用户无事可做）。
+    expect(result.value.summary).toMatchObject({
+      alreadyClaimed: 0, failed: 0, undetermined: 1, claimed: 0,
+    })
     // 无可领活动 ⇒ 一次 claim 都不发。
     expect(h.calls.some((c) => c.method === 'POST' && c.url.includes('/claim'))).toBe(false)
   })

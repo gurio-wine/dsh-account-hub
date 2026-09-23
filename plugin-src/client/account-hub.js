@@ -316,6 +316,113 @@ function claimUnavailableLines(res) {
 }
 
 /**
+ * `abnormal` outcome（签到异常：响应成功但积分未增加）**没有** `message` 时的回退文案。
+ *
+ * 与另外两个回退文案都不同：这一档服务端**没有错误**（它回了成功码），出问题的是
+ * 「这次成功没有产生积分」。回退成「领取失败」会让用户去排查凭据/设备/网络 ——
+ * 而这三样在本次请求里都是好的。
+ */
+const CLAIM_ABNORMAL_FALLBACK = '签到响应成功但积分未增加';
+
+/** 余额数字的展示形态：非有限数一律视为「没有这个数字」（不是显示 0）。 */
+function formatBalanceNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? String(value) : null;
+}
+
+/**
+ * 把一次 `abnormal` 的领取结果格式化成一行「账号：原因（签到前 X → 签到后 Y）」。
+ *
+ * ## 为什么它不复用 {@link formatClaimFailureLine}
+ *
+ * 那个函数按「服务端信封」渲染 `message` / `code` / `logid` 三件事，而本档**没有
+ * code 也没有 logid**（服务端没报错）—— 复用会让每一行尾巴上挂一个「（code 未知）」，
+ * 属于纯噪音。本档真正需要展示的是**前后两个余额数字**：没有它们，用户只看到一句
+ * 「积分未变」，既判断不出是没发还是发少了，也没法拿去跟服务端核对。
+ *
+ * 两个数字任一缺失（旧宿主 / 异常响应）时**不显示那一段**，而不是显示
+ * 「undefined → undefined」—— 那句话本身仍然成立（响应成功但积分没涨）。
+ *
+ * @param result - `results[]` 的一项，`outcome.kind === 'abnormal'`。
+ */
+function formatClaimAbnormalLine(result) {
+  const outcome = result?.outcome ?? {};
+  const label = result?.nickname || result?.accountId || '未知账号';
+  const raw = typeof outcome.message === 'string' ? outcome.message.trim() : '';
+  const message = raw !== '' ? raw : CLAIM_ABNORMAL_FALLBACK;
+  const before = formatBalanceNumber(outcome.balanceBefore);
+  const after = formatBalanceNumber(outcome.balanceAfter);
+  const numbers = before !== null && after !== null ? `（签到前 ${before} → 签到后 ${after}）` : '';
+  return `${label}：${message}${numbers}`;
+}
+
+/**
+ * 从响应里取出 `abnormal` 账号的明细行（「签到异常」）。
+ *
+ * 与 {@link claimFailureLines} / {@link claimUnavailableLines} **三分**，互不混入：
+ * 三者的用户动作完全不同（排查 / 等自动重试 / 等自动重试），混进一个列表会让用户
+ * 把「不用管」的那两类也当成待处理的问题。
+ *
+ * 本档尤其**不能并进 claimed**：那正是「领取成功 +0」这个缺陷的形态 —— 数字与
+ * 「成功」二字互相矛盾，而用户无从追查。
+ */
+function claimAbnormalLines(res) {
+  const results = res?.results;
+  if (!Array.isArray(results)) return [];
+  return results
+    .filter((item) => item?.outcome?.kind === 'abnormal')
+    .map(formatClaimAbnormalLine);
+}
+
+/**
+ * `undetermined` outcome（**无法判定**：Qoder 系空活动列表）**没有** `message`
+ * 时的回退文案。
+ *
+ * 与另外三个回退文案都不同：它不是失败、不是服务端拒绝、也不是「已领」——
+ * 而是**服务端什么都没说**。回退成「今天已领」是本次要修的缺陷本身（伪造一次
+ * 签到），回退成「领取失败」会让用户去排查好的凭据。
+ */
+const CLAIM_UNDETERMINED_FALLBACK = '无法判定今天是否已领取';
+
+/**
+ * 把一次 `undetermined` 的领取结果格式化成一行「账号：原因」。
+ *
+ * ## 为什么它不复用 {@link formatClaimFailureLine}
+ *
+ * 那一档没有服务端错误可转述（HTTP 200、信封合法、**没有错误码**），复用会让
+ * 每行尾巴挂一个「（code 未知）」—— 纯噪音。
+ *
+ * 文案**必须**说清「会自动重试」，因为这是本档唯一可执行的结论：用户什么都不用
+ * 做，下一轮 sweep 会把不确定变成确定（届时活动若已开始就真的领到；若确实已领，
+ * 服务端会回 `replayed:true` ⇒ 那时才显示「已领取」）。
+ *
+ * @param result - `results[]` 的一项，`outcome.kind === 'undetermined'`。
+ */
+function formatClaimUndeterminedLine(result) {
+  const outcome = result?.outcome ?? {};
+  const label = result?.nickname || result?.accountId || '未知账号';
+  const raw = typeof outcome.message === 'string' ? outcome.message.trim() : '';
+  return `${label}：${raw !== '' ? raw : CLAIM_UNDETERMINED_FALLBACK}`;
+}
+
+/**
+ * 从响应里取出 `undetermined` 账号的明细行（「无法判定」）。
+ *
+ * 与另外三类明细**四分**：它们的用户动作各不相同（排查 / 等自动重试 / 等自动
+ * 重试 / **无需动作、重试会自动完成判定**），混进一个列表会让用户把「不用管」
+ * 的那几类也当成待处理的问题。
+ *
+ * 本档尤其**不能并进 already-claimed**：那会让界面显示「今天已领取」，而用户
+ * 可能一分没领到 —— 这正是「qoder 假签到」在界面上的形态。
+ */
+function claimUndeterminedLines(res) {
+  const results = res?.results;
+  if (!Array.isArray(results)) return [];
+  return results
+    .filter((item) => item?.outcome?.kind === 'undetermined')
+    .map(formatClaimUndeterminedLine);
+}
+
+/**
  * 把一次 `credits.claimAll` 的响应整理成 {@link ClaimNotice} 的 props。
  *
  * 摘要行只讲各档计数（「3 个账号领取成功（+300 积分），1 个失败」），
@@ -325,6 +432,10 @@ function claimUnavailableLines(res) {
  * **`unavailable` 单独成行**（`unavailableDetails`，2026-09-23）：它不是失败，
  * 用户的正确动作是「什么都不做，稍后自动重试」，故既不并进失败计数、也不并进
  * 失败明细列表 —— 它的文案里已经写清了「稍后自动重试」。
+ *
+ * **`abnormal` 同样单独成行**（`abnormalDetails`，2026-09-24）：它也不是失败，
+ * 但需要**独立可见** —— 并进 claimed 会让「领取成功 +0」这个缺陷再次隐形，
+ * 并进 failed 会让用户去排查三种都好的东西（凭据 / 设备 / 网络）。
  *
  * 纯函数、不依赖 hooks，故可在单测里直接喂响应做整树深比较。
  * `res.summary` 刻意不做兜底：宿主必然返回它，真缺了就让异常走 `claimCredits`
@@ -339,6 +450,12 @@ function buildClaimNotice(res) {
   // `?? 0`：旧宿主（不返回该字段）的响应不该让摘要行变成「NaN 个暂不可签」。
   const unavailableCount = summary.unavailable ?? 0;
   if (unavailableCount > 0) parts.push(`${unavailableCount} 个暂不可签`);
+  // 同上：`abnormal` 也是新增字段（2026-09-24），旧宿主不返回它。
+  const abnormalCount = summary.abnormal ?? 0;
+  if (abnormalCount > 0) parts.push(`${abnormalCount} 个签到异常`);
+  // 同上：`undetermined` 也是新增字段（2026-09-24）。
+  const undeterminedCount = summary.undetermined ?? 0;
+  if (undeterminedCount > 0) parts.push(`${undeterminedCount} 个无法判定`);
   if (summary.failed > 0) parts.push(`${summary.failed} 个失败`);
   return {
     tone: summary.failed > 0 ? 'warn' : 'ok',
@@ -347,6 +464,10 @@ function buildClaimNotice(res) {
     details: claimFailureLines(res),
     // 暂不可签同样**不并入** details：它不是失败，混进去会让用户去排查。
     unavailableDetails: claimUnavailableLines(res),
+    // 签到异常独立成段，理由见函数头。
+    abnormalDetails: claimAbnormalLines(res),
+    // 无法判定独立成段（2026-09-24）：它既不是失败也不是已领。
+    undeterminedDetails: claimUndeterminedLines(res),
   };
 }
 
@@ -362,7 +483,7 @@ function buildClaimNotice(res) {
  * 的说明）；抽出来才能对这棵树做**整树深比较**，把「成功路径一个字符都不变」
  * 变成可执行的断言，而不是靠肉眼看源码。
  */
-function ClaimNotice({ tone, text, details, unavailableDetails }) {
+function ClaimNotice({ tone, text, details, unavailableDetails, abnormalDetails, undeterminedDetails }) {
   return React.createElement('div', {
     className: 'dim-ah-probeNotice',
     'data-tone': tone,
@@ -383,6 +504,24 @@ function ClaimNotice({ tone, text, details, unavailableDetails }) {
         'data-kind': 'unavailable',
       },
       unavailableDetails.map((line, i) => React.createElement('li', { key: i }, line)))
+    : null,
+  // 「签到异常」同样独立成段（2026-09-24）。它比暂不可签更需要被看见：它描述的
+  // 是「响应说成功但账没动」，是本插件唯一会主动质疑服务端结论的一档。
+  (abnormalDetails?.length ?? 0) > 0
+    ? React.createElement('ul', {
+        className: 'dim-ah-probeDetails',
+        'data-kind': 'abnormal',
+      },
+      abnormalDetails.map((line, i) => React.createElement('li', { key: i }, line)))
+    : null,
+  // 「无法判定」独立成段（2026-09-24）：它既不是失败也不是「已领」。并入已领会
+  // 让用户看到一句不成立的「今天已领取」—— 那正是「qoder 假签到」的界面形态。
+  (undeterminedDetails?.length ?? 0) > 0
+    ? React.createElement('ul', {
+        className: 'dim-ah-probeDetails',
+        'data-kind': 'undetermined',
+      },
+      undeterminedDetails.map((line, i) => React.createElement('li', { key: i }, line)))
     : null);
 }
 
@@ -942,11 +1081,11 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
  * 消耗顺序的三档（**值与宿主 `src/account-consumption.ts` 的联合类型逐字一致**）。
  *
  * `hint` 是给用户看的一句话语义说明：三档的差别是「这次用哪个账号」，光看名字
- * （顺序 / 遍历 / 最高优先）不足以判断实际行为，尤其「顺序」= 现状行为这一点。
+ * （顺序 / 遍历 / 最高优先）不足以判断实际行为。
  */
 const CONSUMPTION_ORDER_OPTIONS = [
-  { value: 'sequential', label: '顺序', hint: '总是用排序里的第一个可用账号（默认，即原有行为）' },
-  { value: 'round-robin', label: '遍历', hint: '每次请求轮转下一个账号，用完一轮再从头开始' },
+  { value: 'sequential', label: '顺序', hint: '总是用排序里的第一个可用账号' },
+  { value: 'round-robin', label: '遍历', hint: '每次请求轮转下一个账号，用完一轮再从头开始（默认）' },
   { value: 'highest-balance', label: '最高优先', hint: '每次请求用积分余额最高的账号；余额未知时按顺序' },
 ];
 
@@ -956,65 +1095,75 @@ const CONSUMPTION_SWITCH_OPTIONS = [
   { value: 'per-turn', label: '按轮次', hint: '一轮对话内固定用同一个账号，下一轮才换（默认，上下文更连贯）' },
 ];
 
-/** 宿主的默认配置（与 `DEFAULT_CONSUMPTION` 同值）：拉取失败时退回它。 */
-const CONSUMPTION_DEFAULTS = { order: 'sequential', switch: 'per-turn' };
+/**
+ * 宿主的默认配置（与 `DEFAULT_CONSUMPTION` 同值）：拉取失败时退回它。
+ *
+ * ⚠️ **必须与宿主逐字一致**，且 `order` 是 `round-robin`：这份常量是
+ * `consumption.get` 失败时的兜底显示值，写错会让「读不到配置」看起来像
+ * 「用户选了另一档」—— 界面与实际选号行为分叉。
+ */
+const CONSUMPTION_DEFAULTS = { order: 'round-robin', switch: 'per-turn' };
 
 /**
- * 一个选择器（一组 radio）。
+ * 一个选择器（一个原生 `<select>`）。
  *
- * 形态**照抄 `ModelTierPicker`**：原生 `input[type=radio]` + `role="radiogroup"`
- * + `aria-label` + `disabled: busy`。**不用 `<select>`**：全仓没有任何 select
- * 惯例，而原生 radio 组在这套面板的样式表里已有现成规则（`.dim-ah-tierOption`）。
+ * ## 为什么是 `<select>` 而不是 radio 组
  *
- * 同一个组内的 radio 必须**同名**（`name`），否则浏览器不会把它们当成互斥的一组；
- * 两组之间必须**不同名**，否则两个选择器会跨组互斥。
+ * 三档 / 两档的选项文案是中文短语（「最高优先」「按轮次」），做成 radio 并排
+ * 时两个选择器各占一半宽、每档一个 label，窄面板下会把文案挤成省略号；
+ * 原生下拉收起时只显示当前档，天然省地方。这是用户明确要求的形态。
+ *
+ * ## 无障碍与键盘
+ *
+ * 原生 `<select>` 自带键盘操作（方向键改档、Tab 进出）与读屏语义，**不需要**
+ * `role` —— 分组是裸 `<div>`，可读名只能来自 `aria-label`（标题那个
+ * `<strong>` 不是 label 关联，读屏读不到）。`title` 给鼠标用户看当前档说明。
+ *
+ * ⚠️ **受控组件**：值只由 `value`（宿主权威值）决定（`value=` 而不是在 option
+ * 上挂 `selected`）—— 后者在 react 里会与 `value` 打架，且让「宿主拒绝写入」
+ * 看起来像成功了。
  */
-function ConsumptionRadioGroup({ name, label, hint, options, value, busy, onSelect }) {
-  return React.createElement('div', {
-    className: 'dim-ah-consumptionGroup',
-    role: 'radiogroup',
-    'aria-label': label,
-  },
+function ConsumptionSelect({ name, label, hint, options, value, busy, onSelect }) {
+  return React.createElement('div', { className: 'dim-ah-consumptionGroup' },
   React.createElement('div', { className: 'dim-ah-consumptionHead' },
     React.createElement('strong', { className: 'dim-ah-consumptionLabel' }, label),
     React.createElement('span', { className: 'dim-ah-consumptionHint' },
       // 提示文案取**当前选中档**的那一句：三档语义不同，把三句都铺开会挤爆
-      // 这一行；悬停任意一档能看到它自己的说明（见下面的 title）。
+      // 这一行；下拉里的任意一档也有它自己的说明（见 option 的 title）。
       options.find(o => o.value === value)?.hint ?? '')),
-  React.createElement('div', { className: 'dim-ah-consumptionOptions' },
-    options.map(option => React.createElement('label', {
-      className: 'dim-ah-tierOption',
-      key: `dim-ah-consumption-${name}-${option.value}`,
-      title: option.hint,
-    },
-    React.createElement('input', {
-      type: 'radio',
-      name: `dim-ah-consumption-${name}`,
-      checked: value === option.value,
-      disabled: busy,
-      onChange: () => onSelect(option.value),
-    }),
-    React.createElement('span', null, option.label)))));
+  React.createElement('select', {
+    className: 'dim-ah-consumptionSelect',
+    // 可读名只来自这里（见上）：分组是裸 div，标题 strong 不构成 label。
+    'aria-label': label,
+    value: value,
+    disabled: busy,
+    onChange: (event) => onSelect(event.target.value),
+  },
+  options.map(option => React.createElement('option', {
+    key: `dim-ah-consumption-${name}-${option.value}`,
+    value: option.value,
+    title: option.hint,
+  }, option.label))));
 }
 
 /**
- * 账号消耗顺序 + 切换粒度：两个**并排**的选择器。
+ * 账号消耗顺序 + 切换粒度：两个**并排**的下拉。
  *
  * ## 版面
  *
- * 与账号卡片同宽、各占一半（`flex: 1 1 50%` 见 `account-hub-styles.js`），
+ * 与账号卡片同宽、各占一半（`flex: 1 1 0` 见 `account-hub-styles.js`），
  * 由 `ProviderPanel` 放在账号卡片列表**之前** —— 那个位置是一个无 class 的裸
  * `<div>`，宽度天然与卡片一致，故这里不需要任何宽度计算。
  *
  * ## 为什么是受控组件 + 不做乐观更新
  *
- * 选中态完全由 `value`（宿主权威值）决定，点击只回调 `onChange`。这与
+ * 选中态完全由 `value`（宿主权威值）决定，改变只回调 `onChange`。这与
  * `ModelToggle` / `ModelTierPicker` 同一条取舍：写入是否被接受由宿主校验决定
  * （非法档位会被拒绝），本地先翻会让「被拒绝」看起来像成功了。
  *
  * ⚠️ 配置用 `value` **对象**传入而不是两个平铺 prop：`switch` 是 JS 保留字，
  * 平铺就要在解构处写 `{ switch: switchMode }` 这种别名，而别名一旦漏写会静默
- * 拿到 `undefined`（Studio 里表现为「粒度选择器永远不勾任何一档」）。放进对象里
+ * 拿到 `undefined`（Studio 里表现为「粒度下拉永远停在默认档」）。放进对象里
  * 没有这个问题，也让「两个设置是一组」这件事在签名上可见。
  *
  * ⚠️ `disabled` 绑 `busy`：写入在途时禁用，避免连点产生两个并发写（它们的
@@ -1024,7 +1173,7 @@ function ConsumptionSelectors({ value, busy, onChange }) {
   const order = value?.order || CONSUMPTION_DEFAULTS.order;
   const switchMode = value?.switch || CONSUMPTION_DEFAULTS.switch;
   return React.createElement('div', { className: 'dim-ah-consumption' },
-    React.createElement(ConsumptionRadioGroup, {
+    React.createElement(ConsumptionSelect, {
       name: 'order',
       label: '消耗顺序',
       options: CONSUMPTION_ORDER_OPTIONS,
@@ -1032,7 +1181,7 @@ function ConsumptionSelectors({ value, busy, onChange }) {
       busy,
       onSelect: (next) => onChange({ order: next }),
     }),
-    React.createElement(ConsumptionRadioGroup, {
+    React.createElement(ConsumptionSelect, {
       name: 'switch',
       label: '切换粒度',
       options: CONSUMPTION_SWITCH_OPTIONS,
@@ -1263,7 +1412,8 @@ function ProviderPanel({ provider, rpcCall }) {
    *
    * 失败**静默**：选择器退回默认档而不是把面板变成错误页 —— 一份读不到的配置
    * 不该让整个账号管理界面不可用（与 `loadCheckinStatus` 同一条取舍）。
-   * 退默认档是安全的：它与宿主的默认行为一致（顺序 = 现状行为）。
+   * 退默认档是安全的：`CONSUMPTION_DEFAULTS` 与宿主 `DEFAULT_CONSUMPTION` 同值，
+   * 因此界面显示的就是宿主此刻实际生效的档位。
    */
   const loadConsumption = React.useCallback(async () => {
     try {
@@ -1588,11 +1738,17 @@ function ProviderPanel({ provider, rpcCall }) {
       const res = await rpcCall('checkin.perform', { provider, accountId });
       if (!mounted.current) return;
       const outcome = res?.results?.[0]?.outcome;
+      // ⚠️ **只有 claimed / already-claimed 算「已签」**（与宿主写状态的白名单
+      // 同源，见 `src/account-hub-rpc.ts` 的 `performCheckinOnTargets`）。
+      // `undetermined`（Qoder 空活动列表）**不算** —— 把它画成「已签」正是
+      // 「qoder 假签到」的界面形态：用户看到已签，而它可能一分没领，且按钮被
+      // 永久禁用、再也点不动。后端 4h sweep 会自动重试，届时才可能变成已领。
       const done = outcome?.kind === 'claimed' || outcome?.kind === 'already-claimed';
       setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: done, checking: false } }));
-      // 四种 outcome 的反馈统一走既有构造器（响应同构，直接喂）。
-      // `unavailable` 在这里 `done` 为 false ⇒ 状态不写、按钮回到「签到」，
-      // 用户可再手试，后台 4h sweep 也会自动重试（不新造三态状态机）。
+      // 五种 outcome 的反馈统一走既有构造器（响应同构，直接喂）。
+      // `unavailable` / `abnormal` / `undetermined` 在这里 `done` 均为 false ⇒
+      // 状态不写、按钮回到「签到」，用户可再手试，后台 4h sweep 也会自动重试
+      // （不新造三态状态机）。
       // `res.summary` 是 buildClaimNotice 的必需输入（它刻意不做兜底）：响应当前
       // 必然带它，真缺了就跳过通知而不是让异常冒到下面那个 catch 里去 ——
       // 那会把一次**成功**的签到报成「签到失败」。
@@ -1850,6 +2006,10 @@ function ProviderPanel({ provider, rpcCall }) {
           // 暂不可签明细（`unavailable`）：旧通知对象没有该字段时为 undefined，
           // ClaimNotice 按「无」渲染 —— 既有路径的树逐元素不变。
           unavailableDetails: claimNotice.unavailableDetails,
+          // 签到异常明细（`abnormal`，2026-09-24）：同上，缺失即按「无」渲染。
+          abnormalDetails: claimNotice.abnormalDetails,
+          // 无法判定明细（`undetermined`，2026-09-24）：同上。
+          undeterminedDetails: claimNotice.undeterminedDetails,
         })
       : null,
     // 弹窗被拦截时的兜底入口。刻意**不做成按钮 + window.open(url)**：

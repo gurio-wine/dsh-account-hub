@@ -18,8 +18,10 @@
  * 2. **请求体必须是空串**（抓包实测 `content-length: 0`）；
  * 3. **只领 `actionType === 'CLAIM_BENEFIT' && claimStatus === 'CLAIMABLE'`**
  *    （`VIEW_DETAILS` 型活动不可发 claim）；
- * 4. **`campaigns` 为空不是「没有活动」**（服务端在「今天已领」时清空它）⇒
- *    `CheckinStatus.active` 恒为 true，无目标归一为 `already-claimed`。
+ * 4. **`campaigns` 为空不是「没有活动」也不是「已领」，而是「判不了」**
+ *    （服务端在「今天已领」时清空它，但活动未开始时同样是空）⇒
+ *    `CheckinStatus.active` 恒为 true、`todayCheckedIn` **恒为 false（不猜）**，
+ *    无目标归一为 `undetermined`（**不写签到状态**，下轮 sweep 重试）。
  *
  * ## 替身边界
  *
@@ -187,20 +189,33 @@ describe('fetchQoderCheckinStatus —— active 恒为 true', () => {
     expect(calls[0]!.url).toContain('.qoder.com.cn')
   })
 
-  it('**列表为空也 active:true**，且 todayCheckedIn 为 true（今天已领）', async () => {
-    // ⚠️ 本文件最重要的一条：`active` 若按列表是否为空判，调用方
-    //（`collectClaimResults` 的预检）会先命中「活动未开启」分支，把
-    //「今天已领」误报成「签到活动未开启」。
+  it('**列表为空也 active:true**，但 todayCheckedIn 报 **false（不猜）**', async () => {
+    // ⚠️ 两条判据各管一件事，别把它们混起来：
+    //
+    // 1. `active` 恒为 true —— 若按列表是否为空判，调用方（`collectClaimResults`
+    //    的预检）会先命中「活动未开启」分支，把情况误报成「签到活动未开启」。
+    // 2. `todayCheckedIn` 为 **false** —— 空列表有两种相反含义（今天已领 /
+    //    暂无活动），响应上无法区分。旧实现报 `true`（「保守判已领」）在第二种
+    //    情形下**伪造了一次签到**：宿主据此写下状态、整个周期不再重试，而该账号
+    //    可能一分没领。现在不猜：界面显示未签，真伪由 claim 的 `undetermined`
+    //    与下一轮 sweep 收敛（详见 `src/qoder-credits.ts` 的说明）。
     const { fetcher } = withFetcher(() => campaignsBody([], { showCampaign: false, claimable: false }))
     const status = await fetchQoderCheckinStatus(CREDENTIAL, fakeAuth(), { fetcher, product: QODER_CN })
 
-    expect(status).toMatchObject({ active: true, todayCheckedIn: true })
+    expect(status).toMatchObject({ active: true, todayCheckedIn: false })
   })
 
   it('无任何 CLAIM_BENEFIT 活动时 dailyCredit 为 0（不编造额度）', async () => {
     const { fetcher } = withFetcher(() => campaignsBody([campaign({ actionType: 'VIEW_DETAILS' })]))
     const status = await fetchQoderCheckinStatus(CREDENTIAL, fakeAuth(), { fetcher, product: QODER_CN })
-    expect(status).toMatchObject({ todayCheckedIn: true, dailyCredit: 0 })
+    // 没有可领项 ⇒ 判不了（不再是「已签」）；额度仍如实回 0 而不是编一个数字。
+    expect(status).toMatchObject({ todayCheckedIn: false, dailyCredit: 0 })
+  })
+
+  it('有可领项时才可能未签，且 dailyCredit 用活动声明的额度', async () => {
+    const { fetcher } = withFetcher(() => campaignsBody([campaign({ benefit: { amount: 100 } })]))
+    const status = await fetchQoderCheckinStatus(CREDENTIAL, fakeAuth(), { fetcher, product: QODER_CN })
+    expect(status).toMatchObject({ todayCheckedIn: false, dailyCredit: 100 })
   })
 
   it('查询失败（非 2xx / 非 JSON / 网络抛错）一律回 null —— 「查不到」≠「无活动」', async () => {
@@ -246,19 +261,27 @@ describe('claimQoderDailyCheckin —— 领取与幂等', () => {
     expect(outcome.kind).toBe('already-claimed')
   })
 
-  it('列表为空 ⇒ already-claimed，且**一次 claim 都不发**', async () => {
+  it('列表为空 ⇒ **undetermined**（不是 already-claimed），且**一次 claim 都不发**', async () => {
+    // ⚠️ 2026-09-24 修正的核心：空列表既可能是「今天已领」（服务端清空了列表），
+    // 也可能是「活动还没开始 / 本账号暂无活动」。旧实现一律归一 `already-claimed`
+    // => 宿主写下签到状态 => 该账号整个周期不再被尝试，而它可能一分没领
+    //（真机调查确认的「qoder 假签到」）。
+    // 现在报 `undetermined`：**不写状态**，下一轮 sweep 自然重试去把不确定变成确定。
     const { fetcher, calls } = withFetcher(() => campaignsBody([], { showCampaign: false, claimable: false }))
     const outcome = await claimQoderDailyCheckin(CREDENTIAL, fakeAuth(), { fetcher, product: QODER_CN })
 
-    expect(outcome.kind).toBe('already-claimed')
+    expect(outcome.kind).toBe('undetermined')
+    expect((outcome as { message: string }).message).toContain('无法判定')
+    // 没有任何写入型请求（否则就不叫「无法判定」了）。
     expect(calls.every((c) => c.method === 'GET')).toBe(true)
   })
 
-  it('`VIEW_DETAILS` 型活动不被领取（零 POST）', async () => {
+  it('`VIEW_DETAILS` 型活动不被领取（零 POST），且归 undetermined 而不是已领', async () => {
     const { fetcher, calls } = withFetcher(() => campaignsBody([campaign({ actionType: 'VIEW_DETAILS' })]))
     const outcome = await claimQoderDailyCheckin(CREDENTIAL, fakeAuth(), { fetcher, product: QODER_CN })
 
-    expect(outcome.kind).toBe('already-claimed')
+    // 无可领的 CLAIM_BENEFIT 项 ⇒ 与空列表同一处境（判不了），不能报「已领」。
+    expect(outcome.kind).toBe('undetermined')
     expect(calls.some((c) => c.method === 'POST')).toBe(false)
   })
 
@@ -307,6 +330,44 @@ describe('claimQoderDailyCheckin —— 领取与幂等', () => {
     const outcome = await claimQoderDailyCheckin(CREDENTIAL, fakeAuth(), { fetcher, product: QODER_CN })
     expect(outcome.kind).toBe('failed')
     expect(outcome.kind === 'failed' && outcome.message).toContain('PENDING')
+  })
+
+  it('`status` **缺失** ⇒ 仍按成功，但留下「未经确认」的调试行（不静默替服务端宣布成功）', async () => {
+    // 2026-09-24 补齐的缺口：旧实现把「响应里没有 status」与「status === 'CLAIMED'」
+    // 走同一条成功路径，等于**替服务端宣布成功** —— 响应形态一变更（网关改字段名、
+    // 错误信封、中间层吞 body）就会把一次未生效的领取报成 claimed。
+    //
+    // 现在的处置是**如实记录而非改判**：没有证据说它失败，故 kind 仍是 claimed；
+    // 但 `credit` 的来源必须是服务端下发的**声明值**（`benefit.amount`），且这一点
+    // 要留在调试行里，便于真机核对「这个数字到底是谁说的」。
+    const debug: string[] = []
+    const { fetcher } = withFetcher((call) => call.method === 'POST'
+      ? new Response(JSON.stringify({ benefit: { amount: 100 } }), { status: 200 })
+      : campaignsBody([campaign()]))
+
+    const outcome = await claimQoderDailyCheckin(CREDENTIAL, fakeAuth(), {
+      fetcher, product: QODER_CN, onDebug: (message) => debug.push(message),
+    })
+
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 100 })
+    const joined = debug.join('\n')
+    expect(joined).toContain('没有 status 字段')
+    // 说清那个数字是「声明值」而非服务端确认值。
+    expect(joined).toContain('声明值')
+  })
+
+  it('`status` 缺失且**没有 benefit.amount** ⇒ credit 为 0（不编数字），调试行照旧', async () => {
+    const debug: string[] = []
+    const { fetcher } = withFetcher((call) => call.method === 'POST'
+      ? new Response(JSON.stringify({}), { status: 200 })
+      : campaignsBody([campaign()]))
+
+    const outcome = await claimQoderDailyCheckin(CREDENTIAL, fakeAuth(), {
+      fetcher, product: QODER_CN, onDebug: (message) => debug.push(message),
+    })
+
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 0 })
+    expect(debug.join('\n')).toContain('没有 status 字段')
   })
 
   it('空 PAT 在**本地**就判终态，一次网都不出', async () => {

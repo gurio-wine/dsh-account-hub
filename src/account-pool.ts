@@ -23,6 +23,7 @@ import {
   type ConsumptionSetting,
 } from './account-consumption.js'
 import { migrateAccountHubIntoStorage } from './account-hub-migration.js'
+import { isCheckinDue } from './checkin-schedule.js'
 import type { BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
 import type {
@@ -83,7 +84,7 @@ interface AccountHubSettingsValue {
   disabledModels?: ModelDisableMap
   /** 逐模型上下文窗口预算（见 {@link ContextBudgetMap}）。 */
   contextBudgets?: ContextBudgetMap
-  /** 自动签到记录（`provider:accountId` → 本地纪元日数，见 `CheckinsMap`）。 */
+  /** 自动签到记录（`provider:accountId` → 下一次可签毫秒时间戳，见 `CheckinsMap`）。 */
   checkins?: Record<string, number>
   /** 消耗顺序 / 切换粒度（见 `ConsumptionMap`）。 */
   consumption?: ConsumptionMap
@@ -102,15 +103,31 @@ interface AccountHubSettingsValue {
  * - `2` = 文档新增第五字段 `checkins`（自动签到记录）。
  * - `3` = 文档新增第六、第七字段 `consumption` / `consumptionCursors`
  *   （消耗顺序 / 切换粒度 / 遍历游标）。
+ * - `4` = `checkins` 的值口径由「本地纪元日数」换成「**下一次可签毫秒时间戳**」
+ *   （各 provider 重置钟点不同，见 `src/checkin-schedule.ts`）。
+ *
+ * ⚠️ **4 是唯一一次「搬动既有数据」的版本提升**（前三次都只补字段）：旧值必须
+ * 换算，否则会被当成一个 1970 年的时间戳、判成「永远可签」而每轮重复签到。
+ * 换算本身发生在**读盘那一层**（`sanitizeCheckins` + `normalizeCheckinValue`），
+ * 故它不依赖迁移函数是否跑过 —— 版本号的提升只是把「文档已按新口径读过一次」
+ * 这件事在存储里落个可判定的标记，并让 `migrateProviderNames` 多跑一趟
+ * （那一趟对已迁移数据是无操作）。
  *
  * ⚠️ **2 与 3 两次提升都只是「补字段」，不搬动任何既有数据**：旧文档读入时
- * 由 `sanitizeAccountHubDocument` 补空对象（等价于「顺序 + 按轮次」的默认配置）。
- * 提升版本号的实际效果是让 `migrateProviderNames` 对旧文档**多跑一次无操作迁移**
- * 并把版本号落定，从而「文档已含该字段」这件事在存储里有个可判定的标记。
+ * 由 `sanitizeAccountHubDocument` 补空对象（缺 `consumption` 即等于
+ * `DEFAULT_CONSUMPTION`）。提升版本号的实际效果是让 `migrateProviderNames`
+ * 对旧文档**多跑一次无操作迁移**并把版本号落定，从而「文档已含该字段」这件事
+ * 在存储里有个可判定的标记。
+ *
+ * ⚠️ **默认档位从 `sequential` 翻成 `round-robin` 时刻意不提升版本号**：
+ * 那是 `DEFAULT_CONSUMPTION` 的取值变化，**不涉及文档形状**——旧文档本来就可能
+ * 没有 `consumption` 条目，读出来即新默认值；提升版本号只会白跑一次无操作迁移
+ * 并让版本号与「文档长什么样」脱钩（版本号表达的是字段集合，不是取值语义）。
+ * 存量用户的选号行为确实会从「固定第一个」变为「逐请求轮转」，那正是用户要的。
  *
  * 迁移函数在版本号 ≥ 本常量时整体 short-circuit，因此这个数字只会前进。
  */
-export const ACCOUNT_HUB_SCHEMA_VERSION = 3
+export const ACCOUNT_HUB_SCHEMA_VERSION = 4
 
 /** ctx.settings.register() 返回的 owner scope（只用到 get/replace）。 */
 interface SettingsScopeLike {
@@ -754,37 +771,64 @@ export class AccountPool {
   }
 
   /**
-   * 读取某账号的签到日（本地时区纪元日数）。
+   * 读取某账号的**下一次可签时刻**（本地时间毫秒时间戳）。
    *
    * 只读进程内权威副本，同步返回 —— 与 {@link contextBudget} 同款。不在表里的键
-   * （尚未签过 / 该键不存在）读回 `undefined` = 今日未签。
+   * （尚未签过 / 该键不存在）读回 `undefined` = 可签。
+   *
+   * ⚠️ **返回值不是「签到日」**：它是「下一次可签的时刻」，判定已签要用
+   * `Date.now() < 返回值`（见 `src/checkin-schedule.ts` 的 `isCheckinDue`）。
+   * 旧口径（本地纪元日数）已整体作废，读盘时由 `sanitizeCheckins` 就地迁移。
    *
    * @param provider - provider id。
    * @param accountId - 账号 id。
    */
-  checkinDay(provider: string, accountId: string): number | undefined {
+  checkinNextEligible(provider: string, accountId: string): number | undefined {
     this.ensureLoaded()
     return this.checkinCache[`${provider}:${accountId}`]
   }
 
   /**
-   * 持久化某账号的签到日。
+   * 判定某账号**此刻是否可签**（无记录、或记录的下一次可签时刻已过）。
+   *
+   * 收在池上而不是让调用方自己比：`now` 的取值时点与存储的读法必须一致，
+   * 三处调用点（sweep 筛选 / 面板状态 / 单账号签到）各写一次就会在边界上漂移。
+   *
+   * @param provider - provider id。
+   * @param accountId - 账号 id。
+   * @param now - 判定时刻，缺省当前时间（便于测试注入固定时刻）。
+   */
+  isCheckinDue(provider: string, accountId: string, now: number = Date.now()): boolean {
+    return isCheckinDue(this.checkinNextEligible(provider, accountId), now)
+  }
+
+  /**
+   * 持久化某账号的**下一次可签时刻**。
    *
    * 只改**单个键**（读 → 改 → 整体 replace），与 {@link writeContextBudget} 同款。
    * 键格式 `${provider}:${accountId}`。
    *
-   * ⚠️ 必须先 ensureLoaded()：整体 replace 若在 `loaded` 尚未置位时跑，会把账号、
+   * ⚠️ **必须先 ensureLoaded()**：整体 replace 若在 `loaded` 尚未置位时跑，会把账号、
    * 黑名单、预算、版本号一起覆盖成空（同 `setModelDisabled` / `writeContextBudget`
    * 那条陷阱）。读经 `ensureLoaded`、写经 `persist` 的唯一通路。
    *
+   * ⚠️ **值是「下一次可签时刻」，不是签到时刻**：调用方应传
+   * `nextEligibleAt(签到成功时刻, provider)`（见 `src/checkin-schedule.ts`），
+   * 不要传 `Date.now()` —— 那等于把「刚签完」记成「此刻可签」，下一个 tick 就会
+   * 再签一次。
+   *
    * @param provider - provider id。
    * @param accountId - 账号 id。
-   * @param day - 本地时区纪元日数（今日 `todayDayNumber()`）。
+   * @param nextEligible - 下一次可签时刻（毫秒时间戳，按该 provider 的重置钟点算）。
    */
-  async writeCheckinDay(provider: string, accountId: string, day: number): Promise<void> {
+  async writeCheckinNextEligible(
+    provider: string,
+    accountId: string,
+    nextEligible: number,
+  ): Promise<void> {
     this.ensureLoaded()
     const next: Record<string, number> = { ...this.checkinCache }
-    next[`${provider}:${accountId}`] = day
+    next[`${provider}:${accountId}`] = nextEligible
     await this.writeCheckins(next)
   }
 
@@ -841,7 +885,7 @@ export class AccountPool {
   /**
    * 读某 provider 的**消耗顺序 / 切换粒度**配置。
    *
-   * 未配置时返回默认值（`sequential` + `per-turn`），**永不抛错** —— 它是选号
+   * 未配置时返回默认值（`round-robin` + `per-turn`），**永不抛错** —— 它是选号
    * 热路径上的同步读，一次配置读取失败绝不能让请求发不出去。
    */
   consumptionSetting(provider: string): ConsumptionSetting {
@@ -1447,9 +1491,9 @@ export class AccountPool {
         if (found !== undefined) return [found]
       }
     }
-    // ② 顺序档：现状行为。
+    // ② 顺序档：原样返回（永远取排序第一个可用账号）。
     if (setting.order === 'sequential') return candidates
-    // ③ 遍历档：把「下一个该用的」提到首位。
+    // ③ 遍历档（**默认档**）：把「下一个该用的」提到首位。
     if (setting.order === 'round-robin') {
       return rotateToCursor(candidates, this.cursorCache[provider])
     }
@@ -1588,8 +1632,13 @@ export class AccountPool {
  * 计算「今天」的**本地时区纪元日数**。
  *
  * 口径：取 `new Date(...)` 的**本地年月日**（`getFullYear()` / `getMonth()` /
- * `getDate()`），再换算成 epoch day（`Date.UTC(y,m,d) / 86400000`）。这与
- * `checkins` 存的值（本地当天的日数）在同一口径，可直接做整数相等比较。
+ * `getDate()`），再换算成 epoch day（`Date.UTC(y,m,d) / 86400000`）。
+ *
+ * ⚠️ **签到域已不再用它判「今天签过没」**（2026-09-24 起改用「下一次可签时刻」
+ * 毫秒时间戳，见 `src/checkin-schedule.ts`）。它仍然有两个在用的消费者：
+ * 1. 旧 dayNumber → 新时间戳的**迁移**（`migrateLegacyCheckinDay` 的换算基准）；
+ * 2. `checkins` 的键之外、按自然日表达的历史语义（如既有测试基线）。
+ * 新代码**不要**再拿它做签到判定。
  *
  * ⚠️ 不要用 `getUTCDay`，也不用时间戳毫秒数 —— 跨时区 / 跨日边界都会乱。时区切换、
  * 夏令时的偏移只在**这一处**收敛，存的值本身不依赖「今天」。

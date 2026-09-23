@@ -60,7 +60,7 @@ export interface LegacyAccountHubSection {
   contextBudgets: AccountHubDocument['contextBudgets']
   /** 签到记录：旧版段里不存在，可选（缺失 = 迁移时补空表）。 */
   checkins?: AccountHubDocument['checkins']
-  /** 消耗顺序 / 切换粒度：旧版段里不存在，可选（缺失 = 补空表 = 默认配置）。 */
+  /** 消耗顺序 / 切换粒度：旧版段里不存在，可选（缺失 = 补空表 = 走 `DEFAULT_CONSUMPTION`）。 */
   consumption?: AccountHubDocument['consumption']
   /** 遍历游标：同上，旧版段里不存在。 */
   consumptionCursors?: AccountHubDocument['consumptionCursors']

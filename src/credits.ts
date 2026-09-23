@@ -92,6 +92,108 @@ export type ClaimOutcome =
   | { kind: 'already-claimed'; message: string }
   | { kind: 'inactive'; message: string }
   /**
+   * **无法判定**：服务端响应正常，但**不足以判定今天到底领没领**（2026-09-24 新增）。
+   *
+   * ## 唯一的产生者：Qoder 系的「空活动列表」
+   *
+   * Qoder 的签到判据是「活动列表里还有没有可领项」（`campaigns[]`）。而
+   * **空列表有两种完全相反的含义**，响应上无法区分：
+   *
+   * | 情形 | 真相 | 正确的后续动作 |
+   * |---|---|---|
+   * | 今天已经领过了，服务端把列表清空 | 已签 | 无（等明天） |
+   * | 活动还没开始 / 本账号暂无活动 | **未签** | 下一轮重试 |
+   *
+   * 旧实现把两者一律归一成 `already-claimed`（「保守判已领」）—— 那在第二种
+   * 情形下**伪造了一次签到**：宿主据此写下「下一次可签时刻」，该账号在**整个
+   * 周期内**都不会再被尝试，而它其实一分钱都没领到（真机调查确认这就是
+   * 「qoder 假签到」的形态）。反方向的误判（把已领报成未领）代价小得多 ——
+   * 只是多打一次幂等请求。故正确取舍是**不猜**。
+   *
+   * ## 与其余 kind 的边界
+   *
+   * - 与 `already-claimed`：那个是**服务端明确说已领**（Qoder 的 `replayed:true`、
+   *   Buddy 的 `10001`、Trae CN 的 `9095`）。本 kind 是「服务端什么都没说」。
+   * - 与 `failed`：没有失败可报（HTTP 200、信封合法、没有错误码），用户也**无
+   *   事可做**。归 failed 会让用户去排查凭据，而凭据是好的。
+   * - 与 `inactive`：`inactive` 是「活动未开启」这个**服务端明说的持续状态」。
+   *   本 kind 连这件事都不确定。
+   *
+   * ## 语义约束（宿主侧必须遵守）
+   *
+   * **绝不写签到状态**（与 `failed` / `inactive` / `unavailable` / `abnormal`
+   * 同待遇）——见 `src/account-hub-rpc.ts` 的 `performCheckinOnTargets`：它只对
+   * `claimed` / `already-claimed` 写状态的白名单，故本 kind 天然不命中。
+   * 不写 ⇒ 下一轮 sweep 自然重试，**这正是本 kind 存在的全部意义**：把「不知道」
+   * 如实说成「不知道」，让重试去把它变成已知。
+   *
+   * ## UI
+   *
+   * 面板显示「无法判定」而不是「已签」（`src/qoder-credits.ts` 的
+   * `fetchQoderCheckinStatus` 也不再把空列表映射成 `todayCheckedIn: true`）。
+   */
+  | {
+    kind: 'undetermined'
+    /** 为什么判不了（如「活动列表为空，无法区分『今天已领』与『暂无活动』」）。 */
+    message: string
+  }
+  /**
+   * **签到异常**：服务端说成功了，但积分余额**没有变多**（2026-09-24 新增）。
+   *
+   * ## 为什么需要它（它回答的是一个 claimed 答不了的问题）
+   *
+   * 五家签到协议里有三家的 claim 响应**根本不含积分数**（Trae CN 的完整响应就是
+   * `{"code":0,"message":"success"}`，见 `src/trae-cn-credits.ts` 的 T8 记录），
+   * 其余几家的「成功」判定也都是**响应码**。响应码只证明「服务端受理了这次请求」，
+   * 不证明「积分真的到账」—— 活动结束、账号资格变更、后端结算失败都可能让一次
+   * `code:0` 不产生任何额度变化，而用户看到的是「领取成功 +0」，什么也查不了。
+   *
+   * 判据因此是**签到前后各取一次余额**（同一个账号、同一个端点、同一口径）：
+   * claim 被判成功但**后 ≤ 前** ⇒ 归本 kind。`totalCredit` 不计入本次所得
+   * （它没有发生），但 `claimed` 那一栏也**不能**算它 —— 那正是本 kind 存在的意义。
+   *
+   * ## 与其余四个 kind 的边界（逐条都不是重复）
+   *
+   * - 与 `claimed`：`claimed` 是「响应成功**且**余额确实涨了（或该 provider 豁免
+   *   比对）」。本 kind 是「响应成功但账没动」。
+   * - 与 `failed`：`failed` 是**需要用户做点什么**（重登 / 校准）。本 kind 的正确
+   *   动作是**什么都不做，等下一次自动重试** —— 与 `unavailable` 同款。若后端只是
+   *   延迟入账，下一次 sweep 的 `already-claimed` 会把它自然收敛掉。
+   * - 与 `unavailable`：那个是**服务端明确拒绝**（Trae CN 的 9074，带 code/logid）。
+   *   本 kind 恰恰相反：服务端**没有任何错误**，是「说了成功却没效果」。
+   * - 与 `inactive`：`inactive` 是活动层面的**持续**状态（服务端自己说未开启）。
+   *
+   * ## 语义约束（宿主侧必须遵守）
+   *
+   * **绝不写签到状态**（与 `failed` / `inactive` / `unavailable` 同待遇）——见
+   * `src/account-hub-rpc.ts` 的 `performCheckinOnTargets`：它只对 `claimed` /
+   * `already-claimed` 写状态的白名单，故本 kind 天然不命中。写成「已签」会让这次
+   * 异常**当天再也不被重试**，等于把「可能只是延迟入账」固化成永久失败。
+   *
+   * ## 判据的边界（两处「拿不准就放行」）
+   *
+   * 1. **任一次余额查询拿不到**（网络失败 / 凭据异常 / 非积分账户）→ **跳过比对、
+   *    按原判定报 `claimed`**。余额查询故障绝不能把一次真实成功判成异常 ——
+   *    那会让用户去追一个不存在的问题，而且下一次 sweep 还得再签一遍。
+   * 2. **登记为不参与比对的 provider**（见 `src/checkin-schedule.ts` 的
+   *    `BALANCE_COMPARISON_EXEMPT_PROVIDERS`）→ 同样直接 `claimed`。前提
+   *    「奖励会立刻体现在这个余额数字上」不成立的 provider 不该被比对。
+   */
+  | {
+    kind: 'abnormal'
+    /**
+     * 签到**前**读到的余额；`undefined` = 该次查询没拿到（此时不会产生本 kind）。
+     *
+     * 带上前后两个数字是刻意的：UI 要能显示「签到前 100 → 签到后 100」，
+     * 否则用户只看到一句「积分未变」而无从判断是没发还是发少了。
+     */
+    balanceBefore: number
+    /** 签到**后**读到的余额（`code:0` 已确认，但账没动）。 */
+    balanceAfter: number
+    /** 固定文案（服务端没有错误可转述，本 kind 的全部信息都在两个数字里）。 */
+    message: string
+  }
+  /**
    * 服务端**此刻暂不受理**这次领取（设备号被拉黑 / 名额类拒绝），稍后自动重试。
    *
    * ## 为什么既不是 `failed` 也不是 `inactive`
@@ -553,3 +655,80 @@ export async function fetchCreditBalance(
 function roundCredits(value: number): number {
   return Math.round(value * 100) / 100
 }
+
+// ── 签到前后余额比对（2026-09-24 新增） ──
+
+/** 一次余额探测的结果：`total` 为 `undefined` 表示**这次没拿到**（不是「余额为 0」）。 */
+export interface BalanceProbe {
+  /** 可用总余额（`CreditBalance.total` 口径）；查不到时 `undefined`。 */
+  total: number | undefined
+}
+
+/**
+ * 一次签到前后余额比对的裁决。
+ *
+ * 三态而不是布尔，是因为「拿到两个数字且没变多」与「有一个数字没拿到」必须走
+ * **相反**的处置：前者判 `abnormal`，后者**放行**（按原判定报成功）。
+ * 用布尔会把两者压成同一个 `false`，而调用方再也分不出该报异常还是该放行。
+ */
+export type BalanceComparisonVerdict =
+  /** 余额确实变多了 → 成功属实。 */
+  | { kind: 'increased'; before: number; after: number }
+  /** 两次数值都拿到了，但**没有变多** → 签到异常。 */
+  | { kind: 'unchanged'; before: number; after: number }
+  /** 任一侧没拿到 → **跳过比对**，按调用方原本的判定走。 */
+  | { kind: 'skipped'; reason: string }
+
+/**
+ * 比对签到前后的余额，判「这次成功是不是真的到账了」。
+ *
+ * 纯函数（不触网、不读时钟），故可在单测里直接喂数字把三态钉死 —— 五家 provider
+ * 的接线都走这一个函数，逐家写一遍必然在某个边界上漂移。
+ *
+ * ## 判据是「没有变多」而不是「没有变化」
+ *
+ * 用 `after <= before` 而不是 `after === before`：签到的同时可能正好有一笔扣费
+ * 结算（对话消耗），余额完全可能**变少**。那种情况下更不该报「成功」—— 用户看到
+ * 的是一笔没到账还倒扣的账。反之，只要 `after > before` 就判成功：中间夹杂扣费
+ * 时这个判据偏宽松（真实增量可能小于差额），但**宁松勿严** —— 报假异常会让用户
+ * 去追一个不存在的问题，而漏报只是退回改动前的行为。
+ *
+ * ## 豁免与探针缺失
+ *
+ * `exempt` 为真时直接 `skipped`：调用方已按
+ * `BALANCE_COMPARISON_EXEMPT_PROVIDERS` 判过，这里再判一次是为了让「跳过」这件事
+ * 在同一处可读（否则纯函数的三态里会缺一态）。
+ *
+ * ⚠️ **浮点噪声不需要特殊处理**：`fetchCreditBalance` 已经 `roundCredits` 到两位
+ * 小数（见 {@link roundCredits}），两次取值的尾数噪声在同一个量级上，`>` 比较足够。
+ * 刻意不加「差小于 0.01 算没变」的容差 —— 那会让「奖励 0.005 积分」这种不存在的
+ * 情形变成一条需要维护的规则，而真实奖励都是整数或两位小数。
+ *
+ * @param before - 签到前的余额探测。
+ * @param after - 签到后的余额探测。
+ * @param exempt - 该 provider 是否登记为不参与比对。
+ */
+export function compareBalanceAroundClaim(
+  before: BalanceProbe,
+  after: BalanceProbe,
+  exempt: boolean,
+): BalanceComparisonVerdict {
+  if (exempt) return { kind: 'skipped', reason: '该 provider 登记为不参与余额比对' }
+  if (before.total === undefined) return { kind: 'skipped', reason: '签到前余额查询未取到' }
+  if (after.total === undefined) return { kind: 'skipped', reason: '签到后余额查询未取到' }
+  if (after.total > before.total) {
+    return { kind: 'increased', before: before.total, after: after.total }
+  }
+  return { kind: 'unchanged', before: before.total, after: after.total }
+}
+
+/**
+ * 「签到异常」的固定文案（`abnormal` outcome 的 `message`）。
+ *
+ * 服务端**没有**错误可转述（这正是本 kind 的处境：它说成功了），故文案由我们写死，
+ * 完整信息在那两个数字里（`balanceBefore` / `balanceAfter`，前端另行拼接）。
+ *
+ * ⚠️ 文案里刻意**不写「失败」**：它不是失败（服务端 code:0），用户也不需要做任何
+ * 事 —— 下一次 sweep 会自动重试。写「失败」会让用户去排查凭据，而凭据是好的。
+ */
+export const CHECKIN_ABNORMAL_MESSAGE = '签到响应成功但积分未增加，视为未签到'
