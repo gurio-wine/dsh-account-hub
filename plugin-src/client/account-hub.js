@@ -1124,6 +1124,19 @@ const CONSUMPTION_SWITCH_OPTIONS = [
 const CONSUMPTION_DEFAULTS = { order: 'round-robin', switch: 'per-turn' };
 
 /**
+ * 一个选择器的悬停提示（原生 `title`，本文件统一做法）。
+ *
+ * 界面上**没有**可见的设置名与解释文案（用户明确要求只留两个下拉），所以
+ * 「这个下拉是干什么的 + 每一档什么意思」必须靠悬停补齐：首行是设置名与用途，
+ * 其后每档一行。`title` 里的 `\n` 由浏览器渲染成换行。
+ */
+function consumptionTooltip(label, purpose, options) {
+  return [`${label}：${purpose}`]
+    .concat(options.map(option => `· ${option.label}：${option.hint}`))
+    .join('\n');
+}
+
+/**
  * 一个选择器（一个原生 `<select>`）。
  *
  * ## 为什么是 `<select>` 而不是 radio 组
@@ -1132,28 +1145,29 @@ const CONSUMPTION_DEFAULTS = { order: 'round-robin', switch: 'per-turn' };
  * 时两个选择器各占一半宽、每档一个 label，窄面板下会把文案挤成省略号；
  * 原生下拉收起时只显示当前档，天然省地方。这是用户明确要求的形态。
  *
+ * ## 版面：无外框、无可见标签、无内联解释
+ *
+ * 外层那个 `dim-ah-consumptionGroup` 只是**等分布局的裸容器**（无边框、无内边距），
+ * 设置名与各档含义全部并入 `title` 悬停提示。可见文案只剩 option 自身的档位名。
+ *
  * ## 无障碍与键盘
  *
  * 原生 `<select>` 自带键盘操作（方向键改档、Tab 进出）与读屏语义，**不需要**
- * `role` —— 分组是裸 `<div>`，可读名只能来自 `aria-label`（标题那个
- * `<strong>` 不是 label 关联，读屏读不到）。`title` 给鼠标用户看当前档说明。
+ * `role`。可读名**只能**来自 `aria-label` —— 界面上已没有可见标签，读屏与
+ * 悬停提示都必须靠它和 `title` 撑住，两者都不能省。
  *
  * ⚠️ **受控组件**：值只由 `value`（宿主权威值）决定（`value=` 而不是在 option
  * 上挂 `selected`）—— 后者在 react 里会与 `value` 打架，且让「宿主拒绝写入」
  * 看起来像成功了。
  */
-function ConsumptionSelect({ name, label, hint, options, value, busy, onSelect }) {
+function ConsumptionSelect({ name, label, purpose, options, value, busy, onSelect }) {
   return React.createElement('div', { className: 'dim-ah-consumptionGroup' },
-  React.createElement('div', { className: 'dim-ah-consumptionHead' },
-    React.createElement('strong', { className: 'dim-ah-consumptionLabel' }, label),
-    React.createElement('span', { className: 'dim-ah-consumptionHint' },
-      // 提示文案取**当前选中档**的那一句：三档语义不同，把三句都铺开会挤爆
-      // 这一行；下拉里的任意一档也有它自己的说明（见 option 的 title）。
-      options.find(o => o.value === value)?.hint ?? '')),
   React.createElement('select', {
     className: 'dim-ah-consumptionSelect',
-    // 可读名只来自这里（见上）：分组是裸 div，标题 strong 不构成 label。
+    // 可读名只来自这里（见上）：界面上没有可见标签。
     'aria-label': label,
+    // 设置名 + 用途 + 每一档的含义（界面上不再有内联解释）。
+    title: consumptionTooltip(label, purpose, options),
     value: value,
     disabled: busy,
     onChange: (event) => onSelect(event.target.value),
@@ -1161,6 +1175,7 @@ function ConsumptionSelect({ name, label, hint, options, value, busy, onSelect }
   options.map(option => React.createElement('option', {
     key: `dim-ah-consumption-${name}-${option.value}`,
     value: option.value,
+    // 每档自己也有说明：展开列表时逐档看得到（收起时的整体说明见 select 的 title）。
     title: option.hint,
   }, option.label))));
 }
@@ -1173,6 +1188,10 @@ function ConsumptionSelect({ name, label, hint, options, value, busy, onSelect }
  * 与账号卡片同宽、各占一半（`flex: 1 1 0` 见 `account-hub-styles.js`），
  * 由 `ProviderPanel` 放在账号卡片列表**之前** —— 那个位置是一个无 class 的裸
  * `<div>`，宽度天然与卡片一致，故这里不需要任何宽度计算。
+ *
+ * ⚠️ 界面上**刻意没有**可见的设置名、解释文案与外框：需求是「就两个下拉」。
+ * 下拉与账号卡片之间也不再有任何提示段落（原先那条排序提示已删除）。设置名与
+ * 各档含义只在悬停提示（select 的 `title`）里，可读名在 `aria-label` 里。
  *
  * ## 为什么是受控组件 + 不做乐观更新
  *
@@ -1195,6 +1214,7 @@ function ConsumptionSelectors({ value, busy, onChange }) {
     React.createElement(ConsumptionSelect, {
       name: 'order',
       label: '消耗顺序',
+      purpose: '在这个顺序上怎么取号',
       options: CONSUMPTION_ORDER_OPTIONS,
       value: order,
       busy,
@@ -1203,6 +1223,7 @@ function ConsumptionSelectors({ value, busy, onChange }) {
     React.createElement(ConsumptionSelect, {
       name: 'switch',
       label: '切换粒度',
+      purpose: '什么时候重新选号',
       options: CONSUMPTION_SWITCH_OPTIONS,
       value: switchMode,
       busy,
@@ -2139,13 +2160,8 @@ function ProviderPanel({ provider, rpcCall }) {
               // PAT 形态移除后文案只剩这一种，不再按登录形态分支。
               React.createElement('p', null, '点击"登录账号"进行浏览器登录。'))
           : React.createElement('div', null,
-              // 排序提示：顺序会真实影响取号，必须让用户知道，否则「拖了有什么用」
-              // 无从得知。仅两个以上账号时才显示（一个账号时拖拽本就不启用）。
-              accounts.length > 1
-                ? React.createElement('p', { className: 'dim-ah-orderHint' },
-                    '拖动卡片可调整顺序。顺序即选号优先级：排在前面的账号优先被使用，'
-                    + '上方「消耗顺序」的三档都消费这个顺序。')
-                : null,
+              // 排序提示整段已按用户要求删除（下拉与账号卡片之间不再有文字段落）；
+              // 「顺序即选号优先级」这条信息仍由卡片上的拖拽柄 title 承载。
               reorderError
                 ? React.createElement('div', {
                     className: 'dim-ah-probeNotice',

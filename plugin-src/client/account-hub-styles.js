@@ -91,8 +91,6 @@ const STYLES = `
 .dim-ah-accountCard[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -6px; height: 3px; border-radius: 2px; background: #1677ff; }
 /* 序号徽标：让当前优先级一目了然（顺序即选号优先级） */
 .dim-ah-accountOrder { flex: none; min-width: 18px; padding: 0 5px; border-radius: 6px; font-size: 11px; line-height: 17px; font-weight: 600; text-align: center; color: var(--dsw-alias-label-secondary, #5f6672); background: rgb(31 35 41 / 6%); }
-/* 排序提示行：解释「拖了有什么用」，只在两个以上账号时出现 */
-.dim-ah-orderHint { margin: 0 0 10px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 顶部一行：状态点 + 名称 + 状态标签 */
 .dim-ah-accountTop { display: flex; align-items: center; gap: 8px; }
@@ -234,11 +232,9 @@ const STYLES = `
    不再等于卡片宽）；而 min-width 默认 auto 会让长 option 文案把这一块撑宽，
    于是两块不等宽 —— 那正是「各占一半」的反面。 */
 .dim-ah-consumption { display: flex; gap: 12px; margin-bottom: 12px; }
-.dim-ah-consumptionGroup { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 6px;
-  padding: 8px 10px; border: 1px solid var(--dsw-alias-border-secondary, #e5e6eb); border-radius: 8px; }
-.dim-ah-consumptionHead { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.dim-ah-consumptionLabel { font-size: 13px; line-height: 18px; }
-.dim-ah-consumptionHint { font-size: 12px; line-height: 16px; color: var(--dsw-alias-label-secondary, #4e5969); }
+/* 块：**无框、无内边距**，只承担「两个下拉等分一排」这一件事。设置名与各档含义
+   都在 select 的 title 悬停提示里，可见文案只剩 option 自身的档位名。 */
+.dim-ah-consumptionGroup { flex: 1 1 0; min-width: 0; }
 /* 下拉本体：视觉对齐 .dim-ah-btn（同样的边框色与圆角），字号取 12px 与档位文案一致。
    width:100% 是「总宽 = 卡片宽」在控件这一层的落点：块是等分的，控件再吃满块。
    appearance:none 之外的箭头不自己画 —— 原生箭头在各平台都已可读，自绘要处理

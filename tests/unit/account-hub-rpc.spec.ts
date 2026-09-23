@@ -1626,7 +1626,12 @@ describe('积分端点的 provider 能力边界', () => {
     // pool 替身：一旦 provider 校验被绕过，listAccounts 会返回空数组，
     // 端点便以 `ok: true` + 空列表「假成功」——下面的断言会立刻揭穿它，
     // 而不会因为抛 TypeError 变成误导性的 handler-failed。
-    const pool = { listAccounts: async () => [] }
+    //
+    // `recordBalances` 是 `credits.balances` 的**余额缓存回写**出口（面板与选号
+    // 同一口径）：账号列表为空时它收到空数组，但方法本身必须存在 ——
+    // 缺了它会以 `pool.recordBalances is not a function` 冒泡成 handler-failed，
+    // 把「provider 被误拒」这类真缺陷伪装成替身不完整。
+    const pool = { listAccounts: async () => [], recordBalances: () => {} }
 
     registerAccountHubRpc(
       ctx as never, pool as never, {} as never, {} as never, {} as never,

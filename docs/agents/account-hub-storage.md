@@ -74,12 +74,20 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
 ⚠️ **轮次 = `options.signal` 的身份**，不是 `sessionId`：DSH 的 `GenerateOptions` 里**没有任何 turn 级字段**，而 `sessionId` 是**会话级、跨轮稳定**（`packages/core/agent-loop/src/agent.ts` 的 `buildRequest` 恒传 `this.session.id`），拿它当轮次键会让「按轮次」退化成「按会话」（一个会话永远只用一个账号）。真正「同轮恒定、跨轮必变」的只有 signal：agent-loop 每开一个 turn 换一次 `AbortController`（`turn()` 末尾 `phase.abort = new AbortController()`），同轮内多个 step 共用一个。因此 `TurnKeyTracker` 用 WeakMap 按**对象身份**发号（不阻止 GC）。⚠️ 适配器的**每一处** `resolveCredential` / `refresh` 都必须带这个实参：漏传任何一处，那条路径就绕过轮次锁、按顺序挑回第一个账号（续期路径上表现为刷新了别的账号的凭据 —— S1 缺陷换个触发条件复现）。`tests/unit/account-consumption-rpc.spec.ts` 有静态断言钉死。
 
 **两个有界状态**（都在池内、**都不落盘**）：
-- **余额缓存**（`BalanceCache`，TTL 4h 与签到 sweep 同节奏）：宿主侧维持，启动后刷一次 + 每 4h 刷一次（`src/index.ts`，与签到 sweep 同款 `setInterval` + `unref` + `ctx.effect` 形态，时序必须挂在 `openStorage()` 之后）。⚠️ **只刷配置了 `highest-balance` 的 provider**（刷新是逐账号一次网络请求，为没开那一档的白打请求没有意义），过滤收在 `refreshConsumptionBalances` 内部（唯一实现）。余额是秒级可变的远端事实，故**不落盘**：过期即降级回顺序，代价只是一次保守选号。
+- **余额缓存**（`BalanceCache`，TTL **5h**）：宿主侧维持，启动后刷一次 + 每 4h 刷一次（`src/index.ts`，与签到 sweep 同款 `setInterval` + `unref` + `ctx.effect` 形态，时序必须挂在 `openStorage()` 之后）。⚠️ **刷新间隔必须严格小于 TTL**（现为 4h < 5h，留 1h 余量）：过期判据是 `now - fetchedAt >= TTL`，两者相等时刷新只要晚一拍（定时器抖动 / 单次查询失败）就会出现整段缓存空窗 —— 那段时间「最高优先」档静默降级回顺序档。⚠️ **只刷配置了 `highest-balance` 的 provider**（刷新是逐账号一次网络请求，为没开那一档的白打请求没有意义），过滤收在 `refreshConsumptionBalances` 内部（唯一实现）。余额是秒级可变的远端事实，故**不落盘**：过期即降级回顺序，代价只是一次保守选号。
 - **轮次锁**（`TurnAccountLock`，LRU 上限 100）：按会话累积而 DSH 不暴露「会话已结束」信号，不设上限就是确定的泄漏。`get` 命中时刷新最近使用次序（否则长会话每轮都被淘汰，粒度档形同虚设）；锁里的账号必须**仍在本次候选里**才算命中，因此「锁住的账号刚被停用/限流」自然走重新选号 —— 锁自愈不需要任何额外失效判定。
 
 **余额与选号共用同一条收集实现**（`collectProviderBalances`，模块级）：RPC `credits.balances` 与宿主余额刷新都调它 —— 各写一份分派必然漂移，而漂移的形态很隐蔽：面板显示的数字与选号用的数字来自两套口径。
 
-**RPC**：`consumption.get` / `consumption.set`（**部分更新**，只改传进来的字段）。⚠️ 与 `model.list` / `model.setDisabled` 同一取舍：这两个配置按 **provider id** 存，**刻意不经过 `poolProviderFor()`**。写入后**不重建任何东西**：选号每次都实时读池里的配置，下一次请求即生效。客户端 `ConsumptionSelectors`（`plugin-src/client/account-hub.js`）是**受控组件 + 不做乐观更新**（与 `ModelToggle` / `ModelTierPicker` 同款），形态是**两个原生 `<select>`**（用户要求的形态；radio 组已整体替换）：值经 `value=` 受控（不在 option 上挂 `selected`）、可读名只能靠 `aria-label`（分组是裸 `<div>`，标题那个 `<strong>` 不构成 label）、`disabled` 绑 `busy`。⚠️ 客户端 `CONSUMPTION_DEFAULTS` 必须与宿主 `DEFAULT_CONSUMPTION` 逐字一致（`order: 'round-robin'`）—— 它是 `consumption.get` 失败时的兜底显示值，写错会让「读不到配置」看起来像「用户选了另一档」。版面：两个块 `flex: 1 1 0` + `min-width: 0` 等分容器（总宽 = 卡片宽）、容器**不换行**（需求是「同一排」）。
+**「最高优先」档的余额缓存必须有三条填充路径，缺一就静默失效**（`highest-balance` 分支本身没写错，失效永远发生在「缓存从未被填充」上）：
+
+1. **启动 + 每 4h 定时刷新**（`refreshConsumptionBalances`，只刷**当时**已配成该档的 provider）；
+2. **`consumption.set` 切档补刷**：写入后若该 provider 的**权威配置**是 `highest-balance`，fire-and-forget 触发一次**白名单只含该 provider** 的刷新（自吞异常，不让网络故障把一次已落盘的配置写入报成失败）。⚠️ 判据读 `pool.consumptionSetting()` 而**不是 `req.order`** —— 界面是部分更新，只改粒度时请求里根本没有 `order` 字段。少了这条，用户中途切档就是「配了最高优先却一直用第一个账号」。
+3. **`credits.balances` 顺手回写**：面板打开 / 点「刷新积分」查到的余额经 `recordCollectedBalances`（**与定时刷新共用的唯一写入口径**）写进缓存，只记 `balance !== null` 的（把「查不到」当 0 会让那个账号自锁）。这条同时兑现了上面那句「面板与选号同一口径」的承诺；对非该档的 provider 无行为差异（缓存只是被写，只有该档会读）。
+
+**RPC**：`consumption.get` / `consumption.set`（**部分更新**，只改传进来的字段）。⚠️ 与 `model.list` / `model.setDisabled` 同一取舍：这两个配置按 **provider id** 存，**刻意不经过 `poolProviderFor()`**。写入后**不重建任何东西**：选号每次都实时读池里的配置，下一次请求即生效。客户端 `ConsumptionSelectors`（`plugin-src/client/account-hub.js`）是**受控组件 + 不做乐观更新**（与 `ModelToggle` / `ModelTierPicker` 同款），形态是**两个原生 `<select>`**（用户要求的形态；radio 组已整体替换）：值经 `value=` 受控（不在 option 上挂 `selected`）、`disabled` 绑 `busy`。⚠️ 客户端 `CONSUMPTION_DEFAULTS` 必须与宿主 `DEFAULT_CONSUMPTION` 逐字一致（`order: 'round-robin'`）—— 它是 `consumption.get` 失败时的兜底显示值，写错会让「读不到配置」看起来像「用户选了另一档」。版面：两个块 `flex: 1 1 0` + `min-width: 0` 等分容器（总宽 = 卡片宽）、容器**不换行**（需求是「同一排」）。
+
+⚠️ **界面上刻意没有可见的设置名与解释文案，也没有外框**（用户明确要求「就两个下拉」）：可读名只在 `aria-label`（读屏），设置名 + 用途 + **每一档的含义**合并在 select 的 `title` 悬停提示里（`consumptionTooltip()`，首行「设置名：用途」、其后每档一行），option 各自再带自己的 `title`。删掉可见标签时**这两个属性一个都不能省** —— 否则「删了标签」等于「删了说明」。下拉与账号卡片之间**不再有任何提示段落**（原 `dim-ah-orderHint` 排序提示已删；「顺序即选号优先级」这条信息仍由卡片拖拽柄的 `title` 承载）。
 
 ## provider 体检迁移（`provider-audit-migration.ts`）
 

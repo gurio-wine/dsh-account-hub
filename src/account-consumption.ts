@@ -88,8 +88,17 @@ export const DEFAULT_CONSUMPTION: ConsumptionSetting = Object.freeze({
   switch: 'per-turn',
 })
 
-/** 余额缓存的存活时长：4 小时，与自动签到 sweep 同节奏。 */
-export const BALANCE_CACHE_TTL_MS = 4 * 60 * 60 * 1000
+/**
+ * 余额缓存的存活时长：**5 小时**（刷新间隔是 4 小时，见 `src/index.ts` 的
+ * `REFRESH_BALANCES_INTERVAL_MS`）。
+ *
+ * ⚠️ **间隔必须 < TTL**：过期判据是 `now - fetchedAt >= TTL`（见
+ * {@link BalanceCache.lookup}），若两者相等，刷新只要晚一拍（定时器抖动、单次
+ * 查询失败、事件循环被长任务占住）就会在两次刷新之间出现**整段缓存空窗** ——
+ * 那段时间里「最高优先」档静默降级回顺序档，用户看到的现象是「配了最高优先
+ * 却一直用第一个账号」。留 1 小时余量后，单次刷新失败仍有一整个小时的旧值可用。
+ */
+export const BALANCE_CACHE_TTL_MS = 5 * 60 * 60 * 1000
 
 /**
  * 轮次锁的**硬上限**。

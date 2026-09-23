@@ -12,7 +12,7 @@
  *    `per-turn` 是「风险小一点」那一档 —— 同轮对话锁同一账号，上下文连贯、
  *    也避免部分后端按会话绑定凭据。
  * 2. **候选重排**（遍历游标轮转 / 余额降序 + 未知余额降级）。
- * 3. **两个有界状态**：余额缓存（TTL 4h）与轮次锁（LRU 上限 100）。
+ * 3. **两个有界状态**：余额缓存（TTL 5h，比 4h 刷新间隔多留 1h 余量）与轮次锁（LRU 上限 100）。
  *
  * ## 为什么拆成纯函数 + 两个小类，而不是写进 AccountPool
  *
@@ -169,14 +169,16 @@ describe('最高优先：按余额降序，余额未知即降级回数组顺序'
   })
 })
 
-describe('余额缓存：TTL 4h、按 provider 分桶、脏值不收', () => {
-  it('TTL 与签到 sweep 同节奏（4 小时）', () => {
-    expect(BALANCE_CACHE_TTL_MS).toBe(4 * 60 * 60 * 1000)
+describe('余额缓存：TTL 5h、按 provider 分桶、脏值不收', () => {
+  it('TTL 5h：比 4h 刷新间隔多留 1h 余量（刷新晚一拍也不会出现整段空窗）', () => {
+    expect(BALANCE_CACHE_TTL_MS).toBe(5 * 60 * 60 * 1000)
   })
 
   it('TTL 内命中，过期后查不到（而不是返回旧值）', () => {
     const cache = new BalanceCache()
     cache.record('buddy-cn', 'a1', 120, 1_000)
+    // 刷新间隔是 4h：刷新晚一拍（4h 之后）时旧值**仍然可用**，不会掉回顺序档。
+    expect(cache.lookup('buddy-cn', 'a1', 1_000 + 4 * 60 * 60 * 1000)).toBe(120)
     expect(cache.lookup('buddy-cn', 'a1', 1_000 + BALANCE_CACHE_TTL_MS - 1)).toBe(120)
     // 边界：恰好到期即失效（与 checkins 的「精确相等即已签」同款边界口径）。
     expect(cache.lookup('buddy-cn', 'a1', 1_000 + BALANCE_CACHE_TTL_MS)).toBeUndefined()

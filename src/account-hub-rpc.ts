@@ -985,10 +985,16 @@ export async function collectCreditBalances<TCredential = BuddyCredential, TProd
 /**
  * 查询某 provider 全部账号余额所需的宿主依赖。
  *
- * 抽出来是因为它有**两个调用方**：RPC `credits.balances`（面板打开 / 手动刷新）
- * 与宿主的**余额缓存刷新**（最高优先档的依赖，见 `src/index.ts`）。两处各写一份
- * 分派必然漂移 —— 而漂移的形态很隐蔽：面板显示的数字与选号用的数字来自两套
- * 口径，用户看到「余额最高的那个」并不是实际被选中的那个。
+ * 抽出来是因为它有**三个调用方**：RPC `credits.balances`（面板打开 / 手动刷新）、
+ * 宿主的**定时余额缓存刷新**（最高优先档的依赖，见 `src/index.ts`）与
+ * `consumption.set` 的**切档补刷**。三处各写一份分派必然漂移 —— 而漂移的形态很
+ * 隐蔽：面板显示的数字与选号用的数字来自两套口径，用户看到「余额最高的那个」
+ * 并不是实际被选中的那个。
+ *
+ * ⚠️ **同一口径不止是「查同一份数据」，还包括「同一处回写」**：查到的余额必须经
+ * {@link recordCollectedBalances} 写进池缓存，否则面板路径查完就丢，最高优先档
+ * 依旧读不到数据（这正是「配了该档却一直用第一个账号」的根因）。两个调用方都
+ * 必须调它。
  */
 export interface ProviderBalancesDeps {
   /** 账号池（读账号列表 + 回写余额缓存）。 */
@@ -999,10 +1005,13 @@ export interface ProviderBalancesDeps {
 }
 
 /**
- * 逐账号查询某 provider 的余额（`credits.balances` 与余额缓存刷新**共用**的唯一实现）。
+ * 逐账号查询某 provider 的余额（三个调用方**共用**的唯一实现）。
  *
  * ⚠️ **`provider` 是面板 id**，池键映射（{@link poolProviderFor}）在本函数内部完成
- * —— 两个调用方都不该各自映射一次。
+ * —— 调用方都不该各自映射一次。
+ *
+ * ⚠️ 本函数**只查不记**：写回缓存是调用方的责任，且必须走
+ * {@link recordCollectedBalances}（唯一写入口径）。
  *
  * @returns 每个账号的余额条目（含失败原因）；provider 无法识别时返回 `undefined`
  *          （调用方决定是回 RPC 错误还是跳过）。
@@ -1098,6 +1107,39 @@ export async function collectProviderBalances(
 }
 
 /**
+ * 把一批**刚查到的**余额回写进池内缓存（`refreshConsumptionBalances` 与 RPC
+ * `credits.balances` **共用**的唯一写入口径）。
+ *
+ * ## 只记查到的，查不到的不动
+ *
+ * 查不到（凭据失效 / 网络失败 / 非积分账户）时**保留缓存里已有的值**，绝不写 0 ——
+ * 把它当成「0 余额」会让那个账号被永久排到最后并**因此再也刷不到余额**（自锁），
+ * 详见 `orderByBalance` 的说明。这条判据收在这里，是因为它有**两个调用方**：
+ * 面板打开 / 手动刷新积分（`credits.balances`）与宿主定时刷新。两处各写一份，
+ * 迟早会在「null 该不该记」这种边界上漂移，而漂移的形态正是上面那种自锁。
+ *
+ * ⚠️ 它**不查、只写**：查询是 `collectProviderBalances` 的职责，调用方拿到结果后
+ * 把两个动作串起来（两处调用点各一行），避免「查了却忘了写」这类静默缺口。
+ *
+ * @param provider - **面板 provider id**（与 `refreshConsumptionBalances` 遍历
+ *        `pool.allConsumption()` 得到的键、以及 `applyConsumptionOrder` 读快照时
+ *        用的键同源）。刻意不走 `poolProviderFor()`：余额分桶与消耗配置一样按
+ *        provider id 存。
+ */
+function recordCollectedBalances(
+  pool: AccountPool,
+  provider: string,
+  values: RpcCreditsBalancesResponse['accounts'],
+): void {
+  const entries: Array<{ accountId: string; total: number }> = []
+  for (const item of values) {
+    if (item.balance === null) continue
+    entries.push({ accountId: item.accountId, total: item.balance.total })
+  }
+  pool.recordBalances(provider, entries)
+}
+
+/**
  * 余额缓存刷新：只刷**配置了「最高优先」档**的 provider。
  *
  * ## 为什么必须按档位过滤（而不是刷全部）
@@ -1112,25 +1154,28 @@ export async function collectProviderBalances(
  * 它跑在定时器里，没有用户可操作的上下文；抛错只会变成一个 unhandledRejection。
  * 单个 provider 失败也不影响其余 —— 最高优先档在余额未知时自动降级回顺序模式。
  *
+ * @param providers - 可选**白名单**：只刷名单里的 provider（与档位过滤是**交集**）。
+ *        唯一的白名单调用方是 `consumption.set` —— 用户中途切到「最高优先」档时
+ *        缓存大概率是空的（它只在启动 + 每 4h 被填），不补一次就会**静默退化**成
+ *        顺序档；而切档只需要这一个 provider 的数据，没有理由顺带打其余六个。
+ *        定时刷新（`src/index.ts`）不传，语义仍是「刷全部该档 provider」。
  * @returns 实际刷新的 provider 列表（供调用方记日志与测试断言）。
  */
-export async function refreshConsumptionBalances(deps: ProviderBalancesDeps): Promise<string[]> {
+export async function refreshConsumptionBalances(
+  deps: ProviderBalancesDeps,
+  providers?: readonly string[],
+): Promise<string[]> {
   const { pool } = deps
   const targets: string[] = []
+  const allowed = providers === undefined ? undefined : new Set(providers)
   for (const [provider, setting] of Object.entries(pool.allConsumption())) {
     if (setting.order !== 'highest-balance') continue
+    if (allowed !== undefined && !allowed.has(provider)) continue
     try {
       const values = await collectProviderBalances(deps, provider)
       if (values === undefined) continue
-      const entries: Array<{ accountId: string; total: number }> = []
-      for (const item of values) {
-        // 只记**查到的**余额：查不到（凭据失效 / 网络失败 / 非积分账户）时保留
-        // 缓存里已有的值 —— 把它当成「0 余额」会让那个账号被永久排到最后并
-        // 因此再也刷不到余额（自锁），详见 `orderByBalance` 的说明。
-        if (item.balance === null) continue
-        entries.push({ accountId: item.accountId, total: item.balance.total })
-      }
-      pool.recordBalances(provider, entries)
+      // 只记**查到的**余额（口径收在 `recordCollectedBalances`，与面板路径同一处）。
+      recordCollectedBalances(pool, provider, values)
       targets.push(provider)
     } catch (error) {
       deps.ctx.logger?.warn?.(
@@ -2391,6 +2436,16 @@ function registerAccountHubEndpoints(
         if (values === undefined) {
           return { ok: false, error: { code: 'bad-request', message: `unsupported provider: ${req.provider}` } }
         }
+        // **顺手回写余额缓存**（只记查到的，口径与宿主定时刷新同一处）：
+        // 面板打开 / 点「刷新积分」拿到的是**同一个端点、同一份数字**，不回写就等于
+        // 让「面板显示余额最高的那个」与「实际被选中的那个」继续是两套口径 ——
+        // 上面 `collectProviderBalances` 的注释把「两处必须同口径」写成了承诺，
+        // 这一行才是兑现它的地方。附带好处：用户切到「最高优先」档后**打开一次面板**
+        // 就能让该档立刻有数据，不必等下一次 4h 定时刷新。
+        //
+        // 对非「最高优先」档的 provider **没有任何行为差异**：缓存只是被写，
+        // 而 `applyConsumptionOrder` 只在该档读它（`record` 本身无副作用）。
+        recordCollectedBalances(pool, req.provider, values)
         return { ok: true, value: { accounts: values } satisfies RpcCreditsBalancesResponse }
       }
 
@@ -2591,6 +2646,12 @@ function registerAccountHubEndpoints(
       //
       // 写入后**不需要任何重建**：选号时每次都实时读池里的配置
       // （`AccountPool.getAvailableAccount` 的 `pick` 分支），因此下一次请求即生效。
+      //
+      // ⚠️ **唯一的例外是切到「最高优先」档**：那一档的选号依据是余额缓存，
+      // 而缓存只在启动 + 每 4h 被填（且只填当时已配成该档的 provider）。用户中途
+      // 切档时缓存大概率是空的，`orderByBalance` 于是原样返回候选 ⇒ 表现成
+      // 「配了最高优先却一直用第一个账号」，**完全静默**。故这里对该 provider
+      // 补一次刷新（见下）。
       case 'consumption.set': {
         const req = payload as RpcConsumptionSetRequest
         if (typeof req.provider !== 'string' || req.provider.length === 0) {
@@ -2620,6 +2681,24 @@ function registerAccountHubEndpoints(
           `[account-hub] ${req.provider} 消耗配置更新：`
           + `顺序 ${req.order ?? '(不变)'}，粒度 ${req.switch ?? '(不变)'}`,
         )
+        // 切到「最高优先」档 → 立刻为该 provider 补一次余额刷新。
+        //
+        // ⚠️ **判据读的是写入后的权威配置**（`pool.consumptionSetting`），不是
+        // `req.order`：客户端可以只发 `switch`（部分更新），此时档位由存储决定；
+        // 用请求字段判会让「已在该档、只改粒度」的那次写入漏掉补刷。
+        //
+        // ⚠️ **fire-and-forget，且必须自吞异常**：这是写配置的同步响应路径，
+        // 让它等十几个网络往返会把「点一下下拉」变成几秒的卡顿；而刷新失败只应
+        // 降级（那一档在余额未知时本来就会退回顺序选号），不该让一次**已经成功
+        // 落盘**的配置写入报错。
+        if (pool.consumptionSetting(req.provider).order === 'highest-balance') {
+          void refreshConsumptionBalances(balanceDeps, [req.provider]).catch((error: unknown) => {
+            ctx.logger.warn(
+              `[account-hub] ${req.provider} 切到最高优先档后的余额补刷失败`
+              + `（该档本次降级回顺序）：${String(error)}`,
+            )
+          })
+        }
         const value: RpcConsumptionSetResponse = {
           provider: req.provider,
           consumption: pool.consumptionSetting(req.provider),

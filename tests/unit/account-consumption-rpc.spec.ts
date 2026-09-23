@@ -13,7 +13,7 @@
  *    档静默失效，而那种失效完全没有报错。
  */
 
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -23,6 +23,7 @@ import {
   registerAccountHubRpc,
 } from '../../src/account-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
+import { BALANCE_CACHE_TTL_MS } from '../../src/account-consumption.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -42,10 +43,47 @@ const ACCOUNT: ProviderAccountEntry = {
   refreshable: true,
 }
 
+/**
+ * 被替身接管的全局 fetch 的还原栈（`afterEach` 统一还原）。
+ *
+ * ⚠️ 必须有它：`consumption.set` 切到「最高优先」档会 **fire-and-forget** 触发一次
+ * 真实余额刷新，而余额刷新走的是全局 `fetch`。不接管的话，单测会真的往
+ * `copilot.tencent.com` 发请求 —— 单测契约是「快速、无网络、全部 mock」。
+ */
+const fetchRestores: Array<() => void> = []
+
+afterEach(() => {
+  while (fetchRestores.length > 0) fetchRestores.pop()!()
+})
+
+/**
+ * 接管全局 fetch 并登记还原。
+ *
+ * @param fetcher - 替身；传 `undefined` 表示「任何出网都算测试缺陷」—— 用于
+ *        断言某条路径**不该**发请求的用例（比 `not.toHaveBeenCalled` 更硬：
+ *        连漏掉 mock 的路径都会当场炸，而不是静默走真网络）。
+ */
+function installFetch(fetcher: unknown): ReturnType<typeof vi.fn> {
+  const spy = vi.fn(fetcher as never)
+  const original = globalThis.fetch
+  globalThis.fetch = spy as unknown as typeof fetch
+  fetchRestores.push(() => { globalThis.fetch = original })
+  return spy
+}
+
 /** 构造一个能调 RPC 端点的替身环境。 */
-function makeEndpointHarness(options: { consumption?: Record<string, unknown> } = {}) {
+function makeEndpointHarness(options: {
+  consumption?: Record<string, unknown>
+  accounts?: ProviderAccountEntry[]
+  /** 覆盖凭据解析（默认交回一份可解析的 buddy 凭据）。 */
+  resolve?: (ref: unknown) => Promise<{ value: string } | undefined>
+} = {}) {
+  // 端点侧的 `consumption.set` 会 fire-and-forget 补刷余额（见 src/account-hub-rpc.ts）：
+  // 默认给一个「查询失败」的响应，让整条链在**不触网**的前提下跑完。需要断言
+  // 真实数字的用例自己再用 `installFetch` 覆盖一次（后装的先还原）。
+  installFetch(async () => new Response('offline', { status: 500 }))
   let stored: Record<string, unknown> = {
-    accounts: [ACCOUNT],
+    accounts: options.accounts ?? [ACCOUNT],
     disabledModels: {},
     contextBudgets: {},
     checkins: {},
@@ -72,7 +110,7 @@ function makeEndpointHarness(options: { consumption?: Record<string, unknown> } 
     logger: { warn: () => {}, info: () => {} },
     credentials: {
       describe: async () => ({ configured: true, writable: true }),
-      resolve: async () => ({ value: JSON.stringify({ access_token: 't' }), source: 'test' as const }),
+      resolve: options.resolve ?? (async () => ({ value: JSON.stringify({ access_token: 't' }), source: 'test' as const })),
       set: async () => {},
       unset: async () => {},
     },
@@ -84,6 +122,9 @@ function makeEndpointHarness(options: { consumption?: Record<string, unknown> } 
       : undefined,
     inject: (_deps: string[], callback: (ctx: unknown) => void) => { callback(ctx) },
     logger: { warn: () => {}, info: () => {}, error: () => {} },
+    credentials: {
+      resolve: options.resolve ?? (async () => ({ value: JSON.stringify({ access_token: 't' }), source: 'test' as const })),
+    },
   }
   registerAccountHubRpc(
     ctx as never, pool, {} as never, {} as never, {} as never,
@@ -104,6 +145,29 @@ function makeEndpointHarness(options: { consumption?: Record<string, unknown> } 
   }
 
   return { call, pool, storedValue: () => stored, writes }
+}
+
+/**
+ * 一份「余额查询成功」的 buddy 系响应（`data.Response.Data.Accounts[]` 双层嵌套，
+ * 与 `fetchCreditBalance` 的解析口径一致）。额度走 `*Precise` 字段（精确值优先）。
+ */
+function balanceResponse(remaining: number): Response {
+  return new Response(JSON.stringify({
+    code: 0,
+    data: {
+      Response: {
+        Data: {
+          Accounts: [{
+            PackageName: 'Free Plan Subscription',
+            Status: 0,
+            CycleCapacityRemainPrecise: String(remaining),
+            CycleCapacitySizePrecise: '1000',
+            CycleCapacityUsedPrecise: '1',
+          }],
+        },
+      },
+    },
+  }), { status: 200, headers: { 'content-type': 'application/json' } })
 }
 
 describe('consumption.get / consumption.set 端点', () => {
@@ -150,6 +214,9 @@ describe('consumption.get / consumption.set 端点', () => {
       provider: 'buddy-cn',
       consumption: { order: 'highest-balance', switch: 'per-request' },
     })
+    // 切到该档会 fire-and-forget 补刷余额：等它跑完再结束，别让这条在途链
+    // 跨到 `afterEach`（fetch 替身已被还原）之后去打真网络。
+    await new Promise(resolve => setTimeout(resolve, 0))
   })
 
   it('非法档位被拒绝，且错误原文里**带着可选值**（用户唯一能据以改正的信息）', async () => {
@@ -196,6 +263,96 @@ describe('consumption.get / consumption.set 端点', () => {
     const result = await h.call('consumption.nope', { provider: 'buddy-cn' })
     expect(result.ok).toBe(false)
     expect(result.error?.message).toContain('unknown method')
+  })
+})
+
+describe('credits.balances 回写余额缓存（面板与选号同一口径）', () => {
+  it('成功路径把非 null 的余额写进池缓存（最高优先档据此排序）', async () => {
+    const h = makeEndpointHarness()
+    installFetch(async () => balanceResponse(347.5))
+    const result = await h.call('credits.balances', { provider: 'buddy-cn' })
+    expect(result.ok).toBe(true)
+    // 这是此前**完全没有覆盖**的一段：面板打开 / 点「刷新积分」拿到的数字
+    // 必须同时成为选号依据，否则「面板显示余额最高」与「实际选中」是两套口径。
+    expect(h.pool.balanceSnapshot('buddy-cn').get(ACCOUNT.id)).toBe(347.5)
+  })
+
+  it('查询失败（余额为 null）不写缓存 —— 未知 ≠ 0，否则该账号会自锁', async () => {
+    const h = makeEndpointHarness()
+    installFetch(async () => new Response('nope', { status: 500 }))
+    const result = await h.call('credits.balances', { provider: 'buddy-cn' })
+    expect(result.ok).toBe(true)
+    expect((result.value as { accounts: Array<{ balance: unknown }> }).accounts[0]!.balance).toBeNull()
+    expect(h.pool.balanceSnapshot('buddy-cn').size).toBe(0)
+  })
+
+  it('凭据缺失同样不写缓存（不把「没查到」当成 0 余额）', async () => {
+    const h = makeEndpointHarness({ resolve: async () => undefined })
+    const result = await h.call('credits.balances', { provider: 'buddy-cn' })
+    expect(result.ok).toBe(true)
+    expect((result.value as { accounts: Array<{ error?: string }> }).accounts[0]!.error).toBe('凭据未配置')
+    expect(h.pool.balanceSnapshot('buddy-cn').size).toBe(0)
+  })
+
+  it('非「最高优先」档的 provider 也会被写缓存，但选号行为毫无差异', async () => {
+    // 回写对任何档位都执行（`record` 本身无副作用）；只有 highest-balance 才读它。
+    const h = makeEndpointHarness()
+    installFetch(async () => balanceResponse(12))
+    await h.call('credits.balances', { provider: 'buddy-cn' })
+    expect(h.pool.balanceSnapshot('buddy-cn').get(ACCOUNT.id)).toBe(12)
+    // 默认档（round-robin）下选号结果与「缓存为空」时一致 —— 仍取手动顺序第一个。
+    const picked = await h.pool.getAvailableAccount('buddy-cn', '', undefined, { turnKey: 't1' })
+    expect(picked!.entry.id).toBe(ACCOUNT.id)
+  })
+})
+
+describe('consumption.set 切到「最高优先」档会补刷该 provider 的余额', () => {
+  /** 让 fire-and-forget 的补刷跑完（它不阻塞 set 的响应）。 */
+  const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0))
+
+  it('切到 highest-balance → 立刻为该 provider 查一次余额并写进缓存', async () => {
+    const h = makeEndpointHarness()
+    const fetcher = installFetch(async () => balanceResponse(88))
+    const written = await h.call('consumption.set', { provider: 'buddy-cn', order: 'highest-balance' })
+    expect(written.ok).toBe(true)
+    await settle()
+    expect(fetcher).toHaveBeenCalled()
+    expect(h.pool.balanceSnapshot('buddy-cn').get(ACCOUNT.id)).toBe(88)
+  })
+
+  it('切到其它档（sequential / round-robin）一次请求都不发', async () => {
+    const h = makeEndpointHarness()
+    // 传 undefined：任何出网都当场炸，比 `not.toHaveBeenCalled` 更硬
+    // （连漏掉 mock 的路径都会被抓住，而不是静默走真网络）。
+    const fetcher = installFetch(undefined)
+    expect((await h.call('consumption.set', { provider: 'buddy-cn', order: 'sequential' })).ok).toBe(true)
+    expect((await h.call('consumption.set', { provider: 'buddy-cn', order: 'round-robin' })).ok).toBe(true)
+    // 只改粒度（已回到默认档）同样不该触发。
+    expect((await h.call('consumption.set', { provider: 'buddy-cn', switch: 'per-request' })).ok).toBe(true)
+    await settle()
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('**部分更新**：只发 switch 时，判据读的是写入后的权威配置（已在该档则照刷）', async () => {
+    const h = makeEndpointHarness({ consumption: { 'buddy-cn': { order: 'highest-balance', switch: 'per-turn' } } })
+    const fetcher = installFetch(async () => balanceResponse(5))
+    const written = await h.call('consumption.set', { provider: 'buddy-cn', switch: 'per-request' })
+    expect(written.ok).toBe(true)
+    await settle()
+    // 用 `req.order` 判会漏掉这一发（请求里根本没有 order 字段）。
+    expect(fetcher).toHaveBeenCalled()
+  })
+
+  it('补刷失败被自吞：配置写入仍然成功返回（不让一次网络故障把落盘的配置报成失败）', async () => {
+    const h = makeEndpointHarness()
+    installFetch(async () => { throw new Error('network down') })
+    const written = await h.call('consumption.set', { provider: 'buddy-cn', order: 'highest-balance' })
+    expect(written.ok).toBe(true)
+    expect((written.value as { consumption: { order: string } }).consumption.order).toBe('highest-balance')
+    await settle()
+    // 落盘生效、缓存保持空（该档本次降级回顺序）。
+    expect(h.storedValue().consumption).toEqual({ 'buddy-cn': { order: 'highest-balance', switch: 'per-turn' } })
+    expect(h.pool.balanceSnapshot('buddy-cn').size).toBe(0)
   })
 })
 
@@ -310,6 +467,48 @@ describe('余额缓存刷新：只为「最高优先」档的 provider 发请求
     }, 'no-such-provider')
     expect(values).toBeUndefined()
   })
+
+  it('白名单实参：只刷名单里的 provider（切档补刷不该顺带打其余六个）', async () => {
+    const h = makeBalanceHarness({
+      'buddy-cn': { order: 'highest-balance', switch: 'per-turn' },
+      'trae-cn': { order: 'highest-balance', switch: 'per-turn' },
+    })
+    const deps = {
+      pool: h.pool as never, ctx: { ...h.ctx, get: () => undefined } as never,
+      qoder: {} as never, qoderCn: {} as never,
+    }
+    const fetcher = vi.fn(async () => new Response(JSON.stringify({
+      code: 0,
+      data: { Response: { Data: { Accounts: [{ PackageName: 'p', Status: 0, CycleCapacityRemainPrecise: '1' }] } } },
+    }), { status: 200, headers: { 'content-type': 'application/json' } }))
+    const original = globalThis.fetch
+    globalThis.fetch = fetcher as unknown as typeof fetch
+    try {
+      const refreshed = await refreshConsumptionBalances(deps, ['trae-cn'])
+      expect(refreshed).toEqual(['trae-cn'])
+      expect(h.queried).toEqual(['trae-cn'])
+    } finally {
+      globalThis.fetch = original
+    }
+  })
+
+  it('白名单为空数组 = 一个都不刷（与「没开该档」等价，不误伤成「刷全部」）', async () => {
+    const h = makeBalanceHarness({ 'buddy-cn': { order: 'highest-balance', switch: 'per-turn' } })
+    const fetcher = vi.fn()
+    const original = globalThis.fetch
+    globalThis.fetch = fetcher as unknown as typeof fetch
+    try {
+      const refreshed = await refreshConsumptionBalances({
+        pool: h.pool as never, ctx: { ...h.ctx, get: () => undefined } as never,
+        qoder: {} as never, qoderCn: {} as never,
+      }, [])
+      expect(refreshed).toEqual([])
+      expect(h.queried).toEqual([])
+      expect(fetcher).not.toHaveBeenCalled()
+    } finally {
+      globalThis.fetch = original
+    }
+  })
 })
 
 describe('轮次标识（options.signal）必须被适配器透传 —— 唯一轮次标识', () => {
@@ -373,5 +572,21 @@ describe('轮次标识（options.signal）必须被适配器透传 —— 唯一
     expect(source).toMatch(/const balanceTimer = setInterval\(runBalanceRefresh, REFRESH_BALANCES_INTERVAL_MS\)/)
     expect(source).toMatch(/balanceTimer\.unref\?\.\(\)/)
     expect(source).toMatch(/clearInterval\(balanceTimer\)/)
+  })
+
+  it('刷新间隔严格小于缓存 TTL（留余量，防刷新晚一拍造成整段空窗）', () => {
+    // 从宿主源码里**读出**间隔值，而不是把 4h 抄一遍：抄一遍就与实现脱钩，
+    // 实现改了这里照样绿。判据是「间隔 < TTL」这条关系本身。
+    const source = readSource('../../src/index.ts')
+    const matched = /const REFRESH_BALANCES_INTERVAL_MS = ([0-9\s*]+)/.exec(source)
+    expect(matched, 'index.ts 里找不到 REFRESH_BALANCES_INTERVAL_MS 的定义').not.toBeNull()
+    // 表达式形态固定为 `a * b * c * d`（纯字面量乘法），按 `*` 求积即可 ——
+    // 刻意不用 eval：测试替身不该执行被读取的源码文本。
+    const interval = matched![1]!.split('*').reduce((product, part) => product * Number(part.trim()), 1)
+    expect(interval).toBe(4 * 60 * 60 * 1000)
+    // 严格小于（不是 ≤）：过期判据是 `now - fetchedAt >= TTL`，相等即出现空窗。
+    expect(interval).toBeLessThan(BALANCE_CACHE_TTL_MS)
+    // 余量至少 1 小时：单次刷新失败时旧值仍可用。
+    expect(BALANCE_CACHE_TTL_MS - interval).toBeGreaterThanOrEqual(60 * 60 * 1000)
   })
 })

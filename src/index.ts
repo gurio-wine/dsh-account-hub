@@ -1027,6 +1027,9 @@ export function apply(ctx: Context): void {
   // 快照或空表 ⇒ 一个 provider 都筛不出来，缓存永远是空的）。与签到 sweep 同一条
   // 约束，故同样挂在那个 Promise 上。
   const balanceDeps: ProviderBalancesDeps = { ctx, pool, qoder, qoderCn }
+  // ⚠️ **间隔必须 < `BALANCE_CACHE_TTL_MS`（5h），留 1h 余量**：过期判据是
+  // `now - fetchedAt >= TTL`，两者相等时刷新只要晚一拍（定时器抖动 / 单次查询失败）
+  // 就会出现整段缓存空窗 —— 那段时间「最高优先」档静默降级回顺序档。
   const REFRESH_BALANCES_INTERVAL_MS = 4 * 60 * 60 * 1000
   const runBalanceRefresh = (): void => {
     // fire-and-forget：`refreshConsumptionBalances` 内部逐 provider 自吞异常，

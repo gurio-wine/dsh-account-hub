@@ -330,16 +330,60 @@ describe('ConsumptionSelectors：两个并排的原生下拉', () => {
     expect(switchLabels).toEqual(['按请求', '按轮次'])
 
     const text = textsOf(tree).join('')
-    // 两个下拉的标题文案（分组的可见标签，不是 aria-label 的替代品）。
-    expect(text).toContain('消耗顺序')
-    expect(text).toContain('切换粒度')
+    // ⚠️ 界面上**不得**再出现设置名（用户明确要求删掉两个可见标签与内联解释）。
+    // 这两个名字只能存在于 `aria-label` / `title` 这类非可见属性里。
+    expect(text).not.toContain('消耗顺序')
+    expect(text).not.toContain('切换粒度')
+    // 设置名 + 各档含义必须仍在悬停提示里，否则删了标签就等于删了说明。
+    const orderTip = String(selects[0]!.props.title)
+    expect(orderTip).toContain('消耗顺序')
+    expect(orderTip).toContain('顺序')
+    expect(orderTip).toContain('遍历')
+    expect(orderTip).toContain('最高优先')
+    const switchTip = String(selects[1]!.props.title)
+    expect(switchTip).toContain('切换粒度')
+    expect(switchTip).toContain('按请求')
+    expect(switchTip).toContain('按轮次')
     // option 的取值必须与宿主联合类型逐字一致（改名等于让用户配置失效）。
     expect(optionsOf(selects[0]!).map((el) => el.props.value))
       .toEqual(['sequential', 'round-robin', 'highest-balance'])
     expect(optionsOf(selects[1]!).map((el) => el.props.value))
       .toEqual(['per-request', 'per-turn'])
-    // 不得出现旧名「轮次」被当成消耗顺序那一档（改名是用户明确要求的）。
-    expect(text).not.toMatch(/消耗顺序[\s\S]{0,40}轮次档/)
+  })
+
+  it('无外框：分组容器只剩等分布局，边框与内边距已删除', () => {
+    const { rpcCall } = makeRpc()
+    client.hooks.__reset()
+    const tree = expandTree(
+      client.hooks.__renderComponent(client.ConsumptionSelectors, {
+        provider: 'buddy-cn', rpcCall, value: { order: 'sequential', switch: 'per-turn' },
+        busy: false, onChange: () => {},
+      }),
+      client.hooks,
+    )
+    // 结构上只剩「两个下拉」：容器 → 分组 → select，中间不再有 head / label / hint。
+    const classes = flatten(tree)
+      .filter(isElement)
+      .map((el) => String(el.props.className ?? ''))
+      .filter((name) => name.startsWith('dim-ah-consumption'))
+    expect(classes).toEqual([
+      'dim-ah-consumption', 'dim-ah-consumptionGroup', 'dim-ah-consumptionSelect',
+      'dim-ah-consumptionGroup', 'dim-ah-consumptionSelect',
+    ])
+    const styles = readFileSync(resolve(here, '../../plugin-src/client/account-hub-styles.js'), 'utf8')
+    const at = styles.indexOf('.dim-ah-consumptionGroup {')
+    const group = styles.slice(at, styles.indexOf('}', at))
+    // 删框：不得再有 border / padding / 圆角（那是「外面那个框」的构成要素）。
+    expect(group).not.toContain('border')
+    expect(group).not.toContain('padding')
+    expect(group).not.toContain('border-radius')
+    // 布局不能塌：等分两块的 flex 基座仍在。
+    expect(group).toContain('flex: 1 1 0')
+    expect(group).toContain('min-width: 0')
+    // 被删掉的三个 class 的规则不得残留（否则是「删了节点、留了样式」）。
+    expect(styles).not.toContain('.dim-ah-consumptionHead')
+    expect(styles).not.toContain('.dim-ah-consumptionLabel')
+    expect(styles).not.toContain('.dim-ah-consumptionHint')
   })
 
   it('两个下拉都是原生 select，各带 aria-label，且不再有任何 radio', () => {
@@ -558,12 +602,12 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
       return {}
     }
     const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    const text = textsOf(tree).join('')
     // 面板骨架与选择器都还在（配置读取失败不该让整个面板消失）。
-    expect(text).toContain('消耗顺序')
-    expect(text).toContain('切换粒度')
+    // 可见文案已不含设置名，故判据是**下拉数量 + 悬停提示**而不是正文文本。
     const selects = consumptionSelects(tree)
     expect(selects).toHaveLength(2)
+    expect(String(selects[0]!.props.title)).toContain('消耗顺序')
+    expect(String(selects[1]!.props.title)).toContain('切换粒度')
     // 退回默认档：遍历 + 按轮次。
     expect(selects[0]!.props.value).toBe('round-robin')
     expect(selects[1]!.props.value).toBe('per-turn')

@@ -174,6 +174,10 @@ function harness(options: {
   const pool = {
     listAllAccounts: async () => options.accounts,
     listAccounts: async (provider: string) => options.accounts.filter((a) => a.provider === provider),
+    // `credits.balances` 会把查到的余额**回写**进余额缓存（面板与选号同一口径）：
+    // 替身必须提供这个出口，否则会以 `pool.recordBalances is not a function`
+    // 冒泡成 handler-failed，把被测的 provider 分派缺陷伪装成替身不完整。
+    recordBalances: () => {},
   }
   registerAccountHubRpc(
     ctx as never,
