@@ -1593,7 +1593,7 @@ function ProviderPanel({ provider, rpcCall }) {
       : null);
 }
 
-export function AccountHubPage({ close, rpcCall }) {
+export function AccountHubPage({ rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
   const [version, setVersion] = React.useState(0);
@@ -1607,11 +1607,7 @@ export function AccountHubPage({ close, rpcCall }) {
     React.createElement('header', { className: 'dim-ah-header' },
       React.createElement('div', { className: 'dim-ah-brand' },
         React.createElement('strong', { className: 'dim-ah-brandName' }, '账号中心'),
-        React.createElement('p', { className: 'dim-ah-brandDesc' }, 'Provider 凭据管理与多账号支持')),
-      close ? React.createElement('button', {
-        className: 'dim-ah-btn',
-        onClick: close,
-      }, '关闭') : null),
+        React.createElement('p', { className: 'dim-ah-brandDesc' }, 'Provider 凭据管理与多账号支持'))),
     React.createElement('div', { className: 'dim-ah-layout' },
       React.createElement('nav', { className: 'dim-ah-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
         PROVIDERS.map(p => React.createElement('button', {
