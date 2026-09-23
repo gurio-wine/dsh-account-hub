@@ -61,6 +61,9 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// ui-primitives 是宿主的隐式 baseline（不在本仓库依赖里）：临时目录里必须补一个
+// 替身文件，否则 require 会以 Cannot find module 让**整个文件**加载失败。
+import { rewriteUiPrimitivesImport, writeUiPrimitivesStub } from './fixtures/ui-primitives-stub.js'
 import { afterAll, describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -136,9 +139,23 @@ exports.__drainEffects = function () {
   }
 };
 
+/**
+ * 与真实 react 对齐：**同时**填 props.children 与 children 数组。
+ *
+ * 只填数组是旧版替身的一个保真度缺口：JSX 的多个子节点在 react 里会进
+ * props.children，故像 \React.createElement(Menu, {...}, a, b)\ 这种「多子节点
+ * 传给组件」的写法，其子节点在 props.children 里；组件若把它透传下去
+ * （ui-primitives 的 Button / Menu / Modal 都这么做），只填数组的替身会让这些
+ * 内容在树上凭空消失 —— 表现为「按钮渲染出来了但没有文字」。
+ * 本仓库所有代码都用 \React.createElement(组件, props, 子节点…)\，从不用 JSX，
+ * 故补上 props.children 不会与既有断言冲突。
+ */
 exports.createElement = function createElement(type, props) {
   var children = Array.prototype.slice.call(arguments, 2);
-  return { type: type, props: props || {}, children: children };
+  var merged = Object.assign({}, props || {});
+  if (children.length === 1) merged.children = children[0];
+  else if (children.length > 1) merged.children = children;
+  return { type: type, props: merged, children: children };
 };
 exports.useState = function useState(initial) {
   var store = current;
@@ -222,6 +239,9 @@ function toCjs(source: string): string {
     }
     out = out.replace(pattern, replacement)
   }
+  // ui-primitives 是宿主隐式 baseline（不在本仓库依赖里），临时目录里没有它：
+  // 按源码**现算**导入名单并改写为替身 require（见 fixtures/ui-primitives-stub.ts）。
+  out = rewriteUiPrimitivesImport(out)
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   return out.concat(
     '\nmodule.exports.__testExports = {'
@@ -300,6 +320,7 @@ function loadClientModule(): {
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
   writeOrderModule(dir)
+  writeUiPrimitivesStub(dir, (path, data) => writeFileSync(path, data))
   writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
@@ -389,6 +410,12 @@ function findButtonByText(node: unknown, text: string): ElementNode | undefined 
  * 故必须在每个 pass 之后让微任务队列排空，否则 `phase` 永远停在 loading。
  *
  * 每次渲染都经 `hooks.__renderComponent`，让面板拿到属于它自己的 hooks 槽位。
+ *
+ * ⚠️ 返回值是**展开后**的树（`expandTree`）：面板的按钮现在经 ui-primitives 的
+ * `Button` / `Tooltip` 渲染，展开前它们在树上只是 `Tooltip` / `Button` 这些
+ * **组件类型**，而 `findButtonByText` 的判据是 `el.type === 'button'` ——
+ * 一个都找不到。迁移前按钮是字面量 `'button'`，不展开也能找到，这个保真度
+ * 缺口当时不可见。
  */
 async function renderStable(
   Component: (props: Record<string, unknown>) => unknown,
@@ -398,7 +425,7 @@ async function renderStable(
   let tree: unknown
   for (let pass = 0; pass < 20; pass++) {
     hooks.__clearDirty()
-    tree = hooks.__renderComponent(Component, props)
+    tree = expandTree(hooks.__renderComponent(Component, props), hooks)
     hooks.__drainEffects()
     // 让 effect 里发起的 promise 结算（loadAccounts / loadCredits 各一层）。
     for (let i = 0; i < 10; i++) await Promise.resolve()
@@ -408,6 +435,23 @@ async function renderStable(
 }
 
 const client = loadClientModule()
+
+/**
+ * 两条源码级常量：从被测源码里**读出来**（而不是在测试里复制一份）。
+ *
+ * 悬停提示那组断言要逐字比对文案，写死一份副本就等于「测试自己跟自己比」——
+ * 源码里的文案被改短了，副本不会跟着变，断言照样绿。故这里从源码里正则取出
+ * 常量定义的值，再断言这些值出现在**使用处**（`withHoverTitle(..., CONST)`）。
+ */
+const constValueOf = (name: string): string => {
+  const source = readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8')
+  const match = new RegExp(`^const ${name} = '([^']*)'`, 'm').exec(source)
+  expect(match, `account-hub.js 里找不到常量 ${name}`).not.toBeNull()
+  return match![1]!
+}
+const MODEL_LIST_HELP = constValueOf('MODEL_LIST_HELP')
+const RETEST_ALL_HELP = constValueOf('RETEST_ALL_HELP')
+const RESET_ALL_HELP = constValueOf('RESET_ALL_HELP')
 
 /** 一个记录调用的 rpcCall 替身。 */
 function makeRpc() {
@@ -527,15 +571,69 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     // 导航渲染的是**显示名**而不是 id（`label`），故这里逐个断言显示名 ——
     // 拿 id 去比会误报（第一版就是这么红的）。
     // 同时断言导航按钮的数量：只比文案的话，某个条目渲染成空壳也算过。
+    //
+    // 七个 tab 现在收在一个折叠组里（组标题是 DisclosureRow），故判据仍是
+    // `role === 'tab'` —— 组标题是 `div[role=button]`，不会混进这个计数。
     const navButtons = flatten(expanded)
       .filter(isElement)
       .filter((el) => el.type === 'button' && el.props.role === 'tab')
-    expect(navButtons, '导航项数量与 provider 数量不一致').toHaveLength(ALL_PROVIDERS.length)
+    // 导航现在有**八个** tab：七个 provider + 一个「自动路由」。
+    //
+    // ⚠️ 判据刻意**不放松**成「≥7」或「7 个 provider 都在」：那样「自动路由入口
+    // 整个没接线」也会绿。这里分两步钉死 —— 总数 8，且七个 provider 一个不少、
+    // 自动路由恰好一个。数量写死也意味着将来再加 tab 时必须回来确认一次。
+    expect(navButtons, '导航项数量应当是 7 个 provider + 1 个自动路由').toHaveLength(ALL_PROVIDERS.length + 1)
+    const navLabels = navButtons.map((el) => textsOf(el).join(''))
     for (const label of ['Codearts', 'Buddy CN', 'Buddy', 'LobsterAI', 'Trae CN', 'Qoder', 'Qoder CN']) {
+      expect(navLabels, `导航里缺少 ${label}`).toContain(label)
       expect(text, `导航里缺少 ${label}`).toContain(label)
     }
+    expect(navLabels.filter((label) => label === '自动路由'), '自动路由入口应当恰好一个').toHaveLength(1)
+    // 组标题在（且不是 tab：它是折叠控件，不是导航项）。
+    expect(text).toContain('供应商')
     // 未选中的 provider 不该出现面板（`AccountHubPage` 只挂载 selected 那一个）。
     expect(text).toContain('Codearts 账号管理')
+  })
+
+  /**
+   * 折叠组的行为闸门：默认展开、折叠只藏导航项、**不动选中**。
+   *
+   * 三条各自防一类回归：① 默认折叠（用户拍板要展开态）② 折叠用 `display`
+   * 隐藏而非条件渲染（那样「七个 tab 还在树里」，tablist 的键盘焦点仍会落到
+   * 看不见的项上）③ 折叠顺手切了 provider（右栏跟着重挂载，等于折叠变成了
+   * 一次隐式导航）。
+   */
+  it('供应商折叠组：默认展开，折叠后 provider tab 整体不在树里，且右侧面板不切换', async () => {
+    const { rpcCall } = makeRpc()
+    const tabsOf = (node: unknown): ElementNode[] =>
+      flatten(node)
+        .filter(isElement)
+        .filter((el) => el.type === 'button' && el.props.role === 'tab'
+          // 自动路由入口在折叠组**之外**（见上一条用例），不参与这条计数。
+          && textsOf(el).join('') !== '自动路由')
+    /** 折叠组标题：真件在 `expandOnRowClick` 下把整行渲染成 `div[role=button]`。 */
+    const groupTitleOf = (node: unknown): ElementNode | undefined =>
+      flatten(node)
+        .filter(isElement)
+        .find((el) => el.props['data-disclosure-row'] === true && el.props.role === 'button')
+
+    const expanded = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    const groupTitle = groupTitleOf(expanded)
+    expect(groupTitle, '导航里找不到 role=button 的折叠组标题（DisclosureRow）').toBeDefined()
+    // 默认展开：aria-expanded 为真，七个 provider tab 都在。
+    expect(groupTitle!.props['aria-expanded'], '折叠组默认不是展开态').toBe(true)
+    expect(tabsOf(expanded)).toHaveLength(ALL_PROVIDERS.length)
+
+    // 折叠：点整行标题（`expandOnRowClick` 把 onToggle 挂在行上）。
+    const onToggle = groupTitle!.props.onClick as (() => void) | undefined
+    expect(typeof onToggle, '折叠组标题没有可点的 onToggle').toBe('function')
+    expect(() => onToggle!()).not.toThrow()
+    const collapsed = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+
+    expect(tabsOf(collapsed), '折叠后 provider 导航项仍在树里（应为条件渲染，不是 display 隐藏）').toHaveLength(0)
+    expect(groupTitleOf(collapsed)!.props['aria-expanded'], '折叠后 aria-expanded 不是 false').toBe(false)
+    // 折叠**不是**选择：右栏仍是折叠前那一个（Codearts），没有被切走。
+    expect(textsOf(collapsed).join('')).toContain('Codearts 账号管理')
   })
 
   it('逐个 provider 渲染面板并点击「登录账号」，一律不得抛错', async () => {
@@ -682,5 +780,103 @@ describe('面板按钮集合（渲染级）', () => {
     )
     expect(source).not.toContain('onRetest')
     expect(source).not.toContain('onReset')
+  })
+})
+
+/**
+ * 控件与样式迁移的**通盘闸门**（纯展示层迁移，零功能变更）。
+ *
+ * 迁移把全部交互控件换成 ui-primitives、把全部颜色换成 design token。这里钉死
+ * 三件最容易「改一半」的事：
+ *
+ * 1. 原生表单控件归零（`<select>` / `<input>` / `confirm()`）—— 少改一处，
+ *    深色主题下就会露出一块系统配色的白板或一个浏览器自绘的对话框；
+ * 2. 样式表里不再有十六进制颜色（品牌色豁免除外）与死 token；
+ * 3. 悬停提示文案**一条都不能丢**（它们承载「这个按钮做什么」与各档含义）。
+ *
+ * 这些是源码级断言，与上面那些渲染级断言互补：渲染级证明「树长成什么样」，
+ * 源码级证明「没有任何遗漏的分支」（渲染只覆盖被渲染到的那几条路径）。
+ */
+describe('控件与样式迁移（源码级通盘闸门）', () => {
+  const clientSource = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/account-hub.js'),
+    'utf8',
+  )
+  const styleSource = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/account-hub-styles.js'),
+    'utf8',
+  )
+  /** 去掉注释行后的源码：注释里叙述历史写法是允许的，生效的代码不行。 */
+  const codeOnly = (text: string): string => text
+    .split('\n')
+    .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .join('\n')
+  const clientCode = codeOnly(clientSource)
+  const styleCode = codeOnly(styleSource)
+
+  it('原生表单控件归零：没有 select / input / option / confirm', () => {
+    for (const native of [
+      "createElement('select'", "createElement('option'", "createElement('input'",
+    ]) {
+      expect(clientCode, `仍在自绘原生控件：${native}`).not.toContain(native)
+    }
+    // 原生 confirm 是浏览器自绘的模态，样式不进主题体系 —— 两处都改成了原语。
+    expect(clientCode).not.toMatch(/\bconfirm\(/)
+    // 反向锚点：替代物必须在位（否则「删了原生控件」也可能只是功能没了）。
+    for (const primitive of ['RiskConfirmation', 'Modal', 'Switch', 'Pill', 'Menu', 'Tooltip']) {
+      expect(clientCode, `没有用上 ${primitive}`).toContain(primitive)
+    }
+  })
+
+  it('悬停提示文案一条都没丢（迁移前挂在原生 title 上）', () => {
+    // 迁移前这些字符串是 `title:` 的值；现在挂在 Tooltip 上，**内容必须逐字相同**。
+    for (const text of [
+      '拖动以调整顺序（顺序即自动选号优先级）',
+      '自动选号优先级',
+      '已启用',
+      '已停用',
+      MODEL_LIST_HELP,
+      RETEST_ALL_HELP,
+      RESET_ALL_HELP,
+      '通过浏览器登录一个新的账号并加入账号池。',
+      '重新查询本页全部账号的剩余积分（Credits Balance）。余额由服务端实时计算，点此可刷新。',
+    ]) {
+      expect(clientCode, `悬停提示文案丢失：${text}`).toContain(text)
+    }
+    // 逐档说明（迁移前是 `<option title>`）也仍在：它经 withHoverTitle 挂在菜单项上。
+    expect(clientCode).toContain('withHoverTitle(React.createElement(\'span\', null, option.label), option.hint)')
+  })
+
+  it('样式表不再有硬编码颜色与死 token', () => {
+    // 唯一的例外是七条 providerIcon 的品牌白底（品牌识别，不属主题体系），
+    // 它们用的是 `white` 关键字而不是十六进制 —— 故「非注释行无 #hex」成立。
+    expect(styleCode).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
+    // 两个曾经存在的死 token：浏览器取 fallback，主题切换时永不跟随。
+    expect(styleCode).not.toContain('--dsw-alias-border-default')
+    expect(styleCode).not.toContain('--dsw-font-mono')
+    // 反向锚点：替换后的真 token 必须在位。
+    expect(styleCode).toContain('--dsw-alias-border-l2')
+    expect(styleCode).toContain('--ds-font-family-code')
+    // 自绘控件的外观规则已整体删除（改由 ui-primitives 提供）。
+    for (const dead of ['.dim-ah-btn {', '.dim-ah-switch {', '.dim-ah-modalOverlay', '.dim-ah-loginOverlay', '.dim-ah-loginDialog', '.dim-ah-accountStatus {', '.dim-ah-accountTag {']) {
+      expect(styleSource, `残留自绘规则：${dead}`).not.toContain(dead)
+    }
+  })
+
+  it('模型列表弹窗保留宽度 / 高度上限（迁移时曾被顺手删掉）', () => {
+    // ⚠️ 这条规则**不是**自绘壳的一部分，故不能进上面那张死类清单：宿主 Modal 的
+    // dialog 默认 `width: min(380px, 100%)` 且**没有 max-height**，而模型列表动辄
+    // 上百条 —— 少了上限，弹窗会高于视口、把「刷新 / 完成」顶出屏幕。
+    // `className` 由 Modal 透传到 dialog 节点上（Modal.tsx 的 clsx(css.dialog, className)），
+    // 故这两条直接覆盖宿主的 380px 默认。
+    const at = styleCode.indexOf('.dim-ah-modal {')
+    expect(at, 'account-hub-styles.js 里找不到 .dim-ah-modal 规则（弹窗上限丢失）').toBeGreaterThan(-1)
+    const rule = styleCode.slice(at, styleCode.indexOf('}', at))
+    expect(rule, '弹窗宽度上限丢失（宿主默认只有 380px）').toContain('min(560px, 100%)')
+    expect(rule, '弹窗高度上限丢失（模型上百条时按钮会被顶出视口）').toContain('max-height')
+    // 反向锚点：这条只补几何上限，不再重开自绘壳（外观仍归 Modal 原语）。
+    expect(rule, '不得重新引入自绘遮罩 / 卡片外观').not.toContain('position: fixed')
+    expect(rule).not.toContain('background')
+    expect(rule).not.toContain('border-radius')
   })
 })

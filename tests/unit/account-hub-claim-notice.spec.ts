@@ -31,6 +31,9 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// ui-primitives 是宿主的隐式 baseline（不在本仓库依赖里）：临时目录里必须补一个
+// 替身文件，否则 require 会以 Cannot find module 让**整个文件**加载失败。
+import { rewriteUiPrimitivesImport, writeUiPrimitivesStub } from './fixtures/ui-primitives-stub.js'
 import { afterAll, describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -38,9 +41,23 @@ const here = dirname(fileURLToPath(import.meta.url))
 /** 一个最小 react 占位模块：把参数收成可深比较的普通对象。 */
 const REACT_STUB = `
 'use strict';
+/**
+ * 与真实 react 对齐：**同时**填 props.children 与 children 数组。
+ *
+ * 只填数组是旧版替身的一个保真度缺口：JSX 的多个子节点在 react 里会进
+ * props.children，故像 \React.createElement(Menu, {...}, a, b)\ 这种「多子节点
+ * 传给组件」的写法，其子节点在 props.children 里；组件若把它透传下去
+ * （ui-primitives 的 Button / Menu / Modal 都这么做），只填数组的替身会让这些
+ * 内容在树上凭空消失 —— 表现为「按钮渲染出来了但没有文字」。
+ * 本仓库所有代码都用 \React.createElement(组件, props, 子节点…)\，从不用 JSX，
+ * 故补上 props.children 不会与既有断言冲突。
+ */
 exports.createElement = function createElement(type, props) {
   var children = Array.prototype.slice.call(arguments, 2);
-  return { type: type, props: props || {}, children: children };
+  var merged = Object.assign({}, props || {});
+  if (children.length === 1) merged.children = children[0];
+  else if (children.length > 1) merged.children = children;
+  return { type: type, props: merged, children: children };
 };
 `
 
@@ -90,6 +107,9 @@ function toCjs(source: string): string {
     out = out.replace(pattern, replacement)
   }
   // `export function` / `export const` → 普通声明（模块作用域内仍互相可见）。
+  // ui-primitives 是宿主隐式 baseline（不在本仓库依赖里），临时目录里没有它：
+  // 按源码**现算**导入名单并改写为替身 require（见 fixtures/ui-primitives-stub.ts）。
+  out = rewriteUiPrimitivesImport(out)
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   // 暴露本次要测的纯函数。它们都是模块作用域的声明，故此处必然可见。
   return out.concat(
@@ -111,6 +131,7 @@ function loadClientModule(): Record<string, unknown> {
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
   writeOrderModule(dir)
+  writeUiPrimitivesStub(dir, (path, data) => writeFileSync(path, data))
   writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)

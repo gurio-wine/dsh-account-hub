@@ -296,7 +296,14 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
       expect(styled, `account-hub-styles.js 缺少 .dim-ah-providerIcon.${logoClass}`).toContain(logoClass)
     }
     // 反向：样式表里不该留下没有条目引用的死类（`workbuddy` 就是改名后的残留）。
-    expect([...styled].sort()).toEqual(EXPECTED.map((e) => e.logoClass).sort())
+    //
+    // ⚠️ 唯一的例外是 `ar`：左侧导航现在还有一个**不属于 PROVIDERS** 的
+    // 「自动路由」入口（见 account-hub.js 的 AUTO_ROUTE_TAB_ID），它的图标容器
+    // 与 provider 同形（同一个 `.dim-ah-providerIcon`），但配色**刻意不走**品牌色
+    // 豁免 —— 它是本插件自己的功能入口，不是第三方产品品牌。
+    // 故判据是「provider 的七个一个不少 + 集合里只多出 ar 这一个非 provider 类」，
+    // 而不是「集合与七个 logoClass 完全相等」（后者会把自动路由入口当成死类）。
+    expect([...styled].sort()).toEqual([...EXPECTED.map((e) => e.logoClass), 'ar'].sort())
   })
 })
 
@@ -528,7 +535,10 @@ describe('客户端积分请求门控（源码级回归）', () => {
 
   it('「刷新积分」按钮与账号卡片的「积分」行都按能力渲染', () => {    // 归一化 CRLF：本仓库源码在 Windows 上是 CRLF，直接比对多行字面量会假失败。
     const normalized = source.replace(/\r\n/g, '\n')
-    expect(normalized).toMatch(/canLoadCredits\s*\n\s*\? React\.createElement\('button'/)
+    // ⚠️ 判据是「按能力门控渲染**一个按钮**」而不是「那个按钮是原生 'button'」：
+    // 控件已换成 ui-primitives 的 `Button` 组件，但门控本身没变（仍是
+    // `canLoadCredits ? 渲染 : null`）。断言跟门控走，不跟控件实现走。
+    expect(normalized).toMatch(/canLoadCredits\s*\n\s*\? withHoverTitle\(React\.createElement\(Button/)
     expect(normalized).toContain('showCredits: canLoadCredits')
     // AccountCard 必须真的消费 showCredits，否则传了也没用
     const cardStart = normalized.indexOf('function AccountCard(')
@@ -554,10 +564,11 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     // AccountCard 收到 showCheckin / onCheckin 两个新 prop。
     expect(normalized).toContain('showCheckin: supportsCredits')
     expect(normalized).toContain('onCheckin: (id) => void checkinAccount(id)')
-    // 按钮元素按门控渲染（showCheckin ? 渲染 : null）。
-    expect(normalized).toMatch(/showCheckin\s*\n?\s*\? React\.createElement\('button'/)
-    // 按钮要带绿色成功形态与三态文案机。
-    expect(normalized).toContain("'data-kind': 'success'")
+    // 按钮按门控渲染（showCheckin ? 渲染 : null）。控件已换成 ui-primitives 的
+    // `Button`，且外面套了一层 `withHoverTitle`（悬停提示改走 Tooltip 原语）——
+    // 门控本身没变，断言跟门控走。
+    expect(normalized).toMatch(/showCheckin\s*\n?\s*\? withHoverTitle\(React\.createElement\(Button/)
+    // 三态文案机。
     expect(normalized).toContain('checkedIn ? \'已签\' : checkingThisAccount ? \'签到中…\' : \'签到\'')
     // disabled 三态：busy（面板忙碌）|| 已签 || 正在签到。
     expect(normalized).toContain('disabled: busy || checkedIn || checkingThisAccount')
@@ -656,19 +667,38 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     expect(normalized).toContain('disabled: claiming || accounts.length === 0 || allCheckedIn')
     // allCheckedIn 派生：列表非空且每账号 checkedInToday 全 true。
     expect(normalized).toContain('accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)')
-    // 头部成功按钮复用绿色形态。
-    expect(normalized).toContain("'data-kind': 'success'")
   })
 
-  it('styles 提供 success（绿色）按钮形态，复用仓库既有成功绿而非新造色值', () => {
+  it('头部「一键签到」用 primary 按钮，成功语义靠文案而非私有绿色变体', () => {
+    // ⚠️ 迁移前这里是 `'data-kind': 'success'` + 样式表里的 `#22c55e` 私有绿色。
+    // ui-primitives 的 Button 只有 primary / ghost / outline / toolbar 四种变体，
+    // **没有** success —— 给它造一个私有变体就等于在插件里重开一套配色，正是本次
+    // 迁移要消除的东西。故成功/进行中/已全签三态由**文案**表达（见上一条），
+    // 按钮取 primary。
+    expect(normalized).not.toContain("'data-kind': 'success'")
+    expect(normalized).not.toContain("'data-kind': 'primary'")
+    expect(normalized).toContain("variant: 'primary'")
+  })
+
+  it('样式表不再自绘按钮配色（一律走 ui-primitives 的 Button + design token）', () => {
     const styles = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/account-hub-styles.js'),
       'utf8',
     )
-    expect(styles).toMatch(/\.dim-ah-btn\[data-kind="success"\]\s*\{[^}]*#22c55e/)
-    expect(styles).toContain('.dim-ah-btn[data-kind="success"]:hover:not(:disabled)')
-    // 禁用态继承通用 :disabled，不与 success 冲突。
-    expect(styles).toContain('.dim-ah-btn:disabled')
+    // 迁移前这里有 `.dim-ah-btn` 全套（含写死的成功绿 #22c55e、主色 #1677ff、
+    // 危险红 #d93025）与 `.dim-ah-switch` / `.dim-ah-consumptionSelect` 的自绘外观。
+    // 现在这些控件都来自 ui-primitives，本文件不该再有任何十六进制颜色。
+    //
+    // ⚠️ 只在**非注释**行上查色值：注释里叙述「曾经用过 #22c55e」「品牌色
+    // #1A1B1D」是允许的（那是历史说明，不是生效的样式）。
+    const styleCode = styles
+      .split('\n')
+      .filter((line) => !/^\s*(\/\*|\*|\/\/)/.test(line))
+      .join('\n')
+    expect(styleCode).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
+    expect(styles).not.toContain('.dim-ah-btn {')
+    expect(styles).not.toContain('.dim-ah-switch {')
+    expect(styles).not.toContain('.dim-ah-consumptionSelect:focus-visible {')
   })
 })
 

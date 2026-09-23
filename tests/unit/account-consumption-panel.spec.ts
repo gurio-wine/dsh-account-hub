@@ -25,6 +25,9 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// ui-primitives 是宿主的隐式 baseline（不在本仓库依赖里）：临时目录里必须补一个
+// 替身文件，否则 require 会以 Cannot find module 让**整个文件**加载失败。
+import { rewriteUiPrimitivesImport, writeUiPrimitivesStub } from './fixtures/ui-primitives-stub.js'
 import { afterAll, describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -78,9 +81,23 @@ exports.__drainEffects = function () {
   effectQueue = [];
   for (var i = 0; i < queued.length; i++) queued[i].run();
 };
+/**
+ * 与真实 react 对齐：**同时**填 props.children 与 children 数组。
+ *
+ * 只填数组是旧版替身的一个保真度缺口：JSX 的多个子节点在 react 里会进
+ * props.children，故像 \React.createElement(Menu, {...}, a, b)\ 这种「多子节点
+ * 传给组件」的写法，其子节点在 props.children 里；组件若把它透传下去
+ * （ui-primitives 的 Button / Menu / Modal 都这么做），只填数组的替身会让这些
+ * 内容在树上凭空消失 —— 表现为「按钮渲染出来了但没有文字」。
+ * 本仓库所有代码都用 \React.createElement(组件, props, 子节点…)\，从不用 JSX，
+ * 故补上 props.children 不会与既有断言冲突。
+ */
 exports.createElement = function createElement(type, props) {
   var children = Array.prototype.slice.call(arguments, 2);
-  return { type: type, props: props || {}, children: children };
+  var merged = Object.assign({}, props || {});
+  if (children.length === 1) merged.children = children[0];
+  else if (children.length > 1) merged.children = children;
+  return { type: type, props: merged, children: children };
 };
 function depsEqual(a, b) {
   if (a === undefined || b === undefined) return false;
@@ -165,6 +182,9 @@ function toCjs(source: string): string {
     }
     out = out.replace(pattern, replacement)
   }
+  // ui-primitives 是宿主隐式 baseline（不在本仓库依赖里），临时目录里没有它：
+  // 按源码**现算**导入名单并改写为替身 require（见 fixtures/ui-primitives-stub.ts）。
+  out = rewriteUiPrimitivesImport(out)
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   return out.concat(
     '\nmodule.exports.__testExports = {'
@@ -192,6 +212,7 @@ function loadClientModule(): {
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
   writeOrderModule(dir)
+  writeUiPrimitivesStub(dir, (path, data) => writeFileSync(path, data))
   writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
@@ -214,6 +235,17 @@ interface ElementNode {
   type: unknown
   props: Record<string, unknown>
   children: unknown[]
+  /**
+   * Menu 替身挂在返回节点上的自身 props（items / selectedId / onSelect）。
+   *
+   * 真件是组件，这些 props 只存在于展开**前**的元素上；展开成宿主节点后就没了，
+   * 而 spec 里的树是展开过的 —— 故替身把它们原样带出来（见 fixtures 里的说明）。
+   */
+  menuProps?: {
+    items?: Array<{ id: string; label: unknown }>
+    selectedId?: string
+    onSelect?: (id: string) => void
+  }
 }
 
 const isElement = (node: unknown): node is ElementNode =>
@@ -290,65 +322,134 @@ function makeRpc(consumption: { order: string; switch: string } = { order: 'sequ
 
 const client = loadClientModule()
 
-/** 树里两个消耗配置下拉（判据是 `select` + `aria-label`，见 `ConsumptionSelect`）。 */
+/**
+ * 树里两个消耗配置下拉的**锚点按钮**。
+ *
+ * 迁移前判据是 `type === 'select'`（原生下拉）；现在锚点是一个 `Button`
+ * （替身渲染成宿主 `button`），靠 `aria-haspopup="menu"` + `aria-label`
+ * 认出来 —— 可读名仍是可访问性的唯一来源，判据跟着它走最稳。
+ */
 function consumptionSelects(node: unknown): ElementNode[] {
   return flatten(node)
     .filter(isElement)
-    .filter((el) => el.type === 'select' && typeof el.props['aria-label'] === 'string')
+    .filter((el) => el.type === 'button'
+      && el.props['aria-haspopup'] === 'menu'
+      && typeof el.props['aria-label'] === 'string')
 }
 
-/** 某个 select 下的 `<option>` 节点（按 DOM 顺序）。 */
-function optionsOf(select: ElementNode): ElementNode[] {
-  return flatten(select).filter(isElement).filter((el) => el.type === 'option')
+/**
+ * 第 index 个下拉**展开后**的菜单项文案（按 DOM 顺序）。
+ *
+ * ⚠️ 必须从 `Menu` 节点整棵子树里取，不能从锚点按钮往下取：菜单行是锚点的
+ * **兄弟**（`Menu` 渲染成「锚点 + 列表」），从锚点往下一个都找不到。
+ */
+function menuRowsOf(tree: unknown, index: number): string[] {
+  const menu = flatten(tree)
+    .filter(isElement)
+    .filter((el) => el.menuProps !== undefined)[index]
+  expect(menu, `第 ${index} 个下拉不存在`).toBeDefined()
+  return flatten(menu)
+    .filter(isElement)
+    .filter((el) => el.type === 'button' && el.props.role === 'menuitem')
+    .map((el) => textsOf(el).join(''))
 }
 
-/** 造一个只带 `target.value` 的 change 事件替身（被测代码只读这一个字段）。 */
-const changeTo = (value: string) => ({ target: { value } })
+/**
+ * 展开一个选择器的下拉：渲染 → 点锚点 → **不重置 hooks** 地重渲染。
+ *
+ * 不能复用 `renderStable`：它开头会 `__reset()` 丢掉 hooks 槽位，而 `open` 正是
+ * 存在槽位里的 state —— 重置后再渲染会回到「收起」。
+ */
+function openSelectors(props: Record<string, unknown>, index: number): unknown {
+  let tree = expandTree(client.hooks.__renderComponent(client.ConsumptionSelectors, props), client.hooks)
+  const anchor = consumptionSelects(tree)[index]!
+  ;(anchor.props.onClick as () => void)()
+  tree = expandTree(client.hooks.__renderComponent(client.ConsumptionSelectors, props), client.hooks)
+  return tree
+}
 
-describe('ConsumptionSelectors：两个并排的原生下拉', () => {
+/** 某个下拉的悬停提示文案（挂在 `Tooltip` 代理投影出的 `data-tooltip` 上）。 */
+function tooltipOfSelect(node: unknown, label: string): string {
+  const anchor = flatten(node)
+    .filter(isElement)
+    .find((el) => el.props['data-tooltip'] !== undefined
+      && flatten(el).some((inner) => isElement(inner) && inner.props['aria-label'] === label))
+  expect(anchor, `找不到「${label}」下拉的悬停提示`).toBeDefined()
+  return String(anchor!.props['data-tooltip'])
+}
+
+describe('ConsumptionSelectors：两个并排的下拉（Menu 原语）', () => {
   it('渲染三档消耗顺序与两档切换粒度，文案与需求一致', () => {
     const { rpcCall } = makeRpc()
     client.hooks.__reset()
+    const props = {
+      provider: 'buddy-cn',
+      rpcCall,
+      value: { order: 'sequential', switch: 'per-turn' },
+      busy: false,
+      onChange: () => {},
+    }
     const tree = expandTree(
-      client.hooks.__renderComponent(client.ConsumptionSelectors, {
-        provider: 'buddy-cn',
-        rpcCall,
-        value: { order: 'sequential', switch: 'per-turn' },
-        busy: false,
-        onChange: () => {},
-      }),
+      client.hooks.__renderComponent(client.ConsumptionSelectors, props),
       client.hooks,
     )
     const selects = consumptionSelects(tree)
     expect(selects, '应当恰好两个下拉（消耗顺序 / 切换粒度）').toHaveLength(2)
 
-    // 三档消耗顺序：文案在 option 上（select 收起时只显示被选中的那一档）。
-    const orderLabels = optionsOf(selects[0]!).map((el) => textsOf(el).join(''))
-    expect(orderLabels).toEqual(['顺序', '遍历', '最高优先'])
-    // 两档切换粒度（第二档是用户没改的默认值）。
-    const switchLabels = optionsOf(selects[1]!).map((el) => textsOf(el).join(''))
-    expect(switchLabels).toEqual(['按请求', '按轮次'])
+    // 收起时锚点上只有**当前档**的文案（下拉收起时只显示被选中的那一档）。
+    expect(textsOf(selects[0]!)).toEqual(['顺序'])
+    expect(textsOf(selects[1]!)).toEqual(['按轮次'])
+
+    // 展开后逐档可见：三档消耗顺序、两档切换粒度（第二档是用户没改的默认值）。
+    //
+    // ⚠️ 一次点击会把**两个**下拉都展开：本文件的 react 占位按**组件函数**缓存
+    // hooks 槽位（`storeFor(fn)`），而两个下拉是同一个 `ConsumptionSelect` 的
+    // 两个实例 —— 它们共用那个 `open` 槽位。真机里两个实例各有一份 state，
+    // 这里读的是同一份，但「两档 / 三档的文案与顺序」这一断言不受影响。
+    const openTree = openSelectors(props, 0)
+    expect(menuRowsOf(openTree, 0)).toEqual(['顺序', '遍历', '最高优先'])
+    expect(menuRowsOf(openTree, 1)).toEqual(['按请求', '按轮次'])
 
     const text = textsOf(tree).join('')
     // ⚠️ 界面上**不得**再出现设置名（用户明确要求删掉两个可见标签与内联解释）。
-    // 这两个名字只能存在于 `aria-label` / `title` 这类非可见属性里。
+    // 这两个名字只能存在于 `aria-label` / 悬停提示这类非可见属性里。
     expect(text).not.toContain('消耗顺序')
     expect(text).not.toContain('切换粒度')
     // 设置名 + 各档含义必须仍在悬停提示里，否则删了标签就等于删了说明。
-    const orderTip = String(selects[0]!.props.title)
+    // ⚠️ 迁移后它**不再挂在原生 `title` 上**，而是经 `Tooltip` 原语渲染
+    // （替身投影为 `data-tooltip`）。文案内容一个字都没改。
+    const orderTip = tooltipOfSelect(tree, '消耗顺序')
     expect(orderTip).toContain('消耗顺序')
     expect(orderTip).toContain('顺序')
     expect(orderTip).toContain('遍历')
     expect(orderTip).toContain('最高优先')
-    const switchTip = String(selects[1]!.props.title)
+    const switchTip = tooltipOfSelect(tree, '切换粒度')
     expect(switchTip).toContain('切换粒度')
     expect(switchTip).toContain('按请求')
     expect(switchTip).toContain('按轮次')
-    // option 的取值必须与宿主联合类型逐字一致（改名等于让用户配置失效）。
-    expect(optionsOf(selects[0]!).map((el) => el.props.value))
-      .toEqual(['sequential', 'round-robin', 'highest-balance'])
-    expect(optionsOf(selects[1]!).map((el) => el.props.value))
-      .toEqual(['per-request', 'per-turn'])
+  })
+
+  it('每档的取值与宿主联合类型逐字一致（改名等于让用户配置失效）', () => {
+    const { rpcCall } = makeRpc()
+    client.hooks.__reset()
+    const props = {
+      provider: 'buddy-cn', rpcCall, value: { order: 'sequential', switch: 'per-turn' },
+      busy: false, onChange: () => {},
+    }
+    // 取值不再挂在 `<option value>` 上，而是菜单项的 **id**（`Menu` 的 onSelect
+    // 回传它）。故这里从 items 的 id 读 —— 那是同一份 `CONSUMPTION_*_OPTIONS`，
+    // 改名同样等于让用户已保存的配置失效。
+    const itemIdsOf = (index: number): string[] => {
+      const tree = expandTree(
+        client.hooks.__renderComponent(client.ConsumptionSelectors, props),
+        client.hooks,
+      )
+      const menu = flatten(tree).filter(isElement).filter((el) => el.menuProps !== undefined)[index]
+      expect(menu, `第 ${index} 个下拉没有 items`).toBeDefined()
+      return (menu!.menuProps!.items as Array<{ id: string }>).map((item) => item.id)
+    }
+    expect(itemIdsOf(0)).toEqual(['sequential', 'round-robin', 'highest-balance'])
+    expect(itemIdsOf(1)).toEqual(['per-request', 'per-turn'])
   })
 
   it('无外框：分组容器只剩等分布局，边框与内边距已删除', () => {
@@ -361,7 +462,9 @@ describe('ConsumptionSelectors：两个并排的原生下拉', () => {
       }),
       client.hooks,
     )
-    // 结构上只剩「两个下拉」：容器 → 分组 → select，中间不再有 head / label / hint。
+    // 结构上只剩「两个下拉」：容器 → 分组 → 锚点按钮，中间不再有 head / label / hint。
+    // ⚠️ `Menu` 自身会包一层 `ui-menu` 的 span（替身同款），它不属于
+    // `dim-ah-consumption*` 命名空间，故被下面的前缀过滤挡在外面。
     const classes = flatten(tree)
       .filter(isElement)
       .map((el) => String(el.props.className ?? ''))
@@ -386,7 +489,7 @@ describe('ConsumptionSelectors：两个并排的原生下拉', () => {
     expect(styles).not.toContain('.dim-ah-consumptionHint')
   })
 
-  it('两个下拉都是原生 select，各带 aria-label，且不再有任何 radio', () => {
+  it('两个下拉各带 aria-label 可读名，且不再有任何原生控件', () => {
     const { rpcCall } = makeRpc()
     client.hooks.__reset()
     const tree = expandTree(
@@ -399,21 +502,24 @@ describe('ConsumptionSelectors：两个并排的原生下拉', () => {
     const selects = consumptionSelects(tree)
     expect(selects.map((el) => el.props['aria-label'])).toEqual(['消耗顺序', '切换粒度'])
     // 无障碍：两个下拉都得有可读名（aria-label 是唯一来源，分组是裸 div）。
+    // 锚点还要声明「这是个会弹出菜单的控件」并把开合状态暴露出去 ——
+    // 原生 select 这两件事是免费的，自绘下拉必须自己声明。
     for (const select of selects) {
       expect(String(select.props['aria-label']).length).toBeGreaterThan(0)
+      expect(select.props['aria-expanded']).toBe(false)
       // 不再声明 radiogroup 角色（radio 形态已整体替换）。
       expect(select.props.role).toBeUndefined()
     }
-    // 反向锚点：radio 一个都不剩（否则「改了但只改了一半」也会绿）。
-    const radios = flatten(tree)
+    // 反向锚点：原生控件一个都不剩（否则「改了但只改了一半」也会绿）。
+    const nativeInputs = flatten(tree)
       .filter(isElement)
-      .filter((el) => el.type === 'input' && el.props.type === 'radio')
-    expect(radios, '消耗配置已改为下拉，不应再有 radio').toHaveLength(0)
+      .filter((el) => el.type === 'input' || el.type === 'select' || el.type === 'option')
+    expect(nativeInputs, '消耗配置已改为 Menu 下拉，不应再有原生表单控件').toHaveLength(0)
     const groups = flatten(tree).filter(isElement).filter((el) => el.props.role === 'radiogroup')
     expect(groups, '不再有 radiogroup 容器').toHaveLength(0)
   })
 
-  it('选中态跟随 value（受控 select）', () => {
+  it('选中态跟随 value（受控：选中项由 value 决定，不挂 selected）', () => {
     const { rpcCall } = makeRpc()
     client.hooks.__reset()
     const tree = expandTree(
@@ -424,13 +530,11 @@ describe('ConsumptionSelectors：两个并排的原生下拉', () => {
       client.hooks,
     )
     const selects = consumptionSelects(tree)
-    expect(selects[0]!.props.value).toBe('round-robin')
-    expect(selects[1]!.props.value).toBe('per-request')
-    // 受控而非「option 上挂 selected」：后者在 react 里会与 value 打架。
-    const selectedOptions = flatten(tree)
-      .filter(isElement)
-      .filter((el) => el.type === 'option' && el.props.selected === true)
-    expect(selectedOptions).toHaveLength(0)
+    // 收起时锚点显示的就是宿主给的那一档（`selectedId` 交给 Menu 画勾选）。
+    expect(textsOf(selects[0]!)).toEqual(['遍历'])
+    expect(textsOf(selects[1]!)).toEqual(['按请求'])
+    const menus = flatten(tree).filter(isElement).filter((el) => el.menuProps !== undefined)
+    expect(menus.map((el) => el.menuProps!.selectedId)).toEqual(['round-robin', 'per-request'])
   })
 
   it('value 缺席 / 非法档位时下拉退回默认档（遍历），不留空白下拉', () => {
@@ -445,8 +549,8 @@ describe('ConsumptionSelectors：两个并排的原生下拉', () => {
       client.hooks,
     )
     const selects = consumptionSelects(tree)
-    expect(selects[0]!.props.value).toBe('round-robin')
-    expect(selects[1]!.props.value).toBe('per-turn')
+    expect(textsOf(selects[0]!)).toEqual(['遍历'])
+    expect(textsOf(selects[1]!)).toEqual(['按轮次'])
   })
 
   it('busy 期间两个下拉都禁用（写入在途时不许连点）', () => {
@@ -464,23 +568,28 @@ describe('ConsumptionSelectors：两个并排的原生下拉', () => {
     expect(selects.every((el) => el.props.disabled === true)).toBe(true)
   })
 
-  it('改变某一档只回调 onChange 一次，且只带该档的字段（不做本地乐观更新）', () => {
+  it('选中某一档只回调 onChange 一次，且只带该档的字段（不做本地乐观更新）', () => {
     const { rpcCall } = makeRpc()
     const changes: Array<Record<string, unknown>> = []
     client.hooks.__reset()
-    const tree = expandTree(
-      client.hooks.__renderComponent(client.ConsumptionSelectors, {
-        provider: 'buddy-cn', rpcCall, value: { order: 'sequential', switch: 'per-turn' },
-        busy: false, onChange: (patch: Record<string, unknown>) => changes.push(patch),
-      }),
-      client.hooks,
-    )
-    const selects = consumptionSelects(tree)
+    const props = {
+      provider: 'buddy-cn', rpcCall, value: { order: 'sequential', switch: 'per-turn' },
+      busy: false, onChange: (patch: Record<string, unknown>) => changes.push(patch),
+    }
+    // 选中动作在 `Menu` 的 `onSelect(id)` 上（不再是 select 的 onChange 事件）。
+    const selectIn = (index: number, id: string): void => {
+      const tree = expandTree(
+        client.hooks.__renderComponent(client.ConsumptionSelectors, props),
+        client.hooks,
+      )
+      const menu = flatten(tree).filter(isElement).filter((el) => el.menuProps !== undefined)[index]!
+      ;(menu.menuProps!.onSelect as (id: string) => void)(id)
+    }
     // 第一个下拉 = 消耗顺序 → 只发 order。
-    ;(selects[0]!.props.onChange as (event: unknown) => void)(changeTo('round-robin'))
+    selectIn(0, 'round-robin')
     expect(changes).toEqual([{ order: 'round-robin' }])
     // 第二个下拉 = 切换粒度 → 只发 switch（两个下拉彼此独立，整体覆盖会冲掉另一半）。
-    ;(selects[1]!.props.onChange as (event: unknown) => void)(changeTo('per-request'))
+    selectIn(1, 'per-request')
     expect(changes[1]).toEqual({ switch: 'per-request' })
   })
 })
@@ -510,14 +619,17 @@ describe('ConsumptionSelectors：版面（两个下拉同排、各占一半宽�
     expect(group).toContain('min-width: 0')
   })
 
-  it('下拉本体对齐现有控件视觉（边框 / 圆角 / focus 态），且有禁用态', () => {
+  it('下拉锚点只负责吃满块宽（外观归 ui-primitives 的 Button）', () => {
     const select = ruleOf('.dim-ah-consumptionSelect')
     expect(select).toContain('width: 100%')
-    expect(select).toContain('border-radius')
-    expect(select).toContain('border: 1px solid')
-    // 与 .dim-ah-btn 同款的 focus 环：键盘用户要能看出焦点在哪。
-    expect(styles).toContain('.dim-ah-consumptionSelect:focus-visible {')
-    expect(styles).toContain('.dim-ah-consumptionSelect:disabled {')
+    // 迁移后**不再自绘**边框 / 圆角 / focus 环 / 禁用态：那些都在
+    // ui-primitives 的 Button 里（类名被 hash，本文件也拿不到）。这里只留
+    // 「吃满块宽」这一条布局职责 —— 反过来断言「没有自绘外观」比断言
+    // 「有边框圆角」更能守住这次迁移的目标。
+    expect(select).not.toContain('border-radius')
+    expect(select).not.toContain('border:')
+    expect(styles).not.toContain('.dim-ah-consumptionSelect:focus-visible {')
+    expect(styles).not.toContain('.dim-ah-consumptionSelect:disabled {')
   })
 })
 
@@ -530,15 +642,15 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
     expect(get!.payload).toEqual({ provider: 'buddy-cn' })
     // 宿主返回的值必须被渲染出来（否则下拉永远显示默认档）。
     const selects = consumptionSelects(tree)
-    expect(selects[0]!.props.value).toBe('sequential')
-    expect(selects[1]!.props.value).toBe('per-request')
+    expect(textsOf(selects[0]!)).toEqual(['顺序'])
+    expect(textsOf(selects[1]!)).toEqual(['按请求'])
   })
 
   it('选择器在账号卡片列表**之前**（面板顶部，与卡片同宽）', async () => {
     const { rpcCall } = makeRpc()
     const full = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
     const nodes = flatten(full).filter(isElement)
-    const selectIndex = nodes.findIndex((el) => el.type === 'select')
+    const selectIndex = nodes.findIndex((el) => el.props['aria-haspopup'] === 'menu')
     expect(selectIndex, '面板里找不到选择器').toBeGreaterThan(-1)
     // 账号区（空态提示）必须排在选择器之后 —— 两个下拉在账号卡片列表
     // **之前**，这正是需求要求的版面位置。
@@ -554,23 +666,24 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
     expect(selectIndex).toBeLessThan(emptyIndex)
   })
 
-  it('改变下拉后发出 consumption.set，且是**部分更新**（只带一个字段）', async () => {
+  it('选中某一档后发出 consumption.set，且是**部分更新**（只带一个字段）', async () => {
     const { calls, rpcCall } = makeRpc()
     let tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    let selects = consumptionSelects(tree)
-    ;(selects[0]!.props.onChange as (event: unknown) => void)(changeTo('sequential'))
-    // 让 RPC 的 promise 结算（onChange 是 async 处理器）。
+    const menuIn = (node: unknown, index: number): ElementNode =>
+      flatten(node).filter(isElement).filter((el) => el.menuProps !== undefined)[index]!
+    ;(menuIn(tree, 0).menuProps!.onSelect as (id: string) => void)('sequential')
+    // 让 RPC 的 promise 结算（onSelect 是 async 处理器）。
     for (let i = 0; i < 10; i++) await Promise.resolve()
     const set = calls.find((c) => c.method === 'consumption.set')
-    expect(set, '改变下拉后应当写回配置').toBeDefined()
+    expect(set, '选中一档后应当写回配置').toBeDefined()
     // **只带 order，不带 switch** —— 两个下拉彼此独立，整体覆盖会让另一个
     // 标签页的过期状态把用户刚改的字段冲掉。
     expect(set!.payload).toEqual({ provider: 'buddy-cn', order: 'sequential' })
 
     // 宿主接受后再渲染：选中态必须跟着宿主返回的值走。
     tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    selects = consumptionSelects(tree)
-    expect(selects[0]!.props.value, '宿主已接受 sequential，下拉应当显示它').toBe('sequential')
+    expect(textsOf(consumptionSelects(tree)[0]!), '宿主已接受 sequential，下拉应当显示它')
+      .toEqual(['顺序'])
   })
 
   it('写回失败时不得把选中态改掉（不做乐观更新，与模型开关同理）', async () => {
@@ -583,8 +696,9 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
       return {}
     }
     const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    const selects = consumptionSelects(tree)
-    ;(selects[0]!.props.onChange as (event: unknown) => void)(changeTo('highest-balance'))
+    const menuIn = (node: unknown, index: number): ElementNode =>
+      flatten(node).filter(isElement).filter((el) => el.menuProps !== undefined)[index]!
+    ;(menuIn(tree, 0).menuProps!.onSelect as (id: string) => void)('highest-balance')
     for (let i = 0; i < 10; i++) await Promise.resolve()
     expect(calls.some((c) => c.method === 'consumption.set')).toBe(true)
     // 重新渲染：仍是宿主给的「遍历」（失败没有污染本地状态）。
@@ -592,7 +706,7 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
       client.hooks.__renderComponent(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }),
       client.hooks,
     )
-    expect(consumptionSelects(after)[0]!.props.value).toBe('round-robin')
+    expect(textsOf(consumptionSelects(after)[0]!)).toEqual(['遍历'])
   })
 
   it('consumption.get 失败时面板仍完整可用（下拉退回默认档，不白屏）', async () => {
@@ -606,11 +720,11 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
     // 可见文案已不含设置名，故判据是**下拉数量 + 悬停提示**而不是正文文本。
     const selects = consumptionSelects(tree)
     expect(selects).toHaveLength(2)
-    expect(String(selects[0]!.props.title)).toContain('消耗顺序')
-    expect(String(selects[1]!.props.title)).toContain('切换粒度')
+    expect(tooltipOfSelect(tree, '消耗顺序')).toContain('消耗顺序')
+    expect(tooltipOfSelect(tree, '切换粒度')).toContain('切换粒度')
     // 退回默认档：遍历 + 按轮次。
-    expect(selects[0]!.props.value).toBe('round-robin')
-    expect(selects[1]!.props.value).toBe('per-turn')
+    expect(textsOf(selects[0]!)).toEqual(['遍历'])
+    expect(textsOf(selects[1]!)).toEqual(['按轮次'])
   })
 
   it('七个 provider 都能渲染出这两个下拉（新增 provider 不会漏接线）', async () => {

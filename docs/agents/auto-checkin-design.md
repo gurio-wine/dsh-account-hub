@@ -105,13 +105,12 @@ if (supportsCredits) void rpcCall('credits.checkinStatus', { provider })
 
 - **单片按钮**（`AccountCard` 的 `dim-ah-accountActions` 行，`重测/重置/停用/删除` 同排，放在最前）：仅 `supportsCredits` 时渲染。文案状态机：`checkedInToday ? '已签' : (checkingThisAccount ? '签到中…' : '签到')`；`disabled` = `busy || checkedInToday || checkingThisAccount`。**禁用态数据来源**：`checkedInToday` 由 `credits.checkinStatus` 带回（读内存），单签成功后再由 `checkin.perform` 的响应更新本地 `checkinsByAccount`。
 - **头部按钮**（`dim-ah-headerActions` 现有「一键领取积分」位）：文案 `claiming ? '签到中…' : allCheckedIn ? '全部已签' : '一键签到'`；`disabled` = `claiming || accounts.length === 0 || allCheckedIn`。`allCheckedIn = accounts.length > 0 && accounts.every(a => checkinsByAccount[a.id]?.checkedInToday)`，由 `credits.checkinStatus` 数据派生。**背景绿色**：见下。
-- **绿色样式**：沿用现样式体系新增 `data-accent="green"` / `data-kind="success"`。在 `account-hub-styles.js` 追加：
-  ```css
-  .dim-ah-btn[data-kind="success"] { background: #22c55e; color: #fff; border-color: #22c55e; }
-  .dim-ah-btn[data-kind="success"]:hover:not(:disabled) { background: #16a34a; border-color: #16a34a; }
-  .dim-ah-btn[data-kind="success"]:disabled { }  /* 继承 :disabled 的 opacity:0.5；已签时点灰即禁用 */
-  ```
-  按钮元素加 `data-kind="success"`（注意别与现有 `primary`/`danger` 冲突，`primary` 是蓝、`danger` 是红，success 是第三个绿）。
+- **绿色样式（已废止，2026-09-25 控件迁移）**：曾用 `data-kind="success"` + 自绘绿色（`#22c55e`）。控件迁移后按钮一律是 ui-primitives 的 `Button`，而它只有 `primary` / `ghost` / `outline` / `toolbar` 四种变体 —— 给插件造一个私有 `success` 变体等于在插件里重开一套配色，正是迁移要消除的东西。故：
+  - **头部「一键签到」用 `variant: 'primary'`**，成功 / 进行中 / 已全签三态由**文案**表达（`'签到中…' / '全部已签' / '一键签到'`），颜色交给设计体系；
+  - **单片「签到」用 `variant: 'outline'`**，状态语义由文案与 `disabled` 承载；
+  - 状态类信息（如「已启用 / 已停用」）改用 `Tag`（tone）与 `StateDot`（state）表达，而不是给按钮换颜色。
+
+  回归护栏：`credits-capabilities.spec.ts` 断言源码里**不再有** `'data-kind': 'success'`，且样式表里不再有十六进制色值。
 
 ## 9. 边界语义
 

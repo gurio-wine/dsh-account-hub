@@ -33,6 +33,9 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// ui-primitives 是宿主的隐式 baseline（不在本仓库依赖里）：临时目录里必须补一个
+// 替身文件，否则 require 会以 Cannot find module 让**整个文件**加载失败。
+import { rewriteUiPrimitivesImport, writeUiPrimitivesStub } from './fixtures/ui-primitives-stub.js'
 import { afterAll, describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -89,9 +92,23 @@ exports.__drainEffects = function () {
   }
 };
 
+/**
+ * 与真实 react 对齐：**同时**填 props.children 与 children 数组。
+ *
+ * 只填数组是旧版替身的一个保真度缺口：JSX 的多个子节点在 react 里会进
+ * props.children，故像 \React.createElement(Menu, {...}, a, b)\ 这种「多子节点
+ * 传给组件」的写法，其子节点在 props.children 里；组件若把它透传下去
+ * （ui-primitives 的 Button / Menu / Modal 都这么做），只填数组的替身会让这些
+ * 内容在树上凭空消失 —— 表现为「按钮渲染出来了但没有文字」。
+ * 本仓库所有代码都用 \React.createElement(组件, props, 子节点…)\，从不用 JSX，
+ * 故补上 props.children 不会与既有断言冲突。
+ */
 exports.createElement = function createElement(type, props) {
   var children = Array.prototype.slice.call(arguments, 2);
-  return { type: type, props: props || {}, children: children };
+  var merged = Object.assign({}, props || {});
+  if (children.length === 1) merged.children = children[0];
+  else if (children.length > 1) merged.children = children;
+  return { type: type, props: merged, children: children };
 };
 exports.useState = function useState(initial) {
   var store = current;
@@ -163,6 +180,9 @@ function toCjs(source: string): string {
     }
     out = out.replace(pattern, replacement)
   }
+  // ui-primitives 是宿主隐式 baseline（不在本仓库依赖里），临时目录里没有它：
+  // 按源码**现算**导入名单并改写为替身 require（见 fixtures/ui-primitives-stub.ts）。
+  out = rewriteUiPrimitivesImport(out)
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   return out.concat(
     '\nmodule.exports.__testExports = {'
@@ -200,6 +220,7 @@ function loadClientModule(): {
   // 这条链的一环 —— 那会变成「占位返回什么、断言就期待什么」的假测试。
   writeFileSync(join(dir, 'account-order.js'),
     readFileSync(resolve(here, '../../plugin-src/client/account-order.js'), 'utf8'))
+  writeUiPrimitivesStub(dir, (path, data) => writeFileSync(path, data))
   writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)

@@ -111,7 +111,12 @@ const result = await build({
   // 且使「用 includes 校验产物文案」的做法天然失效。改用 utf8 后产物保留原文，
   // 加载器按 utf8 读取 bundle（dsh-client-modules 用 "utf8" 解码），故安全。
   charset: 'utf8',
-  external: ['react', 'react-dom'],
+  // ui-primitives 是宿主的**隐式 baseline**（`packages/client/web/src/platform.ts`
+  // 的 PLATFORM_MODULES 把 `@deepseek-ai/dsh-client-ui-primitives` 注入了共享
+  // 模块表），故必须 external：打进产物会得到**第二份** React 与一份
+  // 无法处理的 .module.css 引用（esbuild 不认 CSS Module，直接把 import 留在
+  // 产物里，加载器 require 一个 .css 路径必然炸）。
+  external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
   write: false,
   minify: process.env.NODE_ENV === 'production',
   legalComments: 'none',

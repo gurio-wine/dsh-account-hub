@@ -31,6 +31,9 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// ui-primitives 是宿主的隐式 baseline（不在本仓库依赖里）：临时目录里必须补一个
+// 替身文件，否则 require 会以 Cannot find module 让**整个文件**加载失败。
+import { rewriteUiPrimitivesImport, writeUiPrimitivesStub } from './fixtures/ui-primitives-stub.js'
 import { afterAll, describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -38,9 +41,23 @@ const here = dirname(fileURLToPath(import.meta.url))
 /** 一个最小 react 占位模块：把参数收成可深比较的普通对象。 */
 const REACT_STUB = `
 'use strict';
+/**
+ * 与真实 react 对齐：**同时**填 props.children 与 children 数组。
+ *
+ * 只填数组是旧版替身的一个保真度缺口：JSX 的多个子节点在 react 里会进
+ * props.children，故像 \React.createElement(Menu, {...}, a, b)\ 这种「多子节点
+ * 传给组件」的写法，其子节点在 props.children 里；组件若把它透传下去
+ * （ui-primitives 的 Button / Menu / Modal 都这么做），只填数组的替身会让这些
+ * 内容在树上凭空消失 —— 表现为「按钮渲染出来了但没有文字」。
+ * 本仓库所有代码都用 \React.createElement(组件, props, 子节点…)\，从不用 JSX，
+ * 故补上 props.children 不会与既有断言冲突。
+ */
 exports.createElement = function createElement(type, props) {
   var children = Array.prototype.slice.call(arguments, 2);
-  return { type: type, props: props || {}, children: children };
+  var merged = Object.assign({}, props || {});
+  if (children.length === 1) merged.children = children[0];
+  else if (children.length > 1) merged.children = children;
+  return { type: type, props: merged, children: children };
 };
 `
 
@@ -95,9 +112,14 @@ function toCjs(source: string): string {
     out = out.replace(pattern, replacement)
   }
   // `export function` / `export const` → 普通声明（模块作用域内仍互相可见）。
+  // ui-primitives 是宿主隐式 baseline（不在本仓库依赖里），临时目录里没有它：
+  // 按源码**现算**导入名单并改写为替身 require（见 fixtures/ui-primitives-stub.ts）。
+  out = rewriteUiPrimitivesImport(out)
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   // 暴露本次要测的组件。它是模块作用域里的函数声明，故此处必然可见。
-  return out.concat('\nmodule.exports.__testExports = { CreditBalanceRow: CreditBalanceRow };\n')
+  return out.concat(
+    '\nmodule.exports.__testExports = { CreditBalanceRow: CreditBalanceRow, Tooltip: Tooltip };\n',
+  )
 }
 
 function loadClientModule(): Record<string, unknown> {
@@ -110,6 +132,7 @@ function loadClientModule(): Record<string, unknown> {
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
   writeOrderModule(dir)
+  writeUiPrimitivesStub(dir, (path, data) => writeFileSync(path, data))
   writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
@@ -134,7 +157,14 @@ interface RowNode {
   children: unknown[]
 }
 
-/** 把一个节点渲染成「结构快照」：只保留 type / 关键 props / 文本，便于深比较。 */
+/**
+ * 把一个节点渲染成「结构快照」：只保留 type / 关键 props / 文本，便于深比较。
+ *
+ * ⚠️ 子节点取自 `props.children`（真实 react 的形态），回退到占位的 `children`
+ * 数组。两者在旧版 react 占位里不一致（`createElement(组件, props, 子节点…)`
+ * 的子节点只进数组、不进 props），本文件正是靠 `props.children` 才能看见
+ * 「组件渲染出来的子节点」；占位现已补上该字段（见各 spec 的 REACT_STUB）。
+ */
 function snapshot(node: unknown): unknown {
   if (node === null || node === undefined) return null
   if (typeof node === 'string' || typeof node === 'number') return String(node)
@@ -143,16 +173,50 @@ function snapshot(node: unknown): unknown {
     type: element.type,
     className: element.props.className,
     title: element.props.title,
+    tooltip: element.props['data-tooltip'],
     tone: element.props['data-tone'],
-    children: element.children.filter((child) => child !== null && child !== undefined).map(snapshot),
+    children: childrenOf(element).filter((child) => child !== null && child !== undefined).map(snapshot),
   }
+}
+
+/**
+ * `Tooltip` 是透明代理：树上出现它时，把它折回被包住的那个真实节点，
+ * 并把 `label` 投影成该节点的 `data-tooltip`（与替身 `expandTree` 时的行为一致）。
+ *
+ * 本文件的组件是**直接调用**的（不经 `expandTree`），故代理的投影要在这里补上，
+ * 否则 `data-tooltip` 永远取不到、而 `title` 又已被迁移移除 —— 那会让
+ * 「悬停文案不许丢」这条回归断言假绿。
+ */
+function unwrapTooltip(node: unknown): unknown {
+  if (node === null || typeof node !== 'object') return node
+  const element = node as RowNode
+  if (typeof element.type === 'function' && (element.type as { name?: string }).name === 'Tooltip') {
+    const child = unwrapTooltip(element.props.children)
+    if (child === null || typeof child !== 'object') return child
+    const inner = child as RowNode
+    return { ...inner, props: { ...inner.props, 'data-tooltip': element.props.label } }
+  }
+  return node
+}
+
+/**
+ * 一个节点的子节点（props.children 优先，回退到占位的 children 数组）。
+ *
+ * 每个子节点都过一遍 {@link unwrapTooltip}：`Tooltip` 替身是**透明**的
+ * （不增节点、只把 label 投影成 data-tooltip），故它在树上不该算一层 ——
+ * 否则 `ddParts` 拿到的第一层是 Tooltip 而不是 dd。
+ */
+function childrenOf(element: RowNode): unknown[] {
+  const props = element.props.children
+  const raw = props === undefined ? element.children : (Array.isArray(props) ? props : [props])
+  return raw.map(unwrapTooltip)
 }
 
 /** 一个节点的子树里全部可见文本（按渲染顺序展平）。 */
 function textOf(node: unknown): string[] {
   if (typeof node === 'string' || typeof node === 'number') return [String(node)]
   if (node === null || node === undefined) return []
-  return (node as RowNode).children.flatMap(textOf)
+  return childrenOf(node as RowNode).flatMap(textOf)
 }
 
 /**
@@ -164,8 +228,8 @@ function textOf(node: unknown): string[] {
  */
 function ddParts(balance: Record<string, unknown>): string[][] {
   const node = CreditBalanceRow({ balance }) as RowNode
-  const dd = node.children[1] as RowNode
-  return dd.children
+  const dd = childrenOf(node)[1] as RowNode
+  return childrenOf(dd)
     .filter((child) => child !== null && child !== undefined)
     .map(textOf)
 }
@@ -237,7 +301,10 @@ describe('CreditBalanceRow 永远是单数字（分池后无 provider 专属分�
       ],
     }))
     expect(parts[0]).toEqual(['30'])
-    // 第二段是「2/2 个资源包有效」—— 计数用的就是传进来的数组
+    // 第二段是「2/2 个资源包有效」—— 计数用的就是传进来的数组。
+    // ⚠️ `ddParts` 现在取 `props.children`（与真实 react 对齐，见其定义处），
+    // 而余额行外面套了一层 `Tooltip` 透明代理，故可见文本要经 `ddParts` 之外的
+    // 路径取 —— 这里直接用 `ddParts` 的第二段即可（代理不改变子节点结构）。
     expect(parts[1]).toEqual(['2/2 个资源包有效'])
   })
 
@@ -277,19 +344,23 @@ describe('CreditBalanceRow 的基础渲染（回归护栏）', () => {
       type: 'div',
       className: 'dim-ah-metaRow',
       title: undefined,
+      tooltip: undefined,
       tone: undefined,
       children: [
-        { type: 'dt', className: undefined, title: undefined, tone: undefined, children: ['积分'] },
+        { type: 'dt', className: undefined, title: undefined, tooltip: undefined, tone: undefined, children: ['积分'] },
         {
           type: 'dd',
           className: 'dim-ah-creditValue',
           // 明细按 packages 顺序逐行拼接（失效包带自己的失效时间，有效包显示周期）。
-          title: '免费额度: 100 / 200 · 本周期至 2026-10-01\n[已失效] 活动包: 147.87 / 300 · 失效于 2026-09-01',
+          // ⚠️ 迁移后它**不再挂在 `title` 上**，而是经 `Tooltip` 原语渲染成
+          // `data-tooltip`（快照里的 `tooltip` 字段）。文案本身一个字符没变。
+          title: undefined,
+          tooltip: '免费额度: 100 / 200 · 本周期至 2026-10-01\n[已失效] 活动包: 147.87 / 300 · 失效于 2026-09-01',
           tone: undefined,
           children: [
-            { type: 'strong', className: 'dim-ah-creditTotal', title: undefined, tone: undefined, children: ['247.87'] },
-            { type: 'span', className: 'dim-ah-creditPackages', title: undefined, tone: undefined, children: ['1/2 个资源包有效'] },
-            { type: 'span', className: 'dim-ah-creditExpired', title: undefined, tone: undefined, children: ['另有 12.50 已失效'] },
+            { type: 'strong', className: 'dim-ah-creditTotal', title: undefined, tooltip: undefined, tone: undefined, children: ['247.87'] },
+            { type: 'span', className: 'dim-ah-creditPackages', title: undefined, tooltip: undefined, tone: undefined, children: ['1/2 个资源包有效'] },
+            { type: 'span', className: 'dim-ah-creditExpired', title: undefined, tooltip: undefined, tone: undefined, children: ['另有 12.50 已失效'] },
           ],
         },
       ],

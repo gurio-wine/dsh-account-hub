@@ -23,6 +23,9 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+// ui-primitives 是宿主的隐式 baseline（不在本仓库依赖里）：临时目录里必须补一个
+// 替身文件，否则 require 会以 Cannot find module 让**整个文件**加载失败。
+import { rewriteUiPrimitivesImport, writeUiPrimitivesStub } from './fixtures/ui-primitives-stub.js'
 import { afterAll, describe, expect, it } from 'vitest'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -30,9 +33,23 @@ const here = dirname(fileURLToPath(import.meta.url))
 /** 一个最小 react 占位模块：把参数收成可深比较的普通对象。 */
 const REACT_STUB = `
 'use strict';
+/**
+ * 与真实 react 对齐：**同时**填 props.children 与 children 数组。
+ *
+ * 只填数组是旧版替身的一个保真度缺口：JSX 的多个子节点在 react 里会进
+ * props.children，故像 \React.createElement(Menu, {...}, a, b)\ 这种「多子节点
+ * 传给组件」的写法，其子节点在 props.children 里；组件若把它透传下去
+ * （ui-primitives 的 Button / Menu / Modal 都这么做），只填数组的替身会让这些
+ * 内容在树上凭空消失 —— 表现为「按钮渲染出来了但没有文字」。
+ * 本仓库所有代码都用 \React.createElement(组件, props, 子节点…)\，从不用 JSX，
+ * 故补上 props.children 不会与既有断言冲突。
+ */
 exports.createElement = function createElement(type, props) {
   var children = Array.prototype.slice.call(arguments, 2);
-  return { type: type, props: props || {}, children: children };
+  var merged = Object.assign({}, props || {});
+  if (children.length === 1) merged.children = children[0];
+  else if (children.length > 1) merged.children = children;
+  return { type: type, props: merged, children: children };
 };
 `
 
@@ -82,6 +99,9 @@ function toCjs(source: string): string {
     }
     out = out.replace(pattern, replacement)
   }
+  // ui-primitives 是宿主隐式 baseline（不在本仓库依赖里），临时目录里没有它：
+  // 按源码**现算**导入名单并改写为替身 require（见 fixtures/ui-primitives-stub.ts）。
+  out = rewriteUiPrimitivesImport(out)
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
   return out.concat(
     '\nmodule.exports.__testExports = { formatCapacity: formatCapacity, ModelTierPicker: ModelTierPicker, tierOptionsOf: tierOptionsOf };\n',
@@ -98,6 +118,7 @@ function loadClientModule(): Record<string, unknown> {
   writeFileSync(join(dir, 'node_modules', 'react', 'index.js'), REACT_STUB)
   writeFileSync(join(dir, 'credits-capabilities.js'), CAPABILITIES_STUB)
   writeOrderModule(dir)
+  writeUiPrimitivesStub(dir, (path, data) => writeFileSync(path, data))
   writeFileSync(join(dir, 'account-hub.js'), cjs)
 
   const requireFromTemp = createRequire(pathToFileURL(join(dir, 'noop.cjs')).href)
@@ -124,21 +145,59 @@ interface TierNode {
   children: unknown[]
 }
 
-/** 整棵树里全部可见文本（按渲染顺序展平）。 */
+/**
+ * 整棵树里全部可见文本（按渲染顺序展平）。
+ *
+ * ⚠️ 走 `props.children`（真实 react 的形态），并**穿透 `Tooltip` 代理** ——
+ * 档位文案现在包在 `Tooltip` 里（悬停显示精确 token 数），不穿透就一段文本
+ * 都取不到。
+ */
 function textsOf(node: unknown): string[] {
   if (typeof node === 'string' || typeof node === 'number') return [String(node)]
   if (node === null || node === undefined) return []
-  return ((node as TierNode).children ?? []).flatMap(textsOf)
+  if (typeof node === 'object' && (node as TierNode).type === undefined) return []
+  return childrenOf(node as TierNode).flatMap(textsOf)
 }
 
-/** 收集整棵树里所有 `title` 属性值。 */
+/** 一个节点的子节点（props.children 优先，回退到占位的 children 数组）。 */
+function childrenOf(element: TierNode): unknown[] {
+  const props = element.props?.children
+  const raw = props === undefined ? (element.children ?? []) : (Array.isArray(props) ? props : [props])
+  return raw.map(unwrapTooltip)
+}
+
+/**
+ * `Tooltip` 是透明代理：树上出现它时，折回被包住的真实节点并把 `label`
+ * 投影成 `data-tooltip`（与替身 `expandTree` 的行为一致）。
+ *
+ * ⚠️ `ModelTierPicker` 在本文件里是**直接调用**的（不经 `expandTree`），
+ * 故这层投影必须在测试侧补上 —— 否则 `titlesOf` 既取不到 `title`（已迁移）
+ * 也取不到 `data-tooltip`，那条「精确值仍可见」的断言会**假绿**。
+ */
+function unwrapTooltip(node: unknown): unknown {
+  if (node === null || typeof node !== 'object') return node
+  const element = node as TierNode
+  if (typeof element.type === 'function' && (element.type as { name?: string }).name === 'Tooltip') {
+    const child = unwrapTooltip(element.props.children)
+    if (child === null || typeof child !== 'object') return child
+    const inner = child as TierNode
+    return { ...inner, props: { ...inner.props, 'data-tooltip': element.props.label } }
+  }
+  return node
+}
+
+/**
+ * 收集整棵树里所有悬停提示文案。
+ *
+ * 迁移前它取 `title`；现在档位的精确值挂在 `Tooltip` 上（替身投影为
+ * `data-tooltip`），故两个来源都收 —— 文案本身仍是同一条。
+ */
 function titlesOf(node: unknown): string[] {
   if (node === null || typeof node !== 'object') return []
   const element = node as TierNode
-  return [
-    ...(typeof element.props?.title === 'string' ? [element.props.title] : []),
-    ...(element.children ?? []).flatMap(titlesOf),
-  ]
+  const own = [element.props?.title, element.props?.['data-tooltip']]
+    .filter((value): value is string => typeof value === 'string')
+  return [...own, ...childrenOf(element).flatMap(titlesOf)]
 }
 
 describe('formatCapacity：1000 进制缩写（与厂商口径一致）', () => {
@@ -229,7 +288,7 @@ describe('ModelTierPicker：多档通用（数据驱动，档数不限）', () =
     contextTiers: [200_000, 400_000, 1_000_000],
   }
 
-  it('三档模型渲染三个 radio（默认档标「默认」，其余用容量缩写）', () => {
+  it('三档模型渲染三个档位胶囊（默认档标「默认」，其余用容量缩写）', () => {
     const tree = ModelTierPicker({ model: qoder, busy: false, onSelect: () => {} })
     expect(textsOf(tree)).toEqual(['默认 200K', '400K', '1M'])
     expect(titlesOf(tree)).toEqual([
@@ -239,12 +298,31 @@ describe('ModelTierPicker：多档通用（数据驱动，档数不限）', () =
     ])
   })
 
+  /**
+   * 每档的宿主按钮节点。
+   *
+   * 迁移前判据是 `type === 'input'`（原生 radio）；现在是 `Pill` —— 一个函数
+   * 组件（替身把它渲染成宿主 `button`）。`ModelTierPicker` 在本文件里是直接
+   * 调用的、没有 hooks 驱动器，故这里对函数组件做一次**直接调用**展开
+   * （`Pill` 无 hooks，直接调用是安全的）。
+   * 选中态从 `props.checked` 改为 `aria-checked`（单选语义按
+   * `role="radio"` + `aria-checked` 重建，见 `ModelTierPicker` 的注释）。
+   */
+  const tierNodesOf = (tree: TierNode): TierNode[] =>
+    childrenOf(tree)
+      .map((node) => {
+        const element = node as TierNode
+        if (element === null || typeof element !== 'object') return null
+        return typeof element.type === 'function'
+          ? (element.type as (props: unknown) => TierNode)(element.props)
+          : element
+      })
+      .filter((node): node is TierNode => node !== null && node.type === 'button')
+
   it('选中态 = `contextBudget` 精确等于该档；未设预算 / 编造值都是默认档', () => {
     const checkedOf = (budget: number | undefined) => {
       const tree = ModelTierPicker({ model: { ...qoder, contextBudget: budget }, busy: false, onSelect: () => {} })!
-      return tree.children
-        .map((child) => (child as TierNode).children.find((node) => (node as TierNode)?.type === 'input') as TierNode)
-        .map((input) => input.props.checked)
+      return tierNodesOf(tree).map((node) => node.props['aria-checked'])
     }
     // 未设预算 → 默认档；设中间档 → 中间档；设编造值 → 静默回默认档
     // （与宿主 `effectiveContextWindow` 同向：界面显示的选中项就是宿主会用的窗口）。
@@ -258,9 +336,7 @@ describe('ModelTierPicker：多档通用（数据驱动，档数不限）', () =
   it('点击某一档把**该档的值**交给回调（宿主据此校验与写入）', () => {
     const seen: Array<[string, number]> = []
     const tree = ModelTierPicker({ model: qoder, busy: false, onSelect: (id: string, w: number) => seen.push([id, w]) })!
-    const inputs = tree.children.map((child) =>
-      (child as TierNode).children.find((node) => (node as TierNode)?.type === 'input') as TierNode)
-    for (const input of inputs) (input.props.onChange as () => void)()
+    for (const node of tierNodesOf(tree)) (node.props.onClick as () => void)()
     expect(seen).toEqual([
       ['qmodel_38max', 200_000],
       ['qmodel_38max', 400_000],
