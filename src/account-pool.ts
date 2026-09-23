@@ -23,6 +23,14 @@ import {
   type ConsumptionSetting,
 } from './account-consumption.js'
 import { migrateAccountHubIntoStorage } from './account-hub-migration.js'
+import {
+  AUTO_ROUTE_PROVIDER_ID,
+  DEFAULT_AUTO_ROUTE_CONFIG,
+  assertValidAutoRouteConfig,
+  sanitizeAutoRouteConfig,
+  type AutoRouteConfig,
+  type AutoRouteDefinition,
+} from './auto-route.js'
 import { isCheckinDue } from './checkin-schedule.js'
 import { jwtIssuer, type BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
@@ -90,6 +98,13 @@ interface AccountHubSettingsValue {
   consumption?: ConsumptionMap
   /** 遍历游标（见 `ConsumptionCursorMap`）。 */
   consumptionCursors?: ConsumptionCursorMap
+  /**
+   * 自动路由配置（见 {@link AutoRouteConfig}）。
+   *
+   * 唯一真相源是 `src/auto-route.ts`（默认值与全部判据都在那里）；这里是
+   * **回退路径**的落盘形态，与 storage 文档的 `autoRoute` 逐字段同形。
+   */
+  autoRoute?: AutoRouteConfig
   /** 数据版本号，供一次性迁移 short-circuit（见 provider-rename-migration.ts）。 */
   schemaVersion?: number
   /** provider 体检版本号，供体检迁移 short-circuit（见 provider-audit-migration.ts）。 */
@@ -108,6 +123,8 @@ interface AccountHubSettingsValue {
  * - `4` = `checkins` 的值口径由「本地纪元日数」换成「**下一次可签毫秒时间戳**」
  *   （各 provider 重置钟点不同，见 `src/checkin-schedule.ts`）。
  * - `5` = 文档新增第八字段 `providerAuditVersion`（provider 体检的独立闸门）。
+ * - `6` = 文档新增第九字段 `autoRoute`（自动路由配置，唯一真相源在
+ *   `src/auto-route.ts`）。
  *
  * ⚠️ **4 是唯一一次「搬动既有数据」的版本提升**（其余都只补字段）：旧值必须
  * 换算，否则会被当成一个 1970 年的时间戳、判成「永远可签」而每轮重复签到。
@@ -116,9 +133,10 @@ interface AccountHubSettingsValue {
  * 这件事在存储里落个可判定的标记，并让 `migrateProviderNames` 多跑一趟
  * （那一趟对已迁移数据是无操作）。
  *
- * ⚠️ **2 / 3 / 5 三次提升都只是「补字段」，不搬动任何既有数据**：旧文档读入时
- * 由 `sanitizeAccountHubDocument` 补空对象 / 0（缺 `consumption` 即等于
- * `DEFAULT_CONSUMPTION`，缺 `providerAuditVersion` 即等于「体检未跑」）。
+ * ⚠️ **2 / 3 / 5 / 6 四次提升都只是「补字段」，不搬动任何既有数据**：旧文档读入时
+ * 由 `sanitizeAccountHubDocument` 补空对象 / 0 / 默认配置（缺 `consumption` 即等于
+ * `DEFAULT_CONSUMPTION`，缺 `providerAuditVersion` 即等于「体检未跑」，缺
+ * `autoRoute` 即等于 `DEFAULT_AUTO_ROUTE_CONFIG`）。
  * 提升版本号的实际效果是让 `migrateProviderNames` 对旧文档**多跑一次无操作迁移**
  * 并把版本号落定，从而「文档已含该字段」这件事在存储里有个可判定的标记。
  * 数据搬迁由各自的独立闸门负责：体检走 {@link PROVIDER_AUDIT_VERSION}。
@@ -137,7 +155,7 @@ interface AccountHubSettingsValue {
  * 数据因此活了很久。结论：**字段集合版本**与**体检版本**必须是两个数字，见
  * `src/provider-audit-migration.ts` 的模块头。
  */
-export const ACCOUNT_HUB_SCHEMA_VERSION = 5
+export const ACCOUNT_HUB_SCHEMA_VERSION = 6
 
 /**
  * provider 体检的**独立**版本号（存入文档的 `providerAuditVersion` 字段）。
@@ -162,7 +180,7 @@ interface SettingsScopeLike {
 /**
  * 一次整体写入的载荷形状。
  *
- * 与 storage 域的 `AccountHubDocument` **刻意同形**（八件套齐全）：两条写路径
+ * 与 storage 域的 `AccountHubDocument` **刻意同形**（九件套齐全）：两条写路径
  * （storage 的 `global.set` 与 settings 的 `replace`）都是整体替换，用同一个形状
  * 可以让 `persist()` 成为唯一写落点，杜绝「某条路径漏带某个字段」。
  */
@@ -173,6 +191,7 @@ interface AccountHubDocumentLike {
   checkins: Record<string, number>
   consumption: ConsumptionMap
   consumptionCursors: ConsumptionCursorMap
+  autoRoute: AutoRouteConfig
   schemaVersion: number
   providerAuditVersion: number
 }
@@ -224,6 +243,19 @@ const accountHubSchema = Schema.object({
   // 遍历游标（provider id → 下一个该用的 accountId）。同上，键值都动态。
   // **必须带 `.default({})`**：老配置里没有该字段。
   consumptionCursors: Schema.dict(Schema.any()).default({}),
+  // 自动路由配置（`{ enabled, models }`）。**整个字段用 `Schema.any()` 承接**：
+  // 它的形状由 `src/auto-route.ts` 的判据负责（那是唯一真相源），在这里再写一份
+  // schemastery 结构就是第二份判据 —— 两份一旦漂移，会出现「settings 校验过了
+  // 但池拒收」或反过来的静默分歧。
+  //
+  // **必须带 `.default(…)`**：老配置里没有该字段。默认值直接取真相源的默认常量
+  // —— schemastery 在填默认值时会**深拷贝**它（`Schema.resolve` 里的 `clone(fallback)`），
+  // 故那个深冻结对象不会被就地改写。
+  // ⚠️ 但深拷贝**保留不可写属性描述符**：`DEFAULT_AUTO_ROUTE_CONFIG` 是
+  // `Object.freeze` 的，`clone` 出来的副本（以及其中的 `models`）仍不可写 ——
+  // 直接改它会静默失败（非严格模式）或抛 TypeError。实际无风险：池在读回时经
+  // `sanitizeAutoRouteConfig` 换成**可写副本**，从不由这份缺省值直接改。
+  autoRoute: Schema.any().default(DEFAULT_AUTO_ROUTE_CONFIG),
   // 数据版本号。`0` = 旧命名（buddy=中国版 / workbuddy=国际版）尚未迁移；
   // 见 {@link ACCOUNT_HUB_SCHEMA_VERSION}。**必须带 default**：老配置文件里没有
   // 这个字段，缺失时按 0 处理才等价于「迁移尚未执行」。
@@ -382,6 +414,14 @@ export class AccountPool {
    */
   private cursorCache: ConsumptionCursorMap = {}
   /**
+   * 自动路由配置的**权威进程内副本**（同 {@link cache}）。
+   *
+   * ⚠️ 同属九件套（理由见 {@link consumptionCache}）。它只在用户改自动路由时写，
+   * 但**任何**写入路径都必须带上它 —— 否则一次无关的「改个模型开关」就会把
+   * 用户配好的自动模型整组清空，且完全没有报错。
+   */
+  private autoRouteCache: AutoRouteConfig = sanitizeAutoRouteConfig(undefined)
+  /**
    * 数据版本号的**权威进程内副本**（同 {@link cache}）。
    *
    * 一次性迁移（provider 改名）靠它 short-circuit，因此它必须与账号、黑名单
@@ -506,7 +546,7 @@ export class AccountPool {
     }
   }
 
-  /** 首次访问时从**主路径**载入八件套。 */
+  /** 首次访问时从**主路径**载入九件套。 */
   private ensureLoaded(): void {
     if (this.loaded) return
     this.loaded = true
@@ -518,6 +558,7 @@ export class AccountPool {
       this.checkinCache = doc.checkins
       this.consumptionCache = doc.consumption
       this.cursorCache = doc.consumptionCursors
+      this.autoRouteCache = doc.autoRoute
       this.versionCache = doc.schemaVersion
       this.auditVersionCache = doc.providerAuditVersion
       return
@@ -544,6 +585,9 @@ export class AccountPool {
     // —— 等价于「顺序 + 按轮次」的默认配置，即**改动前的行为**。
     this.consumptionCache = sanitizeConsumption(value?.consumption)
     this.cursorCache = sanitizeConsumptionCursors(value?.consumptionCursors)
+    // 自动路由配置同理（最新一件）：缺失时保持默认（**关闭** + 空列表）
+    // —— 等价于「功能未启用」，即改动前的行为。脏值逐层丢弃，绝不抛错。
+    this.autoRouteCache = sanitizeAutoRouteConfig(value?.autoRoute)
     // 版本号同理：老配置文件（或首次安装）没有该字段 → 按 0 处理，
     // 即「迁移尚未执行」。
     const version = value?.schemaVersion
@@ -556,9 +600,9 @@ export class AccountPool {
   }
 
   /**
-   * 持久化八件套。
+   * 持久化九件套。
    *
-   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，八件套一起带上。
+   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，九件套一起带上。
    * 主路径是 storage 域的 `global.set`（整体替换那份单例文档）；回退路径是
    * settings scope 的 `replace`（同样是整体替换，漏带即清空）。
    */
@@ -573,6 +617,7 @@ export class AccountPool {
         checkins: document.checkins,
         consumption: document.consumption,
         consumptionCursors: document.consumptionCursors,
+        autoRoute: document.autoRoute,
         schemaVersion: document.schemaVersion,
         providerAuditVersion: document.providerAuditVersion,
       })
@@ -630,15 +675,18 @@ export class AccountPool {
 
   /**
    * 一次性整体写入账号列表、模型黑名单与上下文预算（外加版本号、签到、
-   * 游标与体检版本）。
+   * 游标、自动路由与体检版本）。
    *
    * 为什么需要它：{@link writeAccounts} / {@link writeModels} 各自只接受
    * 自己那一半，调用方要先写一半再写另一半，中间崩溃会留下半迁移状态。
    * 一次性迁移必须**原子**地落盘「账号 + 黑名单 + 上下文预算 + 版本号 + 体检版本」
-   * 八件套，故这里直接构造完整的 replace 载荷，只发一次写。
+   * 九件套，故这里直接构造完整的 replace 载荷，只发一次写。
    *
-   * ⚠️ **上下文预算、消耗顺序与游标原样带上**（不是本次迁移的对象，但同属一个
-   * 文档）：漏带会让迁移顺手清空用户的窗口档位选择或轮转进度。
+   * ⚠️ **上下文预算、消耗顺序、游标与自动路由原样带上**（不是本次迁移的对象，
+   * 但同属一个文档）：漏带会让迁移顺手清空用户的窗口档位选择、轮转进度或
+   * 配好的自动模型。
+   * ⚠️ 本方法**逐字段构造** replace 载荷（不是 spread 保留未列字段）：加新字段时
+   * 这里必须显式补一行，漏了就是静默清空。
    *
    * @param accounts - 新的账号列表。
    * @param disabledModels - 新的模型黑名单。
@@ -679,6 +727,7 @@ export class AccountPool {
       checkins: checkins ?? this.checkinCache,
       consumption: this.consumptionCache,
       consumptionCursors: consumptionCursors ?? this.cursorCache,
+      autoRoute: this.autoRouteCache,
       schemaVersion,
       providerAuditVersion: providerAuditVersion ?? this.auditVersionCache,
     }, '无 settings scope，数据迁移结果未持久化')
@@ -705,6 +754,7 @@ export class AccountPool {
       checkins: this.checkinCache,
       consumption: this.consumptionCache,
       consumptionCursors: this.cursorCache,
+      autoRoute: this.autoRouteCache,
       schemaVersion: this.versionCache,
       providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，账号变更未持久化')
@@ -774,6 +824,7 @@ export class AccountPool {
       checkins: this.checkinCache,
       consumption: this.consumptionCache,
       consumptionCursors: this.cursorCache,
+      autoRoute: this.autoRouteCache,
       schemaVersion: this.versionCache,
       providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，模型黑名单变更未持久化')
@@ -833,6 +884,7 @@ export class AccountPool {
       checkins: this.checkinCache,
       consumption: this.consumptionCache,
       consumptionCursors: this.cursorCache,
+      autoRoute: this.autoRouteCache,
       schemaVersion: this.versionCache,
       providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，上下文窗口预算变更未持久化')
@@ -929,6 +981,7 @@ export class AccountPool {
       checkins,
       consumption: this.consumptionCache,
       consumptionCursors: this.cursorCache,
+      autoRoute: this.autoRouteCache,
       schemaVersion: this.versionCache,
       providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，签到记录变更未持久化')
@@ -1003,6 +1056,91 @@ export class AccountPool {
   }
 
   /**
+   * 读**自动路由配置**（整份）。
+   *
+   * 只读进程内权威副本，同步返回 —— 与 {@link consumptionSetting} 同款。返回的是
+   * **深拷贝**（经 `sanitizeAutoRouteConfig`，它每次都新建定义与条目）：调用方
+   * （适配器注册、RPC 回传）就地改它不会串到池内状态。
+   *
+   * **永不抛错**：它是适配器 `listModels` 热路径上的同步读，一次配置读取失败
+   * 绝不能让整条模型目录播报不出来。脏值由读路径逐层丢弃。
+   */
+  autoRouteConfig(): AutoRouteConfig {
+    this.ensureLoaded()
+    return sanitizeAutoRouteConfig(this.autoRouteCache)
+  }
+
+  /**
+   * 写**自动路由配置**（**部分更新**）。
+   *
+   * ## 为什么是部分更新而不是整体覆盖
+   *
+   * 界面上「总开关」与「自动模型列表」是两个彼此独立的入口，各自只改一个字段。
+   * 若做成整体覆盖，客户端每次都要把另一半也回传 —— 一旦它手上的另一半是过期的
+   * （另一个标签页刚改过），用户改列表会顺手把开关改回去。与
+   * {@link writeConsumption} 的取舍一致。
+   *
+   * ## `models` 是**整组替换**，不做逐条合并
+   *
+   * 定义是有序的、且 `entries` 的顺序就是候选优先级：逐条合并无法表达「删掉一条」
+   * 与「把某条挪到队首」，而这两种操作都是界面上的常规动作。故客户端提交的是
+   * **完整的目标列表**，这里整体落位。
+   *
+   * ## 校验在写入侧（RPC 也要再判一次）
+   *
+   * **合并当前值后整体过** {@link assertValidAutoRouteConfig}：非法配置**抛错拒绝**，
+   * 而不是「尽力而为」地写一个永不生效的值 —— 后者在界面上的表现是「点了保存
+   * 却什么都没存」，比一句明确的报错难排查得多。⚠️ 校验必须发生在**改进程内副本
+   * 之前**：否则一次被拒的写入会把池内状态留在半截形态。
+   *
+   * @param patch - 只含要改的字段；两个字段都不给时是无操作（不写盘）。
+   */
+  async writeAutoRoute(patch: { enabled?: boolean; models?: AutoRouteDefinition[] }): Promise<void> {
+    // 必须先 ensureLoaded()：`writeAutoRouteAll` 会把 `loaded` 置 true 并整份写回，
+    // 若此时九件套还是构造初值，这次写入会把它们全部覆盖成空（同 `setModelDisabled`）。
+    this.ensureLoaded()
+    // 两个字段都不给 = 无操作（不写盘、也不校验）：与 `writeConsumption` 同款。
+    // 放在校验之前 —— 一次空 patch 不该有机会因为当前值的形态而报错。
+    if (patch.enabled === undefined && patch.models === undefined) return
+    const current = this.autoRouteCache
+    // ⚠️ 判「字段给没给」必须用 `=== undefined`，不能用 `??`：`??` 会把
+    // `enabled: null` / `models: null` 这类**非法但已给**的值悄悄换成当前值，
+    // 于是「客户端发了一个坏值」表现成「保存成功但没生效」—— 正是写路径最该
+    // 避免的静默形态。坏值必须走到下面的校验里被明确拒绝。
+    const merged = {
+      enabled: patch.enabled === undefined ? current.enabled : patch.enabled,
+      models: patch.models === undefined ? current.models : patch.models,
+    }
+    // 校验在改副本之前：被拒的写入不该留下任何痕迹（RPC 层把这句原文回给用户）。
+    assertValidAutoRouteConfig(merged)
+    // 经 `sanitizeAutoRouteConfig` 落位（与写路径判据同源，只是处置不同）：写入的
+    // 形态与读回来的形态**逐字段一致**，不会出现「存得进去却读不出来」。
+    await this.writeAutoRouteAll(sanitizeAutoRouteConfig(merged))
+  }
+
+  /** 持久化自动路由配置（同时更新进程内权威副本）。 */
+  private async writeAutoRouteAll(autoRoute: AutoRouteConfig): Promise<void> {
+    this.autoRouteCache = autoRoute
+    this.loaded = true
+    if (this.storage === undefined && !this.scope) {
+      this.ctx.logger?.warn?.('[account-hub] 无持久化通路，自动路由配置变更未持久化')
+      return
+    }
+    // 与其余各 writeXxx 对称：整体 replace 必须携带另外八件套，否则会被清空。
+    await this.persist({
+      accounts: this.cache,
+      disabledModels: this.modelCache,
+      contextBudgets: this.budgetCache,
+      checkins: this.checkinCache,
+      consumption: this.consumptionCache,
+      consumptionCursors: this.cursorCache,
+      autoRoute,
+      schemaVersion: this.versionCache,
+      providerAuditVersion: this.auditVersionCache,
+    }, '无 settings scope，自动路由配置变更未持久化')
+  }
+
+  /**
    * 写某 provider 的消耗配置（**部分更新**）。
    *
    * ## 为什么是部分更新而不是整体覆盖
@@ -1062,6 +1200,7 @@ export class AccountPool {
       checkins: this.checkinCache,
       consumption,
       consumptionCursors: this.cursorCache,
+      autoRoute: this.autoRouteCache,
       schemaVersion: this.versionCache,
       providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，消耗配置变更未持久化')
@@ -1088,6 +1227,7 @@ export class AccountPool {
       checkins: this.checkinCache,
       consumption: this.consumptionCache,
       consumptionCursors: next,
+      autoRoute: this.autoRouteCache,
       schemaVersion: this.versionCache,
       providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，遍历游标变更未持久化')
@@ -1825,6 +1965,43 @@ export async function pruneOrphanCheckins(pool: AccountPool, provider: string): 
  * - `extraCredentialRefs` 承载本仓的**单凭据路径**（见
  *   {@link AccountPool.hasLoggedInAccount} 的说明），仅 CodeArts 需要。
  *
+ * ## 自动路由的**隐藏门控**（本函数里的第一条判据）
+ *
+ * `auto-route` 是一个**虚拟 provider**：它自己没有任何账号，「已登录」这个判据对它
+ * 不成立。用户在 Account Hub 里打开总开关时，模型下拉里应当出现这些自动模型；
+ * **关掉开关时它必须从下拉里消失** —— 否则留下的是「点了必然报全部不可用」的一组
+ * 模型，比不显示糟得多。
+ *
+ * ⚠️ **门控只作用于 DSH 的目录拉取路径**（即各适配器 `listModels` → `buildModelCatalog`）。
+ * 面板内的 `model.list` RPC 走的是适配器实例的 `listAllModels()`、账号管理与签到余额
+ * 更是完全不经过这里 —— 用户要求「关掉开关后依旧可编辑」，故这些路径一行都不动。
+ *
+ * ⚠️ **与 `hasLoggedInAccount` 判据是「或」的关系，且必须**：自动路由没有账号，
+ * 若照抄账号判据会恒返回 false，于是**开着开关也永远看不到**（正是这条接线要避免的
+ * 静默失效）。故这里是「命中自动路由 → 按开关返回」，否则才走原来的账号判据。
+ *
+ * ## 自动路由开关的**反向**判据：开着就隐藏其它 provider（本函数里的第零条）
+ *
+ * 上面那条只管「自动路由自己可不可见」，**不足以**实现面板文案承诺的语义：
+ * 「开启后本插件其它供应商从列表隐藏」。缺了它，用户打开自动路由后模型下拉里会
+ * 同时出现「自动路由」与七个直连 provider 的全部分组 —— 而后者恰恰是用户选择
+ * 自动路由**想要摆脱**的那一堆（自动路由已把它们打包成一个模型，重复列出等于
+ * 让选择器重新臃肿）。
+ *
+ * 三条边界：
+ *
+ * 1. **单列判据、置于 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` 短路之前**。那个变量名字与
+ *    文档都只讲一件事：「**没有已登录账号**就隐藏」。而本判据与账号无关 —— 它是
+ *    用户在面板上的**显式选择**（「以后走自动路由」）。把两者混在一起，会让
+ *    「为了看全目录而临时关掉账号门控」的用户连带失去自动路由的隐藏效果，
+ *    于是**开着自动路由却又看到七个直连 provider**，与面板上的开关状态自相矛盾。
+ *    （自动路由**自己**那条判据仍留在短路之后：那是既有语义，不改。）
+ * 2. **用 `!== AUTO_ROUTE_PROVIDER_ID` 反向保护自己**，绝不写成「除自己外全部隐藏」
+ *    之后又忘了自己 —— 那会让开启后**一个分组都不剩**（比不隐藏更糟）。
+ * 3. **只在「池存在且开关可读到 true」时隐藏**；读配置抛错与池缺失都**保守放行**
+ *    （与下面各条同款）。宁可多显示一组（用户能自己看到开关状态），也不要让
+ *    七个 provider 的模型凭空消失且无从排查。
+ *
  * @param accountPool - 适配器的账号池（可能为 undefined）。
  * @param provider - provider id。
  * @param extraCredentialRefs - 额外的单凭据 ref（CodeArts 的单凭据回退）。
@@ -1834,7 +2011,35 @@ export async function providerCatalogVisible(
   provider: string,
   extraCredentialRefs?: readonly string[],
 ): Promise<boolean> {
+  // ⓪ 自动路由开着 → 本插件其它 provider 全部从 DSH 目录隐藏（**在环境变量短路之前**，
+  // 理由见上方文档第 1 条）。`!== AUTO_ROUTE_PROVIDER_ID` 保护自动路由自己。
+  if (provider !== AUTO_ROUTE_PROVIDER_ID && accountPool !== undefined) {
+    try {
+      if (accountPool.autoRouteConfig().enabled === true) return false
+    } catch {
+      // 读配置异常（存储损坏等）→ 保守放行，绝不因一次读取抖动藏掉七个 provider。
+    }
+  }
   if (!resolveHideWithoutAccountFlag(process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT)) return true
+  // 自动路由：**开关即可见性**，不看账号（它没有账号）。放在能力检测与账号判据
+  // 之前 —— 它与那两者都不相干。
+  //
+  // ⚠️ 判定用 `provider === AUTO_ROUTE_PROVIDER_ID`，而不是「id 里含 auto」这类
+  // 模糊匹配：虚拟 provider 的 id 是契约常量，模糊匹配会在将来出现同名前缀的
+  // 真实 provider 时静默误判。
+  //
+  // ⚠️ 账号池缺失（headless / CLI / 单测）时**放行**（与下面各条同款）：此时适配器
+  // 多半也没注册，放行不会有任何可见后果，而在这里返回 false 会让「谁把目录藏了」
+  // 变成一处无从排查的静默行为。
+  if (provider === AUTO_ROUTE_PROVIDER_ID && accountPool !== undefined) {
+    try {
+      return accountPool.autoRouteConfig().enabled === true
+    } catch {
+      // 读配置异常（存储损坏等）与下面「保守展示」同款：宁可多显示一组（用户能
+      // 自己看到开关状态），也不要让整组模型凭空消失且无从排查。
+      return true
+    }
+  }
   if (accountPool === undefined) return true
   // 能力检测：单测替身通常只 mock 了 disabledModelsFor 等少量方法。
   if (typeof accountPool.hasLoggedInAccount !== 'function') return true

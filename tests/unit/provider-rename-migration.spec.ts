@@ -583,7 +583,7 @@ describe('migrateProviderNames —— disabledModels 对调搬运', () => {
 })
 
 describe('迁移与存储契约', () => {
-  it('一次 replace 同时携带账号 / 黑名单 / 上下文预算 / 版本号（八件套都不丢）', async () => {
+  it('一次 replace 同时携带账号 / 黑名单 / 上下文预算 / 版本号（九件套都不丢）', async () => {
     const h = makeHarness({
       accounts: [makeEntry({ id: 'buddy-7b0c71b1', credentialRef: 'BUDDY_ACCOUNT_7B0C71B1' })],
       disabledModels: { buddy: { 'glm-5.2': true } },
@@ -603,8 +603,10 @@ describe('迁移与存储契约', () => {
     // 否则一次「provider 改名」就会把用户配好的消耗顺序与轮转进度一并清零。
     // `providerAuditVersion`（provider 体检闸门）是最新一件：漏带会让体检在
     // 每次启动重跑（体检幂等，症状只是噪音，但那正是「闸门形同虚设」）。
+    // `autoRoute`（自动路由配置）同理：漏带会让用户配好的自动模型在一次 provider
+    // 改名后整组消失，且完全没有报错。
     expect(Object.keys(payload).sort()).toEqual([
-      'accounts', 'checkins', 'consumption', 'consumptionCursors',
+      'accounts', 'autoRoute', 'checkins', 'consumption', 'consumptionCursors',
       'contextBudgets', 'disabledModels', 'providerAuditVersion', 'schemaVersion',
     ])
     expect(payload.schemaVersion).toBe(ACCOUNT_HUB_SCHEMA_VERSION)

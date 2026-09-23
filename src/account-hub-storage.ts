@@ -33,6 +33,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { sanitizeConsumption, sanitizeConsumptionCursors } from './account-consumption.js'
 import type { ConsumptionCursorMap, ConsumptionMap } from './account-consumption.js'
+import { sanitizeAutoRouteConfig } from './auto-route.js'
+import type { AutoRouteConfig } from './auto-route.js'
 import { normalizeCheckinValue } from './checkin-schedule.js'
 import type { ProviderAccountEntry } from './types.js'
 
@@ -108,13 +110,23 @@ export type CheckinsMap = Record<string, number>
 export type { ConsumptionCursorMap, ConsumptionMap } from './account-consumption.js'
 
 /**
+ * 自动路由配置类型（见 `src/auto-route.ts` 的 `AutoRouteConfig`）。
+ *
+ * 与上面两个类型同理**重导出**而不是另写一份同形接口：两份定义一旦漂移，
+ * 落盘形态与读取方的形态就会静默错位（存了却永远不生效）。
+ */
+export type { AutoRouteConfig } from './auto-route.js'
+
+/**
  * storage 里那份单例文档的结构。
  *
- * ⚠️ **八件套是一个整体**：`AccountPool` 的每次写入都是「读 → 改 → 整体 replace」，
+ * ⚠️ **九件套是一个整体**：`AccountPool` 的每次写入都是「读 → 改 → 整体 replace」，
  * 漏带任何一个字段就会在下次别的写入里被清空（`schemaVersion` 丢失会让改名迁移
- * 在每次启动重跑，`providerAuditVersion` 丢失会让体检在每次启动重跑）。
+ * 在每次启动重跑，`providerAuditVersion` 丢失会让体检在每次启动重跑，
+ * `autoRoute` 丢失会让用户配好的自动模型自己消失）。
  * 前五件与旧 settings namespace 里的字段**逐字段对应**，迁移就是原样搬运；
- * 「消耗顺序 / 切换粒度」「遍历游标」「provider 体检版本」是后来加的三件。
+ * 「消耗顺序 / 切换粒度」「遍历游标」「provider 体检版本」是后来加的三件，
+ * 「自动路由」是第九件（唯一真相源在 `src/auto-route.ts`，默认关闭）。
  */
 export interface AccountHubDocument {
   accounts: ProviderAccountEntry[]
@@ -125,6 +137,13 @@ export interface AccountHubDocument {
   consumption: ConsumptionMap
   /** 遍历游标（见 {@link ConsumptionCursorMap}）。 */
   consumptionCursors: ConsumptionCursorMap
+  /**
+   * 自动路由配置（见 {@link AutoRouteConfig}）。
+   *
+   * 唯一真相源是 `src/auto-route.ts`；这里只承载落盘形态。默认 `{ enabled: false, models: [] }`
+   * —— 新功能默认关，用户显式打开才生效。
+   */
+  autoRoute: AutoRouteConfig
   schemaVersion: number
   /**
    * provider 体检（**账号标签与凭据内容是否对得上**）的**独立版本闸门**。
@@ -137,7 +156,14 @@ export interface AccountHubDocument {
   providerAuditVersion: number
 }
 
-/** 空文档。每次都返回新对象 —— 共享引用会被写入方就地改坏。 */
+/**
+ * 空文档。每次都返回新对象 —— 共享引用会被写入方就地改坏。
+ *
+ * ⚠️ `autoRoute` 经 {@link sanitizeAutoRouteConfig} 构造而不是直接引用
+ * `DEFAULT_AUTO_ROUTE_CONFIG`：那个常量是**深冻结**的（防全局缺省被就地改写），
+ * 而文档是「读 → 改 → 整体 replace」的可变载荷，把冻结对象塞进去会让下游
+ * 的写入当场抛 `TypeError`。sanitize 每次都返回全新的可写副本。
+ */
 export function emptyAccountHubDocument(): AccountHubDocument {
   return {
     accounts: [],
@@ -146,6 +172,7 @@ export function emptyAccountHubDocument(): AccountHubDocument {
     checkins: {},
     consumption: {},
     consumptionCursors: {},
+    autoRoute: sanitizeAutoRouteConfig(undefined),
     schemaVersion: 0,
     providerAuditVersion: 0,
   }
@@ -230,8 +257,8 @@ function providerOfCheckinKey(key: string): string {
  * 存储文件可能被手工编辑过，也可能残留旧格式，因此逐层校验：任何一层形状不符就
  * 丢弃那一层，**不抛错** —— 存储被外部改坏不该让整个账号管理功能不可用
  * （既有 settings 路径的 `sanitizeDisabledModels` 同一取舍）。
- * 旧文档（无 `checkins` / `consumption` / `consumptionCursors` / `providerAuditVersion`
- * 字段）读入时补空对象 / 0。
+ * 旧文档（无 `checkins` / `consumption` / `consumptionCursors` / `autoRoute` /
+ * `providerAuditVersion` 字段）读入时补空对象 / 默认配置 / 0。
  */
 export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
   const empty = emptyAccountHubDocument()
@@ -249,6 +276,10 @@ export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
     checkins: sanitizeCheckins(value.checkins),
     consumption: sanitizeConsumption(value.consumption),
     consumptionCursors: sanitizeConsumptionCursors(value.consumptionCursors),
+    // 自动路由同理：老文档没有该字段 → 读成「默认关闭的空配置」，而不是 undefined
+    // （undefined 会让适配器读取时当场抛，整条模型目录都播报不出来）。
+    // 归一化复用唯一真相源，脏层逐条丢弃，永不抛错。
+    autoRoute: sanitizeAutoRouteConfig(value.autoRoute),
     schemaVersion: typeof version === 'number' && Number.isFinite(version) ? version : 0,
     // 体检版本同理：老文档没有该字段 → 按 0 处理，即「体检尚未执行」
     // —— 这正是本次要修的那批脏数据的唯一入口。
@@ -315,7 +346,7 @@ export interface AccountHubStorage {
   readonly domain: OpenedDomainLike
   /** 同步读取归一化后的文档（读自 storage 域的权威内存态）。 */
   read(): AccountHubDocument
-  /** 整体写入八件套；落盘失败时向调用方抛出。 */
+  /** 整体写入九件套；落盘失败时向调用方抛出。 */
   write(doc: AccountHubDocument): Promise<void>
   /** 存储里是否已有账号数据（一次性迁移的幂等闸门）。 */
   hasAccounts(): boolean

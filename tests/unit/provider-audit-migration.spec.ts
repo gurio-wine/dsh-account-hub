@@ -19,7 +19,7 @@
  * 的值）、冲突（目标 ref 已存在且值不同）与只读凭据源（拷贝失败）两种保守路径。
  *
  * ⚠️ 这里刻意走 **storage 域**（而不是 settings 回退路径）：生产就是它，
- * 而「八件套在 storage 那条 `persist()` 分支里漏带字段」正是最隐蔽的失败形态。
+ * 而「九件套在 storage 那条 `persist()` 分支里漏带字段」正是最隐蔽的失败形态。
  */
 
 import { describe, expect, it, beforeEach } from 'vitest'
@@ -153,7 +153,7 @@ function makeHarness(seed: {
     credentials,
     /** 当前落盘的文档（体检后核对用）。 */
     stored: () => sanitizeAccountHubDocument(global),
-    /** 最后一次写入的原始快照（断言「八件套一起带上」）。 */
+    /** 最后一次写入的原始快照（断言「九件套一起带上」）。 */
     lastWrite: () => writes[writes.length - 1],
   }
 }
@@ -251,7 +251,7 @@ describe('auditProviderAssignments —— 国际版凭据挂在 CN 条目下（�
       buddy: 'buddy-keep',
     })
 
-    // 体检版本号落定，且八件套一起写（一次原子写）。
+    // 体检版本号落定，且九件套一起写（一次原子写）。
     expect(h.writes).toHaveLength(1)
     expect(h.lastWrite()).toMatchObject({
       providerAuditVersion: PROVIDER_AUDIT_VERSION,

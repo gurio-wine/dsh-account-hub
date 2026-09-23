@@ -1088,7 +1088,7 @@ describe('AccountPool 签到存储（checkins 第五件套）', () => {
     const nextEligible = Date.now() + 3_600_000
     await pool.writeCheckinNextEligible('trae-cn', 'trae-cn-a1b2', nextEligible)
     expect(pool.checkinNextEligible('trae-cn', 'trae-cn-a1b2')).toBe(nextEligible)
-    // 写账号操作不得抹掉已写入的时刻（八件套互带）
+    // 写账号操作不得抹掉已写入的时刻（九件套互带）
     await pool.addAccount(makeMockAccount({ id: 'trae-cn-x', provider: 'trae-cn', credentialRef: 'TRAE_CN_ACCOUNT_X' }))
     expect(pool.checkinNextEligible('trae-cn', 'trae-cn-a1b2')).toBe(nextEligible)
     // 未写入的键读不到（undefined = 从未签过 ⇒ 可签）
@@ -1208,7 +1208,7 @@ describe('AccountPool 签到存储（checkins 第五件套）', () => {
     expect(p.checkinNextEligible('trae-cn', 'obj')).toBeUndefined()
   })
 
-  it('八件套互带：写账号只带 checkins，不抹黑名单 / 预算 / 版本号', async () => {
+  it('九件套互带：写账号只带 checkins，不抹黑名单 / 预算 / 版本号', async () => {
     await pool.setModelDisabled('buddy-cn', 'glm-5.2', true)
     await pool.writeContextBudget('buddy-cn', 'glm-5.2', 200_000)
     const nextEligible = Date.now() + 9_000

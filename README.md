@@ -123,7 +123,7 @@ dsh plugin --profile <name> add "https://github.com/gurio-wine/dsh-account-hub.g
 | 域名 | `dsh_account_hub`（⚠️ storage 只接受 `^[a-z][a-z0-9_]*$`，**连字符不合法**，故与插件 id 形态不同） |
 | 布局 | `single` + 一个 global 单例文档（无表）—— 账号池数据量小且整体读写 |
 | 落盘 | `$DSH_HOME/storages/dsh_account_hub.json` |
-| 字段 | `accounts` / `disabledModels` / `contextBudgets` / `checkins` / `consumption` / `consumptionCursors` / `schemaVersion` / `providerAuditVersion`（**八件套**） |
+| 字段 | `accounts` / `disabledModels` / `contextBudgets` / `checkins` / `consumption` / `consumptionCursors` / `autoRoute` / `schemaVersion` / `providerAuditVersion`（**九件套**） |
 
 **为什么搬**：DSH v0.1.7-alpha.1 删除了 `ctx.settings.register(ns, schema) → owner scope`
 整套 seam。插件走的是优雅降级分支，因此**不抛错、静默全空** —— 用户看到「所有账号
@@ -227,7 +227,7 @@ settings 写入目标是 profile 的 `cordis.patch.yml`（配置）。storage �
   的 provider 发查询请求** —— 没开那一档的 provider 一次网络请求都不会多打。
   缓存有三条填充路径，缺一就会「配了最高优先却一直用第一个账号」：启动 + 每 4h
   定时刷新、**切到该档时立刻补刷**、以及打开面板 / 点「刷新积分」时顺手回写。
-- 细节（八件套串接、轮次键、锁上限、降级语义）见 `docs/agents/account-hub-storage.md`
+- 细节（九件套串接、轮次键、锁上限、降级语义）见 `docs/agents/account-hub-storage.md`
   的「账号消耗顺序与切换粒度」与「provider 体检迁移」。
 
 > **与上方「账号顺序」的关系**：两者是**两个维度**，不是两套并行机制。
@@ -391,6 +391,40 @@ openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
 `qoder` 与 `qoder-cn`（Qoder 的**两个 region**，见
 [Qoder provider](#qoder-providerqoder)）。
 七者互不覆盖，可同时使用。
+
+此外还有一个**虚拟路由 `auto-route`（自动路由）**，见下节。它默认关闭，且与上面七个
+不同：它自己不持有任何凭据，只是把请求转发给你指定的真实 provider。
+
+### 自动路由（auto-route）
+
+把若干 `(provider, model, 可选思考档)` 候选按**优先级**排成一个「自动模型」，
+在 Account Hub 设置页里配好之后，它就会作为**一个模型**出现在 DSH 的模型选择器里。
+发请求时按顺序取队首条目委派给真实 provider，**失败者被移到队尾**（跨请求持续），
+降级后新队首立刻顶替 —— 成功不升位、不探活、不主动恢复。
+
+- **配置面**：Account Hub 面板（`autoroute.get` / `autoroute.set`），存在账号池的
+  `autoRoute` 字段里。总开关**默认关闭**；关着时 `auto-route` 从 provider 列表与
+  模型下拉里一并消失（面板里照常可编辑）。
+- **开启后本插件七个直连 provider 从 DSH 模型目录隐藏**（反向门控）：打开开关就是在
+  说「以后走自动路由」，故 `codearts` / `buddy-cn` / `buddy` / `lobsterai` /
+  `trae-cn` / `qoder` / `qoder-cn` 一并从下拉里消失（**面板仍可编辑**，候选目录走
+  的是另一条不受门控的路径）。关掉开关即恢复。
+- **降级是轮转，不是淘汰**：一次请求最多把每个候选试一遍；**已产出内容之后**失败
+  不硬换 provider（否则同一条流里会出现两段开头），而是**透传失败交给 DSH 官方重试** ——
+  用户在界面上看到的是**一条正常重试**，而重试的**新一轮请求从新队首开始**。
+- **用户取消（aborted）绝不降级**：换一个 provider 继续跑等于无视取消动作。
+- **全部条目都失败**时，用户看到一次中文错误「自动模型『…』全部条目不可用」，
+  且**只出现一次**（本路由显式声明了重试策略，不把一轮全失败放大成五轮）。
+- **运行时状态不落盘**：进程重启回到你手排的原始顺序 —— 你排的顺序是意图，运行时
+  轮转只是本次进程内的临时偏移。在面板里改候选顺序会让运行时立即归位。
+- **思考档**：条目里配了档位就用条目的（自动模型 = provider + model + 档位的打包语义）；
+  没配就用你在界面上实时选的那一档。
+
+转发时会重写历史消息的来源 provider（思考模式下工具调用轮依赖 provider 侧签名，
+不重写会让 replayState 被摘掉、下一轮 400），并保留目标模型的上下文窗口与输出上限。
+实现细节、降级语义的逐条对应与重试实测结论见
+`docs/agents/auto-route-runtime.md`；配置面（存储字段与 RPC）见
+`docs/agents/account-hub-storage.md` 的「自动路由（配置面）」。
 
 > ℹ️ **曾经的第八个路由（TraeWork 网页协议那条路径）已于 `47bd690` 整体移除**：
 > 官方把 Work 侧模型合并进通用通道，`trae-cn` 一条通道即可覆盖（真机实拉动态目录

@@ -215,7 +215,9 @@ export async function migrateAccountHubIntoStorage(
   const document: AccountHubDocument = {
     // 从空文档起步再逐字段覆盖：加字段时这里**不可能漏**（漏了就是 undefined，
     // 而 storage 的 sanitize 会把 undefined 读成默认值 —— 体检版本号一旦这样
-    // 丢掉，体检就会在每次启动重跑）。旧来源里没有的字段一律保留空文档的默认值。
+    // 丢掉，体检就会在每次启动重跑；自动路由一旦这样丢掉，用户配好的自动模型
+    // 会在首次迁移后整组消失）。旧来源里没有的字段一律保留空文档的默认值
+    // —— 对 `autoRoute` 就是「默认关闭 + 空列表」，即功能未启用。
     ...emptyAccountHubDocument(),
     accounts: section.accounts,
     disabledModels: section.disabledModels,

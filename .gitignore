@@ -1,4 +1,4 @@
-﻿docs/superpowers
+docs/superpowers
 node_modules/
 lib/
 *.tsbuildinfo
@@ -10,6 +10,7 @@ lib/
 .tmp-*.mjs
 tests/e2e/*.mjs
 tests/e2e/*-evidence.json
+tests/e2e/qoder-desktop-*.json
 .atomcode/
 .deveco/
 -1

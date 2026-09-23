@@ -13,6 +13,7 @@ import { LobsteraiAuth } from './lobsterai-auth.js'
 import { TraeCnAuth } from './trae-cn-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
+import { createAutoRouteRegistration } from './auto-route-adapter.js'
 import { TurnKeyTracker } from './account-consumption.js'
 import { createContextTierRegistry } from './context-tiers.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
@@ -936,6 +937,40 @@ export function apply(ctx: Context): void {
     } catch { /* 静默 */ }
   })
 
+  // ===== 自动路由（聚合 provider）=====
+  //
+  // 聚合适配器与「配置面」的分工：配置（哪些自动模型、候选顺序）由用户在 Account Hub
+  // 面板里改、落在池的 `autoRoute` 字段；本段负责把它接上 DSH 的模型目录与请求转发。
+  //
+  // 生命周期（注册 / 按开关休眠唤醒 / 运行时归位 / 内容幂等门）整段在
+  // `createAutoRouteRegistration` 里，本段只做两件事：给出「读当前配置」这个来源，
+  // 以及把它挂上启动链与 RPC 通知。
+  //
+  // ## 注册是**按需**的（与另外七个 register*Llm 的关键差别）
+  //
+  // 另外七个在 `apply()` 里一次性注册且永不撤销。自动路由不行：它默认**关着**，而
+  // 一个注册着的 provider 即使 `listModels` 返回 `[]`，仍会出现在
+  // `listProviders()` 里 —— 于是「关掉自动路由」并不能让它从 provider 列表里消失。
+  // 故按开关**休眠/唤醒**（关着 = 零路由），细节见 `createAutoRouteRegistration`。
+  //
+  // ## 为什么配置来源是 `() => pool.autoRouteConfig()`
+  //
+  // 适配器的 `listModels` / `resolveModel` 每次现读，不做缓存 —— 用户改了自动模型，
+  // 下一轮目录刷新就该看到，不存在「忘了重建」的窗口。运行时（降级队列）不能现读
+  // （它有状态），故由刷新函数按**内容指纹**决定何时重建。
+  const ensureAutoRouteRegistration = createAutoRouteRegistration(ctx, () => pool.autoRouteConfig())
+  // 启动链：`openStorage()` 完成后调用（在那之前读到的是旧 settings 快照或空表，
+  // 据此注册会把开关状态判错）。异步注册合法（`ctx.effect` 只要求 fiber 活着）。
+  void pool.openStorage().then(() => {
+    try {
+      ensureAutoRouteRegistration()
+    } catch (error: unknown) {
+      ctx.logger.warn(`[account-hub] 自动路由注册失败（该功能本次不可用）：${String(error)}`)
+    }
+  }).catch((error: unknown) => {
+    ctx.logger.warn(`[account-hub] 自动路由启动注册未能等到 storage 就绪：${String(error)}`)
+  })
+
   // ===== Account Hub RPC 注册 =====
   // 参数次序照既有惯例：provider 服务的排列顺序与上面注册顺序一致，
   // 新增的 `qoderCn` 排在尾（`qoder` 之后）；其后的两个可选实参都是
@@ -986,6 +1021,9 @@ export function apply(ctx: Context): void {
   }
   registerAccountHubRpc(
     ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTierRegistry, modelAdapters,
+    // 第 12 个实参：`autoroute.set` 成功后的配置变更通知 —— 让聚合适配器的降级队列
+    // 与用户刚改的候选顺序归位（内容幂等，重复调用无副作用）。
+    ensureAutoRouteRegistration,
   )
   ctx.provide('accountPool', pool)
 

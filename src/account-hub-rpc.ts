@@ -10,6 +10,7 @@
  *           credits.status / credits.claimAll / credits.balances /
  *           credits.checkinStatus / checkin.perform / checkin.sweep /
  *           consumption.get / consumption.set /
+ *           autoroute.get / autoroute.set / autoroute.catalog / autoroute.model-info /
  *           model.list / model.setDisabled / model.setContextBudget
  */
 
@@ -112,7 +113,15 @@ import type {
   RpcModelSetDisabledResponse,
   RpcModelSetContextBudgetRequest,
   RpcModelSetContextBudgetResponse,
+  RpcAutoRouteGetResponse,
+  RpcAutoRouteSetRequest,
+  RpcAutoRouteSetResponse,
+  RpcAutoRouteCatalogProvider,
+  RpcAutoRouteCatalogResponse,
+  RpcAutoRouteModelInfoRequest,
+  RpcAutoRouteModelInfoResponse,
 } from './types.js'
+import { AUTO_ROUTE_PROVIDER_ID, type AutoRouteDefinition } from './auto-route.js'
 
 /** Account Hub RPC API 路径 */
 export const ACCOUNT_HUB_API_PATH = '/api/account-hub'
@@ -1191,10 +1200,32 @@ export async function refreshConsumptionBalances(
  *
  * 用 `ctx.get` 而不是 `inject`：Account Hub 的账号管理是主要职责，模型开关只是
  * 附加能力；llm 服务缺失时账号面板仍应可用，只是「显示列表」按钮报错。
+ *
+ * ⚠️ 这里声明的是**本模块用到的最小面**（`listProviders` / `listModels` /
+ * `resolveModelInfo`），不是 `LlmRuntime` 的完整接口 —— 结构类型只按需取用，
+ * 宿主加方法不会波及本文件。
  */
-function llmServiceOf(ctx: Context): { listModels(provider: string): Promise<Array<{ id: string; name: string }>> } | undefined {
+function llmServiceOf(ctx: Context): {
+  listProviders(): Array<{ id: string; name: string }>
+  listModels(provider: string): Promise<Array<{ id: string; name: string }>>
+  resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<{
+    reasoning?: {
+      efforts: ReadonlyArray<{ id: string; name: string }>
+      defaultEffort?: string
+    }
+  }>
+} | undefined {
   return ctx.get('llm') as
-    | { listModels(provider: string): Promise<Array<{ id: string; name: string }>> }
+    | {
+      listProviders(): Array<{ id: string; name: string }>
+      listModels(provider: string): Promise<Array<{ id: string; name: string }>>
+      resolveModelInfo(provider: string, model: string, signal?: AbortSignal): Promise<{
+        reasoning?: {
+          efforts: ReadonlyArray<{ id: string; name: string }>
+          defaultEffort?: string
+        }
+      }>
+    }
     | undefined
 }
 
@@ -1540,6 +1571,12 @@ function busyCheckinPerformResponse(provider: string): RpcCheckinPerformResponse
  *        目录门控**的完整目录，使被关闭的模型也显示正确的展示名（含倍率）而不是
  *        退化成裸 id。省略时退化为「`listModels` 结果 + 黑名单裸 id 回补」的历史
  *        行为（同样是 headless / 测试的既定降级）。
+ * @param onAutoRouteChanged - 可选的**配置变更通知**（`autoroute.set` 成功后调用）。
+ *        自动路由的运行时（降级队列）由聚合适配器持有，而配置写入发生在池上 ——
+ *        没有这条通知，用户在面板里改了候选顺序后，适配器仍握着**旧队列**：新加的
+ *        候选永远轮不到、删掉的还会被使用，且没有任何报错。由 `src/index.ts` 传
+ *        `ensureAutoRouteRegistration`（它内部做内容幂等，重复调用无副作用）。
+ *        省略时（headless / 测试）配置照常写入，只是运行时不在本进程内。
  */
 export function registerAccountHubRpc(
   ctx: Context,
@@ -1553,11 +1590,12 @@ export function registerAccountHubRpc(
   qoderCn: QoderAuth,
   contextTiers?: ContextTierRegistry,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
+  onAutoRouteChanged?: () => void,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
     registerAccountHubEndpoints(
       connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn,
-      contextTiers, modelAdapters,
+      contextTiers, modelAdapters, onAutoRouteChanged,
     )
   })
 }
@@ -1575,6 +1613,7 @@ function registerAccountHubEndpoints(
   qoderCn: QoderAuth,
   contextTiers: ContextTierRegistry | undefined,
   modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
+  onAutoRouteChanged: (() => void) | undefined,
 ): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
@@ -2704,6 +2743,189 @@ function registerAccountHubEndpoints(
           consumption: pool.consumptionSetting(req.provider),
         }
         return { ok: true, value }
+      }
+
+      // 读**自动路由配置**（面板打开时拉一次）。
+      //
+      // ⚠️ 刻意**不收 `provider`**：自动路由是全局配置（虚拟 provider `auto-route`
+      // 的模型列表由它派生），不属于任何真实 provider。照抄 consumption.get 的
+      // `{ provider }` 形态会误导客户端以为配置按 provider 分。
+      //
+      // 返回值经 `sanitizeAutoRouteConfig`（池内已做一次，这里不重复）：池的
+      // `autoRouteConfig()` 本身就返回深拷贝，客户端改它不会串到池内状态。
+      case 'autoroute.get': {
+        const config = pool.autoRouteConfig()
+        const value: RpcAutoRouteGetResponse = {
+          enabled: config.enabled,
+          models: config.models,
+        }
+        return { ok: true, value }
+      }
+
+      // 写自动路由配置。**部分更新**：只改传进来的字段（界面上的总开关与自动模型
+      // 列表彼此独立，整体覆盖会让一个标签页的过期状态把另一个标签页刚改的字段
+      // 冲掉）。`models` 是整组替换，理由见 {@link RpcAutoRouteSetRequest}。
+      //
+      // ⚠️ **目录侧不需要重建、运行时侧需要**（两者容易混为一谈）：
+      // - `listModels` / `resolveModel` 实时读池里的配置，故模型列表下一轮目录刷新
+      //   即生效（与 model.setDisabled 同款取舍）；
+      // - 但**降级队列**是聚合适配器持有的进程内状态，必须经 `onAutoRouteChanged`
+      //   重建 —— 否则用户改了候选顺序，运行时仍按旧顺序转发。
+      case 'autoroute.set': {
+        // ⚠️ **畸形顶层必须在这里挡掉**：`payload as RpcAutoRouteSetRequest` 之后，
+        // `req?.enabled` / `req?.models` 在 `42` / `"x"` / `null` 上全都读成
+        // `undefined`，于是 `writeAutoRoute({enabled: undefined, models: undefined})`
+        // 走「两字段都不给 = 无操作」的合法分支并回 `ok: true` —— 用户点保存拿到
+        // 「成功」，配置一字未动，且没有任何可排查的痕迹。
+        // 守卫风格对照上面的 `consumption.set`（同样是「先验形状，再交给池校验取值域」）。
+        if (typeof payload !== 'object' || payload === null) {
+          return { ok: false, error: { code: 'bad-request', message: '自动路由配置必须是对象' } }
+        }
+        const req = payload as RpcAutoRouteSetRequest
+        try {
+          // 类型层面放宽成 `unknown` 是刻意的：这是**来自客户端的不可信输入**，
+          // 取值域校验的唯一权威在 `AccountPool.writeAutoRoute`（它抛出的那句
+          // 中文错误直接回给用户）。在这里先断言成 `AutoRouteDefinition[]` 只会
+          // 把「校验」伪装成「类型安全」—— 客户端照样可以发任意结构。
+          await pool.writeAutoRoute({
+            enabled: req?.enabled as boolean | undefined,
+            models: req?.models as AutoRouteDefinition[] | undefined,
+          })
+        } catch (error) {
+          // 非法配置：把池那句点名「哪个定义 / 哪个字段」的原文回给客户端 ——
+          // 那是用户唯一能据以改正的信息（与 consumption.set 的取舍一致）。
+          return {
+            ok: false,
+            error: {
+              code: 'bad-request',
+              message: error instanceof Error ? error.message : String(error),
+            },
+          }
+        }
+        const written = pool.autoRouteConfig()
+        ctx.logger.info(
+          `[account-hub] 自动路由配置更新：${written.enabled ? '已启用' : '已停用'}，`
+          + `${written.models.length} 个自动模型`,
+        )
+        // 通知宿主重建运行时（降级队列归位）。**fire-and-forget 且自吞异常**：
+        // 配置已经写成功了，这条通知只是让运行时不落后于配置 —— 它的失败绝不能
+        // 让用户看到「保存失败」（那会促使他再点一次保存，而配置其实早就对了）。
+        // 不 await 也不进 try：回调本身被要求同步返回，重活（重建队列）在它内部。
+        if (onAutoRouteChanged !== undefined) {
+          try {
+            onAutoRouteChanged()
+          } catch (error) {
+            ctx.logger.warn(`[account-hub] 自动路由运行时刷新失败（配置已写入，运行时下一轮自愈）：${String(error)}`)
+          }
+        }
+        const value: RpcAutoRouteSetResponse = {
+          enabled: written.enabled,
+          models: written.models,
+        }
+        return { ok: true, value }
+      }
+
+      // 读**供应商 × 模型两级目录**（编辑器选择候选时拉一次）。
+      //
+      // 与 `autoroute.get` 的分工：那条读的是**用户配好的自动路由配置**，这条读的是
+      // **可被选中的全集**（DSH 内置 provider + 本插件七个 provider）。两者数据源
+      // 完全不同（池里的文档 vs. `ctx.llm` 的实时注册表），不要合并成一条。
+      //
+      // ⚠️ **必须排除 `auto-route` 自身**：把虚拟 provider 列进它自己的候选，用户
+      // 就能配出「自动路由委派给自动路由」——写路径会拒（`assertValidAutoRouteConfig`
+      // 的自引用判据），但让编辑器先把它显示出来再报错是更差的体验。排除判据与
+      // `src/auto-route.ts` 同源（同一个常量），不在这里另写一份字符串。
+      //
+      // ⚠️ **数据源是混合的，且必须如此**（2026-09-23 修复「开启自动路由后选不到本
+      // 插件模型」）：本插件适配器的 `listModels` 套 `providerCatalogVisible`，而该
+      // 门控的第 ⓪ 条正是「自动路由开着 → 本插件其它 provider 从 DSH 目录隐藏」
+      // （对话框里隐藏它们是需求本身）。若这里照旧逐个 `await llm.listModels(id)`，
+      // 用户一开总开关，本插件七个 provider **全部返回 `[]`** ⇒ 编辑器里一个模型都
+      // 选不出来，「加候选」这个动作直接死掉。故：
+      //   - `modelAdapters` 里有条目的 provider（本插件七个）→ 走适配器实例的
+      //     `listAllModels()`。判法与 `model.list` **完全同源**（同一张注入映射、
+      //     同一个 `?.` 取法），不另写一套「是不是本插件 provider」的白名单；
+      //   - 没有条目的（DSH 内置 / 其它插件）→ 回落 `ctx.llm.listModels()`。它们
+      //     不经过本插件门控，天然安全，且那条路还负责拉远端目录（`listAllModels`
+      //     是同步只读缓存的，不会触发 IO）。
+      // ⚠️ **不套黑名单是刻意的**：`disabledModels` 只影响播报（见 AGENTS.md 的
+      // 「账号池与模型列表」），被用户关掉的模型当然仍可当自动路由的候选。
+      case 'autoroute.catalog': {
+        const llm = llmServiceOf(ctx)
+        if (llm === undefined) {
+          return { ok: false, error: { code: 'bad-request', message: 'llm 服务不可用' } }
+        }
+        const providers: RpcAutoRouteCatalogProvider[] = []
+        for (const provider of llm.listProviders()) {
+          if (provider.id === AUTO_ROUTE_PROVIDER_ID) continue
+          let models: Array<{ id: string; name: string }> = []
+          try {
+            // ⚠️ 逐 provider 收窄失败面：适配器抛错、远端目录超时都只让**这一组**
+            // 空着 —— 一个供应商的远端不可达不该让编辑器连别的供应商都看不到。
+            // （本插件 provider 因「无已登录账号」的目录门控返回 `[]` 走的是上面
+            // 适配器那一支，不再经过这里。）
+            const adapter = modelAdapters?.[provider.id]
+            models = adapter === undefined
+              ? (await llm.listModels(provider.id)).map((model) => ({ id: model.id, name: model.name }))
+              : adapter.listAllModels().map((model) => ({ id: model.id, name: model.name }))
+          } catch (error) {
+            ctx.logger?.warn?.(
+              `[account-hub] 读取 ${provider.id} 的模型目录失败（该供应商本次记为空列表）：${String(error)}`,
+            )
+          }
+          providers.push({ id: provider.id, name: provider.name, models })
+        }
+        return { ok: true, value: { providers } satisfies RpcAutoRouteCatalogResponse }
+      }
+
+      // 读**单个模型的档位**（编辑器选中某模型时按需拉）。
+      //
+      // ⚠️ **尽力而为，永不报错**：无 `reasoning` 元数据（CodeArts 全系）、provider
+      // 不认这个模型、适配器抛错 —— 三种都回 `{}`。这里的 `{}` 是**正常结果**
+      // （编辑器据此显示「该模型无档位可选」），报错会让它显示成「加载失败」，
+      // 把「这个模型本来就没有档位」误导成「查询坏了」。
+      //
+      // 档位刻意**不随 `autoroute.catalog` 一起返回**：那要逐个模型问适配器，会把
+      // 一次面板打开变成几十次查询，故编辑器按需拉。
+      case 'autoroute.model-info': {
+        const req = payload as RpcAutoRouteModelInfoRequest
+        // 校验走既有 handler-failed 模式（`throw` 由端点外层包成
+        // `account-hub/handler-failed`），与 `model.setContextBudget` 的 bad-request
+        // 分支不同 —— 这里的入参是**编辑器自己填的**，非法即客户端 bug，回原文更有用。
+        if (typeof req?.provider !== 'string' || req.provider.length === 0) {
+          throw new Error('provider 必填')
+        }
+        if (typeof req.model !== 'string' || req.model.length === 0) {
+          throw new Error('model 必填')
+        }
+        // 防递归查询：`auto-route` 的 `resolveModelInfo` 会回到本插件自己的聚合
+        // 适配器上，而那条路径正是这次查询的发起方。直接回 `{}` 断掉回路。
+        if (req.provider === AUTO_ROUTE_PROVIDER_ID) {
+          return { ok: true, value: {} satisfies RpcAutoRouteModelInfoResponse }
+        }
+        const llm = llmServiceOf(ctx)
+        if (llm === undefined) {
+          return { ok: true, value: {} satisfies RpcAutoRouteModelInfoResponse }
+        }
+        try {
+          const info = await llm.resolveModelInfo(req.provider, req.model)
+          const reasoning = info?.reasoning
+          if (reasoning === undefined || reasoning.efforts.length === 0) {
+            return { ok: true, value: {} satisfies RpcAutoRouteModelInfoResponse }
+          }
+          const value: RpcAutoRouteModelInfoResponse = {
+            efforts: reasoning.efforts.map((effort) => effort.id),
+            // `defaultEffort` 缺席 = 用 provider 自己的默认档，**不补一个猜测值**：
+            // 编造默认档会让编辑器把「没配」显示成「配了某一档」。
+            ...reasoning.defaultEffort === undefined ? {} : { defaultEffort: reasoning.defaultEffort },
+          }
+          return { ok: true, value }
+        } catch (error) {
+          ctx.logger?.warn?.(
+            `[account-hub] 读取 ${req.provider}/${req.model} 的档位失败（编辑器显示为无档位可选）：${String(error)}`,
+          )
+          return { ok: true, value: {} satisfies RpcAutoRouteModelInfoResponse }
+        }
       }
 
       // 打开/关闭某个模型。写入后**不重建适配器**：适配器的 listModels 每次

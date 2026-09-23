@@ -75,7 +75,7 @@ describe('账号池 storage 域的域名与版本', () => {
 })
 
 describe('emptyAccountHubDocument', () => {
-  it('空文档是八件套齐全的空表，而不是缺字段的部分对象', () => {
+  it('空文档是九件套齐全的空表，而不是缺字段的部分对象', () => {
     expect(emptyAccountHubDocument()).toEqual({
       accounts: [],
       disabledModels: {},
@@ -84,6 +84,9 @@ describe('emptyAccountHubDocument', () => {
       // 「消耗顺序 / 切换粒度」及其遍历游标（比签到更晚加入的两个字段）。
       consumption: {},
       consumptionCursors: {},
+      // 自动路由配置（第九件，唯一真相源在 src/auto-route.ts）：默认**关闭** +
+      // 空列表 —— 新功能默认关，用户显式打开才生效。
+      autoRoute: { enabled: false, models: [] },
       schemaVersion: 0,
       // provider 体检的独立闸门（0 = 尚未体检；与 schemaVersion 刻意分开，
       // 合并过一次直接导致体检永远 short-circuit）。

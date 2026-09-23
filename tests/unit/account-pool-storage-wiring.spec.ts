@@ -151,7 +151,7 @@ describe('AccountPool × storage —— storage 为主', () => {
     expect(pool.schemaVersion).toBe(1)
   })
 
-  it('写入走 storage 的 global.set，且一次写入包含八件套', async () => {
+  it('写入走 storage 的 global.set，且一次写入包含九件套', async () => {
     const mock = createMockStorage()
     const ctx = createMockContext({ storage: mock.storage })
     const pool = new AccountPool(ctx as never)
@@ -165,6 +165,8 @@ describe('AccountPool × storage —— storage 为主', () => {
       checkins: {},
       consumption: {},
       consumptionCursors: {},
+      // 第九件：自动路由配置（默认关闭 + 空列表；唯一真相源在 src/auto-route.ts）。
+      autoRoute: { enabled: false, models: [] },
       schemaVersion: 0,
       // 第八件：provider 体检的独立闸门（0 = 尚未体检）。
       providerAuditVersion: 0,

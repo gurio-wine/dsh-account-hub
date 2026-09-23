@@ -423,6 +423,118 @@ export interface RpcModelSetContextBudgetResponse {
   contextBudget?: number
 }
 
+/**
+ * ========================================
+ * 自动路由（配置面）
+ * ========================================
+ *
+ * 纯逻辑与全部判据的唯一真相源是 `src/auto-route.ts`（含 `AutoRouteConfig` /
+ * `AutoRouteDefinition` / 默认值与校验函数）。这里**重导出**那两个类型而不是另写
+ * 一份同形接口：两份定义一旦漂移，RPC 的落盘形态与适配器读取的形态就会静默错位。
+ */
+
+/** 自动路由配置与自动模型定义（见 `src/auto-route.ts`）。 */
+export type { AutoRouteConfig, AutoRouteDefinition, AutoRouteEntry } from './auto-route.js'
+
+/**
+ * RPC: `autoroute.get` 请求。
+ *
+ * **无字段**：自动路由是全局配置（不属于任何 provider），故没有 `provider` 参数
+ * —— 不要为「形态统一」照抄 consumption.get 的 `{ provider }`，那会让客户端
+ * 以为配置是按 provider 分的。
+ */
+export type RpcAutoRouteGetRequest = Record<string, never>
+
+/** RPC: `autoroute.get` 响应（永远是完整的权威配置，不会是 undefined）。 */
+export interface RpcAutoRouteGetResponse {
+  enabled: boolean
+  models: import('./auto-route.js').AutoRouteDefinition[]
+}
+
+/**
+ * RPC: `autoroute.set` 请求（**部分更新**）。
+ *
+ * 两个字段都可选：界面上的总开关与自动模型列表彼此独立，各自只发自己那一个。
+ *
+ * ⚠️ `models` 是**整组替换**语义（不是逐条合并）：定义有序、`entries` 的顺序
+ * 就是候选优先级，逐条合并无法表达「删除一条」与「挪到队首」。客户端提交的是
+ * 完整的目标列表。
+ */
+export interface RpcAutoRouteSetRequest {
+  enabled?: boolean
+  models?: import('./auto-route.js').AutoRouteDefinition[]
+}
+
+/** RPC: `autoroute.set` 响应（回传写入后的**权威**配置，供客户端对齐界面状态）。 */
+export interface RpcAutoRouteSetResponse {
+  enabled: boolean
+  models: import('./auto-route.js').AutoRouteDefinition[]
+}
+
+/**
+ * RPC: `autoroute.catalog` 请求。
+ *
+ * **无字段**：与 `autoroute.get` 同款 —— 目录是**全部已注册 provider** 的聚合，
+ * 不属于任何单个 provider，故没有 `provider` 参数（编辑器一次拉全量，再本地筛选）。
+ */
+export type RpcAutoRouteCatalogRequest = Record<string, never>
+
+/**
+ * 目录里的一个模型条目。
+ *
+ * ⚠️ 刻意**只带 `{ id, name }`**：宿主 `LlmModelInfo` 还有 `provider` /
+ * `description` / `inputModalities`，编辑器一个都用不到；照抄出去等于把宿主的
+ * 字段名变成客户端的隐性契约，宿主加字段时这里会静默跟着变。
+ */
+export interface RpcAutoRouteCatalogModel {
+  id: string
+  name: string
+}
+
+/** 目录里的一个供应商（含它当前播报的全部模型）。 */
+export interface RpcAutoRouteCatalogProvider {
+  id: string
+  name: string
+  /** 该 provider 的模型列表；目录拉取失败时为**空数组**（不是省略字段）。 */
+  models: RpcAutoRouteCatalogModel[]
+}
+
+/**
+ * RPC: `autoroute.catalog` 响应（供应商 × 模型两级目录）。
+ *
+ * ⚠️ **不含 `auto-route` 自身**：把虚拟 provider 列进它自己的候选，用户就能配出
+ * 「自动路由委派给自动路由」的无限递归（与 `AutoRouteEntry.provider` 的排除判据
+ * 同源，见 `src/auto-route.ts` 的 `AUTO_ROUTE_PROVIDER_ID`）。
+ */
+export interface RpcAutoRouteCatalogResponse {
+  providers: RpcAutoRouteCatalogProvider[]
+}
+
+/**
+ * RPC: `autoroute.model-info` 请求（单个 provider/model 的档位查询）。
+ *
+ * 档位**不随目录一起返回**：档位要逐个模型问适配器（`resolveModelInfo`），
+ * 全量拉取会把一次面板打开变成几十次适配器查询，故编辑器按需（选中某模型时）拉。
+ */
+export interface RpcAutoRouteModelInfoRequest {
+  provider: string
+  model: string
+}
+
+/**
+ * RPC: `autoroute.model-info` 响应。
+ *
+ * 两个字段都可选且**可以同时缺席**：该模型没有档位（如 CodeArts 全系没有
+ * `reasoning` 元数据）时返回 `{}` —— 这是**正常结果**而不是错误，编辑器据此
+ * 显示「该模型无档位可选」。
+ */
+export interface RpcAutoRouteModelInfoResponse {
+  /** 可选档位 id（适配器偏好顺序）。 */
+  efforts?: string[]
+  /** 适配器配置的默认档；缺席 = 用 provider 自己的默认。 */
+  defaultEffort?: string
+}
+
 /** 存储在 CODEARTS_ACCESS_TOKEN 下的归一化临时凭据。 */
 export interface CodeArtsCredential {
   access_key_id: string
