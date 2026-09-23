@@ -567,8 +567,10 @@ describe('pruneAccountsWithForeignDomain', () => {
   /** WorkBuddy 国际版的判定目标：域名是 www.workbuddy.ai */
   const product = { id: 'buddy', apiDomain: 'www.workbuddy.ai' } as never
 
-  it('删除 domain 指向旧端点（中国版）的 WorkBuddy 账号', async () => {
+  it('domain 失配 → 保留账号与凭据，仅记警告不删除', async () => {
     const ctx = createMockContext()
+    const warn = vi.fn()
+    ctx.logger.warn = warn
     const pool = new AccountPool(ctx as never)
     await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_OLD'), JSON.stringify({
       access_token: 'AT', refresh_token: 'RT',
@@ -580,14 +582,22 @@ describe('pruneAccountsWithForeignDomain', () => {
       credentialRef: 'BUDDY_ACCOUNT_OLD', createdAt: Date.now(), refreshable: true,
     })
 
-    const removed = await pool.pruneAccountsWithForeignDomain(product)
+    const flagged = await pool.pruneAccountsWithForeignDomain(product)
 
-    expect(removed).toEqual(['workbuddy-old'])
-    expect(await pool.listAllAccounts()).toHaveLength(0)
+    // 机器不再静默销毁数据：账号与凭据都保留。
+    expect(flagged).toEqual(['workbuddy-old'])
+    expect(await pool.listAllAccounts()).toHaveLength(1)
+    expect(await ctx.credentials.resolve(credentialRef('BUDDY_ACCOUNT_OLD'))).toBeDefined()
+    // 记一条含 provider / accountId / domain 的警告，让用户可自行处理。
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0][0]).toContain('workbuddy-old')
+    expect(warn.mock.calls[0][0]).toContain('copilot.tencent.com')
   })
 
-  it('保留 domain 与新端点一致的 WorkBuddy 账号', async () => {
+  it('保留 domain 与新端点一致的 WorkBuddy 账号，且零警告', async () => {
     const ctx = createMockContext()
+    const warn = vi.fn()
+    ctx.logger.warn = warn
     const pool = new AccountPool(ctx as never)
     await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_NEW'), JSON.stringify({
       access_token: 'AT', refresh_token: 'RT',
@@ -603,12 +613,15 @@ describe('pruneAccountsWithForeignDomain', () => {
 
     expect(removed).toEqual([])
     expect(await pool.listAllAccounts()).toHaveLength(1)
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it('不触碰其他 provider 的账号', async () => {
     const ctx = createMockContext()
+    const warn = vi.fn()
+    ctx.logger.warn = warn
     const pool = new AccountPool(ctx as never)
-    // CodeBuddy 账号的 domain 也是 copilot.tencent.com，但不该被 WorkBuddy 的清理波及
+    // CodeBuddy 账号的 domain 也是 copilot.tencent.com，但不该被 WorkBuddy 的审计波及
     await ctx.credentials.set(credentialRef('BUDDY_CN_ACCOUNT_KEEP'), JSON.stringify({
       access_token: 'AT', refresh_token: 'RT',
       expires_at: String(Date.now() + 3_600_000),
@@ -623,10 +636,13 @@ describe('pruneAccountsWithForeignDomain', () => {
 
     expect(removed).toEqual([])
     expect(await pool.listAllAccounts()).toHaveLength(1)
+    expect(warn).not.toHaveBeenCalled()
   })
 
-  it('domain 为空的历史凭据保守保留（无法判定）', async () => {
+  it('domain 为空的历史凭据保守保留（无法判定，不告警）', async () => {
     const ctx = createMockContext()
+    const warn = vi.fn()
+    ctx.logger.warn = warn
     const pool = new AccountPool(ctx as never)
     await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_NODOMAIN'), JSON.stringify({
       access_token: 'AT', refresh_token: 'RT',
@@ -642,6 +658,7 @@ describe('pruneAccountsWithForeignDomain', () => {
 
     expect(removed).toEqual([])
     expect(await pool.listAllAccounts()).toHaveLength(1)
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it('凭据缺失时不删除（交给正常的「凭据未配置」报错路径）', async () => {
@@ -673,8 +690,10 @@ describe('pruneAccountsWithForeignDomain', () => {
     expect(await pool.listAllAccounts()).toHaveLength(1)
   })
 
-  it('混合场景：只删失配的，保留其余', async () => {
+  it('混合场景：失配的全部保留并在案，其余不动', async () => {
     const ctx = createMockContext()
+    const warn = vi.fn()
+    ctx.logger.warn = warn
     const pool = new AccountPool(ctx as never)
     for (const [ref, domain] of [
       ['BUDDY_ACCOUNT_A', 'copilot.tencent.com'],
@@ -691,12 +710,13 @@ describe('pruneAccountsWithForeignDomain', () => {
       })
     }
 
-    const removed = await pool.pruneAccountsWithForeignDomain(product)
+    const flagged = await pool.pruneAccountsWithForeignDomain(product)
 
-    expect(removed.sort()).toEqual(['buddy_account_a', 'buddy_account_c'])
-    const left = await pool.listAllAccounts()
-    expect(left).toHaveLength(1)
-    expect(left[0]!.id).toBe('buddy_account_b')
+    // 三条账号一条都不删。
+    expect(flagged.sort()).toEqual(['buddy_account_a', 'buddy_account_c'])
+    expect(await pool.listAllAccounts()).toHaveLength(3)
+    // 只对失配的两条各记一条警告。
+    expect(warn).toHaveBeenCalledTimes(2)
   })
 })
 

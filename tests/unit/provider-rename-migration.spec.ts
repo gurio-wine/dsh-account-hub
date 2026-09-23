@@ -674,17 +674,19 @@ describe('迁移失败不阻断启动', () => {
 })
 
 /**
- * 启动顺序不变量：**域名清理必须跑在迁移之后**。
+ * 启动顺序不变量：**域名审计必须跑在迁移之后**。
  *
  * 这两步都按 `entry.provider` 选账号，而 `buddy` 这个 id 前后指两个不同产品
  * （迁移前=中国版，迁移后=国际版）。若两者并行（例如都是 `void pool.xxx()`），
- * 清理会拿迁移**之前**的账号表去比对 `BUDDY.apiDomain`，把中国版账号
- * （domain=copilot.tencent.com）判成「失配」并**连凭据一起删掉**。
+ * 审计会拿迁移**之前**的账号表去比对 `BUDDY.apiDomain`，把中国版账号
+ * （domain=copilot.tencent.com）**误判**成「失配」。
  *
- * `src/index.ts` 因此把清理挂在迁移 Promise 的 `.then()` 里。本用例锁死这条
- * 顺序在**数据层**的必要性：先清理后迁移 = 删错账号。
+ * 保守语义下审计**不再删号**（只告警不删除），但误判仍会打出误导性警告，让用户
+ * 误以为国际版账号出了问题。`src/index.ts` 因此把审计挂在迁移 Promise 的
+ * `.then()` 里，避开在迁移之前的账号表上做判定的窗口。本用例锁死这条顺序在
+ * 数据层的内核：乱序仍会误判（但绝不删号和凭据），正序则零误判。
  */
-describe('启动顺序不变量：域名清理不能先于迁移', () => {
+describe('启动顺序不变量：域名审计不能先于迁移', () => {
   /** 中国版账号：domain 指向 copilot.tencent.com。 */
   const cnCredential = JSON.stringify({
     access_token: 'CN', refresh_token: 'RT',
@@ -711,31 +713,32 @@ describe('启动顺序不变量：域名清理不能先于迁移', () => {
     })
   }
 
-  it('反例（错误顺序）：清理先跑会把中国版账号连同凭据一起删掉', async () => {
+  it('反例（错误顺序）：审计先跑会把中国版账号误判成失配，但绝不再删号和凭据', async () => {
     const h = seed()
     const pool = makePool(h.ctx)
     const { BUDDY } = await import('../../src/product.js')
 
-    // 模拟「并行」：迁移尚未落盘，清理先读到旧表。
-    const removed = await pool.pruneAccountsWithForeignDomain(BUDDY)
+    // 模拟「并行」：迁移尚未落盘，审计先读到旧表。
+    const flagged = await pool.pruneAccountsWithForeignDomain(BUDDY)
 
-    // 迁移前的 `buddy` = 中国版，其 domain 与 BUDDY.apiDomain（国际版）不符。
-    expect(removed).toEqual(['buddy-cn-a'])
-    // 凭据被一起删掉 —— 这正是必须避免的破坏。
-    expect(h.credentials.has('BUDDY_ACCOUNT_CNA')).toBe(false)
+    // 迁移前的 `buddy` = 中国版，其 domain 与 BUDDY.apiDomain（国际版）不符 → 被误判。
+    expect(flagged).toEqual(['buddy-cn-a'])
+    // 保守语义兜底：**账号与凭据都保留**，不再发生数据丢失。
+    expect(h.credentials.has('BUDDY_ACCOUNT_CNA')).toBe(true)
+    expect((h.stored().accounts as ProviderAccountEntry[]).length).toBe(2)
   })
 
-  it('正例（正确顺序）：迁移先跑，清理不再误删中国版账号', async () => {
+  it('正例（正确顺序）：迁移先跑，审计既不误判也不触碰中国版账号', async () => {
     const h = seed()
     const pool = makePool(h.ctx)
     const { BUDDY } = await import('../../src/product.js')
 
-    // 与 src/index.ts 的 apply() 同序：迁移 → 清理。
+    // 与 src/index.ts 的 apply() 同序：迁移 → 审计。
     await migrateProviderNames(pool, h.ctx)
-    const removed = await pool.pruneAccountsWithForeignDomain(BUDDY)
+    const flagged = await pool.pruneAccountsWithForeignDomain(BUDDY)
 
-    // 迁移后 `buddy` 只指国际版；中国版已改名 `buddy-cn`，不再被它选中。
-    expect(removed).toEqual([])
+    // 迁移后 `buddy` 只指国际版；中国版已改名 `buddy-cn`，不再被它选中 → 零误判。
+    expect(flagged).toEqual([])
     // 两条账号与凭据都完好。
     expect(h.credentials.get('BUDDY_CN_ACCOUNT_CNA')).toBe(cnCredential)
     expect(h.credentials.has('BUDDY_ACCOUNT_INTLB')).toBe(true)

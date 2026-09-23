@@ -79,7 +79,9 @@ function parseModelInfo(m: Record<string, unknown>, seen: Set<string>): RemoteMo
   // 过滤视觉（VL）多模态模型
   // id 含 -VL- 或以 -VL 结尾（如 Qwen3-VL-235B），上下文小、不支持工具调用，
   // 不适合当 agent 主模型，从列表隐藏；只通过 analyzeImage 等工具间接调用。
-  if (id.includes('-VL-') || id.endsWith('-VL')) return undefined
+  // **大小写不敏感**：远端既下发大写（Qwen3-VL-235B）也下发小写（kimi-k2.6-vl），
+  // 两款都要滤掉，与 adapter 的 `listAllModels` 同款 `/i` 匹配（src/models.ts ↔ llm-adapter.ts）。
+  if (/-vl-/i.test(id) || /-vl$/i.test(id)) return undefined
   const rawName = m['model_name']
   const name = typeof rawName === 'string' && rawName.length > 0 ? normalizeModelId(rawName) : id
   if (seen.has(id)) return undefined

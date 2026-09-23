@@ -861,6 +861,10 @@ function ProviderPanel({ provider, rpcCall }) {
   // `checkin.perform` 响应局部更新。已签/未签判定只信宿主的 `checkedIn`，客户端
   // 不自己算今日纪元日数。
   const [checkinsByAccount, setCheckinsByAccount] = React.useState({});
+  // 签到状态是否已从宿主成功拉取并落地（`loadCheckinStatus` 写出后置真）。
+  // 自动补签的**前置闸**：只有先确认「哪些账号今日已签」才能决定要不要补签，
+  // 拉状态失败（不置真）时不自动签到，避免在无从判断的情况下误发补签请求。
+  const [checkinStatusLoaded, setCheckinStatusLoaded] = React.useState(false);
   /**
    * 弹窗被拦截时的**手动登录链接**（`{ url }` | null）。
    *
@@ -876,6 +880,13 @@ function ProviderPanel({ provider, rpcCall }) {
    * 闭包里的 accounts 还是初始空数组。ref 保证读到的是最新值。
    */
   const accountsRef = React.useRef([]);
+  // 签到是否进行中（自动补签与手动「一键签到」共用）：用 ref 镜像 claiming，
+  // 让挂载 effect 里的自动补签能读到**实时** busy 值（闭包里的 claiming 在挂载
+  // 时刻恒为初始 false），避免补签与用户刚点的手动签到并发各发一次 checkin.perform。
+  const claimingRef = React.useRef(false);
+  // 本面板是否已执行过自动补签：每次面板挂载只补一次（对应需求「每次进入 Hub」）。
+  // React.StrictMode 在 dev 会双执行挂载 effect，ref 挡住第二发。
+  const autoCheckinRanRef = React.useRef(false);
 
   const loadAccounts = React.useCallback(async () => {
     setPhase('loading');
@@ -1008,6 +1019,10 @@ function ProviderPanel({ provider, rpcCall }) {
         }
         setCheckinsByAccount(next);
       }
+      // 成功即置「签到状态已落地」——即使此刻 accountsRef 尚空（与 loadAccounts
+      // 并发竞态），也标记状态已可用，让自动补签的触发 effect 等账号列表就绪后
+      // 再动手；只有拉取失败才不置真，据此跳过自动补签。
+      if (mounted.current) setCheckinStatusLoaded(true);
     } catch (caught) {
       // 签到状态是可选的增强信息：拉不到不该让面板崩溃或报错，静默即可；
       // 头部按钮会按「全部未签」推出（allCheckedIn 恒 false），单签按钮正常可点。
@@ -1031,6 +1046,17 @@ function ProviderPanel({ provider, rpcCall }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider]);
 
+  // 自动补签触发点：只要本面板挂载、签到状态已落地（`checkinStatusLoaded`），
+  // 且账号列表可用，就对未签账号自动补一次 `checkin.perform`。
+  // 依赖 `checkinStatusLoaded` + `accounts`：前者守「拉状态成功才补签」，后者守
+  // 「账号列表就绪才补签」（与 loadAccounts 并发时可能先空后满，靠它补一次再触发）。
+  // **真正执行的幂等由 autoCheckinRanRef 保证**——该 ref 一旦置真就只会真补一次，
+  // `accounts` 数组在后续重渲染中换引用反复触发本 effect 也不会重复补签。
+  React.useEffect(() => {
+    if (checkinStatusLoaded) void autoCheckinOnEntry();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [checkinStatusLoaded, accounts]);
+
   // 积分领取状态：claiming 用于禁用按钮，claimNotice 展示上一次领取的结果摘要。
   const [claiming, setClaiming] = React.useState(false);
   const [claimNotice, setClaimNotice] = React.useState(null);
@@ -1050,6 +1076,8 @@ function ProviderPanel({ provider, rpcCall }) {
    */
   const claimCredits = async () => {
     if (!supportsCredits) return;
+    if (claimingRef.current) return;
+    claimingRef.current = true;
     setClaiming(true);
     setClaimNotice(null);
     try {
@@ -1073,6 +1101,7 @@ function ProviderPanel({ provider, rpcCall }) {
       if (!mounted.current) return;
       setClaimNotice({ tone: 'error', text: caught?.message || '领取积分失败' });
     } finally {
+      claimingRef.current = false;
       if (mounted.current) setClaiming(false);
     }
   };
@@ -1090,6 +1119,53 @@ function ProviderPanel({ provider, rpcCall }) {
     && accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true);
 
   /**
+   * 自动补签（需求：每次进入 Hub 页面时，未签账号要自动签到）。
+   *
+   * 语义对齐需求原文 —— 已签/签到成功都算已签：以 `checkinsByAccount`（由宿主的
+   * `checkedIn` 判定，客户端不算今日纪元）为准，只要列表非空且存在任一账号
+   * `checkedInToday !== true` 就**自动补一次** `checkin.perform({ provider })`
+   *（全量，不带 accountId，覆盖全部账号）。已签账号由宿主幂等归
+   * `already-claimed`，无害。**只有面板挂载时才触发一次**（见挂载 effect），
+   * 进入 Hub 页即该 provider 面板挂载时执行。
+   *
+   * 为什么是「进入页面自动补」而不是所有调用点：签到状态（`checkinStatus`）本来
+   * 就是零网络纯内存读，这里补签也只在成本可忽略时发生；手动「一键签到」已有
+   * `claimCredits`，两者共用 `claimingRef` 互斥，不会重复并发各发一次。
+   *
+   * 失败**静默**：自动补签不得弹打断性通知（用户只是进页面，不该被失败打断），
+   * 也不得把页面搞坏 —— catch 后仅刷新签到状态，让按钮态回到「未签」由用户
+   * 决定是否手动补。与手动的 `claimCredits`（会弹 claimNotice）刻意分开。
+   */
+  const autoCheckinOnEntry = async () => {
+    if (!supportsCredits) return;
+    if (autoCheckinRanRef.current) return;
+    // 账号列表为空 = 尚无可签对象（与 loadAccounts 并发时状态可能还没就绪）。
+    // **不置 ran**，触发 effect 会随账号列表就绪再次进来补判。
+    if (accounts.length === 0) return;
+    // 已全部签过就无需自动补签。
+    if (accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)) return;
+    // 走到这里才算真正发起过判定/补签，标记本面板只做这一次。
+    autoCheckinRanRef.current = true;
+    // 已有手动签到在跑（claimed 或单片 checkinAccount 都置 claiming），别并发。
+    if (claimingRef.current) return;
+    claimingRef.current = true;
+    if (mounted.current) setClaiming(true);
+    try {
+      await rpcCall('checkin.perform', { provider });
+    } catch (caught) {
+      // 自动补签失败：静默，仅记录，不弹 claimNotice、不破坏页面。
+      console.error('[account-hub] auto checkin failed:', caught);
+    } finally {
+      claimingRef.current = false;
+      if (!mounted.current) return;
+      setClaiming(false);
+      // 无论成功失败都重拉一次签到状态，让按钮态反映真实结果；成功时头部翻成
+      // 「全部已签」，失败时保留「一键签到」由用户决定是否手动补。
+      try { await loadCheckinStatus(); } catch { /* 状态刷新失败也静默 */ }
+    }
+  };
+
+  /**
    * 单账号签到（「签到」单片按钮）。
    *
    * 调 `checkin.perform` 携带 accountId；响应里的 `checkedInToday` 仅作参考，
@@ -1097,25 +1173,28 @@ function ProviderPanel({ provider, rpcCall }) {
    * 对服务端 already-claimed 也已写今日），失败/未开启不回写为「已签」，下次
    * 进入/触发重试。成功后局部更新该账号状态，并联动头部按钮（若全签则变「全部
    * 已签」禁用）。
+   *
+   * 注意：单片签到也会把 `claimingRef` 置真（用于与自动补签互斥），但只禁用它
+   * 自己的按钮、不置面板级 `claiming`（那只归头部「一键签到」与自动补签共用）。
    */
   const checkinAccount = async (accountId) => {
     if (!supportsCredits) return;
+    if (claimingRef.current) return;
+    claimingRef.current = true;
     setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: false, checking: true } }));
     try {
       const res = await rpcCall('checkin.perform', { provider, accountId });
       if (!mounted.current) return;
-      // 单账号响应带 results[].outcome（完整 object）：kind === 'claimed'（签到
-      // 成功）与 'already-claimed'（服务端今日已领）都算「今日已签」；inactive /
-      // failed **不写**，下次进入或触发重试（对齐设计 §2 宿主口径，失败不落「已签」）。
       const outcome = res?.results?.[0]?.outcome;
       const done = outcome?.kind === 'claimed' || outcome?.kind === 'already-claimed';
       setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: done, checking: false } }));
-      // 签到带起余额刷新（领取可能改变余额数字，与 claimCredits 同款）。
       if (canLoadCredits) void loadCredits();
     } catch (caught) {
       console.error('[account-hub] checkin failed:', caught);
       if (!mounted.current) return;
       setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: false, checking: false } }));
+    } finally {
+      claimingRef.current = false;
     }
   };
 

@@ -467,6 +467,42 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     expect(normalized).toContain('{ checkedInToday: Boolean(res.checkedIn?.[account.id]) }')
   })
 
+  it('进入 Hub 时自动补签：挂载后只要存在未签账号就自动调一次 `checkin.perform`', () => {
+    // 自动补签走全量 `checkin.perform({ provider })`（不带 accountId，覆盖全部账号）。
+    expect(normalized).toContain("rpcCall('checkin.perform', { provider })")
+    // 自动补签只在本面板挂载时触发一次：由「签到状态已落地」门控的 effect 驱动，
+    // 且用 autoCheckinRanRef 幂等防 StrictMode 双执行与重渲染重复触发。
+    expect(normalized).toContain('autoCheckinRanRef.current')
+    expect(normalized).toContain('setCheckinStatusLoaded(true)')
+    expect(normalized).toContain('checkinStatusLoaded) void autoCheckinOnEntry();')
+    expect(normalized).toContain('autoCheckinRanRef.current = true;')
+  })
+
+  it('自动补签跳过条件：账号列表为空 / 已全部签到 / 已有签到在跑都不发请求', () => {
+    // 账号为空：不置 ran、不发请求（等账号就绪后触发 effect 补判）。
+    expect(normalized).toContain('if (accounts.length === 0) return;')
+    // 已全部签过：不发请求。
+    expect(normalized).toContain("if (accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)) return;")
+    // 尚未真正发过判定/补签前不置 ran（保证账号就绪后能再进来补判一次）。
+    expect(normalized).toContain('autoCheckinRanRef.current = true;')
+    // 与手动签到（一键/单片）共用 claimingRef 互斥，避免并发各发一次。
+    expect(normalized).toContain('if (claimingRef.current) return;')
+  })
+
+  it('自动补签失败静默：不弹打断性通知，仅刷新签到状态', () => {
+    // 自动补签自己的 catch 只 console.error，不 setClaimNotice。
+    const start = normalized.indexOf('const autoCheckinOnEntry')
+    expect(start).toBeGreaterThan(-1)
+    const body = normalized.slice(start, start + 1400)
+    expect(body).toContain('console.error(\'[account-hub] auto checkin failed:\', caught);')
+    // 成功/失败后都重拉一次签到状态，让按钮态反映真实结果。
+    expect(body).toContain('await loadCheckinStatus();')
+    // 不弹 claimNotice（打断性通知）—— body 里不该出现 setClaimNotice。
+    expect(body).not.toContain('setClaimNotice')
+    // 自动补签与手动 claimCredits 共用 claimingRef：手动一键也走该 ref 互斥。
+    expect(normalized).toContain('claimingRef.current = true;')
+  })
+
   it('头部按钮文案改为「一键签到」，全签显示「全部已签」并禁用', () => {
     expect(normalized).not.toContain(": '一键领取积分'")
     expect(normalized).toContain(": '一键签到')")

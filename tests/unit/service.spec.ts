@@ -4,6 +4,17 @@ import { runLoginFlow, runOAuthFlow } from '../../src/login.js'
 import { RefreshTokenExpiredError, exchangeRefreshToken, generateDpopKeyPair, type TokenResponse } from '../../src/oauth.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from '../../src/service.js'
 import { AccountPool } from '../../src/account-pool.js'
+import { fetchCodeArtsRemoteModels, saveModelsCache, setMemoryCache } from '../../src/models.js'
+
+vi.mock('../../src/models.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/models.js')>()
+  return {
+    ...actual,
+    fetchCodeArtsRemoteModels: vi.fn(),
+    saveModelsCache: vi.fn(),
+    setMemoryCache: vi.fn(),
+  }
+})
 
 vi.mock('../../src/login.js', async (importOriginal) => ({
   // 两段式的 prepare 用真实实现（它只起本地回调服务器），
@@ -25,6 +36,13 @@ vi.mock('../../src/oauth.js', async (importOriginal) => {
 const mockedRunLoginFlow = vi.mocked(runLoginFlow)
 const mockedRunOAuthFlow = vi.mocked(runOAuthFlow)
 const mockedExchangeRefreshToken = vi.mocked(exchangeRefreshToken)
+const mockedFetchRemoteModels = vi.mocked(fetchCodeArtsRemoteModels)
+const mockedSaveModelsCache = vi.mocked(saveModelsCache)
+const mockedSetMemoryCache = vi.mocked(setMemoryCache)
+
+// refreshModels 依赖远端模型拉取的返回；所有用例默认拉取空（不写缓存），
+// 具体「返回非空 → 写缓存」的分支在专项用例里单独覆盖。
+mockedFetchRemoteModels.mockResolvedValue([])
 
 /** 所有已创建的 service；afterEach 统一 stop()，避免登录/刷新后 armed 的真实定时器泄漏。 */
 const services: CodeArtsAuth[] = []
@@ -369,5 +387,100 @@ describe('CodeArtsAuth silent refresh', () => {
     expect(await credentials.resolve(CODEARTS_CREDENTIAL_REF)).toBeUndefined()
     // 调度未被重新武装。
     expect(scheduleSpy).not.toHaveBeenCalled()
+  })
+})
+
+/** 构造一条 CodeArts 凭据 JSON（含 AK/SK 与可选的 refresh_token）。 */
+function codeartsCredentialJson(ak = 'AK', sk = 'SK', extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    access_key_id: ak, secret_access_key: sk, security_token: 'ST',
+    expires_at: '2026-12-31T00:00:00Z', refresh_token: 'RT', ...extra,
+  })
+}
+
+describe('CodeArtsAuth 模型刷新 — 凭据来源回退链', () => {
+  afterEach(() => {
+    mockedFetchRemoteModels.mockResolvedValue([])
+    mockedSaveModelsCache.mockClear()
+    mockedSetMemoryCache.mockClear()
+    mockedFetchRemoteModels.mockClear()
+  })
+
+  it('单凭据 ref（CODEARTS_ACCESS_TOKEN）可解析时直接用，不查账号池', async () => {
+    const { ctx, credentials } = makeContext()
+    // 账号池已注入（模拟 apply() 的 ctx.provide('accountPool', pool)）。
+    const pool = new AccountPool(ctx)
+    ctx.provide('accountPool', pool)
+    // 池里也有一条 codearts 账号（不应被用到，因为单凭据更优先）。
+    await pool.addAccount({
+      id: 'codearts-pool1', provider: 'codearts', nickname: 'p1', enabled: true,
+      credentialRef: 'CODEARTS_ACCOUNT_P1', refreshable: true, createdAt: 1,
+    })
+    // 单凭据路径写入有效 AK/SK。
+    await credentials.set(CODEARTS_CREDENTIAL_REF, codeartsCredentialJson('AK-SINGLE', 'SK-SINGLE'))
+    mockedFetchRemoteModels.mockResolvedValue([{ id: 'GLM-5.2', name: 'GLM-5.2' }])
+    const service = newService(ctx, { fetcher: mockFetcher })
+    const models = await service.refreshModels()
+    expect(models).toHaveLength(1)
+    // 接口以单凭据的 AK/SK 收到请求，而非账号池账号（池账号占用会因单凭据优先而未被 resolve）。
+    expect(mockedFetchRemoteModels).toHaveBeenCalledWith(
+      expect.objectContaining({ access_key_id: 'AK-SINGLE', secret_access_key: 'SK-SINGLE' }),
+      mockFetcher,
+    )
+    expect(mockedSaveModelsCache).toHaveBeenCalled()
+    expect(mockedSetMemoryCache).toHaveBeenCalled()
+  })
+
+  it('单凭据 ref 为空时，回退到账号池第一条可解析且启用的 codearts 凭据', async () => {
+    const { ctx } = makeContext()
+    // 池已注入；账号池账号写在 CODEARTS_ACCOUNT_P1。
+    const pool = new AccountPool(ctx)
+    ctx.provide('accountPool', pool)
+    await pool.addAccount({
+      id: 'codearts-p1', provider: 'codearts', nickname: 'p1', enabled: true,
+      credentialRef: 'CODEARTS_ACCOUNT_P1', refreshable: true, createdAt: 1,
+    })
+    await ctx.credentials.set('CODEARTS_ACCOUNT_P1', codeartsCredentialJson('AK-POOL', 'SK-POOL'))
+    // 单凭据 ref 未配置 → 应回退到账号池。
+    mockedFetchRemoteModels.mockResolvedValue([{ id: 'GLM-5.2', name: 'GLM-5.2' }])
+    const service = newService(ctx, { fetcher: mockFetcher })
+    const models = await service.refreshModels()
+    expect(models).toHaveLength(1)
+    expect(mockedFetchRemoteModels).toHaveBeenCalledWith(
+      expect.objectContaining({ access_key_id: 'AK-POOL', secret_access_key: 'SK-POOL' }),
+      mockFetcher,
+    )
+    expect(mockedSaveModelsCache).toHaveBeenCalled()
+  })
+
+  it('单凭据与账号池都没有可解析凭据时，不刷新、不写缓存', async () => {
+    const { ctx } = makeContext()
+    // 池已注入但没有任何账号。
+    ctx.provide('accountPool', new AccountPool(ctx))
+    mockedFetchRemoteModels.mockClear()
+    const service = newService(ctx, { fetcher: mockFetcher })
+    const models = await service.refreshModels()
+    expect(models).toEqual([])
+    expect(mockedFetchRemoteModels).not.toHaveBeenCalled()
+    expect(mockedSaveModelsCache).not.toHaveBeenCalled()
+    expect(mockedSetMemoryCache).not.toHaveBeenCalled()
+  })
+
+  it('账号池里的已停用账号持有效凭据也不参与候选（目录拉取只用可用账号）', async () => {
+    const { ctx } = makeContext()
+    const pool = new AccountPool(ctx)
+    ctx.provide('accountPool', pool)
+    // 已停用账号（enabled: false），且其凭据可解析、含 AK/SK。
+    await pool.addAccount({
+      id: 'codearts-disabled', provider: 'codearts', nickname: 'd', enabled: false,
+      credentialRef: 'CODEARTS_ACCOUNT_DISABLED', refreshable: true, createdAt: 1,
+    })
+    await ctx.credentials.set('CODEARTS_ACCOUNT_DISABLED', codeartsCredentialJson('AK-DISABLED', 'SK-DISABLED'))
+    mockedFetchRemoteModels.mockClear()
+    const service = newService(ctx, { fetcher: mockFetcher })
+    const models = await service.refreshModels()
+    expect(models).toEqual([])
+    expect(mockedFetchRemoteModels).not.toHaveBeenCalled()
+    expect(mockedSaveModelsCache).not.toHaveBeenCalled()
   })
 })

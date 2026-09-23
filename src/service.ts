@@ -376,13 +376,11 @@ export class CodeArtsAuth extends Service {
     })
   }
 
-  /** 启动时若已有可刷新凭据则安排模型刷新（由 apply 调用）。 */
+  /** 启动时若已有可解析凭据则安排模型刷新（由 apply 调用）。 */
   scheduleModelRefresh(): void {
     this.stopModelRefresh()
-    void this.ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF)).then((resolved) => {
-      if (!resolved) return
-      const credential = parseCredential(resolved.value)
-      if (!credential?.access_key_id || !credential?.secret_access_key) return
+    void this.resolveModelsCredential().then((credential) => {
+      if (credential === undefined) return
       void this.refreshModels()
       this.modelRefreshTimer = setInterval(() => void this.refreshModels(), MODEL_REFRESH_INTERVAL_MS)
       if (this.modelRefreshTimer?.unref) this.modelRefreshTimer.unref()
@@ -397,13 +395,48 @@ export class CodeArtsAuth extends Service {
     }
   }
 
+  /**
+   * 解析一个可用于拉取远端模型目录、且不含 refresh_token 流出到模型的凭据。
+   *
+   * 凭据来源**回退链**（账号池用户走 `CODEARTS_ACCOUNT_*`，单凭据用户走
+   * `CODEARTS_ACCESS_TOKEN`）：
+   * 1. 默认单凭据 ref（`CODEARTS_ACCESS_TOKEN`）可解析且含 AK/SK → 用之；
+   * 2. 否则从账号池的 codearts 条目里找**第一条可解析且含 AK/SK** 的凭据；
+   * 3. 仍找不到 → 返回 undefined（调用方不刷新、不写缓存）。
+   *
+   * 刻意不走 `AccountPool.getAvailableAccount`（它只选 **enabled** 账号、还可能被
+   * 限流过滤）：模型目录拉取只需**任意一条有效凭据**，与「发请求选号」语义不同；
+   * 也刻意不放宽到已停用账号 —— 停用账号的凭据可能已烂，用它拉目录纯属浪费网络。
+   *
+   * ⚠️ 依赖账号池仅在 `ctx.accountPool` 已注入（`src/index.ts` 在 `apply()` 里
+   * `ctx.provide('accountPool', pool)`）之后才可用 —— 本方法的调用点（启动定时
+   * 刷新、适配器懒加载）都发生在 `apply()` 完成后，故取不到时安全降级为 undefined。
+   */
+  private async resolveModelsCredential(): Promise<CodeArtsCredential | undefined> {
+    // 默认单凭据 ref — 单凭据登录（/codearts-login）的用户走这条路。
+    const resolved = await this.ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF))
+    if (resolved) {
+      const credential = parseCredential(resolved.value)
+      if (credential?.access_key_id && credential?.secret_access_key) return credential
+    }
+    // 账号池回退 — 多账号登录（Account Hub）的用户走这条路。
+    const pool = this.ctx.accountPool
+    const accounts = pool?.listAccountsByProvider('codearts') ?? []
+    for (const entry of accounts) {
+      if (!entry.enabled) continue
+      const entryResolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
+      if (!entryResolved) continue
+      const credential = parseCredential(entryResolved.value)
+      if (credential?.access_key_id && credential?.secret_access_key) return credential
+    }
+    return undefined
+  }
+
   /** 用当前凭据从远端拉取模型列表，非空时更新内存缓存与磁盘。返回模型列表（可能为空）。 */
   async refreshModels(): Promise<Array<{ id: string; name: string }>> {
     if (!this.active) return []
-    const resolved = await this.ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF))
-    if (!resolved) return []
-    const credential = parseCredential(resolved.value)
-    if (!credential?.access_key_id || !credential?.secret_access_key) return []
+    const credential = await this.resolveModelsCredential()
+    if (credential === undefined) return []
     const models = await fetchCodeArtsRemoteModels(credential, this.fetchImpl)
     if (models.length > 0) {
       setMemoryCache(models)

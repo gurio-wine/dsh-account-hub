@@ -757,20 +757,26 @@ export class AccountPool {
   }
 
   /**
-   * 清理「凭据域名与当前产品配置不符」的账号。
+   * 审计「凭据域名与当前产品配置不符」的账号，**只告警、不删除**。
    *
    * 用途：国际版 provider（`buddy`，www.workbuddy.ai）早年是中国版实现
    * （copilot.tencent.com），改造后旧账号存的仍是中国版凭据 —— 它们的
    * `token.domain` 指向旧端点，用新 endpoint 发请求必然失败（且会一直续期失败）。
-   * 这类条目已无修复价值，直接删除，让用户在 Account Hub 重新登录。
+   *
+   * ⚠️ **迷信删除是数据丢失事故的根因**：domain 失配的账号其凭据往往依然有效
+   * （例如国际版账号凭据里写着中国版时代遗留的 domain），直接连凭据一起删除会把
+   * 不可恢复的登录凭据销毁。因此这里**保留**账号与凭据，仅记一条含 provider /
+   * accountId / domain 的警告，交由用户自行判断与处理——机器不再静默销毁数据。
    *
    * 判据是**凭据里记录的 domain 与产品配置的 apiDomain 不一致**（而不是简单按
-   * provider 名删），这样只清理真正失配的条目，不会误删已在新端点登录的账号。
+   * provider 名），这样只圈定真正失配的条目，不会误伤已在新端点登录的账号。
+   * 凭据完全不可解析（缺失 / domain 为空 / JSON 损坏）的历史条目**从不动手**，
+   * 一律保守保留，交给「凭据未配置」的正常报错路径处理。
    *
-   * @returns 被删除的账号 id 列表（供调用方记日志）。
+   * @returns 被判定为「域名失配」的账号 id 列表（供调用方记日志）。
    */
   async pruneAccountsWithForeignDomain(product: BuddyProduct): Promise<string[]> {
-    const removed: string[] = []
+    const flagged: string[] = []
     for (const entry of this.readAccounts()) {
       if (entry.provider !== product.id) continue
       let domain = ''
@@ -780,17 +786,22 @@ export class AccountPool {
         const parsed = JSON.parse(resolved.value) as { domain?: unknown }
         domain = typeof parsed.domain === 'string' ? parsed.domain : ''
       } catch {
-        // 凭据缺失或损坏：留给「凭据未配置」的正常报错路径处理，这里不删
+        // 凭据缺失或损坏：留给「凭据未配置」的正常报错路径处理，这里不动
         continue
       }
       // domain 为空表示历史凭据未记录域名，无法判定，保守保留。
       if (domain.length === 0) continue
       if (domain !== product.apiDomain) {
-        await this.removeAccount(entry.id)
-        removed.push(entry.id)
+        // 保守语义：不删除、不 unset 凭据，只告警，让用户可以自行处理。
+        this.ctx.logger?.warn?.(
+          `[account-hub] ${product.id} 账号 ${entry.id} 的凭据域名失配：记录 ${domain}，`
+          + `预期 ${product.apiDomain}。账号与凭据已保留、未删除，请人工确认该账号是否仍有效；`
+          + `若不适用可自行注销。`,
+        )
+        flagged.push(entry.id)
       }
     }
-    return removed
+    return flagged
   }
 
   /** 添加新账号（登录成功后调用） */

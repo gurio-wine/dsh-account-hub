@@ -286,28 +286,25 @@ export function apply(ctx: Context): void {
     // （buddy-cn / buddy）。**必须早于下面所有池查询** —— 池的每次读取都按
     // provider 过滤，带着旧 id 的账号在新体系里等同于不存在。
     //
-    // ⚠️ **下面的域名清理必须挂在本 Promise 之后，不能与它并行**：
+    // ⚠️ **下面的域名审计必须挂在本 Promise 之后，不能与它并行**：
     // `pruneAccountsWithForeignDomain(BUDDY)` 按 `entry.provider === 'buddy'` 选账号，
     // 而迁移**之前**的 `buddy` 正是中国版（域名 copilot.tencent.com）。若两者
-    // 并行，清理会把这批中国版账号判成「域名失配」并连凭据一起删掉 —— 迁移还
-    // 没来得及给它们改成 `buddy-cn`。迁移自身是 fire-and-forget（内部自吞异常
+    // 并行，审计会把这批中国版账号判成「域名失配」——虽已改为只告警不删除，
+    // 但会打出误导性警告。迁移自身是 fire-and-forget（内部自吞异常
     // 并打日志，绝不阻断启动），故这里用 `.then()` 串联而不是 `await`。
     void migrateProviderNames(pool, ctx).then(() => {
       // Buddy（国际版）provider 早年是中国版（copilot.tencent.com）实现，
       // 后来改造为国际版（www.workbuddy.ai）。期间登录的账号其 token.domain
-      // 仍指向中国版端点，用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理。
-      // 判据是「凭据 domain ≠ 产品 apiDomain」，只清真正失配的条目。
-      // 两个产品各清一次：中国版（buddy-cn）历史上也踩过同类坑（凭据里写着国际版域名），
-      // 只清一边会漏掉另一半。
+      // 仍指向中国版端点，用新 endpoint 发请求必然失败且会一直续期失败。
+      // 判据是「凭据 domain ≠ 产品 apiDomain」，只圈定真正失配的条目。
+      // ⚠️ **只告警、不删除**：失配条目的凭据可能依然有效（国际版账号凭据里
+      // 写着中国版时代遗留的 domain），连凭据一起删除会把不可恢复的数据销毁。
+      // 此处仅记录警告，交由用户自行处理。两个产品各审计一次：中国版
+      // （buddy-cn）历史上也踩过同类坑，只审一边会漏掉另一半。
       for (const product of [BUDDY_CN, BUDDY]) {
-        void pool.pruneAccountsWithForeignDomain(product).then((removed) => {
-          if (removed.length > 0) {
-            ctx.logger.info(
-              `[account-hub] 已清理 ${removed.length} 个 ${product.displayName} 域名失配账号，请重新登录：${removed.join(', ')}`,
-            )
-          }
-        }).catch((error: unknown) => {
-          ctx.logger.warn(`[account-hub] 清理 ${product.displayName} 域名失配账号失败：${String(error)}`)
+        // 单条账号的告警由函数内部逐条打出，这里只兜住意外异常。
+        void pool.pruneAccountsWithForeignDomain(product).catch((error: unknown) => {
+          ctx.logger.warn(`[account-hub] 审计 ${product.displayName} 域名失配账号失败：${String(error)}`)
         })
       }
     })

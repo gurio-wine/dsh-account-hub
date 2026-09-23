@@ -97,6 +97,28 @@ describe('fetchCodeArtsRemoteModels', () => {
     expect(ids).not.toContain('something-VL')
   })
 
+  it('filters VL models case-insensitively (lowercase kimi-k2.6-vl, like uppercase Qwen3-VL-235B)', async () => {
+    // 真机实测（2026-09-23）：snap-access /v1/model/builtin 下发 `kimi-k2.6-vl`
+    // 小写格式，而旧匹配只认大写 `-VL-`/`-VL$`，导致小写 VL 漏过滤混进目录。
+    // 此处锁死：大小写 VL 一律滤掉。
+    const { fetcher } = makeFetcher({
+      [SNAP_MODEL_BUILTIN_URL]: {
+        body: JSON.stringify({
+          builtinModels: [
+            { model_id: 'kimi-k2.6-vl', model_name: 'kimi-k2.6-vl' },
+            { model_id: 'Qwen3-VL-235B', model_name: 'Qwen3-VL-235B' },
+            { model_id: 'GLM-5.2', model_name: 'GLM-5.2' },
+          ],
+        }),
+      },
+    })
+    const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    const ids = models.map((m) => m.id)
+    expect(ids).not.toContain('kimi-k2.6-vl')
+    expect(ids).not.toContain('Qwen3-VL-235B')
+    expect(ids).toContain('GLM-5.2')
+  })
+
   it('merges opengw gateway/config benefit models with builtin models, deduped', async () => {
     const { fetcher } = makeFetcher({
       [OPENGW_GATEWAY_CONFIG_URL]: {

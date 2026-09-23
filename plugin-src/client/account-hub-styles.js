@@ -3,14 +3,19 @@
  */
 
 const STYLES = `
-.dim-ah-page { display: flex; flex-direction: column; height: 100%; }
+/* 页面随内容自然展开，不再套一层固定高度：
+   宿主 settings.section 的 .options 自带页面级滚动，账号多时列表撑开、
+   由宿主滚动，避免在本面板内再叠一层滚动条。 */
+.dim-ah-page { display: flex; flex-direction: column; min-height: 100%; }
 .dim-ah-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--dsw-alias-border-default, #e5e5e5); }
 .dim-ah-brand { display: flex; flex-direction: column; }
 .dim-ah-brandName { font-size: 18px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1a1a); }
 .dim-ah-brandDesc { font-size: 13px; color: var(--dsw-alias-label-secondary, #555); margin: 2px 0 0; }
 
-/* 布局：对齐 dsh-im 的两栏 */
-.dim-ah-layout { display: flex; flex: 1; overflow: hidden; }
+/* 布局：对齐 dsh-im 的两栏。
+   去掉 overflow:hidden —— 配合页面 min-height 让内容自然撑开，
+   overflow 交给外层宿主的页面级滚动。 */
+.dim-ah-layout { display: flex; flex: 1; }
 
 /* 左侧导航：align dsh-im .dim-rail */
 .dim-ah-rail { width: 200px; border-right: 1px solid var(--dsw-alias-border-default, #e5e5e5); padding: 8px; overflow-y: auto; display: grid; align-content: start; gap: 8px; }
@@ -46,8 +51,9 @@ const STYLES = `
 .dim-ah-providerLabel { min-width: 0; display: grid; }
 .dim-ah-providerLabel strong { overflow: hidden; color: inherit; font-size: 14px; line-height: 20px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 右侧面板 */
-.dim-ah-panel { flex: 1; padding: 24px; overflow-y: auto; }
+/* 右侧面板：去掉自身 overflow-y:auto，账号多时随内容自然展开，
+   不在此处再叠一层滚动条（页面级滚动由宿主 settings.section 负责）。 */
+.dim-ah-panel { flex: 1; padding: 24px; }
 .dim-ah-empty { text-align: center; padding: 40px; color: var(--dsw-alias-label-tertiary, #888); }
 .dim-ah-empty p { margin: 8px 0; font-size: 14px; }
 

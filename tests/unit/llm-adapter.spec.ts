@@ -82,6 +82,23 @@ describe('CodeArtsAdapter', () => {
     expect(ids[0]).toBe('GLM-5.2')
   })
 
+  it('static DEFAULT_MODLES covers deepseek-v4.1-flash and glm-5.2-sft-harmony', async () => {
+    // 真机实测（2026-09-23）：远端两处都下发这两条文本模型 ——
+    // - glm-5.2-sft-harmony（端点 B snap-access builtinModels，context_window=202752）
+    // - deepseek-v4.1-flash（端点 A opengw gateway/config，context_window=1048576）
+    // 此前静态表 DEFAULT_MODELS 漏接，远端目录未落地时会整条消失。
+    const ids = (await makeAdapter().listModels('codearts')).map((m) => m.id)
+    expect(ids).toContain('glm-5.2-sft-harmony')
+    expect(ids).toContain('deepseek-v4.1-flash')
+  })
+
+  it('static context fallback discloses windows for deepseek-v4.1-flash (1048576) and glm-5.2-sft-harmony (202752)', async () => {
+    // 静态兜底值钉死：远端目录整体失败时这两个模型窗口不能漂移。
+    const adapter = makeAdapter()
+    expect((await adapter.resolveModel('codearts', 'deepseek-v4.1-flash')).context).toEqual({ contextWindow: 1048576 })
+    expect((await adapter.resolveModel('codearts', 'glm-5.2-sft-harmony')).context).toEqual({ contextWindow: 202752 })
+  })
+
   it('resolveModel discloses contextWindow for GLM-5.2 and deepseek-v4 models', async () => {
     // GLM-5.2：202752；glm-5.3-flash：1048576（1M，对齐 deveco-code-rust 90aeb17d）；
     // deepseek-v4-flash/pro：1048576（1M）。
@@ -747,6 +764,26 @@ describe('CodeArtsAdapter', () => {
     expect(ids).not.toContain('Qwen3.5-397B-A17B-VL')
     // 普通模型不受影响。
     expect(ids).toContain('GLM-5.2')
+  })
+
+  it('filters VL models case-insensitively from listModels (lowercase kimi-k2.6-vl)', async () => {
+    // 真机实测（2026-09-23）：远端 builtinModels 下发小写 `kimi-k2.6-vl`，
+    // 只匹配大写 -VL- 会让它漏过滤混进目录。大小写都要滤掉。
+    const adapter = makeAdapter({
+      fetchRemoteModels: async () => [
+        { id: 'kimi-k2.6-vl', name: 'kimi-k2.6-vl' },
+        { id: 'Qwen3-VL-235B', name: 'Qwen3-VL-235B' },
+        { id: 'GLM-5.2', name: 'GLM-5.2' },
+      ],
+    })
+    const ids = (await adapter.listModels('codearts')).map((m) => m.id)
+    expect(ids).not.toContain('kimi-k2.6-vl')
+    expect(ids).not.toContain('Qwen3-VL-235B')
+    expect(ids).toContain('GLM-5.2')
+    // listAllModels（设置页「显示列表」）共用同一份 VL 可见性过滤。
+    const allIds = adapter.listAllModels().map((m) => m.id)
+    expect(allIds).not.toContain('kimi-k2.6-vl')
+    expect(allIds).not.toContain('Qwen3-VL-235B')
   })
 
   /**

@@ -28,9 +28,9 @@ export const PROVIDER = 'codearts'
 // 结论：IDE 模型列表显示的 flash ID 与后端实际注册 ID 不一致，使用无后缀的 deepseek-v4-flash。
 const DEFAULT_MODELS: readonly string[] = [
   'GLM-5.2', 'GLM-5.1', 'GLM-5',
-  'glm-5.3-flash',
+  'glm-5.3-flash', 'glm-5.2-sft-harmony',
   'openpangu-2.0-flash', 'openpangu-2.0-pro',
-  'deepseek-v4-flash', 'deepseek-v4-pro',
+  'deepseek-v4-flash', 'deepseek-v4-pro', 'deepseek-v4.1-flash',
 ]
 
 /**
@@ -48,6 +48,8 @@ const DEFAULT_MODELS: readonly string[] = [
  *   GLM-5.2 同一口径处理；无独立旁证）。
  * - glm-5.3-flash：1048576（1M，逆向自 IDE gateway/config，对齐 deveco-code-rust 90aeb17d）。
  * - deepseek-v4-flash / deepseek-v4-pro：1048576（1M，UI 标注）。
+ * - deepseek-v4.1-flash：1048576（1M，真机 2026-09-23 实测远端 gateway/config 下发
+ *   `deepseek-v4.1-flash` context_window=1048576）。
  * - ⚠️ **openpangu-2.0-flash / openpangu-2.0-pro 与 GLM-5 刻意留空**：三者
  *   在 IDE 模型卡、内置 KERNEL_MODELS、远端目录**三方都没有窗口旁证**。宁可让
  *   宿主按「未声明」处理，也不编造一个数字 —— 声明错值会直接改写它的压缩时机
@@ -60,6 +62,7 @@ const CONTEXT_WINDOWS: ReadonlyMap<string, number> = new Map([
   ['glm-5.3-flash', 1_048_576],
   ['deepseek-v4-flash', 1048576],
   ['deepseek-v4-pro', 1048576],
+  ['deepseek-v4.1-flash', 1048576],
 ])
 
 /**
