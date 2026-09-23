@@ -75,7 +75,7 @@ describe('账号池 storage 域的域名与版本', () => {
 })
 
 describe('emptyAccountHubDocument', () => {
-  it('空文档是七件套齐全的空表，而不是缺字段的部分对象', () => {
+  it('空文档是八件套齐全的空表，而不是缺字段的部分对象', () => {
     expect(emptyAccountHubDocument()).toEqual({
       accounts: [],
       disabledModels: {},
@@ -85,12 +85,16 @@ describe('emptyAccountHubDocument', () => {
       consumption: {},
       consumptionCursors: {},
       schemaVersion: 0,
+      // provider 体检的独立闸门（0 = 尚未体检；与 schemaVersion 刻意分开，
+      // 合并过一次直接导致体检永远 short-circuit）。
+      providerAuditVersion: 0,
     })
   })
 
   it('旧文档（无新字段）读入时补空表，而不是读成 undefined', () => {
-    // 升级路径：盘上那份文档是上一版写的，没有 consumption / consumptionCursors。
-    // 读成 `{}` 等价于「顺序 + 按轮次」的默认配置，即**改动前的行为**。
+    // 升级路径：盘上那份文档是上一版写的，没有 consumption / consumptionCursors /
+    // providerAuditVersion。前两者读成 `{}` 等价于「顺序 + 按轮次」的默认配置；
+    // 体检版本读成 0 等价于「体检未跑过」—— 这正是本次要修的那批脏数据的入口。
     const doc = sanitizeAccountHubDocument({
       accounts: [],
       disabledModels: {},
@@ -100,7 +104,15 @@ describe('emptyAccountHubDocument', () => {
     })
     expect(doc.consumption).toEqual({})
     expect(doc.consumptionCursors).toEqual({})
+    expect(doc.providerAuditVersion).toBe(0)
     expect(doc.schemaVersion).toBe(1)
+  })
+
+  it('体检版本号：脏值按 0 处理，合法值原样读回', () => {
+    expect(sanitizeAccountHubDocument({ providerAuditVersion: 1 }).providerAuditVersion).toBe(1)
+    expect(sanitizeAccountHubDocument({ providerAuditVersion: Number.NaN }).providerAuditVersion).toBe(0)
+    expect(sanitizeAccountHubDocument({ providerAuditVersion: '1' }).providerAuditVersion).toBe(0)
+    expect(sanitizeAccountHubDocument(null).providerAuditVersion).toBe(0)
   })
 
   it('新字段的脏值逐层丢弃，不影响既有字段', () => {
@@ -301,14 +313,22 @@ describe('storage 写入', () => {
       accounts: [ACCOUNT],
       disabledModels: { 'buddy-cn': { 'glm-5.2': true } },
       contextBudgets: { 'buddy-cn': { 'glm-5.2': 300_000 } },
+      checkins: {},
+      consumption: {},
+      consumptionCursors: {},
       schemaVersion: 1,
+      providerAuditVersion: 0,
     })
     expect(mock.setCalls).toBe(1)
     expect(mock.global).toEqual({
       accounts: [ACCOUNT],
       disabledModels: { 'buddy-cn': { 'glm-5.2': true } },
       contextBudgets: { 'buddy-cn': { 'glm-5.2': 300_000 } },
+      checkins: {},
+      consumption: {},
+      consumptionCursors: {},
       schemaVersion: 1,
+      providerAuditVersion: 0,
     })
   })
 

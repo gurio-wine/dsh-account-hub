@@ -110,10 +110,11 @@ export type { ConsumptionCursorMap, ConsumptionMap } from './account-consumption
 /**
  * storage 里那份单例文档的结构。
  *
- * ⚠️ **七件套是一个整体**：`AccountPool` 的每次写入都是「读 → 改 → 整体 replace」，
+ * ⚠️ **八件套是一个整体**：`AccountPool` 的每次写入都是「读 → 改 → 整体 replace」，
  * 漏带任何一个字段就会在下次别的写入里被清空（`schemaVersion` 丢失会让改名迁移
- * 在每次启动重跑）。前五件与旧 settings namespace 里的字段**逐字段对应**，
- * 迁移就是原样搬运；末两件是「消耗顺序 / 切换粒度」带来的新字段。
+ * 在每次启动重跑，`providerAuditVersion` 丢失会让体检在每次启动重跑）。
+ * 前五件与旧 settings namespace 里的字段**逐字段对应**，迁移就是原样搬运；
+ * 「消耗顺序 / 切换粒度」「遍历游标」「provider 体检版本」是后来加的三件。
  */
 export interface AccountHubDocument {
   accounts: ProviderAccountEntry[]
@@ -125,6 +126,15 @@ export interface AccountHubDocument {
   /** 遍历游标（见 {@link ConsumptionCursorMap}）。 */
   consumptionCursors: ConsumptionCursorMap
   schemaVersion: number
+  /**
+   * provider 体检（**账号标签与凭据内容是否对得上**）的**独立版本闸门**。
+   *
+   * ⚠️ **刻意与 {@link schemaVersion} 分开**：那是「文档字段集合」的版本，
+   * 这个只表达「体检跑到第几版」。两者曾被同一个数字兼职 —— 改名迁移把闸门
+   * 推到 1 之后，体检的判据也落在 1 上，于是**永远 short-circuit**，脏数据
+   * 活了很久（详见 `src/provider-audit-migration.ts` 的模块头）。
+   */
+  providerAuditVersion: number
 }
 
 /** 空文档。每次都返回新对象 —— 共享引用会被写入方就地改坏。 */
@@ -137,6 +147,7 @@ export function emptyAccountHubDocument(): AccountHubDocument {
     consumption: {},
     consumptionCursors: {},
     schemaVersion: 0,
+    providerAuditVersion: 0,
   }
 }
 
@@ -219,7 +230,8 @@ function providerOfCheckinKey(key: string): string {
  * 存储文件可能被手工编辑过，也可能残留旧格式，因此逐层校验：任何一层形状不符就
  * 丢弃那一层，**不抛错** —— 存储被外部改坏不该让整个账号管理功能不可用
  * （既有 settings 路径的 `sanitizeDisabledModels` 同一取舍）。
- * 旧文档（无 `checkins` / `consumption` / `consumptionCursors` 字段）读入时补空对象。
+ * 旧文档（无 `checkins` / `consumption` / `consumptionCursors` / `providerAuditVersion`
+ * 字段）读入时补空对象 / 0。
  */
 export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
   const empty = emptyAccountHubDocument()
@@ -229,6 +241,7 @@ export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
     ? (value.accounts as ProviderAccountEntry[])
     : empty.accounts
   const version = value.schemaVersion
+  const auditVersion = value.providerAuditVersion
   return {
     accounts,
     disabledModels: sanitizeDisabledModels(value.disabledModels),
@@ -237,6 +250,11 @@ export function sanitizeAccountHubDocument(raw: unknown): AccountHubDocument {
     consumption: sanitizeConsumption(value.consumption),
     consumptionCursors: sanitizeConsumptionCursors(value.consumptionCursors),
     schemaVersion: typeof version === 'number' && Number.isFinite(version) ? version : 0,
+    // 体检版本同理：老文档没有该字段 → 按 0 处理，即「体检尚未执行」
+    // —— 这正是本次要修的那批脏数据的唯一入口。
+    providerAuditVersion: typeof auditVersion === 'number' && Number.isFinite(auditVersion)
+      ? auditVersion
+      : 0,
   }
 }
 
@@ -297,7 +315,7 @@ export interface AccountHubStorage {
   readonly domain: OpenedDomainLike
   /** 同步读取归一化后的文档（读自 storage 域的权威内存态）。 */
   read(): AccountHubDocument
-  /** 整体写入七件套；落盘失败时向调用方抛出。 */
+  /** 整体写入八件套；落盘失败时向调用方抛出。 */
   write(doc: AccountHubDocument): Promise<void>
   /** 存储里是否已有账号数据（一次性迁移的幂等闸门）。 */
   hasAccounts(): boolean

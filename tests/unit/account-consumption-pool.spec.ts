@@ -8,8 +8,8 @@
  *    ⚠️ 与「不传新的可选参数」是**两件事**：不传 `pick` 的调用点（`buddy-auth` /
  *    `lobsterai-auth` 拉目录、适配器换号重试）在任何档位下都必须拿到第一个可用
  *    账号 —— 那条由「不传 pick 时整段重排都不执行」保证，与默认档位无关。
- * 2. **持久化七件套互带**：新增两个字段与既有五件套同属一份文档，任何一次
- *    整体 replace 漏带即被清空。
+ * 2. **持久化八件套互带**：新增字段（含后来加的 `providerAuditVersion` 体检闸门）
+ *    与既有字段同属一份文档，任何一次整体 replace 漏带即被清空。
  * 3. **遍历游标持久化 + 自愈**：跨请求记忆下一个轮到谁；账号被删除 / 停用后
  *    回落数组顺序，绝不抛错。
  * 4. **轮次锁**：按调用方给的轮次键（宿主侧由 `options.signal` 身份换算）锁定账号，
@@ -22,7 +22,16 @@ import { AccountPool } from '../../src/account-pool.js'
 import { BALANCE_CACHE_TTL_MS } from '../../src/account-consumption.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 
-const ACCOUNT_KEYS = ['accounts', 'consumption', 'consumptionCursors', 'contextBudgets', 'disabledModels', 'checkins', 'schemaVersion'].sort()
+/**
+ * 落盘载荷必须**恰好**是这八个键。
+ *
+ * ⚠️ 断言的是「键集合完全相等」而不是「包含」：整体 replace 的语义下，
+ * **漏带一个键就等于清空它**，只断言包含会让漏带悄悄通过。
+ */
+const ACCOUNT_KEYS = [
+  'accounts', 'consumption', 'consumptionCursors', 'contextBudgets',
+  'disabledModels', 'checkins', 'schemaVersion', 'providerAuditVersion',
+].sort()
 
 interface HarnessOptions {
   accounts?: ProviderAccountEntry[]
@@ -418,8 +427,8 @@ describe('切换粒度：per-turn 锁住同轮账号，per-request 每次重选'
   })
 })
 
-describe('配置持久化：七件套互带（漏一个就被静默清空）', () => {
-  it('每一条写路径的落盘载荷都带齐七个键', async () => {
+describe('配置持久化：八件套互带（漏一个就被静默清空）', () => {
+  it('每一条写路径的落盘载荷都带齐八个键', async () => {
     const h = makeHarness()
     const pool = await makePool(h, [])
     await seed(pool, [account('a')])
@@ -490,7 +499,7 @@ describe('配置持久化：七件套互带（漏一个就被静默清空）', (
     expect(pool.consumptionSetting('buddy-cn')).toEqual({ order: 'sequential', switch: 'per-turn' })
   })
 
-  it('回退路径写入两个新字段，且仍带上既有五件套', async () => {
+  it('回退路径写入两个新字段，且仍带上既有六件套', async () => {
     const h = makeHarness({ withStorage: false })
     const pool = new AccountPool(h.ctx as never)
     await pool.openStorage()

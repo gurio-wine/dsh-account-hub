@@ -53,7 +53,7 @@ catch (network/凭据异常):
 
 沿用既有 `collectCreditsStatus` / `collectClaimResults` 的逐账号编排，**不改 registerAccountHubRpc 的既有 11 个实参含义**；新增三个 case，全部在 `handleMethod` 的 switch 内加分支即可：
 - **`credits.checkinStatus`**（读全量状态，供面板挂载渲染）— `RpcCheckinStatusRequest = { provider }`；`RpcCheckinStatusResponse = { accounts: [{ accountId, nickname, checkinDay, checkedInToday }] }`，`checkedInToday = checkinDay === today`。宿主读进程内 `checkins`，**不发网络请求**。仅对 `supportsDailyCheckin` 的 provider 有效；未知/无签到能力 provider 返回空表（客户端还保留能力门控，见第 8 节）。
-- **`checkin.perform`**（**单账号**签到，替代/配合单片按钮）— `RpcCheckinPerformRequest = { provider, accountId }`；`RpcCheckinPerformResponse = { outcome: ClaimOutcome, checkedInToday: boolean }`。内部调 `checkInIfDue`；**accountId 为空串时**退化为「该 provider 全量 sweep」（供头部"一键签到"与定时器复用同一入口）。
+- **`checkin.perform`**（**单账号**签到，替代/配合单片按钮）— `RpcCheckinPerformRequest = { provider, accountId }`；`RpcCheckinPerformResponse = { provider, nextReset, results[], summary, busy? }`（现行契约见 `src/account-hub-rpc.ts`；本文写作时的 `{ outcome, checkedInToday }` 形态已被「与 `credits.claimAll` 同构」的响应取代）。内部调 `checkInIfDue`；**accountId 为空串时**退化为「该 provider 全量 sweep」（供头部"一键签到"与定时器复用同一入口）。`busy: true` = 被共享互斥挡下、**零 claim**，见第 9 节。
 - **`checkin.sweep`**（执行一次全量 sweep，宿主自触发/手动）— `{ }`（无入参），内部遍历全部 provider。响应 `{ summary }`（复用 `RpcCreditsClaimSummary` 结构 + 每 provider 计数可选）。
 
 现有 `credits.claimAll` **保留不动**（provider 级全账号手动领取仍是独立能力）；单账号按钮**不改造 claimAll**，新增 `checkin.perform` 携带 accountId 更贴合现有 `collectClaimResults` 的「逐账号 try」结构，避免给 claimAll 塞一个会破坏「全账号+含停用」语义的可选参数。
@@ -99,6 +99,8 @@ if (supportsCredits) void rpcCall('credits.checkinStatus', { provider })
 ```
 放在 `React.useEffect(() => { void loadAccounts(); ... }, [provider])` **内部的同一 effect**、`loadAccounts` 之后（可用 `accountsRef` 避免并发读到空数组，与 `loadCredits` 同款）。签到状态存本地 hook `checkinsByAccount: Record<accountId, { day, checkedInToday }>`。`ClaimNotice` 摘要流已在 `claimCredits` 处理，自动签到的状态回传改走 `checkinsByAccount`。**头部「一键签到」按钮 = 现有 `claimCredits` 的 `credits.claimAll` 路径保留下，但改文案/色为「一键签到」（见第 9 节）**，或改调 `checkin.perform`（无 accountId）。**单片「签到」按钮 = 新增 `onCheckin(account.id)`，调 `checkin.perform { provider, accountId }`，成功后 `setCheckinsByAccount` 对该账号置今日**。
 
+> ⚠️ **就绪判据是「已结算」而不是「列表非空」**（2026-09-24 修复）：自动补签的触发依赖只有两个**完成信号** —— `checkinStatusLoaded`（状态已落地）与 `accountsLoaded`（`loadAccounts` 已结算，**成败都置真**）。不能把「账号就绪」编码成「`accounts` 数组的引用变化」：列表结算为**空数组**或**读取失败**时那个引用再也不会变，本次挂载的自动补签就被静默吞掉（界面正常、签到一声不响地没发生）。本地列表为空**不构成**跳过理由 —— `checkin.perform` 不带 accountId 时目标集合由**宿主**按自己的账号池决定。客户端不掌握列表时也不得用 `[].every()`（恒真）判「已全部签过」。
+
 ## 8. UI 规格
 
 - **单片按钮**（`AccountCard` 的 `dim-ah-accountActions` 行，`重测/重置/停用/删除` 同排，放在最前）：仅 `supportsCredits` 时渲染。文案状态机：`checkedInToday ? '已签' : (checkingThisAccount ? '签到中…' : '签到')`；`disabled` = `busy || checkedInToday || checkingThisAccount`。**禁用态数据来源**：`checkedInToday` 由 `credits.checkinStatus` 带回（读内存），单签成功后再由 `checkin.perform` 的响应更新本地 `checkinsByAccount`。
@@ -116,7 +118,11 @@ if (supportsCredits) void rpcCall('credits.checkinStatus', { provider })
 - **失败不写状态**：`checkInIfDue` 对 `inactive`/`failed` 一律不写今日（第 2 节），下次触发重试。
 - **停用账号是否参与**：**建议参与**（与现有 `credits.claimAll`/`credits.status`「含已停用」约定一致——停用只影响账号池自动选号，不影响签到）。理由：用户停用只是不想它被自动选中发请求，签到是白拿积分、且手动「一键领取」本就含停用，自动签到与它对齐最不意外。⚠️ **留「待拍板」**：若希望停用不自动签（省请求），改为 `checkInIfDue` 对 `!account.enabled` 直接返回 `skipped` 且不写状态即可，改动一行。
 - **无账号 provider 跳过**：`dailyCheckin` 为 false 的 provider 根本不遍历；某 provider 无账号（`listAccounts` 空）时直接跳该 provider。
-- **并发防重**：4h 定时器与页面触发（`checkin.perform`/`sweep`）可能同时跑。**方案：宿主模块级互斥信号量** `let sweepRunning = false`，`sweepAllCheckins` 入口 `if (sweepRunning) return`（已跑则本趟跳过，不排队不重入）。因每账号依次 `await`、服务端本身幂等（already-claimed），同一账号几乎不可能被两路真正走到 claim；即便竞态，两个 claim 中后到者拿到 `already-claimed` 也写今日，结果一致。**不做跨实例分布式锁**（单宿主单进程语义足够）。
+- **并发防重**：4h 定时器、启动 sweep 与页面触发（`checkin.perform` / `checkin.sweep`）可能同时跑。**方案：宿主模块级互斥信号量** `checkinBusy`（原名 `sweepRunning`，2026-09-24 扩为**共享**锁），入口 `if (checkinBusy) return`（已跑则本趟跳过，不排队不重入）。**不做跨实例分布式锁**（单宿主单进程语义足够）。
+- ⚠️ **面板单发与 sweep 必须共享同一把锁**（2026-09-24 修复，原设计的缺口）：`checkin.perform` 与 sweep 签的是**同一批账号**（不带 accountId 时目标集就是该 provider 的全部账号），而旧实现里互斥只覆盖 sweep 内部 —— 两路可以对同一账号**各发一次 claim**。原设计认为「几乎不可能被两路真正走到 claim；即便竞态，后到者拿到 already-claimed 也写今日，结果一致」，这个推理**对 trae-cn 不成立**：它的 9074 处置会**各自换签到设备号并各自落盘**（`claimTraeCnWithDeviceRotation` → `persistRotatedDeviceId`），后写覆盖先写 ⇒ 盘上留的可能是**另一路**用的号（下一轮又从旧号起步白撞一次 9074），或者「这一发成功了、盘上却是另一个号」。故被挡方的语义按路分开：
+  - sweep 被挡 → `{ running: false, providers: [] }`（既有形态）；
+  - 面板单发被挡 → `RpcCheckinPerformResponse.busy = true` + 空 `results`/`summary`、**零 claim**（客户端据此区分「被挡」与「跑了但没账号可签」；自动补签静默、手动按钮提示「已有签到正在进行」）。
+  另有一条**顺序约束**：取锁必须在第一个 `await` 之前（`if (checkinBusy) return …; checkinBusy = true` 之间隔着 `pool.listAccounts` 的话，两个同 tick 的调用会双双看到「空闲」）。
 
 ## 10. 测试计划
 

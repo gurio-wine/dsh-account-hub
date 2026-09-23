@@ -587,19 +587,38 @@ describe('自动签到客户端 UI（源码级回归）', () => {
   it('进入 Hub 时自动补签：挂载后只要存在未签账号就自动调一次 `checkin.perform`', () => {
     // 自动补签走全量 `checkin.perform({ provider })`（不带 accountId，覆盖全部账号）。
     expect(normalized).toContain("rpcCall('checkin.perform', { provider })")
-    // 自动补签只在本面板挂载时触发一次：由「签到状态已落地」门控的 effect 驱动，
-    // 且用 autoCheckinRanRef 幂等防 StrictMode 双执行与重渲染重复触发。
+    // 自动补签只在本面板挂载时触发一次：由**两个完成信号**（签到状态已落地 +
+    // 账号列表已结算）门控的 effect 驱动，且用 autoCheckinRanRef 幂等防 StrictMode
+    // 双执行与重渲染重复触发。
     expect(normalized).toContain('autoCheckinRanRef.current')
     expect(normalized).toContain('setCheckinStatusLoaded(true)')
-    expect(normalized).toContain('checkinStatusLoaded) void autoCheckinOnEntry();')
+    // ⚠️ 触发依赖必须只有这两个完成信号，**不含 `accounts`**：把「账号就绪」编码成
+    // 「某个数组的引用变化」时，列表结算为「空」或「读取失败」的挂载周期里那个引用
+    // 再也不会变，补签被静默吞掉（2026-09-24 修复的缺陷形态）。
+    expect(normalized).toContain('if (checkinStatusLoaded && accountsLoaded) void autoCheckinOnEntry();')
+    expect(normalized).toContain('}, [checkinStatusLoaded, accountsLoaded]);')
     expect(normalized).toContain('autoCheckinRanRef.current = true;')
   })
 
-  it('自动补签跳过条件：账号列表为空 / 已全部签到 / 已有签到在跑都不发请求', () => {
-    // 账号为空：不置 ran、不发请求（等账号就绪后触发 effect 补判）。
-    expect(normalized).toContain('if (accounts.length === 0) return;')
-    // 已全部签过：不发请求。
-    expect(normalized).toContain("if (accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)) return;")
+  it('自动补签就绪判据是「账号列表已结算」而不是「列表非空」（空/失败都必须照发）', () => {
+    // 未结算：不置 ran、不发请求（等 accountsLoaded 置真后的那次 effect 补判）。
+    expect(normalized).toContain('if (!accountsLoaded) return;')
+    // 判据**不得**退回「引用非空」——那正是本次修掉的静默断流（列表读空或读失败
+    // 时该判据永远为假，且不会再有下一次状态更新来救它）。
+    expect(normalized).not.toContain('if (accounts.length === 0) return;')
+    // 结算信号两个分支都要置真：读到空列表、以及读取失败。
+    const loadAccountsStart = normalized.indexOf('const loadAccounts = React.useCallback')
+    expect(loadAccountsStart).toBeGreaterThan(-1)
+    const loadAccountsBody = normalized.slice(loadAccountsStart, loadAccountsStart + 1400)
+    expect(loadAccountsBody.match(/setAccountsLoaded\(true\);/g) ?? []).toHaveLength(2)
+  })
+
+  it('自动补签跳过条件：已全部签到 / 已有签到在跑都不发请求（空列表不得被误判为已全签）', () => {
+    // 已全部签过：不发请求。⚠️ `accounts.length > 0` 这一半是必需的 ——
+    // `[].every()` 恒为 true，只留 every 会把「本地没有可判对象」误判成
+    // 「已全部签过」，缺陷只换个位置复发（静默不发）。
+    expect(normalized)
+      .toContain('if (accounts.length > 0 && accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)) return;')
     // 尚未真正发过判定/补签前不置 ran（保证账号就绪后能再进来补判一次）。
     expect(normalized).toContain('autoCheckinRanRef.current = true;')
     // 与手动签到（一键/单片）共用 claimingRef 互斥，避免并发各发一次。
@@ -610,12 +629,20 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     // 自动补签自己的 catch 只 console.error，不 setClaimNotice。
     const start = normalized.indexOf('const autoCheckinOnEntry')
     expect(start).toBeGreaterThan(-1)
-    const body = normalized.slice(start, start + 1400)
+    // 窗口要覆盖整个函数体（含本文件风格的长注释）—— 取到下一个顶层 const 为止，
+    // 不用固定字符数：注释一长，固定窗口会把被断言的语句挤出视野（假失败）。
+    const nextTopLevel = normalized.indexOf('\n  const checkinAccount = async', start)
+    expect(nextTopLevel).toBeGreaterThan(start)
+    const body = normalized.slice(start, nextTopLevel)
     expect(body).toContain('console.error(\'[account-hub] auto checkin failed:\', caught);')
     // 成功/失败后都重拉一次签到状态，让按钮态反映真实结果。
     expect(body).toContain('await loadCheckinStatus();')
-    // 不弹 claimNotice（打断性通知）—— body 里不该出现 setClaimNotice。
+    // 不弹 claimNotice（打断性通知）—— body 里不该出现 setClaimNotice，
+    // 也不该出现那条「已有签到正在进行」提示（那是用户主动点击才该看到的）。
     expect(body).not.toContain('setClaimNotice')
+    expect(body).not.toContain('CHECKIN_BUSY_NOTICE')
+    // 宿主回 busy（另一路签到在跑）时**不能装作跑了**：留一行可区分的日志。
+    expect(body).toContain('another check-in is already running')
     // 自动补签与手动 claimCredits 共用 claimingRef：手动一键也走该 ref 互斥。
     expect(normalized).toContain('claimingRef.current = true;')
   })

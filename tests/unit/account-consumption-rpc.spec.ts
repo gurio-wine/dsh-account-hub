@@ -183,10 +183,10 @@ describe('consumption.get / consumption.set 端点', () => {
     // 写**非默认档**（顺序）才落键；默认档会被剔除（等于「没配过」）。
     await h.call('consumption.set', { provider: 'buddy-cn', order: 'sequential' })
     const last = h.storedValue()
-    // 七件套齐全。
+    // 八件套齐全（含 provider 体检闸门 —— 漏带会让体检每次启动重跑）。
     expect(Object.keys(last).sort()).toEqual([
       'accounts', 'checkins', 'consumption', 'consumptionCursors',
-      'contextBudgets', 'disabledModels', 'schemaVersion',
+      'contextBudgets', 'disabledModels', 'providerAuditVersion', 'schemaVersion',
     ])
     expect(last.consumption).toEqual({ 'buddy-cn': { order: 'sequential', switch: 'per-turn' } })
   })

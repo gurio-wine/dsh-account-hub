@@ -151,7 +151,7 @@ describe('AccountPool × storage —— storage 为主', () => {
     expect(pool.schemaVersion).toBe(1)
   })
 
-  it('写入走 storage 的 global.set，且一次写入包含七件套', async () => {
+  it('写入走 storage 的 global.set，且一次写入包含八件套', async () => {
     const mock = createMockStorage()
     const ctx = createMockContext({ storage: mock.storage })
     const pool = new AccountPool(ctx as never)
@@ -166,6 +166,8 @@ describe('AccountPool × storage —— storage 为主', () => {
       consumption: {},
       consumptionCursors: {},
       schemaVersion: 0,
+      // 第八件：provider 体检的独立闸门（0 = 尚未体检）。
+      providerAuditVersion: 0,
     })
     // 一次都不该碰 settings 路径（storage 可用时它是唯一写源）
     expect(ctx.replacePayloads).toHaveLength(0)

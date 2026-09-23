@@ -140,19 +140,29 @@ export const CHECKIN_ELIGIBLE_PROVIDERS: ReadonlySet<string> = new Set([
 ])
 
 /**
- * sweep 的**模块级互斥信号量**。
+ * 签到路径的**模块级共享互斥信号**。
  *
- * 4 小时定时器与页面触发（`checkin.perform` 无 accountId / `checkin.sweep`）可能
- * 同时跑。入口若非空闲直接跳过本趟（不排队、不重入），返回「进行中」摘要。
- * 因每账号依次 `await`、服务端本身幂等（already-claimed 也写今日），同一账号
- * 几乎不可能被两路真正走到 claim；即便竞态，两 claim 中后到者拿到
- * already-claimed 也写今日，结果一致。—— 语义见设计文档 §9。
+ * 三路触发都可能撞在一起：4 小时定时器 sweep、启动 sweep（`src/index.ts`）与
+ * 面板单发（`checkin.perform`）。**面板单发与 sweep 签的是同一批账号**
+ * （`performCheckin` 不带 accountId 时目标集就是该 provider 的全部账号），故两路
+ * 必须共享**同一把**锁，入口非空闲的一方直接让路（不排队、不重入）。
+ *
+ * ⚠️ 名字从 `sweepRunning` 改成 `checkinBusy` 是刻意的：旧名字只覆盖 sweep 内部，
+ * 而面板单发原先**根本不看它** —— 于是「进页面自动补签」与 sweep 可以对同一账号
+ * 各发一次 claim。这不是理论风险：`trae-cn` 的 9074 处置会**各自换设备号并各自
+ * 落盘**（见 `src/trae-cn-credits.ts` 的 `claimTraeCnWithDeviceRotation`），后写
+ * 覆盖先写 ⇒ 盘上留的可能是**另一路**用的号，下一轮又从旧号起步白撞一次 9074，
+ * 或者「这一发成功了、盘上却是另一个号」。锁名必须覆盖它真正保护的东西。
+ *
+ * 被挡方的语义各不相同，但都**不能**伪装成「跑了但没账号可签」：
+ * - sweep 被挡 → `{ running: false, providers: [] }`（既有形态，不动）；
+ * - 面板单发被挡 → `RpcCheckinPerformResponse.busy = true` + 空 results/summary。
  */
-export let sweepRunning = false
+export let checkinBusy = false
 
-/** 重置 sweep 互斥（仅测试用）。 */
-export function __resetSweepRunning(): void {
-  sweepRunning = false
+/** 重置签到互斥（仅测试用）。 */
+export function __resetCheckinBusy(): void {
+  checkinBusy = false
 }
 
 /**
@@ -164,8 +174,12 @@ export function __resetSweepRunning(): void {
  *  2. 成功（claimed）或已领（already-claimed）都写 `writeCheckinDay`（今日），
  *     inactive / failed **不写**（失败不写，下次 sweep 重试）。
  *
- * 返回按账号的 outcome 摘要（claimed / already-claimed / failed）。互斥由调用方
- * （`checkin.sweep` case）统一管理，这里不做 —— 单账号 perform 不占互斥。
+ * 返回按账号的 outcome 摘要（claimed / already-claimed / failed）。
+ *
+ * ⚠️ **互斥由本路径自己持有**（模块级 {@link checkinBusy}，与 sweep 共享同一把）：
+ * 撞上 sweep 在跑时回 `busy: true` 的空响应，**不发任何 claim** —— 早期版本的注释
+ * 写的是「单账号 perform 不占互斥」，那正是「进页面自动补签与 4h sweep 并发各发
+ * 一发」的缺口。
  */
 /**
  * 与 `credits.claimAll` 的 {@link RpcCreditsClaimAccountResult} **同构**的逐账号
@@ -243,6 +257,16 @@ export interface RpcCheckinPerformResponse {
   nextReset: number
   results: CheckinAccountResult[]
   summary: RpcCreditsClaimSummary
+  /**
+   * **本趟被共享互斥挡下**（另一路签到——sweep 或面板另一发——正在跑）。
+   *
+   * `true` 时 `results` 为空、`summary` 全零，且**没有发过任何 claim**。刻意做成
+   * 「成功响应 + 一个显式标志」而不是 RPC 错误，理由有两条：
+   *  1. 它不是失败：同一批账号**正在被签**，客户端不该报错、也不该提示用户排查；
+   *  2. 客户端必须能把它与「跑了但没账号可签」（同样是空 results）区分开 ——
+   *     否则「被挡」会退化成静默（正是本次要修的缺陷形态）。
+   */
+  busy?: boolean
 }
 
 /** 单个 provider 的一次 sweep 结果。 */
@@ -1414,13 +1438,13 @@ async function performCheckinOnTargets(
  * - 无账号 provider 跳过；
  * - 每个 provider 只签**此刻可签**的账号（`pool.isCheckinDue`：无记录、或记录的
  *   下一次可签时刻已过）；
- * - 模块级互斥 {@link sweepRunning}：已有一趟在跑就**直接返回进行中快照**，
- *   不排队不重入（设计文档 §9 并发防重）。
+ * - 模块级互斥 {@link checkinBusy}：已有一趟在跑（sweep **或**面板单发
+ *   `checkin.perform`）就**直接返回进行中快照**，不排队不重入（设计文档 §9）。
  */
 export async function performCheckinSweep(deps: CheckinSweepDeps): Promise<RpcCheckinSweepResponse> {
   const { pool } = deps
-  if (sweepRunning) return { running: false, providers: [] }
-  sweepRunning = true
+  if (checkinBusy) return { running: false, providers: [] }
+  checkinBusy = true
   try {
     const providers: RpcCheckinSweepProviderResult[] = []
     for (const provider of CHECKIN_ELIGIBLE_PROVIDERS) {
@@ -1433,7 +1457,23 @@ export async function performCheckinSweep(deps: CheckinSweepDeps): Promise<RpcCh
     }
     return { running: true, providers }
   } finally {
-    sweepRunning = false
+    checkinBusy = false
+  }
+}
+
+/**
+ * 被共享互斥挡下时的 `checkin.perform` 响应（见 {@link RpcCheckinPerformResponse.busy}）。
+ *
+ * 单独一个构造函数而不是两处各写一遍对象字面量：`busy` 一旦在某个分支上漏写，
+ * 「被挡」就退化成「跑了但没账号可签」—— 那正是客户端无法区分、只能静默的情形。
+ */
+function busyCheckinPerformResponse(provider: string): RpcCheckinPerformResponse {
+  return {
+    provider,
+    nextReset: nextEligibleAt(Date.now(), provider),
+    results: [],
+    summary: computeClaimSummary([]),
+    busy: true,
   }
 }
 
@@ -1560,18 +1600,38 @@ function registerAccountHubEndpoints(
    * accountId 缺省/空串 → 该 provider 全量账号；否则只处理该账号（若不在列表中，
    * targets 为空，结果为空、不发请求）。未知 provider **即使无账号也拒绝**（在该
    * provider 有账号时 `runCreditsClaim` 会二次抛，空数组分支提前兜住）。
+   *
+   * ## 与 sweep 共享同一把互斥（{@link checkinBusy}）
+   *
+   * `checkin.perform` 与 sweep 签的是**同一批账号**，故两路不能并行：撞上 sweep
+   * 在跑时回 {@link busyCheckinPerformResponse}（`busy: true`、空 results、**零
+   * claim**），由客户端决定怎么呈现（自动补签视作「已有人在签」，手动按钮提示
+   * 「已有签到正在进行」）。
+   *
+   * ⚠️ 顺序是硬约束：
+   *  - **未知 provider 先判**：那是客户端 bug，必须回 `bad-request`，不能被互斥
+   *    含糊成「进行中」；
+   *  - **取锁在第一个 `await` 之前**：`if (checkinBusy) return …` 与
+   *    `checkinBusy = true` 之间只要隔一次 `await`（例如 `pool.listAccounts`），
+   *    两个同 tick 的调用就都能看到「空闲」并双双进锁 —— 互斥形同虚设。
    */
   async function performCheckin(
     provider: string,
     accountId?: string,
   ): Promise<RpcCheckinPerformResponse> {
-    const accounts = await pool.listAccounts(provider)
-    const targets = accountId !== undefined && accountId.length > 0
-      ? accounts.filter((a) => a.id === accountId)
-      : accounts
     if (!isKnownCheckinProvider(provider)) throw new UnsupportedProviderError(provider)
-    const { results, summary } = await performCheckinOnTargets(checkinDeps, provider, targets)
-    return { provider, nextReset: nextEligibleAt(Date.now(), provider), results, summary }
+    if (checkinBusy) return busyCheckinPerformResponse(provider)
+    checkinBusy = true
+    try {
+      const accounts = await pool.listAccounts(provider)
+      const targets = accountId !== undefined && accountId.length > 0
+        ? accounts.filter((a) => a.id === accountId)
+        : accounts
+      const { results, summary } = await performCheckinOnTargets(checkinDeps, provider, targets)
+      return { provider, nextReset: nextEligibleAt(Date.now(), provider), results, summary }
+    } finally {
+      checkinBusy = false
+    }
   }
 
   /** 分发端点方法到对应的处理器 */

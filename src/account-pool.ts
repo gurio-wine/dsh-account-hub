@@ -24,7 +24,7 @@ import {
 } from './account-consumption.js'
 import { migrateAccountHubIntoStorage } from './account-hub-migration.js'
 import { isCheckinDue } from './checkin-schedule.js'
-import type { BuddyCredential } from './buddy.js'
+import { jwtIssuer, type BuddyCredential } from './buddy.js'
 import type { BuddyProduct } from './product.js'
 import type {
   CodeArtsCredential,
@@ -92,6 +92,8 @@ interface AccountHubSettingsValue {
   consumptionCursors?: ConsumptionCursorMap
   /** 数据版本号，供一次性迁移 short-circuit（见 provider-rename-migration.ts）。 */
   schemaVersion?: number
+  /** provider 体检版本号，供体检迁移 short-circuit（见 provider-audit-migration.ts）。 */
+  providerAuditVersion?: number
 }
 
 /**
@@ -105,19 +107,21 @@ interface AccountHubSettingsValue {
  *   （消耗顺序 / 切换粒度 / 遍历游标）。
  * - `4` = `checkins` 的值口径由「本地纪元日数」换成「**下一次可签毫秒时间戳**」
  *   （各 provider 重置钟点不同，见 `src/checkin-schedule.ts`）。
+ * - `5` = 文档新增第八字段 `providerAuditVersion`（provider 体检的独立闸门）。
  *
- * ⚠️ **4 是唯一一次「搬动既有数据」的版本提升**（前三次都只补字段）：旧值必须
+ * ⚠️ **4 是唯一一次「搬动既有数据」的版本提升**（其余都只补字段）：旧值必须
  * 换算，否则会被当成一个 1970 年的时间戳、判成「永远可签」而每轮重复签到。
  * 换算本身发生在**读盘那一层**（`sanitizeCheckins` + `normalizeCheckinValue`），
  * 故它不依赖迁移函数是否跑过 —— 版本号的提升只是把「文档已按新口径读过一次」
  * 这件事在存储里落个可判定的标记，并让 `migrateProviderNames` 多跑一趟
  * （那一趟对已迁移数据是无操作）。
  *
- * ⚠️ **2 与 3 两次提升都只是「补字段」，不搬动任何既有数据**：旧文档读入时
- * 由 `sanitizeAccountHubDocument` 补空对象（缺 `consumption` 即等于
- * `DEFAULT_CONSUMPTION`）。提升版本号的实际效果是让 `migrateProviderNames`
- * 对旧文档**多跑一次无操作迁移**并把版本号落定，从而「文档已含该字段」这件事
- * 在存储里有个可判定的标记。
+ * ⚠️ **2 / 3 / 5 三次提升都只是「补字段」，不搬动任何既有数据**：旧文档读入时
+ * 由 `sanitizeAccountHubDocument` 补空对象 / 0（缺 `consumption` 即等于
+ * `DEFAULT_CONSUMPTION`，缺 `providerAuditVersion` 即等于「体检未跑」）。
+ * 提升版本号的实际效果是让 `migrateProviderNames` 对旧文档**多跑一次无操作迁移**
+ * 并把版本号落定，从而「文档已含该字段」这件事在存储里有个可判定的标记。
+ * 数据搬迁由各自的独立闸门负责：体检走 {@link PROVIDER_AUDIT_VERSION}。
  *
  * ⚠️ **默认档位从 `sequential` 翻成 `round-robin` 时刻意不提升版本号**：
  * 那是 `DEFAULT_CONSUMPTION` 的取值变化，**不涉及文档形状**——旧文档本来就可能
@@ -126,8 +130,28 @@ interface AccountHubSettingsValue {
  * 存量用户的选号行为确实会从「固定第一个」变为「逐请求轮转」，那正是用户要的。
  *
  * 迁移函数在版本号 ≥ 本常量时整体 short-circuit，因此这个数字只会前进。
+ *
+ * ⚠️ **本常量兼职过一次「体检闸门」，那是一次事故**：体检（账号标签与凭据内容
+ * 是否对得上）当年把闸门判据也写成 `schemaVersion >= 1`，而改名迁移早已把版本
+ * 推到 1 ⇒ 体检**永远不会执行**，一条「国际版凭据挂在 `buddy-cn` 前缀下」的脏
+ * 数据因此活了很久。结论：**字段集合版本**与**体检版本**必须是两个数字，见
+ * `src/provider-audit-migration.ts` 的模块头。
  */
-export const ACCOUNT_HUB_SCHEMA_VERSION = 4
+export const ACCOUNT_HUB_SCHEMA_VERSION = 5
+
+/**
+ * provider 体检的**独立**版本号（存入文档的 `providerAuditVersion` 字段）。
+ *
+ * 体检内容：逐条账号解析其凭据里 JWT 的 `iss` / `domain`，判定该凭据属于哪个
+ * 产品，与条目上的 `provider` 标签比对，不一致即原地重建为正确的 provider。
+ * 见 `src/provider-audit-migration.ts`。
+ *
+ * ⚠️ **不要与 {@link ACCOUNT_HUB_SCHEMA_VERSION} 合并**（理由见该常量的末段：
+ * 合并正是脏数据活下来的原因）。`0`（或字段缺失）表示从未体检；达到 `1` 即
+ * 整体 short-circuit。体检逻辑本身也刻意写成幂等 —— 万一有人手工把版本号改回
+ * 0，重跑一遍不会破坏任何数据（只可能多留一份无害的孤儿凭据）。
+ */
+export const PROVIDER_AUDIT_VERSION = 1
 
 /** ctx.settings.register() 返回的 owner scope（只用到 get/replace）。 */
 interface SettingsScopeLike {
@@ -138,7 +162,7 @@ interface SettingsScopeLike {
 /**
  * 一次整体写入的载荷形状。
  *
- * 与 storage 域的 `AccountHubDocument` **刻意同形**（五件套齐全）：两条写路径
+ * 与 storage 域的 `AccountHubDocument` **刻意同形**（八件套齐全）：两条写路径
  * （storage 的 `global.set` 与 settings 的 `replace`）都是整体替换，用同一个形状
  * 可以让 `persist()` 成为唯一写落点，杜绝「某条路径漏带某个字段」。
  */
@@ -150,6 +174,7 @@ interface AccountHubDocumentLike {
   consumption: ConsumptionMap
   consumptionCursors: ConsumptionCursorMap
   schemaVersion: number
+  providerAuditVersion: number
 }
 
 /** ctx.settings 服务的最小接口。schema 必须是 schemastery schema。 */
@@ -203,6 +228,10 @@ const accountHubSchema = Schema.object({
   // 见 {@link ACCOUNT_HUB_SCHEMA_VERSION}。**必须带 default**：老配置文件里没有
   // 这个字段，缺失时按 0 处理才等价于「迁移尚未执行」。
   schemaVersion: Schema.number().default(0),
+  // provider 体检版本号。`0` = 体检尚未执行；见 {@link PROVIDER_AUDIT_VERSION}。
+  // **必须带 default**：老配置文件里没有这个字段（settings 回退路径下同理），
+  // 缺失时按 0 处理才等价于「体检未跑过」。
+  providerAuditVersion: Schema.number().default(0),
 })
 
 /**
@@ -360,6 +389,14 @@ export class AccountPool {
    * 让迁移在每次启动时重跑。
    */
   private versionCache = 0
+  /**
+   * provider 体检版本号的**权威进程内副本**（同 {@link cache}）。
+   *
+   * ⚠️ 与 `versionCache` 同一条陷阱：它必须参与每一次「读 → 改 → 整体 replace」。
+   * 漏带会让体检在**每次启动**重跑（多打日志、多搬一次凭据），而体检本身是
+   * 幂等的，所以症状只是噪音 —— 但那正是「闸门形同虚设」。
+   */
+  private auditVersionCache = 0
   /** 是否已从持久层完成首次载入。 */
   private loaded = false
   /**
@@ -469,7 +506,7 @@ export class AccountPool {
     }
   }
 
-  /** 首次访问时从**主路径**载入五件套。 */
+  /** 首次访问时从**主路径**载入八件套。 */
   private ensureLoaded(): void {
     if (this.loaded) return
     this.loaded = true
@@ -482,6 +519,7 @@ export class AccountPool {
       this.consumptionCache = doc.consumption
       this.cursorCache = doc.consumptionCursors
       this.versionCache = doc.schemaVersion
+      this.auditVersionCache = doc.providerAuditVersion
       return
     }
     if (!this.scope) return
@@ -510,12 +548,17 @@ export class AccountPool {
     // 即「迁移尚未执行」。
     const version = value?.schemaVersion
     this.versionCache = typeof version === 'number' && Number.isFinite(version) ? version : 0
+    // 体检版本号同理：按 0 处理 = 「体检尚未执行」。
+    const auditVersion = value?.providerAuditVersion
+    this.auditVersionCache = typeof auditVersion === 'number' && Number.isFinite(auditVersion)
+      ? auditVersion
+      : 0
   }
 
   /**
-   * 持久化七件套。
+   * 持久化八件套。
    *
-   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，七件套一起带上。
+   * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，八件套一起带上。
    * 主路径是 storage 域的 `global.set`（整体替换那份单例文档）；回退路径是
    * settings scope 的 `replace`（同样是整体替换，漏带即清空）。
    */
@@ -531,6 +574,7 @@ export class AccountPool {
         consumption: document.consumption,
         consumptionCursors: document.consumptionCursors,
         schemaVersion: document.schemaVersion,
+        providerAuditVersion: document.providerAuditVersion,
       })
       return
     }
@@ -558,6 +602,17 @@ export class AccountPool {
   }
 
   /**
+   * provider 体检版本号（0 = 体检尚未执行，见 {@link PROVIDER_AUDIT_VERSION}）。
+   *
+   * 体检迁移（`src/provider-audit-migration.ts`）用它 short-circuit；普通读取
+   * 路径不关心它。⚠️ **它与 `schemaVersion` 是两个独立的闸门**，不要合并。
+   */
+  get providerAuditVersion(): number {
+    this.ensureLoaded()
+    return this.auditVersionCache
+  }
+
+  /**
    * 列出**全部** provider 的模型黑名单（含从未改过开关的 provider）。
    *
    * 与 {@link listDisabledModels} 的区别：后者按 provider 取单个子表，
@@ -574,26 +629,33 @@ export class AccountPool {
   }
 
   /**
-   * 一次性整体写入账号列表、模型黑名单与上下文预算（外加版本号和签到）。
+   * 一次性整体写入账号列表、模型黑名单与上下文预算（外加版本号、签到、
+   * 游标与体检版本）。
    *
    * 为什么需要它：{@link writeAccounts} / {@link writeModels} 各自只接受
    * 自己那一半，调用方要先写一半再写另一半，中间崩溃会留下半迁移状态。
-   * 一次性迁移必须**原子**地落盘「账号 + 黑名单 + 上下文预算 + 版本号」五件套，
-   * 故这里直接构造完整的 replace 载荷，只发一次写。
+   * 一次性迁移必须**原子**地落盘「账号 + 黑名单 + 上下文预算 + 版本号 + 体检版本」
+   * 八件套，故这里直接构造完整的 replace 载荷，只发一次写。
    *
-   * ⚠️ **上下文预算原样带上**（不是本次迁移的对象，但同属一个 namespace）：
-   * 漏带会让改名迁移顺手清空用户的窗口档位选择。
+   * ⚠️ **上下文预算、消耗顺序与游标原样带上**（不是本次迁移的对象，但同属一个
+   * 文档）：漏带会让迁移顺手清空用户的窗口档位选择或轮转进度。
    *
    * @param accounts - 新的账号列表。
    * @param disabledModels - 新的模型黑名单。
-   * @param schemaVersion - 迁移完成后的版本号。
+   * @param schemaVersion - 迁移完成后的**数据版本号**（字段集合版本）。
    * @param checkins - 签到记录；缺省取进程内副本（与 `contextBudgets` 的处理一致）。
+   * @param consumptionCursors - 遍历游标；缺省取进程内副本。体检迁移**必须**传
+   *        新的（被重建账号的游标值指向旧 accountId）。
+   * @param providerAuditVersion - 体检版本号；缺省取进程内副本（体检迁移传
+   *        {@link PROVIDER_AUDIT_VERSION} 标记已跑完）。
    */
   async replaceAll(
     accounts: ProviderAccountEntry[],
     disabledModels: ModelDisableMap,
     schemaVersion: number = ACCOUNT_HUB_SCHEMA_VERSION,
     checkins?: Record<string, number>,
+    consumptionCursors?: ConsumptionCursorMap,
+    providerAuditVersion?: number,
   ): Promise<void> {
     // ⚠️ 必须先 ensureLoaded()：本方法只从调用方接收三件套，**上下文预算取自进程内
     // 副本**（它不是迁移对象）。没载入就写，会把用户已有的档位选择覆盖成空。
@@ -603,6 +665,8 @@ export class AccountPool {
     this.modelCache = disabledModels
     this.versionCache = schemaVersion
     if (checkins !== undefined) this.checkinCache = checkins
+    if (consumptionCursors !== undefined) this.cursorCache = consumptionCursors
+    if (providerAuditVersion !== undefined) this.auditVersionCache = providerAuditVersion
     this.loaded = true
     if (this.storage === undefined && !this.scope) {
       this.ctx.logger?.warn?.('[account-hub] 无 storage 域与 settings scope，数据迁移结果未持久化')
@@ -614,8 +678,9 @@ export class AccountPool {
       contextBudgets: this.budgetCache,
       checkins: checkins ?? this.checkinCache,
       consumption: this.consumptionCache,
-      consumptionCursors: this.cursorCache,
+      consumptionCursors: consumptionCursors ?? this.cursorCache,
       schemaVersion,
+      providerAuditVersion: providerAuditVersion ?? this.auditVersionCache,
     }, '无 settings scope，数据迁移结果未持久化')
   }
 
@@ -641,6 +706,7 @@ export class AccountPool {
       consumption: this.consumptionCache,
       consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
+      providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，账号变更未持久化')
   }
 
@@ -709,6 +775,7 @@ export class AccountPool {
       consumption: this.consumptionCache,
       consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
+      providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，模型黑名单变更未持久化')
   }
 
@@ -767,6 +834,7 @@ export class AccountPool {
       consumption: this.consumptionCache,
       consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
+      providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，上下文窗口预算变更未持久化')
   }
 
@@ -786,6 +854,18 @@ export class AccountPool {
   checkinNextEligible(provider: string, accountId: string): number | undefined {
     this.ensureLoaded()
     return this.checkinCache[`${provider}:${accountId}`]
+  }
+
+  /**
+   * 列出**全部**签到记录（浅拷贝快照）。
+   *
+   * 与 {@link allDisabledModels} 同款：一次性迁移要按 `provider:accountId` 键
+   * **搬动整条记录**（账号被重建时键的两半都变），逐账号读 `checkinNextEligible`
+   * 做不到这件事。返回的是副本，改它不会影响进程内权威副本。
+   */
+  allCheckins(): Record<string, number> {
+    this.ensureLoaded()
+    return { ...this.checkinCache }
   }
 
   /**
@@ -850,6 +930,7 @@ export class AccountPool {
       consumption: this.consumptionCache,
       consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
+      providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，签到记录变更未持久化')
   }
 
@@ -906,6 +987,19 @@ export class AccountPool {
       snapshot[provider] = { ...setting }
     }
     return snapshot
+  }
+
+  /**
+   * 列出**全部** provider 的遍历游标（浅拷贝快照）。
+   *
+   * 与 {@link allConsumption} 同款：一次性迁移要在**原子写**里搬走游标，
+   * 而池没有别的读法（`writeConsumptionCursor` 只写单个 provider）。
+   * 游标的值是 accountId —— 账号被重建时它**必须跟着换**，否则「下一个该用的
+   * 账号」会指向一个不存在的 id，轮转档在下一轮悄悄退回数组首位。
+   */
+  allConsumptionCursors(): ConsumptionCursorMap {
+    this.ensureLoaded()
+    return { ...this.cursorCache }
   }
 
   /**
@@ -969,6 +1063,7 @@ export class AccountPool {
       consumption,
       consumptionCursors: this.cursorCache,
       schemaVersion: this.versionCache,
+      providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，消耗配置变更未持久化')
   }
 
@@ -994,6 +1089,7 @@ export class AccountPool {
       consumption: this.consumptionCache,
       consumptionCursors: next,
       schemaVersion: this.versionCache,
+      providerAuditVersion: this.auditVersionCache,
     }, '无 settings scope，遍历游标变更未持久化')
   }
 
@@ -1078,11 +1174,16 @@ export class AccountPool {
     for (const entry of this.readAccounts()) {
       if (entry.provider !== product.id) continue
       let domain = ''
+      // 凭据里 JWT 的签发方：与 domain 一起打进告警，便于人工判断「这条到底属于
+      // 哪个产品」（domain 是登录时的快照，可能被历史迁移漏改；iss 是签发方
+      // 写在令牌里的，改不了）。
+      let issuer = ''
       try {
         const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
         if (resolved === undefined) continue
-        const parsed = JSON.parse(resolved.value) as { domain?: unknown }
+        const parsed = JSON.parse(resolved.value) as { domain?: unknown; access_token?: unknown }
         domain = typeof parsed.domain === 'string' ? parsed.domain : ''
+        issuer = typeof parsed.access_token === 'string' ? jwtIssuer(parsed.access_token) : ''
       } catch {
         // 凭据缺失或损坏：留给「凭据未配置」的正常报错路径处理，这里不动
         continue
@@ -1093,7 +1194,8 @@ export class AccountPool {
         // 保守语义：不删除、不 unset 凭据，只告警，让用户可以自行处理。
         this.ctx.logger?.warn?.(
           `[account-hub] ${product.id} 账号 ${entry.id} 的凭据域名失配：记录 ${domain}，`
-          + `预期 ${product.apiDomain}。账号与凭据已保留、未删除，请人工确认该账号是否仍有效；`
+          + `预期 ${product.apiDomain}；凭据 iss=${issuer.length > 0 ? issuer : '(未记录)'}。`
+          + `账号与凭据已保留、未删除，请人工确认该账号是否仍有效；`
           + `若不适用可自行注销。`,
         )
         flagged.push(entry.id)
@@ -1121,20 +1223,46 @@ export class AccountPool {
     await this.writeAccounts(next)
   }
 
-  /** 删除账号（同时清理凭据，并顺带清掉其孤儿签到键） */
+  /**
+   * 删除账号（同时尽力清理凭据，并顺带清掉其孤儿签到键）。
+   *
+   * ## ⚠️ 顺序是「先写账号列表、后 unset 凭据」—— 刻意如此，别改回去
+   *
+   * 反过来的顺序（旧实现：先 `unset` 凭据、再写账号列表）在**两步之间中断**时
+   * 留下的是最坏的一种残骸：**条目还在、凭据已经被删**。而条目上的 `credentialRef`
+   * 是「同前缀的下一次登录」可能复用的名字（ref 由 `${provider}-${shortId}` 派生，
+   * 短 id 撞车虽罕见，但**外部重建 / 手工编辑**不需要撞车就能命中同一个 ref），
+   * 于是新登录写进去的凭据挂到了旧条目上 —— 真实事故正是这么发生的：国际版
+   * （`iss=…workbuddy.ai`）的凭据落在 `BUDDY_CN_ACCOUNT_*` 下，条目却写着
+   * `buddy-cn`，并因此活了很久（见 `src/provider-audit-migration.ts` 的模块头）。
+   *
+   * 换成「先写条目、后 unset」之后，同一个中断点的最坏形态变成**孤儿凭据但没有
+   * 条目** —— 无害：没有任何条目指向它，它只是一份没人读的登录态（下次同 ref
+   * 登录会覆盖它，或被用户手工清理）。
+   *
+   * 调用方语义不变：仍然是「删条目 + 尽力清凭据」。
+   */
   async removeAccount(id: string): Promise<void> {
     const accounts = this.readAccounts()
     const entry = accounts.find(a => a.id === id)
     if (!entry) return
-    try {
-      await this.ctx.credentials.unset(credentialRef(entry.credentialRef))
-    } catch { /* 凭据可能已被删除 */ }
     // 清除该账号的签到记录（`provider:${id}` 精确键），随本次整体 replace 顺带写。
     // 与 `clearModelRateLimits` 同模式：不额外写盘，避免删除账号触发两次落盘。
     if (Object.prototype.hasOwnProperty.call(this.checkinCache, `${entry.provider}:${id}`)) {
       delete this.checkinCache[`${entry.provider}:${id}`]
     }
+    // ① 条目先落盘：从这一刻起，它不再出现在任何读路径上。
     await this.writeAccounts(accounts.filter(a => a.id !== id))
+    // ② 再尽力清凭据。失败**不回滚**条目删除 —— 回滚等于把「条目指向错凭据」
+    //    这个有害形态重新制造出来，而孤儿凭据本身无害（理由见方法头）。
+    try {
+      await this.ctx.credentials.unset(credentialRef(entry.credentialRef))
+    } catch (error) {
+      this.ctx.logger?.warn?.(
+        `[account-hub] 账号 ${id} 已删除，但其凭据 ${entry.credentialRef} 未能清理`
+        + `（不影响账号列表，可忽略或手工清理）：${String(error)}`,
+      )
+    }
   }
 
   /**

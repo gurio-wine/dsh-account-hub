@@ -238,8 +238,13 @@ describe('余额比对豁免表', () => {
     expect(comparesBalanceAroundClaim('codearts')).toBe(false)
   })
 
-  it('其余五家都参与比对', () => {
-    for (const provider of ['buddy-cn', 'buddy', 'lobsterai', 'trae-cn', 'qoder', 'qoder-cn']) {
+  it('trae-cn 登记为豁免（签到奖励结算延迟会假报 abnormal，见模块注释）', () => {
+    expect(BALANCE_COMPARISON_EXEMPT_PROVIDERS.has('trae-cn')).toBe(true)
+    expect(comparesBalanceAroundClaim('trae-cn')).toBe(false)
+  })
+
+  it('其余四家都参与比对', () => {
+    for (const provider of ['buddy-cn', 'buddy', 'lobsterai', 'qoder', 'qoder-cn']) {
       expect(comparesBalanceAroundClaim(provider), provider).toBe(true)
     }
   })

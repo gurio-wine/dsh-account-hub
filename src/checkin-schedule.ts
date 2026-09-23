@@ -239,7 +239,7 @@ export function normalizeCheckinValue(raw: unknown, provider: string): number | 
  * 成功**报成异常，那比不比对坏得多。故不满足前提的 provider 要显式登记在这里，
  * 而不是各自在接线处写一个 if。
  *
- * ## 当前登记项：`codearts`
+ * ## 当前登记项：`codearts`、`trae-cn`
  *
  * 理由（**登记，不是结论**）：CodeArts 的余额来自 `statistics/plugin` 的
  * `metrics[]` 统计口径（见 `src/codearts-credits.ts`），而它是**用量统计**接口
@@ -247,16 +247,23 @@ export function normalizeCheckinValue(raw: unknown, provider: string): number | 
  * 可见」的观测，也没有「有结算延迟」的观测）。比对要求前后两次取值同源可比，
  * 这一条在 CodeArts 上无法证实，故按「拿不准就跳过」处理。
  *
+ * Trae CN（2026-09-24 登记）：其签到奖励的到账存在**结算延迟**的真实观测——
+ * 服务端领取成功但奖励未立刻反映到余额 ⇒ 比对会把真实成功误报 `abnormal`
+ * （不写签到状态 + 自动补签静默 =「首次没签」），重进面板时 status 预检回
+ * `checked_in: true` 走 `already-claimed` 又写状态 ⇒「重进才成功」。该路径
+ * 与签到互斥缺口（已修）**能独立复现原报障**，故按用户拍板豁免。
+ *
  * ⚠️ **解除豁免的唯一条件是真机证据**：先手动签一次，立刻查两次余额
- * （`credits.balances` 前后各一次）并确认数字确实增加了，再把 `codearts`
- * 从本集合删掉，并在 `docs/agents/providers-codearts.md` 记下观测。
+ * （`credits.balances` 前后各一次）并确认数字确实增加了，再把对应 provider
+ * 从本集合删掉，并在 `docs/agents/providers-*.md` 记下观测。
  * 在此之前不要因为「看起来应该会加」而放开它。
  *
- * 其余六家（含余额口径同为「积分包」的 buddy 系 / lobsterai / trae-cn / qoder
+ * 其余各家（含余额口径同为「积分包」的 buddy 系 / lobsterai / qoder
  * 两区）都参与比对：它们的签到奖励与余额出自**同一个积分口径**。
  */
 export const BALANCE_COMPARISON_EXEMPT_PROVIDERS: ReadonlySet<string> = new Set([
   'codearts',
+  'trae-cn',
 ])
 
 /**

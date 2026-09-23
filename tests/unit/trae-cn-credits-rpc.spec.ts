@@ -320,16 +320,14 @@ describe('credits.claimAll 的 trae-cn 分派', () => {
     expect(value.summary).toMatchObject({ claimed: 1, totalCredit: 150, alreadyClaimed: 1, failed: 0 })
     // 顺序性 + 幂等短路：A 的 status（预检）/claim/status（补查）各一次，
     // B 只有 status 一次（已签到 ⇒ 既不发 claim、也不补查）。
-    // ⚠️ 只看 status / claim 两个落点（余额探测另列，见下）——本断言管的是
-    // 「发了几发领取请求、按什么顺序」。
+    // ⚠️ 只看 status / claim 两个落点——本断言管的是「发了几发领取请求、按什么
+    // 顺序」。trae-cn 已登记余额比对豁免（签到奖励结算延迟，见 checkin-schedule.ts
+    // 的 BALANCE_COMPARISON_EXEMPT_PROVIDERS），故 balance 一发都不该有。
     const protocol = h.calls.filter((c) => kindOf(c.url) !== 'balance')
     expect(protocol.map((c) => kindOf(c.url)))
       .toEqual(['status', 'claim', 'status', 'status'])
     expect(protocol.map((c) => c.deviceId)).toEqual([DEVICE_A, DEVICE_A, DEVICE_A, DEVICE_B])
-    // 签到前后余额比对：claimed 的 A 前后各一次（同一设备号 = 同一账号的凭据），
-    // 已签的 B 只有「签到前」那一发（比对只在 claimed 时收尾，见 collectClaimResults）。
-    expect(h.calls.filter((c) => kindOf(c.url) === 'balance').map((c) => c.deviceId))
-      .toEqual([DEVICE_A, DEVICE_A, DEVICE_B])
+    expect(h.calls.filter((c) => kindOf(c.url) === 'balance')).toHaveLength(0)
   })
 
   it('包含已停用账号（签到与账号池自动选择无关）', async () => {

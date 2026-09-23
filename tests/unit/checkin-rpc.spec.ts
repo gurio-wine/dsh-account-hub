@@ -32,7 +32,7 @@
  */
 
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { registerAccountHubRpc, CHECKIN_ELIGIBLE_PROVIDERS, __resetSweepRunning } from '../../src/account-hub-rpc.js'
+import { registerAccountHubRpc, CHECKIN_ELIGIBLE_PROVIDERS, __resetCheckinBusy } from '../../src/account-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { nextEligibleAt } from '../../src/checkin-schedule.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -110,6 +110,41 @@ class ScriptedFetcher {
   /** 余额请求已发生的次数（用于按序取 `balance.totals`）。 */
   private balanceCalls = 0
 
+  /**
+   * 领取请求的**人工闸门**（缺省 `null` = 立刻返回）。
+   *
+   * 并发用例必须让第一路**真的停在 claim 里**才能验互斥：`Promise.all` 里同 tick
+   * 发起两路时，第一路可能已经跑完（替身的响应是同步构造的），那样测出来的是
+   * 「串行两趟」而不是「并发两路」—— 互斥有没有生效都照样绿。
+   *
+   * 由 {@link holdClaim} 建立、{@link releaseClaimHold} 放行。
+   */
+  private claimHold: Promise<void> | null = null
+  private releaseClaimHold: (() => void) | null = null
+  /** 「领取请求已发出」的信号；由 {@link holdClaim} 重建。 */
+  private claimStarted: Promise<void> = Promise.resolve()
+  private markClaimStarted: (() => void) | null = null
+
+  /**
+   * 挂起 `/daily-checkin`：返回「已发出」与「放行」两个把手。
+   *
+   * 用法：先 `const gate = h.fetcher.holdClaim()`，发起第一路，`await gate.started`
+   * 确认它真的在 claim 里，再发起第二路做断言，最后 `gate.release()` 收尾。
+   */
+  holdClaim(): { started: Promise<void>; release: () => void } {
+    this.claimHold = new Promise<void>((resolve) => { this.releaseClaimHold = resolve })
+    this.claimStarted = new Promise<void>((resolve) => { this.markClaimStarted = resolve })
+    return {
+      started: this.claimStarted,
+      release: () => { this.releaseClaimHold?.(); this.claimHold = null },
+    }
+  }
+
+  /** 领取请求（`/daily-checkin`）真正发出的次数——互斥用例的核心计数。 */
+  claimRequestCount(): number {
+    return this.calls.filter((url) => url.includes('/daily-checkin')).length
+  }
+
   private balanceBody(): Response {
     const index = this.balanceCalls
     this.balanceCalls += 1
@@ -169,6 +204,14 @@ class ScriptedFetcher {
       return new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 })
     }
     if (url.includes('/daily-checkin')) {
+      // 并发用例的闸门：先宣告「已在途」，再真的停住（见 {@link holdClaim}）。
+      this.markClaimStarted?.()
+      this.markClaimStarted = null
+      // ⚠️ 只挂住**第一个**领取请求，后续请求立刻返回：否则「被挡方有没有发第二发」
+      // 会以**测试超时**暴露（两边都挂住、谁都不结算），既看不出缺陷也看不出修复。
+      const hold = this.claimHold
+      this.claimHold = null
+      if (hold !== null) await hold
       if (this.claimCode === 10001) {
         return new Response(JSON.stringify({ code: 10001, msg: '今天已签到' }), { status: 200 })
       }
@@ -313,7 +356,7 @@ function qoderCampaignsOnly(campaigns: () => Response) {
 
 afterEach(() => {
   vi.unstubAllGlobals()
-  __resetSweepRunning()
+  __resetCheckinBusy()
 })
 
 // ── CHECKIN_ELIGIBLE_PROVIDERS ──────────────────────────────────────────────
@@ -871,7 +914,7 @@ describe('checkin.sweep 端点', () => {
   it('互斥：并发重入时不并发，返回 running=false', async () => {
     const h = createHarness([makeEntry('x')])
     h.fetcher.claimCode = 0
-    // 同时发起两趟 sweep。第一趟进入后立即置 sweepRunning=true，
+    // 同时发起两趟 sweep。第一趟进入后立即置 checkinBusy=true，
     // 第二趟（同 tick 内）看到忙就直接返回 running=false，不排队不重入。
     const [first, second] = await Promise.all([
       h.call<any>('checkin.sweep', {}),
@@ -893,5 +936,69 @@ describe('checkin.sweep 端点', () => {
     // 第二趟（串行）应能再次真跑。
     const r2 = await h.call<any>('checkin.sweep', {})
     expect((r2 as { value: { running: boolean } }).value.running).toBe(true)
+  })
+})
+
+// ── 面板单发（checkin.perform）与 sweep 的共享互斥 ──────────────────────────
+//
+// 真机形态：**进页面触发的 `checkin.perform` 与 4h/启动 sweep 撞在同一时刻**。
+// 两路都签**同一批**账号，而互斥原先只覆盖 sweep 内部（`performCheckin` 完全不
+// 看那个信号）—— 于是同一账号会被两路各 claim 一次，且两路各自换签到设备号
+// （trae-cn 的 9074 处置）**各自落盘**，后写覆盖先写：盘上留的可能是**另一路**
+// 用的号，下一轮又从旧号起步、白撞一次 9074。
+//
+// 故两路必须共享同一把互斥，且**被挡方要拿到明确语义**（不能与「跑了但没账号
+// 可签」混为一谈，否则界面只能装作什么都没发生）。
+
+describe('签到互斥：checkin.perform 与 sweep 共享同一把', () => {
+  it('sweep 在跑时，面板单发被挡：不发第二发 claim，且明确回「进行中」', async () => {
+    const h = createHarness([makeEntry('acc-1')])
+    h.fetcher.claimCode = 0
+    const gate = h.fetcher.holdClaim()
+
+    // 第一路：sweep，停在 claim 里（真在途，不是「同 tick 抢跑」）。
+    const sweep = h.call<any>('checkin.sweep', {})
+    await gate.started
+    expect(h.fetcher.claimRequestCount()).toBe(1)
+
+    // 第二路：面板单发（自动补签走的就是这一发）。
+    const perform = await h.call<any>('checkin.perform', { provider: 'buddy-cn' })
+
+    // 被挡：同一账号**只有一发**真正 claim。
+    expect(h.fetcher.claimRequestCount(), 'sweep 在跑时面板单发又发了一发 claim').toBe(1)
+    const value = (perform as { value: { busy?: boolean; results: unknown[] } }).value
+    expect(value.busy, '被互斥挡下却没有「进行中」语义').toBe(true)
+    expect(value.results).toEqual([])
+
+    // 放行 sweep → 互斥复位 → 面板单发能再次真跑（不是被永久锁死）。
+    gate.release()
+    const swept = await sweep
+    expect((swept as { value: { running: boolean } }).value.running).toBe(true)
+    expect(h.fetcher.claimRequestCount()).toBe(1)
+
+    const later = await h.call<any>('checkin.perform', { provider: 'buddy-cn' })
+    expect((later as { value: { busy?: boolean } }).value.busy).toBeFalsy()
+    expect(h.fetcher.claimRequestCount()).toBe(2)
+  })
+
+  it('面板单发在跑时，sweep 被挡：同样不发第二发 claim', async () => {
+    const h = createHarness([makeEntry('acc-1')])
+    h.fetcher.claimCode = 0
+    const gate = h.fetcher.holdClaim()
+
+    // 第一路：面板单发（进页面自动补签 / 用户点「一键签到」）。
+    const perform = h.call<any>('checkin.perform', { provider: 'buddy-cn' })
+    await gate.started
+    expect(h.fetcher.claimRequestCount()).toBe(1)
+
+    // 第二路：sweep（4h 定时器恰好在此刻触发）。
+    const sweep = await h.call<any>('checkin.sweep', {})
+
+    expect(h.fetcher.claimRequestCount(), '面板单发在跑时 sweep 又发了一发 claim').toBe(1)
+    expect((sweep as { value: { running: boolean } }).value).toMatchObject({ running: false, providers: [] })
+
+    gate.release()
+    const done = await perform
+    expect((done as { value: { busy?: boolean } }).value.busy).toBeFalsy()
   })
 })

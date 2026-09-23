@@ -4,7 +4,7 @@
 
 ## 存储与通路
 
-**存储与通路**：账号池持久层是 **`ctx.storage` 的 storage 域**（`dsh_account_hub` → `$DSH_HOME/storages/dsh_account_hub.json`，single 布局 + 一个 global 单例文档，七件套 `accounts` / `disabledModels` / `contextBudgets` / `checkins` / `consumption` / `consumptionCursors` / `schemaVersion`，末两件见「账号消耗顺序与切换粒度」一节）。`contextBudget` / `writeContextBudget` 读写第四件；`writeAccounts` / `writeModels` / `writeBudgets` / `writeCheckins` / `writeConsumption` / `writeConsumptionCursor` / `replaceAll` **七件套互带**、都汇入唯一写落点 `persist()`，且都**先 `ensureLoaded()`**（它们不过读路径，漏了就整体写空）。**降级矩阵** = storage 为主 → 旧 settings（`jet-hub` namespace，**历史兼容读取，勿改**）回退 → 纯内存兜底；`apply()` 里 `await pool.openStorage()` **必须早于改名迁移**（它内部重置载入标记，切换点不留数据分叉）。**一次性迁移**（`account-hub-migration.ts`）：storage 无账号数据且能读到旧来源时把 `jet-hub` 段原样搬入，来源优先级 `settings.yaml.imported` → `settings.yaml` → 旧 scope；只读来源 / 幂等 / 空表不落 / 失败不半途覆盖。⚠️ **provider 改名迁移（`provider-rename-migration.ts`）不是「只搬账号与黑名单」**：它的 `replaceAll` 必须携带全部七件套，否则一次改名就会把用户配好的消耗顺序与轮转进度一并清零（有测试断言键集合）。⚠️ **storage 域名只接受 `^[a-z][a-z0-9_]*$`（连字符不合法）**，故是 `dsh_account_hub` 而非插件 id；⚠️ 域打开后**必须 `ctx.effect` 登记 `domain.close`**（facility 按域名单开）；⚠️ **不引 YAML 依赖**：`simple-yaml.ts` 只取目标一节，不支持的构造（锚点/别名/块标量）显式抛错。⚠️ `LlmRuntime.listModels` 会重建条目、丢掉额外字段，`ctx` 也没有「按 provider 取适配器」的入口 ⇒ 由 `register*Llm` **返回适配器实例**经上述参数注入；省略时 `model.list` 不带窗口字段、`setContextBudget` 一律拒绝（headless / 测试的既定降级）。⚠️ **回填行（被关闭的模型）与目录行必须带同一组窗口字段**。⚠️ 客户端 `ModelToggle` 根节点是 `div`、`label` 只包「名称 + 显示开关」，**档位 radio 必须在 label 之外**（放进去会连带翻转显示开关）。
+**存储与通路**：账号池持久层是 **`ctx.storage` 的 storage 域**（`dsh_account_hub` → `$DSH_HOME/storages/dsh_account_hub.json`，single 布局 + 一个 global 单例文档，八件套 `accounts` / `disabledModels` / `contextBudgets` / `checkins` / `consumption` / `consumptionCursors` / `schemaVersion` / `providerAuditVersion`，末三件见「账号消耗顺序与切换粒度」与「provider 体检迁移」两节）。`contextBudget` / `writeContextBudget` 读写第四件；`writeAccounts` / `writeModels` / `writeBudgets` / `writeCheckins` / `writeConsumption` / `writeConsumptionCursor` / `replaceAll` **八件套互带**、都汇入唯一写落点 `persist()`，且都**先 `ensureLoaded()`**（它们不过读路径，漏了就整体写空）。**降级矩阵** = storage 为主 → 旧 settings（`jet-hub` namespace，**历史兼容读取，勿改**）回退 → 纯内存兜底；`apply()` 里 `await pool.openStorage()` **必须早于改名迁移**（它内部重置载入标记，切换点不留数据分叉）。**一次性迁移**（`account-hub-migration.ts`）：storage 无账号数据且能读到旧来源时把 `jet-hub` 段原样搬入，来源优先级 `settings.yaml.imported` → `settings.yaml` → 旧 scope；只读来源 / 幂等 / 空表不落 / 失败不半途覆盖。⚠️ **provider 改名迁移（`provider-rename-migration.ts`）不是「只搬账号与黑名单」**：它的 `replaceAll` 必须携带全部八件套，否则一次改名就会把用户配好的消耗顺序与轮转进度一并清零（有测试断言键集合）。⚠️ **storage 域名只接受 `^[a-z][a-z0-9_]*$`（连字符不合法）**，故是 `dsh_account_hub` 而非插件 id；⚠️ 域打开后**必须 `ctx.effect` 登记 `domain.close`**（facility 按域名单开）；⚠️ **不引 YAML 依赖**：`simple-yaml.ts` 只取目标一节，不支持的构造（锚点/别名/块标量）显式抛错。⚠️ `LlmRuntime.listModels` 会重建条目、丢掉额外字段，`ctx` 也没有「按 provider 取适配器」的入口 ⇒ 由 `register*Llm` **返回适配器实例**经上述参数注入；省略时 `model.list` 不带窗口字段、`setContextBudget` 一律拒绝（headless / 测试的既定降级）。⚠️ **回填行（被关闭的模型）与目录行必须带同一组窗口字段**。⚠️ 客户端 `ModelToggle` 根节点是 `div`、`label` 只包「名称 + 显示开关」，**档位 radio 必须在 label 之外**（放进去会连带翻转显示开关）。
 
 ⚠️ **`openStorage()` 返回被缓存的同一个 Promise，可安全重入**：早期实现只用布尔闸门（`if (storageOpened) return this.storage !== undefined`），于是**首次打开仍在途**时第二次调用会以 `false` **提前 resolve** —— 挂在它 `.then()` 上的启动逻辑（改名迁移、Qoder 资料回填、自动签到 sweep、续期调度判据）全都在 storage 真正接管**之前**跑，读到旧 settings/内存快照。**任何「读池前必须等 storage」的启动逻辑都必须挂在这个 Promise 上**，不要改回布尔闸门；也不要在 `apply()` 的**同步**执行期直接读池（那时 storage 一定还没接管）。
 
@@ -65,7 +65,7 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
 
 ⚠️ **默认档从 `sequential` 翻成 `round-robin`（用户拍板）**：存量用户没动过配置的会从「固定第一个账号」变为「逐请求轮转」。**不提升 `ACCOUNT_HUB_SCHEMA_VERSION`、不做数据迁移** —— 版本号表达的是**字段集合**而非取值语义，而这次只动了 `DEFAULT_CONSUMPTION` 的取值：旧文档里没有 `consumption` 条目，读出来即新默认值；显式写着 `sequential` 的旧条目现在是一份**真实配置**（`sanitizeConsumption` 的「等于默认值不留」判等用的是 `DEFAULT_CONSUMPTION` 本身，剔除的键自动跟着翻转，没有第二份需要同步的名单）。
 
-**存储七件套**：`AccountHubDocument` 新增 `consumption`（`provider → { order, switch }`）与 `consumptionCursors`（`provider → 下一个该用的 accountId`）。它们与既有五件套是**同一份文档**，故必须逐点串进 `emptyAccountHubDocument()` / `sanitizeAccountHubDocument()` / `persist()` 两条分支 / `writeAccounts` / `writeModels` / `writeBudgets` / `writeCheckins` / `writeConsumption` / `writeConsumptionCursor` / `replaceAll` / `ensureLoaded()` 两分支 —— **漏一处就被静默清空**。`ACCOUNT_HUB_SCHEMA_VERSION` bump 到 **3**；⚠️ `ACCOUNT_HUB_DOMAIN_VERSION`（文件格式版本）**保持 1**：storage 后端不校验字段集合，加字段不破坏既有文件。
+**存储七件套**：`AccountHubDocument` 新增 `consumption`（`provider → { order, switch }`）与 `consumptionCursors`（`provider → 下一个该用的 accountId`）。它们与既有五件套是**同一份文档**，故必须逐点串进 `emptyAccountHubDocument()` / `sanitizeAccountHubDocument()` / `persist()` 两条分支 / `writeAccounts` / `writeModels` / `writeBudgets` / `writeCheckins` / `writeConsumption` / `writeConsumptionCursor` / `replaceAll` / `ensureLoaded()` 两分支 —— **漏一处就被静默清空**。`ACCOUNT_HUB_SCHEMA_VERSION` bump 到 **3**（此后因第八字段 `providerAuditVersion` 再 bump 到 **5**，见下节）；⚠️ `ACCOUNT_HUB_DOMAIN_VERSION`（文件格式版本）**保持 1**：storage 后端不校验字段集合，加字段不破坏既有文件。
 
 **等于默认值的条目不留**（读入与写入两侧同口径，复用同一个 `sanitizeConsumption`）：否则「用户从没配过」与「配成了默认值」在存储文件里长得一样。非法档位在 `AccountPool.writeConsumption` **抛错拒绝**（RPC 把它原文回给客户端，那句里带着可选值）。
 
@@ -80,3 +80,41 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
 **余额与选号共用同一条收集实现**（`collectProviderBalances`，模块级）：RPC `credits.balances` 与宿主余额刷新都调它 —— 各写一份分派必然漂移，而漂移的形态很隐蔽：面板显示的数字与选号用的数字来自两套口径。
 
 **RPC**：`consumption.get` / `consumption.set`（**部分更新**，只改传进来的字段）。⚠️ 与 `model.list` / `model.setDisabled` 同一取舍：这两个配置按 **provider id** 存，**刻意不经过 `poolProviderFor()`**。写入后**不重建任何东西**：选号每次都实时读池里的配置，下一次请求即生效。客户端 `ConsumptionSelectors`（`plugin-src/client/account-hub.js`）是**受控组件 + 不做乐观更新**（与 `ModelToggle` / `ModelTierPicker` 同款），形态是**两个原生 `<select>`**（用户要求的形态；radio 组已整体替换）：值经 `value=` 受控（不在 option 上挂 `selected`）、可读名只能靠 `aria-label`（分组是裸 `<div>`，标题那个 `<strong>` 不构成 label）、`disabled` 绑 `busy`。⚠️ 客户端 `CONSUMPTION_DEFAULTS` 必须与宿主 `DEFAULT_CONSUMPTION` 逐字一致（`order: 'round-robin'`）—— 它是 `consumption.get` 失败时的兜底显示值，写错会让「读不到配置」看起来像「用户选了另一档」。版面：两个块 `flex: 1 1 0` + `min-width: 0` 等分容器（总宽 = 卡片宽）、容器**不换行**（需求是「同一排」）。
+
+## provider 体检迁移（`provider-audit-migration.ts`）
+
+**修的脏数据**：账号条目的 `provider` 标签与它凭据的**真实归属**不符 —— 现场案例是
+`BUDDY_CN_ACCOUNT_5C80F1BE` 里躺着 `iss=https://www.workbuddy.ai/auth/realms/copilot`、
+`domain=www.workbuddy.ai` 的**国际版**一年期令牌，条目却写着 `provider: 'buddy-cn'`。
+
+**成因（两处历史缺陷，都已关闭）**：`pruneAccountsWithForeignDomain` 早期**直接删号**；
+`removeAccount` 早期顺序是「先 unset 凭据 → 再写账号列表」，两步间中断留下**孤儿凭据**
+（ref 在、条目没了），下一次同前缀登录复用该 ref ⇒ 新凭据写进旧 ref、条目仍是旧标签。
+现在的顺序是「**先写条目、后尽力 unset**」，中断最坏只留孤儿凭据（无害）。
+
+**为什么它能活很久（闸门教训，别再犯）**：当年的体检闸门写成
+`pool.schemaVersion >= ACCOUNT_HUB_SCHEMA_VERSION` —— 与**改名迁移共用同一个数字**，
+而该常量在改名迁移落地当天就是 1 ⇒ 体检**永远 short-circuit**。现在体检用**自己的**
+`providerAuditVersion`（`PROVIDER_AUDIT_VERSION = 1`，默认 0）：**字段集合版本与体检版本
+各司其职，不许合并**。
+
+**判据（两级，都不猜）**：首选 JWT 的 `iss`（`src/buddy.ts` 的 `jwtIssuer`，只 base64url
+解码不验签）；无 `iss` 时回退凭据的 `domain` 字段并 `warn` 一条。期望域由
+`src/product.ts` 的产品配置**派生**（`PROVIDER_ISSUER_PATTERNS`：品牌域 = `apiDomain` /
+`endpoint` 的末两段，`buddy` → `workbuddy.ai`、`buddy-cn` → `tencent.com`（真实中国版
+`iss` 是 `…codebuddy.cn`，两者同表成立）），迁移模块里不造字面量。两级都说不清
+（凭据缺失 / JSON 损坏 / 签发方既非 buddy 也非 buddy-cn）⇒ **原样保留**。
+
+**动作（重建而非改标签）**：`provider` → 目标 id、`id` → `<目标 id>-<新短 id>`、
+`credentialRef` → `<目标前缀>_ACCOUNT_<新短 id 大写>`，凭据**读旧写新**、
+**绝不 `unset` 旧 ref**（那是有效登录态，只是标签错了）。关联键一起搬：`checkins` 的
+`${provider}:${accountId}` 键、`consumptionCursors` 的值（值就是 accountId）。
+`disabledModels` / `contextBudgets` **不搬**（键是 provider id，属面板配置不属账号）；
+`loginFailures` 是宿主内存表，不落盘。目标 ref 已存在且值不同 ⇒ 冲突，整条跳过并
+`error`，绝不覆盖。id / ref **每次新生成**是刻意的：中断重跑不会撞上自己上次留下的
+半成品（代价只是一份无害孤儿凭据），也让「把版本号手工改回 0」重跑绝对安全。
+
+**接线顺序（`src/index.ts` 的 `apply()`）**：`openStorage()` → 改名迁移 → **体检** →
+域名审计。三者都是 fire-and-forget 且内部自吞异常；体检的 `replaceAll` 是**一次原子写**
+（账号 + 黑名单 + 版本号 + 签到 + 游标 + 体检版本）。`replaceAll` 的实参顺序：
+`accounts, disabledModels, schemaVersion, checkins?, consumptionCursors?, providerAuditVersion?`。

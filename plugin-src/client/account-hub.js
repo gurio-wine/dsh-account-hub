@@ -423,6 +423,25 @@ function claimUndeterminedLines(res) {
 }
 
 /**
+ * 「已有签到正在进行」的提示（**唯一文案**，三个入口共用）。
+ *
+ * 三种触发情形，用户看到的必须是同一句话：
+ *  1. 本地互斥：`claimingRef` 已置真（自动补签 / 一键签到 / 单片签到任一在跑），
+ *     此时按钮通常已 disabled，只剩键盘与程序化调用这两个旁路；
+ *  2. 宿主互斥：`checkin.perform` 回 `busy: true` —— **另一路**签到在跑
+ *     （4h sweep / 启动 sweep），本次一个 claim 都没发；
+ *  3. 同一次点击被连点。
+ *
+ * ⚠️ 为什么必须**说出来**而不是静默 return：这三种情形都属于「点了没反应」的
+ * 典型形态 —— 用户看到按钮弹回原状，无从判断是没点到、被挡、还是签到失败了。
+ * 与自动补签（静默，用户只是进页面）刻意不同：那是被动触发，这是用户主动点的。
+ *
+ * 做成常量而不是两处各写一遍字面量：`details` 缺了会渲染成 `undefined` 行，
+ * 三处写法漂移则同一件事会有三种说法。
+ */
+const CHECKIN_BUSY_NOTICE = { tone: 'warn', text: '已有签到正在进行，请稍候', details: [] };
+
+/**
  * 把一次 `credits.claimAll` 的响应整理成 {@link ClaimNotice} 的 props。
  *
  * 摘要行只讲各档计数（「3 个账号领取成功（+300 积分），1 个失败」），
@@ -1215,6 +1234,22 @@ function ProviderPanel({ provider, rpcCall }) {
   // 拉状态失败（不置真）时不自动签到，避免在无从判断的情况下误发补签请求。
   const [checkinStatusLoaded, setCheckinStatusLoaded] = React.useState(false);
   /**
+   * `loadAccounts` 是否**已结算**（成功或失败都算）。
+   *
+   * 自动补签的**第二个前置闸**，也是本组件里「账号就绪」的**唯一显式信号**。
+   *
+   * ⚠️ 不要退回「`accounts` 引用非空即就绪」：那个判据把「就绪」编码在一个数组的
+   * 引用上，而账号列表有两种**再也不会变化**的结算形态 —— 读到空列表、或读取失败
+   *（面板进 error 态）。两者都会让 `accounts` 永远停在 `[]`，于是「非空才动手」
+   * 的守卫把**整个挂载周期**的自动补签静默吞掉：界面看起来一切正常，只是签到
+   * 一声不响地没发生（真机报障「首次进账号中心没签、重进才成功」的形态）。
+   *
+   * 另外，本地列表为空**并不代表没有可签对象**：`checkin.perform` 不带 accountId
+   * 时目标集合是**宿主**按自己的账号池算的（`performCheckin` → `pool.listAccounts`），
+   * 客户端读不到列表并不妨碍这次签到发生 —— 所以「结算」而非「非空」才是正确判据。
+   */
+  const [accountsLoaded, setAccountsLoaded] = React.useState(false);
+  /**
    * 弹窗被拦截时的**手动登录链接**（`{ url }` | null）。
    *
    * 空窗开不出来时不顶掉 DSH 页面，而是在面板内渲染一个由用户亲自点击的
@@ -1279,11 +1314,19 @@ function ProviderPanel({ provider, rpcCall }) {
       const list = res.accounts || [];
       accountsRef.current = list;
       setAccounts(list);
+      // 结算信号：**成功也置真**（哪怕列表为空）—— 自动补签的触发由它驱动，
+      // 若只在非空时置真，「读到空列表」就会让补签永不触发（见 accountsLoaded）。
+      setAccountsLoaded(true);
       setPhase('ready');
     } catch (caught) {
       if (!mounted.current) return;
       setError(caught?.message || '无法读取账号列表');
       setPhase('error');
+      // ⚠️ **失败同样算结算**：这一次账号列表没读到，但「等账号就绪」这件事已经
+      // 有了结论 —— 继续等下去不会再来一次（本函数不会自动重试）。自动补签不该
+      // 因此静默断流：目标集合由宿主掌握，客户端读不到列表不影响那一发。
+      // 失败路径不置真的话，用户看到的就是「面板报错 + 签到一声不响地没发生」。
+      setAccountsLoaded(true);
     }
   }, [provider, rpcCall]);
 
@@ -1573,16 +1616,18 @@ function ProviderPanel({ provider, rpcCall }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider]);
 
-  // 自动补签触发点：只要本面板挂载、签到状态已落地（`checkinStatusLoaded`），
-  // 且账号列表可用，就对未签账号自动补一次 `checkin.perform`。
-  // 依赖 `checkinStatusLoaded` + `accounts`：前者守「拉状态成功才补签」，后者守
-  // 「账号列表就绪才补签」（与 loadAccounts 并发时可能先空后满，靠它补一次再触发）。
-  // **真正执行的幂等由 autoCheckinRanRef 保证**——该 ref 一旦置真就只会真补一次，
-  // `accounts` 数组在后续重渲染中换引用反复触发本 effect 也不会重复补签。
+  // 自动补签触发点：本面板挂载后，**两个完成信号都就绪**（签到状态已落地 +
+  // 账号列表已结算）就对未签账号自动补一次 `checkin.perform`。
+  //
+  // ⚠️ 依赖刻意**只有这两个完成信号**，不含 `accounts`：把「账号就绪」编码成
+  // 「某个数组的引用变化」正是本次要修的缺陷 —— 列表结算为「空」或「读取失败」
+  // 时那个引用再也不会变，触发条件永远不成立，补签被静默吞掉（见 accountsLoaded）。
+  // 两个信号各自只置真一次（`loadCheckinStatus` / `loadAccounts` 各一处），故本
+  // effect 至多再触发一次，`autoCheckinRanRef` 仍然保证整个挂载周期只自动签一次。
   React.useEffect(() => {
-    if (checkinStatusLoaded) void autoCheckinOnEntry();
+    if (checkinStatusLoaded && accountsLoaded) void autoCheckinOnEntry();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [checkinStatusLoaded, accounts]);
+  }, [checkinStatusLoaded, accountsLoaded]);
 
   // 积分领取状态：claiming 用于禁用按钮，claimNotice 展示上一次领取的结果摘要。
   const [claiming, setClaiming] = React.useState(false);
@@ -1613,6 +1658,14 @@ function ProviderPanel({ provider, rpcCall }) {
       // 对象），故下方的摘要/失败明细消费代码（buildClaimNotice / claimFailureLines
       // / formatClaimFailureLine）一字不改即可复用。
       const res = await rpcCall('checkin.perform', { provider });
+      // 宿主回 `busy`：另一路签到在跑，本次**一个 claim 都没发**。既不是成功也不能
+      // 报成失败（进度正在别处推进），故走同一句「已有签到正在进行」提示并直接收尾
+      // —— 空 summary 喂给 buildClaimNotice 会显示成「没有可领取的账号」，那是
+      // 把「没跑」谎报成「跑了但没有账号」，正是本次要消灭的形态。
+      if (res?.busy) {
+        if (mounted.current) setClaimNotice(CHECKIN_BUSY_NOTICE);
+        return;
+      }
       // 摘要与失败明细一起交给 ClaimNotice（含每个失败账号的服务端 code +
       // message —— 早期实现只解构 summary，把用户判断原因的唯一依据整块丢了）。
       const notice = buildClaimNotice(res);
@@ -1649,11 +1702,25 @@ function ProviderPanel({ provider, rpcCall }) {
    * 自动补签（需求：每次进入 Hub 页面时，未签账号要自动签到）。
    *
    * 语义对齐需求原文 —— 已签/签到成功都算已签：以 `checkinsByAccount`（由宿主的
-   * `checkedIn` 判定，客户端不算今日纪元）为准，只要列表非空且存在任一账号
+   * `checkedIn` 判定，客户端不算今日纪元）为准，存在任一账号
    * `checkedInToday !== true` 就**自动补一次** `checkin.perform({ provider })`
    *（全量，不带 accountId，覆盖全部账号）。已签账号由宿主幂等归
    * `already-claimed`，无害。**只有面板挂载时才触发一次**（见挂载 effect），
    * 进入 Hub 页即该 provider 面板挂载时执行。
+   *
+   * ## 就绪判据是「结算」而不是「非空」（2026-09-24 修复）
+   *
+   * 本函数原先在 `accounts.length === 0` 时直接 `return`（不置 ran，指望账号列表
+   * 就绪后再触发一次）。那个指望只在列表**从空变非空**时成立 —— 而列表还有两种
+   * 终态：读到空数组、读取失败（面板进 error 态）。两者都不会再来一次状态更新，
+   * 于是本次挂载的自动补签被**静默吞掉**：界面正常、签到一声不响地没发生。
+   * 现在等的是 `accountsLoaded`（`loadAccounts` 的结算信号，成败都置真），且本地
+   * 列表为空**不构成**跳过理由 —— `checkin.perform` 不带 accountId 时目标集合由
+   * **宿主**按自己的账号池决定，客户端读不到列表并不妨碍那一发。
+   *
+   * 反之，若宿主回 `busy`（另一路签到在跑），那一路签的是同一批账号，故不重试、
+   * 不打扰用户，只在控制台留一行「被挡」—— 静默的「跑了」与静默的「没跑」必须
+   * 在日志层可区分，否则下一次排查又要从零开始。
    *
    * 为什么是「进入页面自动补」而不是所有调用点：签到状态（`checkinStatus`）本来
    * 就是零网络纯内存读，这里补签也只在成本可忽略时发生；手动「一键签到」已有
@@ -1666,11 +1733,16 @@ function ProviderPanel({ provider, rpcCall }) {
   const autoCheckinOnEntry = async () => {
     if (!supportsCredits) return;
     if (autoCheckinRanRef.current) return;
-    // 账号列表为空 = 尚无可签对象（与 loadAccounts 并发时状态可能还没就绪）。
-    // **不置 ran**，触发 effect 会随账号列表就绪再次进来补判。
-    if (accounts.length === 0) return;
+    // 账号列表尚未**结算**（与 loadCheckinStatus 并发时状态可能先到）：
+    // 什么都不做，**也不置 ran** —— `accountsLoaded` 置真后的那次 effect 会再进来
+    // 补判一次。判据是「已结算」而不是「引用非空」：空列表 / 读取失败同样是结算，
+    // 且本地列表读不到**不影响**这次签到（目标集合由宿主按自己的账号池决定）。
+    if (!accountsLoaded) return;
     // 已全部签过就无需自动补签。
-    if (accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)) return;
+    // ⚠️ `accounts.length > 0` 这一半不可省：`[].every()` **恒为 true**，只留
+    // `every` 会把「本地没有可判对象」（列表结算为空）误判成「已全部签过」——
+    // 缺陷只是从上面那道守卫换到这个位置，形态一模一样（静默不发）。
+    if (accounts.length > 0 && accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)) return;
     // 走到这里才算真正发起过判定/补签，标记本面板只做这一次。
     autoCheckinRanRef.current = true;
     // 已有手动签到在跑（claimed 或单片 checkinAccount 都置 claiming），别并发。
@@ -1678,7 +1750,14 @@ function ProviderPanel({ provider, rpcCall }) {
     claimingRef.current = true;
     if (mounted.current) setClaiming(true);
     try {
-      await rpcCall('checkin.perform', { provider });
+      const res = await rpcCall('checkin.perform', { provider });
+      // 宿主回 `busy`：**另一路签到正在跑**（4h / 启动 sweep，或本面板另一发），
+      // 本次**没有发过任何 claim**。它签的是同一批账号，故无需重试、也不必打断
+      // 用户（自动补签的失败一律静默）—— 但要如实记录「被挡」而不是当成已处理：
+      // 静默的「跑了」与静默的「没跑」在日志层必须可区分。
+      if (res?.busy) {
+        console.warn('[account-hub] auto checkin skipped: another check-in is already running');
+      }
     } catch (caught) {
       // 自动补签失败：静默，仅记录，不弹 claimNotice、不破坏页面。
       console.error('[account-hub] auto checkin failed:', caught);
@@ -1729,7 +1808,7 @@ function ProviderPanel({ provider, rpcCall }) {
     // 正常路径下按钮此时已被 disabled（`claiming` 进了 disabled 条件），
     // 故这里只是键盘/程序化调用等旁路的兜底 —— 给一句话，而不是装作没发生。
     if (claimingRef.current) {
-      setClaimNotice({ tone: 'warn', text: '已有签到正在进行，请稍候', details: [] });
+      setClaimNotice(CHECKIN_BUSY_NOTICE);
       return;
     }
     claimingRef.current = true;
@@ -1737,6 +1816,15 @@ function ProviderPanel({ provider, rpcCall }) {
     try {
       const res = await rpcCall('checkin.perform', { provider, accountId });
       if (!mounted.current) return;
+      // 宿主回 `busy`：另一路签到在跑，本账号这一发**没有发过任何 claim**。
+      // 必须与「跑了但结果是 unavailable/failed」分开：那时服务端已经表过态，
+      // 而这里什么都没发生。状态回到未签（不写「已签」），给同一句提示 ——
+      // 用户该做的动作是稍候，而不是去排查凭据。
+      if (res?.busy) {
+        setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: false, checking: false } }));
+        setClaimNotice(CHECKIN_BUSY_NOTICE);
+        return;
+      }
       const outcome = res?.results?.[0]?.outcome;
       // ⚠️ **只有 claimed / already-claimed 算「已签」**（与宿主写状态的白名单
       // 同源，见 `src/account-hub-rpc.ts` 的 `performCheckinOnTargets`）。

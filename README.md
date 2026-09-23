@@ -123,7 +123,7 @@ dsh plugin --profile <name> add "https://github.com/gurio-wine/dsh-account-hub.g
 | 域名 | `dsh_account_hub`（⚠️ storage 只接受 `^[a-z][a-z0-9_]*$`，**连字符不合法**，故与插件 id 形态不同） |
 | 布局 | `single` + 一个 global 单例文档（无表）—— 账号池数据量小且整体读写 |
 | 落盘 | `$DSH_HOME/storages/dsh_account_hub.json` |
-| 字段 | `accounts` / `disabledModels` / `contextBudgets` / `checkins` / `consumption` / `consumptionCursors` / `schemaVersion`（**七件套**） |
+| 字段 | `accounts` / `disabledModels` / `contextBudgets` / `checkins` / `consumption` / `consumptionCursors` / `schemaVersion` / `providerAuditVersion`（**八件套**） |
 
 **为什么搬**：DSH v0.1.7-alpha.1 删除了 `ctx.settings.register(ns, schema) → owner scope`
 整套 seam。插件走的是优雅降级分支，因此**不抛错、静默全空** —— 用户看到「所有账号
@@ -222,8 +222,8 @@ settings 写入目标是 profile 的 `cordis.patch.yml`（配置）。storage �
   拿它当轮次键会让「按轮次」退化成「按会话」）。
 - **余额缓存在宿主内存里**（TTL 4 小时，启动后与每 4 小时刷新），**且只为配了「最高优先」
   的 provider 发查询请求** —— 没开那一档的 provider 一次网络请求都不会多打。
-- 细节（七件套串接、轮次键、锁上限、降级语义）见 `docs/agents/account-hub-storage.md`
-  的「账号消耗顺序与切换粒度」。
+- 细节（八件套串接、轮次键、锁上限、降级语义）见 `docs/agents/account-hub-storage.md`
+  的「账号消耗顺序与切换粒度」与「provider 体检迁移」。
 
 > **与上方「账号顺序」的关系**：两者是**两个维度**，不是两套并行机制。
 > 拖拽改的是**顺序本身**（候选列表长什么样），消耗顺序档位决定**在这个顺序上

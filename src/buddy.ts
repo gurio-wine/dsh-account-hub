@@ -119,6 +119,15 @@ export interface BuddyCredential {
   scope?: string
   /** API 域名（"copilot.tencent.com"）。 */
   domain?: string
+  /**
+   * access_token 这个 JWT 的 `iss` 声明（**签发方**，形如
+   * `https://www.workbuddy.ai/auth/realms/copilot`）。仅在解析成功时出现。
+   *
+   * ⚠️ 这是**凭据归属哪个产品**的权威判据（与 `domain` 不同：`domain` 是登录时
+   * 快照、可能被历史迁移漏改，而 `iss` 是签发方写死在令牌里的）。目前只有
+   * provider 体检迁移读它，见 `src/provider-audit-migration.ts`。
+   */
+  issuer?: string
   /** 用户 ID（account.uid）。 */
   user_id?: string
   /** 用户昵称（account.nickname）。 */
@@ -172,19 +181,43 @@ export function credentialExpiresAtMs(credential: BuddyCredential): number | und
 }
 
 /**
+ * 从 JWT 的 payload 读取一批声明；非 JWT 或解析失败时返回空对象。
+ *
+ * 仅做 base64url 解码，**不验签** —— 这里的用途全是「展示与本地归类」，
+ * 不涉及任何信任判定（令牌本身还要交给服务端校验）。
+ */
+function jwtClaims(token: string): Record<string, unknown> {
+  if (typeof token !== 'string' || token.length === 0) return {}
+  const parts = token.split('.')
+  if (parts.length < 2) return {}
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as unknown
+    return typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+      ? payload as Record<string, unknown>
+      : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
  * 从 JWT 的 payload 读取 `exp`（秒）并换算为毫秒；非 JWT 或解析失败返回 undefined。
  * 仅做 base64url 解码，不验签——该值只用于展示与续期调度。
  */
 export function jwtExpiresAtMs(token: string): number | undefined {
-  if (typeof token !== 'string' || token.length === 0) return undefined
-  const parts = token.split('.')
-  if (parts.length < 2) return undefined
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as { exp?: unknown }
-    return typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp * 1000 : undefined
-  } catch {
-    return undefined
-  }
+  const exp = jwtClaims(token).exp
+  return typeof exp === 'number' && Number.isFinite(exp) ? exp * 1000 : undefined
+}
+
+/**
+ * 从 JWT 的 payload 读取 `iss`（签发方 URL）；非 JWT、无该声明或解析失败返回空串。
+ *
+ * 与 `jwtExpiresAtMs` 同一取舍：只解码不验签。返回值形如
+ * `https://www.workbuddy.ai/auth/realms/copilot`。
+ */
+export function jwtIssuer(token: string): string {
+  const iss = jwtClaims(token).iss
+  return typeof iss === 'string' ? iss : ''
 }
 
 /**

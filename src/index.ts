@@ -16,6 +16,7 @@ import { AccountPool } from './account-pool.js'
 import { TurnKeyTracker } from './account-consumption.js'
 import { createContextTierRegistry } from './context-tiers.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
+import { auditProviderAssignments } from './provider-audit-migration.js'
 import {
   registerAccountHubRpc,
   performCheckinSweep,
@@ -387,20 +388,35 @@ export function apply(ctx: Context): void {
     // 但会打出误导性警告。迁移自身是 fire-and-forget（内部自吞异常
     // 并打日志，绝不阻断启动），故这里用 `.then()` 串联而不是 `await`。
     void migrateProviderNames(pool, ctx).then(() => {
-      // Buddy（国际版）provider 早年是中国版（copilot.tencent.com）实现，
-      // 后来改造为国际版（www.workbuddy.ai）。期间登录的账号其 token.domain
-      // 仍指向中国版端点，用新 endpoint 发请求必然失败且会一直续期失败。
-      // 判据是「凭据 domain ≠ 产品 apiDomain」，只圈定真正失配的条目。
-      // ⚠️ **只告警、不删除**：失配条目的凭据可能依然有效（国际版账号凭据里
-      // 写着中国版时代遗留的 domain），连凭据一起删除会把不可恢复的数据销毁。
-      // 此处仅记录警告，交由用户自行处理。两个产品各审计一次：中国版
-      // （buddy-cn）历史上也踩过同类坑，只审一边会漏掉另一半。
-      for (const product of [BUDDY_CN, BUDDY]) {
-        // 单条账号的告警由函数内部逐条打出，这里只兜住意外异常。
-        void pool.pruneAccountsWithForeignDomain(product).catch((error: unknown) => {
-          ctx.logger.warn(`[account-hub] 审计 ${product.displayName} 域名失配账号失败：${String(error)}`)
-        })
-      }
+      // 一次性**体检迁移**：逐条把凭据内容（JWT 的 `iss` 声明，回退 domain）与
+      // 条目上的 provider 标签对一遍，不一致就重建为目标 provider 的条目
+      // （新 id / 新 ref、凭据读旧写新、**绝不 unset 旧凭据**）。历史事故是
+      // 「国际版凭据挂在 BUDDY_CN_ACCOUNT_* 前缀下、条目写着 buddy-cn」，
+      // 成因见 `src/provider-audit-migration.ts` 的模块头。
+      //
+      // ⚠️ **必须挂在改名迁移之后**：两条迁移都按 `entry.provider` 选账号，而
+      // `buddy` 这个 id 在改名迁移前后指两个不同产品。顺序反了（或并行）时，
+      // 体检会拿旧标签去比对凭据签发方，把刚改对名的账号又重建回旧标签。
+      // 它有自己的版本闸门（`providerAuditVersion`），与 schemaVersion 无关。
+      //
+      // 下面的域名审计挂在体检**之后**：体检把标签修对之后，审计的
+      // 「domain ≠ 产品 apiDomain」才不会对刚修好的条目误报。
+      void auditProviderAssignments(pool, ctx).then(() => {
+        // Buddy（国际版）provider 早年是中国版（copilot.tencent.com）实现，
+        // 后来改造为国际版（www.workbuddy.ai）。期间登录的账号其 token.domain
+        // 仍指向中国版端点，用新 endpoint 发请求必然失败且会一直续期失败。
+        // 判据是「凭据 domain ≠ 产品 apiDomain」，只圈定真正失配的条目。
+        // ⚠️ **只告警、不删除**：失配条目的凭据可能依然有效（国际版账号凭据里
+        // 写着中国版时代遗留的 domain），连凭据一起删除会把不可恢复的数据销毁。
+        // 此处仅记录警告，交由用户自行处理。两个产品各审计一次：中国版
+        // （buddy-cn）历史上也踩过同类坑，只审一边会漏掉另一半。
+        for (const product of [BUDDY_CN, BUDDY]) {
+          // 单条账号的告警由函数内部逐条打出，这里只兜住意外异常。
+          void pool.pruneAccountsWithForeignDomain(product).catch((error: unknown) => {
+            ctx.logger.warn(`[account-hub] 审计 ${product.displayName} 域名失配账号失败：${String(error)}`)
+          })
+        }
+      })
     })
   }).catch((error: unknown) => {
     // openStorage 自身已把可预期的失败吞掉并降级；这里只兜住意外异常，
@@ -977,7 +993,8 @@ export function apply(ctx: Context): void {
   // 进入 Hub 由客户端触发（见 auto-checkin-design.md §7，宿主不监听页面）。宿主只做
   // **启动 sweep** 与 **每 4 小时定时 sweep** 两件事，共同收口到模块级的
   // `performCheckinSweep`（RPC `checkin.sweep` case 与定时器共用同一入口；内部
-  // `sweepRunning` 模块级互斥保证定时器与页面触发不并发 —— 设计文档 §9）。
+  // `checkinBusy` 模块级互斥保证定时器、启动 sweep 与页面触发（`checkin.perform`）
+  // 三路互不并发 —— 设计文档 §9）。
   const AUTO_CHECKIN_INTERVAL_MS = 4 * 60 * 60 * 1000
   const runAutoCheckinSweep = () => performCheckinSweep({ ctx, pool, lobsterai, qoder, qoderCn })
 
