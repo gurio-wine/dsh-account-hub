@@ -9,9 +9,11 @@ import {
 } from './login.js'
 import {
   RefreshTokenExpiredError,
+  RefreshTokenReusedError,
   credentialFromTokenResponse,
   exchangeRefreshToken,
   keyPairFromStoredJwk,
+  type TokenResponse,
 } from './oauth.js'
 import { RefreshScheduler } from './refresh.js'
 import type { CodeArtsCredential, LoginFlowOptions, LoginFlowResult, ProviderAccountEntry } from './types.js'
@@ -63,6 +65,53 @@ function parseCredential(value: string): CodeArtsCredential | undefined {
     return JSON.parse(value) as CodeArtsCredential
   } catch {
     return undefined
+  }
+}
+
+/**
+ * 用一份凭据去换令牌；若后端回「refresh_token 已被使用」（`STS5.1806`），
+ * **重读存储再试一次**。
+ *
+ * ## 为什么「已被使用」值得重试
+ *
+ * 刷新令牌是**一次性轮换**的：每次成功续期都会作废旧令牌、下发新令牌。当两条
+ * 路径并发续期同一份凭据时（例如 30 分钟批量续期与适配器的鉴权失败兜底同时
+ * 触发），先到的那条会消费掉令牌并写回新凭据，后到的那条必然拿到「已被使用」。
+ * 此时存储里躺着一份**完全可用**的新凭据 —— 直接判失败（更别说判终态、要求
+ * 重新登录）是错的。
+ *
+ * ## 判据是「令牌真的变了吗」
+ *
+ * 只有重读到的 `refresh_token` **与本次使用的那份不同**才值得再试：相同就说明
+ * 没有并发消费者，这个「已被使用」是该令牌自身的历史问题，重试只会再撞一次墙。
+ * 因此**最多重试一次**，且重试前必须比对令牌。
+ *
+ * @param credential - 本次要用的凭据（调用方已确保三个字段齐全）。
+ * @param resolveAgain - 重新解析同一 ref 的最新值（账号路径与单凭据路径共用本函数）。
+ * @param fetcher - 注入的 fetch（测试可替换）。
+ * @returns 令牌响应，以及**实际生效的那份凭据**（重试时是重读所得的新凭据）。
+ *   调用方必须用返回的 `used` 去组装落盘凭据：它携带与本次兑换配对的
+ *   `code_verifier` 与 DPoP 私钥，用旧那份组装会在二者被轮换时写出坏凭据。
+ */
+async function exchangeWithReuseRetry(
+  credential: CodeArtsCredential,
+  resolveAgain: () => Promise<CodeArtsCredential | undefined>,
+  fetcher: typeof fetch,
+): Promise<{ token: TokenResponse; used: CodeArtsCredential }> {
+  const keyPair = keyPairFromStoredJwk(credential.dpop_private_key_jwk!)
+  try {
+    const token = await exchangeRefreshToken(credential.refresh_token!, credential.code_verifier!, keyPair, fetcher)
+    return { token, used: credential }
+  } catch (error) {
+    if (!(error instanceof RefreshTokenReusedError)) throw error
+    const latest = await resolveAgain()
+    // 没有并发消费者（令牌没变）、或新值不完整 ⇒ 原样抛出，交由失败分类处理。
+    if (latest?.refresh_token === undefined || latest.refresh_token === credential.refresh_token) throw error
+    if (latest.code_verifier === undefined || latest.dpop_private_key_jwk === undefined) throw error
+    // 用别人写回的新令牌重试**一次**（不再递归：一次性轮换下二次撞车没有意义）。
+    const retryKeyPair = keyPairFromStoredJwk(latest.dpop_private_key_jwk)
+    const token = await exchangeRefreshToken(latest.refresh_token, latest.code_verifier, retryKeyPair, fetcher)
+    return { token, used: latest }
   }
 }
 
@@ -167,7 +216,11 @@ export class CodeArtsAuth extends Service {
     await this.ctx.credentials.set(ref, flow.access)
     this.refreshTokenInvalid = false
     this.lastRefreshError = undefined
-    this.scheduleRefresh()
+    // ⚠️ **只在单凭据登录时武装调度器**（判据见 {@link scheduleRefresh}）：
+    // 池内账号写的是 `CODEARTS_ACCOUNT_XXX`，而调度器的回调 `refresh()` 读写
+    // `CODEARTS_ACCESS_TOKEN` —— 对它武装等于「按一个与本次登录无关的凭据
+    // 安排续期」。池内账号由 `refreshAll(pool)` 的 30 分钟定时器兜住。
+    if (options.refName === undefined) this.scheduleRefresh()
     void this.refreshModels()
     const credential = parseCredential(flow.access)
     // 多账号：accountId 提供时落位到账号池的一条记录（占位则补全，否则新建）。
@@ -240,11 +293,23 @@ export class CodeArtsAuth extends Service {
     }
     const keyPair = keyPairFromStoredJwk(credential.dpop_private_key_jwk)
     try {
-      const token = await exchangeRefreshToken(credential.refresh_token, credential.code_verifier, keyPair, this.fetchImpl)
+      const { token, used } = await exchangeWithReuseRetry(
+        credential,
+        async () => {
+          const again = await this.ctx.credentials.resolve(ref)
+          return again === undefined ? undefined : parseCredential(again.value)
+        },
+        this.fetchImpl,
+      )
       // 登出竞态保护：在途刷新期间已 logout()/stop() 时，跳过凭据回写与调度武装，
       // 避免已登出的凭据被在途刷新复活。
       if (!this.active) return
-      const refreshed = credentialFromTokenResponse(token, { codeVerifier: credential.code_verifier, codeChallenge: '' }, keyPair)
+      // ⚠️ 用 `used`（而非开头的 `credential`）组装：重试路径上真正生效的是
+      // 重读所得的那份，它的 code_verifier 与 DPoP 私钥才是与本次令牌配对的。
+      const usedKeyPair = used.dpop_private_key_jwk === undefined
+        ? keyPair
+        : keyPairFromStoredJwk(used.dpop_private_key_jwk)
+      const refreshed = credentialFromTokenResponse(token, { codeVerifier: used.code_verifier ?? credential.code_verifier, codeChallenge: '' }, usedKeyPair)
       // 保留无变化字段（domain_id/user_id/user_name 等）。
       refreshed.domain_id = credential.domain_id
       refreshed.user_id = credential.user_id
@@ -281,8 +346,19 @@ export class CodeArtsAuth extends Service {
       throw new Error('无 refresh_token，请重新登录')
     }
     const keyPair = keyPairFromStoredJwk(credential.dpop_private_key_jwk)
-    const token = await exchangeRefreshToken(credential.refresh_token, credential.code_verifier, keyPair, this.fetchImpl)
-    const refreshed = credentialFromTokenResponse(token, { codeVerifier: credential.code_verifier, codeChallenge: '' }, keyPair)
+    // 同一 ref 上仍可能与本服务的批量续期并发：走同一个「已被使用 → 重读再试」。
+    const { token, used } = await exchangeWithReuseRetry(
+      credential,
+      async () => {
+        const again = await this.ctx.credentials.resolve(ref)
+        return again === undefined ? undefined : parseCredential(again.value)
+      },
+      this.fetchImpl,
+    )
+    const usedKeyPair = used.dpop_private_key_jwk === undefined
+      ? keyPair
+      : keyPairFromStoredJwk(used.dpop_private_key_jwk)
+    const refreshed = credentialFromTokenResponse(token, { codeVerifier: used.code_verifier ?? credential.code_verifier, codeChallenge: '' }, usedKeyPair)
     // 保留无变化字段（domain_id/user_id/user_name 等）。
     refreshed.domain_id = credential.domain_id
     refreshed.user_id = credential.user_id
@@ -319,8 +395,21 @@ export class CodeArtsAuth extends Service {
           continue
         }
         const keyPair = keyPairFromStoredJwk(credential.dpop_private_key_jwk)
-        const token = await exchangeRefreshToken(credential.refresh_token, credential.code_verifier, keyPair, this.fetchImpl)
-        const refreshed = credentialFromTokenResponse(token, { codeVerifier: credential.code_verifier, codeChallenge: '' }, keyPair)
+        // **本函数正是「并发消费 refresh_token」的主要来源**（30 分钟一轮，
+        // 可能与适配器的鉴权失败兜底、或用户手点账号卡片的「刷新」同时发生）。
+        // 撞上「已被使用」时重读存储：多半是另一条路径刚写回了新凭据。
+        const { token, used } = await exchangeWithReuseRetry(
+          credential,
+          async () => {
+            const again = await this.ctx.credentials.resolve(ref)
+            return again === undefined ? undefined : parseCredential(again.value)
+          },
+          this.fetchImpl,
+        )
+        const usedKeyPair = used.dpop_private_key_jwk === undefined
+          ? keyPair
+          : keyPairFromStoredJwk(used.dpop_private_key_jwk)
+        const refreshed = credentialFromTokenResponse(token, { codeVerifier: used.code_verifier ?? credential.code_verifier, codeChallenge: '' }, usedKeyPair)
         // 保留无变化字段
         refreshed.domain_id = credential.domain_id
         refreshed.user_id = credential.user_id
@@ -365,7 +454,21 @@ export class CodeArtsAuth extends Service {
     this.stopModelRefresh()
   }
 
-  /** 启动时若已有可刷新凭据则安排续期（由 apply 调用）。 */
+  /**
+   * 按**默认单凭据 ref**（`CODEARTS_ACCESS_TOKEN`）武装续期调度器。
+   *
+   * ⚠️ **只能用于单凭据路径**：调度器的回调是 {@link refresh}，而它读写的正是
+   * `CODEARTS_ACCESS_TOKEN`。若在**池内账号**登录后调用它，读到的会是另一个
+   * ref（该默认 ref 对纯池内账号用户**根本不存在**）⇒ 要么不武装、要么按一个
+   * 与本次登录无关的过期时间武装。池内账号（`CODEARTS_ACCOUNT_XXX`）的续期
+   * 由 `refreshAll(pool)` 的 30 分钟定时器负责（见 `src/index.ts` 的多账号
+   * 静默续期调度），**不是**这里。
+   *
+   * 调用点只有两处，都在本类内（不存在「由 apply 调用」——`apply()` 走的是
+   * 上面那条按池遍历的批量路径）：
+   * 1. {@link persistLoginResult}（**且仅当**未传 `refName`，即单凭据登录）；
+   * 2. {@link refresh} 成功之后（它刚刷新了默认 ref，按新过期时间重新武装）。
+   */
   scheduleRefresh(): void {
     void this.ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF)).then((resolved) => {
       if (!resolved) return

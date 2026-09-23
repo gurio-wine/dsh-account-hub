@@ -70,20 +70,54 @@ export async function readWithIdleTimeout(
  * 而不是让整个会话崩溃。
  */
 /**
- * 剔除无法配对的工具调用与工具结果。
+ * 工具名是否可用（非空字符串）。
  *
- * OpenAI 兼容协议要求：带 `tool_calls` 的 assistant 消息，其**每一个**
- * tool_call id 都必须紧跟一条对应的 `role:'tool'` 结果消息；反之，
- * `role:'tool'` 消息也必须有对应的前置 tool_call。缺任一侧，后端都会以
- * 400 拒绝整个请求。
+ * ⚠️ **不能用 `String(name).length > 0` 代替**：`undefined` / `null` 经 `String()`
+ * 会变成 `"undefined"` / `"null"` 这类**非空**字符串，于是"缺名字"被误判成
+ * "有名字"，原样发给上游照样 400。判据必须落在原始值上。
+ */
+export function hasUsableToolName(name: unknown): boolean {
+  return typeof name === 'string' && name.trim().length > 0
+}
+
+/**
+ * 剔除无法配对、或**名称不可用**的工具调用与工具结果。
  *
- * 工具执行失败时（参数非法、超时、工具不存在……）harness 会把 assistant 的
- * tool_calls 持久化进会话历史，却写不回结果消息。这条坏历史随后被**每次
- * 请求原样重放**，于是后端对之后每一条用户消息都返回 400——表现为"任务突然
- * 中断，此后发送任何内容都没有回复"，整个会话彻底报废。
+ * ## 两类必须剔除的坏数据
  *
- * 适配器是最后一道防线：发出请求前剔除无法配对的条目让会话自愈。宁可丢失
- * 一轮工具上下文，也好过整条会话死亡。
+ * ① **配对缺口**：OpenAI 兼容协议要求带 `tool_calls` 的 assistant 消息，
+ * 其**每一个** tool_call id 都必须紧跟一条对应的 `role:'tool'` 结果消息；
+ * 反之，`role:'tool'` 消息也必须有对应的前置 tool_call。缺任一侧，后端都会以
+ * 400 拒绝整个请求。工具执行失败时（参数非法、超时、工具不存在……）harness
+ * 会把 assistant 的 tool_calls 持久化进会话历史，却写不回结果消息。
+ *
+ * ② **名称为空 / 缺失的 tool_call**（2026-09-23 定位，用户报障）：
+ * 会话历史里出现 `{type:'tool-call', id:'call_…', name:'', arguments:'{}'}`
+ * 时，腾讯系端点以 **HTTP 400 `code 11133 model_param_invalid`** 拒绝整个请求
+ * （错误文案只说"请求参数不符合当前模型要求"，**不指出是哪个字段**，极难排查）。
+ *
+ * | wire 上 `function.name` | 结果 |
+ * |---|---|
+ * | `"read"` | 200 |
+ * | `"unknown_tool"`（不存在的工具名） | 200 ← **只校验"非空"，不校验存在性** |
+ * | `""` / `null` / 缺失 | **400 code 11133** |
+ *
+ * 与配对缺口的关键差异：**空名字即使配对完整也照样 400**，两者成因完全独立。
+ *
+ * 来源是 SSE 消费侧：模型偶发吐出一个**完全没有 name 字段**的 tool-call
+ * 分片，消费端若在 block-end 处以 `name: block.name ?? ''` 落块，harness 执行
+ * 得到 `unknown tool ""` 并把这条坏块**持久化进会话**。此后用户一旦切换到
+ * 腾讯系端点，该坏块被**每次请求原样重放** → 会话彻底报废（表现为"一发消息
+ * 就报参数错误，怎么重试都不行"）。
+ *
+ * 这条坏数据**跨 provider 传染**（qoder 产生、workbuddy 受害），且**五个适配器
+ * 的序列化入口都调用本函数**（`buddy` / `codearts` / `lobsterai` / `qoder` /
+ * `trae-cn`）—— 故防线放在这里一处，而不是某个适配器内部。
+ *
+ * ## 为什么由适配器兜底
+ *
+ * 坏块已在会话里，harness 不会自愈。适配器是最后一道防线：发出请求前剔除，
+ * 宁可丢失一轮工具上下文，也好过整条会话死亡。
  *
  * @param messages - harness 会话消息（按时间顺序）。
  * @returns 应当保留的 tool_call id 与 tool 结果 id 集合。
@@ -101,17 +135,22 @@ export function resolveToolPairing(
       }
     }
   }
-  // 一批 tool_calls 只有全部拿到结果才能保留：部分保留会留下无结果的
-  // tool_call，后端照样拒绝。
+  // 一批 tool_calls 里，**名称可用**的那些才可能保留：名称为空的调用无论
+  // 是否配对完整都会被上游 400（见上方说明）。同批其余调用不受影响 ——
+  // 结果按 id 匹配，剔掉一个不会破坏另一个的配对。
   const keepCallIds = new Set<string>()
   for (const message of messages) {
     if (message.role !== 'assistant') continue
     const content = Array.isArray(message.content) ? message.content : []
-    const calls = content.filter((block): block is { type: string; id: unknown } =>
+    const calls = content.filter((block): block is { type: string; id: unknown; name: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
     if (calls.length === 0) continue
-    if (calls.every(block => allResultIds.has(String(block.id)))) {
-      for (const block of calls) keepCallIds.add(String(block.id))
+    const usable = calls.filter(block => hasUsableToolName(block.name))
+    if (usable.length === 0) continue
+    // 一批里可用的那些只有**全部**拿到结果才能保留：部分保留会留下无结果的
+    // tool_call，后端照样拒绝。
+    if (usable.every(block => allResultIds.has(String(block.id)))) {
+      for (const block of usable) keepCallIds.add(String(block.id))
     }
   }
   // 结果消息只有在对应 tool_call 被保留时才保留。

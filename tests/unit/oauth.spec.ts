@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import {
   CLIENT_ID, REDIRECT_PATH, STS_TOKEN_ENDPOINT,
-  RefreshTokenExpiredError, credentialFromTokenResponse,
-  exchangeAuthorizationCode, exchangeRefreshToken,
+  RefreshTokenExpiredError, RefreshTokenReusedError, credentialFromTokenResponse,
+  exchangeAuthorizationCode, exchangeRefreshToken, isRefreshTokenReusedError,
   generateDpopKeyPair, generatePkcePair, requestToken, signDpopJws,
 } from '../../src/oauth.js'
 
@@ -98,6 +98,33 @@ describe('requestToken / exchangeAuthorizationCode', () => {
     const pair = await generateDpopKeyPair()
     await expect(requestToken({ grant_type: 'refresh_token' }, pair, fetcher as unknown as typeof fetch))
       .rejects.toThrow(/failed/)
+  })
+
+  /**
+   * `STS5.1806 the refresh token has been used` 在**一次性轮换**下通常意味着
+   * 另一条并发路径刚刚成功消费了这份令牌并写回了新凭据 —— 那是「我们手里这份
+   * 过期了」，**不是**「登录失效了」。
+   *
+   * 故它必须是**独立类型**：若归入 `RefreshTokenExpiredError` 终态，调度器会
+   * 停止续期并要求重新登录，而存储里其实躺着一份完全可用的新凭据。
+   */
+  it('classifies STS5.1806 as RefreshTokenReusedError（不是终态 Expired）', async () => {
+    const fetcher = vi.fn(async () =>
+      new Response(JSON.stringify({
+        error_code: 'STS5.1806',
+        error_msg: 'the refresh token has been used',
+      }), { status: 400 }))
+    const pair = await generateDpopKeyPair()
+    const error = await exchangeRefreshToken('RT', 'VERIFIER', pair, fetcher as unknown as typeof fetch)
+      .catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(RefreshTokenReusedError)
+    // 关键反面判据：不得被当成终态 —— 否则并发消费会被误报成「请重新登录」。
+    expect(error).not.toBeInstanceOf(RefreshTokenExpiredError)
+    // 结构化判定同样只看该码 / 该英文原文。
+    expect(isRefreshTokenReusedError({ error_code: 'STS5.1806' })).toBe(true)
+    expect(isRefreshTokenReusedError({ error_msg: 'The refresh token has been used' })).toBe(true)
+    expect(isRefreshTokenReusedError({ error: 'invalid_grant' })).toBe(false)
+    expect(isRefreshTokenReusedError(null)).toBe(false)
   })
 })
 

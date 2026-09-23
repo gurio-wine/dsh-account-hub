@@ -46,11 +46,21 @@ import { LOBSTERAI, type LobsteraiFallbackModel, type LobsteraiProduct } from '.
 import {
   LOBSTERAI_CONTEXT_OVERFLOW_HINT,
   classifyLobsteraiError,
+  classifyLobsteraiStreamError,
   lobsteraiHarnessErrorCode,
   recordsLobsteraiRateLimit,
   shouldRotateLobsteraiAccount,
+  type LobsteraiErrorKind,
 } from './lobsterai-errors.js'
-import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
+import {
+  createReasoningLoopDetector,
+  isReasoningLoopGuardEnabled,
+} from './reasoning-loop-guard.js'
+import {
+  stripCourseLeakFromHistoryContent,
+  stripCourseLeakIfEnabled,
+} from './course-leak-strip.js'
+import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export const PROVIDER = 'lobsterai'
@@ -136,7 +146,11 @@ const LOBSTERAI_EFFORT_NAMES: Readonly<Record<string, string>> = {
   low: '低 Low',
   medium: '中 Medium',
   high: '高 High',
-  xhigh: '最高 XHigh',
+  // 产品侧名为 **Max**（远端 `level:'max'` → wire `'xhigh'`）。
+  // ⚠️ 早期直译 wire 值显示「最高 XHigh」，与产品侧命名不一致，用户按 IDE 的
+  // 「Max」找不到对应档位、以为缺了最高档（Issue #IKHCZF，用户报障）。
+  // **wire 值 `xhigh` 本身一个字符都不动** —— 它才决定真正触发哪一档。
+  xhigh: '最高 Max',
 }
 
 /** 档位 id 的展示名；未登记的 id 回退为 id 本身。 */
@@ -420,7 +434,13 @@ function serializeMessages(
 
   for (const message of messages) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
@@ -508,6 +528,81 @@ function contextWindowError(body: string, status: number): LlmError {
     lobsteraiHarnessErrorCode('context-window', status),
     { status },
   )
+}
+
+/**
+ * 上游把错误放进 **SSE 流内帧**（HTTP 200 + `{error:{message}}`）时抛出的错误。
+ *
+ * ⚠️ **必须是可识别的独立类型**：换号循环要据此区分「这个账号此刻失败了，
+ * 换个号可以重试」与「传输中断 / 用户取消 / 已产出内容后的错误 —— 换号重放
+ * 会污染输出」。仅凭 message 文本无法可靠区分。
+ *
+ * 携带 {@link kind}（已分类）与 {@link detail}（原始 message，用于诊断），
+ * 使流内错误与 HTTP 非 2xx 在换号循环里**共享同一套处理**。
+ */
+class LobsteraiStreamError extends LlmError {
+  constructor(
+    message: string,
+    readonly kind: LobsteraiErrorKind,
+    readonly detail: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, kind === 'hard-credit' ? 'QUOTA_EXCEEDED' : 'SERVER', options)
+  }
+}
+
+/** {@link buildLobsteraiFailure} 的入参。 */
+interface LobsteraiFailureInput {
+  kind: LobsteraiErrorKind
+  status: number
+  /** 原始错误体/错误帧 message（诊断用）。 */
+  text: string
+  model: string
+  /** 该失败是否来自流内错误帧（HTTP 200）。 */
+  fromStream: boolean
+  /** 是否已试遍候选账号（决定文案与错误码）。 */
+  exhausted: boolean
+}
+
+/**
+ * 构造换号循环终止时的最终错误。
+ *
+ * 三种情形共用（避免三处文案与错误码各自漂移）：
+ * 1. **无账号池 / 策略不轮转**：如实报错；
+ * 2. **候选耗尽**（池里没有下一个账号，或已达 `MaxRotate` 上限）：
+ *    报「所有账号均不可用」并带上**最后一次**的真实原因；
+ * 3. **流内错误**：原文是业务 message（如「免费额度已用完，请升级套餐」），
+ *    直接呈现，不再套 `errorDetail` 的 JSON 解析（那会原样返回文本，无害但冗余）。
+ *
+ * ⚠️ 错误码按**最后一次**失败的 kind/status 决定（成组同源）：早期实现把
+ * `kind` 留在循环外只算一次，导致「A=402(积分不足) → B=503」时错误码变成
+ * SERVER，用户完全看不到真实原因。
+ *
+ * ⚠️ **`context-window` 不走本函数**：它有专属的 {@link contextWindowError}
+ * （要附中文补救说明，且必须在换号循环**中途**提前抛出，不能被「均不可用」吞掉）。
+ */
+function buildLobsteraiFailure(input: LobsteraiFailureInput): LlmError {
+  const { kind, status, text, model, fromStream, exhausted } = input
+  const detail = fromStream ? text : errorDetail(text)
+
+  // 额度耗尽是最主要的失败模式，必须用可读文案明确告知（而非泛泛的 HTTP 错误）。
+  if (kind === 'hard-credit') {
+    const prefix = exhausted
+      ? `lobsterai: 模型 ${model} 所有账号均不可用`
+      : 'lobsterai: 积分不足'
+    return new LlmError(`${prefix}（${detail}）`, 'QUOTA_EXCEEDED', { status })
+  }
+
+  // ⚠️ 流内错误帧的 HTTP 状态恒为 **200**：拿它过 `lobsteraiHarnessErrorCode`
+  // 会得到 `HTTP_200` 这种既不可重试、也无语义的码。流内失败属上游侧故障，
+  // 统一归 `SERVER`（与改动前 `throw new LlmError(..., 'SERVER')` 逐字一致）。
+  const code = fromStream ? 'SERVER' : lobsteraiHarnessErrorCode(kind, status)
+
+  if (exhausted) {
+    return new LlmError(`lobsterai: 模型 ${model} 所有账号均不可用（${detail}）`, code, { status })
+  }
+
+  return new LlmError(`lobsterai: ${detail}`, code, { status })
 }
 
 /**
@@ -848,121 +943,146 @@ export class LobsteraiAdapter extends LlmAdapter {
       response = await this.send(credential, body, options)
     }
 
-    if (!response.ok) {
-      let errorText = await response.text().catch(() => '')
-      // 当前这次失败的**成组**状态（status / kind / body 必须同源）。
-      //
-      // 用一组可变变量而不是只看循环外的 `kind`：换号循环里
-      // `response`、`errorText` 每轮都被覆盖，若单把 `kind` 留在循环外，
-      // 就会出现「A 账号的 kind 配 B 账号的 status/body」——
-      //   实测：A=402(积分不足) → B=503 时最终 code 变成 SERVER，
-      //   用户完全看不到「积分不足」这个真实原因；
-      //   且会拿 A 的 kind 去判断「要不要给 B 记限流徽章」，
-      //   给 B 写上「该模型限流 1 小时」这种虚假信息。
-      let lastStatus = response.status
-      let lastKind = classifyLobsteraiError(response.status, errorText)
+    // 5. 统一的重试循环：**HTTP 非 2xx 与流内错误帧都参与换号**。
+    //
+    // ⚠️ 这是用户报障「一个账号用完出错但没有切换」的**根因**。
+    // 额度耗尽是以 **HTTP 200 + SSE 流内错误帧** 表达的（Web 上那句
+    // 「lobsterai: 免费额度已用完，请升级套餐」正是 `consumeSse` 里
+    // `data.error.message` 的产物），而早期实现把整个换号循环放在
+    // `if (!response.ok)` **之内** —— 流内错误在消费阶段才抛出，
+    // 根本走不到换号逻辑，于是池里还有可用账号也不会被尝试。
+    //
+    // 现在两种失败模式共用同一个循环与同一套成组状态（status / kind / text
+    // 必须同源），换号、记徽章、上限与错误构造都只有一份实现。
+    const tried = new Set<string>()
+    if (currentAccountId) tried.add(currentAccountId)
 
-      // 任何非 2xx 都轮转到下一个账号（对齐 Go `handler.go:218-243`：
-      // 那个 switch 每个分支都以 continue 结尾）。策略判定集中在
-      // `shouldRotateLobsteraiAccount` 里，不在这里内联条件 ——
-      // 否则「策略声明」与「实际行为」两处分叉，后续维护必然互相误导。
-      if (this.options.accountPool && shouldRotateLobsteraiAccount(lastKind)) {
-        const tried = new Set<string>()
-        if (currentAccountId) tried.add(currentAccountId)
+    // 当前这次失败的**成组**状态（三者必须同源，见下方说明）。
+    let lastStatus = response.status
+    let lastKind: LobsteraiErrorKind = 'none'
+    let lastText = ''
+    /** 本次失败是否来自流内错误帧（决定错误文案与错误码的映射）。 */
+    let lastFromStream = false
 
-        // 换号次数上限，对齐 Go 的 `MaxRotate`（`handler.go:190` 的
-        // `for i := 0; i < h.cfg.MaxRotate; i++`，默认值 3 见
-        // `server.NewHandler`）。防雪崩：账号池很大时若逐个试完，
-        // 一次用户请求会打出 N 个上游请求，放大延迟与额度消耗。
-        //
-        // ⚠️ **减 1**：Go 的循环计数**包含首个账号**（它每次迭代都
-        // `PickExcluding` 取一个号），而本适配器在进入这个循环**之前**
-        // 已经用首个凭据发过一次请求了。若这里不减，总请求数会变成
-        // 1 + MaxRotate = 4，比 Go 多一次。
-        const maxRotate = LOBSTERAI_MAX_ROTATE - 1
-        for (let round = 0; round < maxRotate; round++) {
-          // 用**本轮**的 lastKind 判断是否该记徽章，而不是循环外的 kind：
-          // 只有 Go 里真正 `Cooldown(...)` 的三类才记（见
-          // `recordsLobsteraiRateLimit` 的说明），且必须记在**真正失败的那个
-          // 账号**上 —— currentAccountId 在下面的循环体里会被推进到下一个账号。
-          if (currentAccountId && recordsLobsteraiRateLimit(lastKind)) {
-            // 两层取值：优先 `parseRateLimitError` 从错误体里抠出**服务端声明的**
-            // 重置时刻；抠不到则用本地兜底。两者都要能落地 ——
-            // 若在抠不到时直接跳过记录，UI 上就不会出现任何限流标记，
-            // 「重测/重置」按钮也就无从操作。
-            const parsed = parseRateLimitError(errorText, options.model)
-            await this.options.accountPool.updateModelRateLimit(
-              currentAccountId,
-              parsed?.modelId ?? options.model,
-              // `parseRateLimitError` 内部要求错误体是 JSON（它 `JSON.parse` 取 msg），
-              // 而部分上游/网关会用**纯文本** 429。此时它返回 null，这里用
-              // 「1 小时后」兜底 —— 与它自己 JSON 路径下的 fallback 同一口径，
-              // 也与本插件「标记只是快照、可主动重测」的语义一致。
-              parsed?.resetTimeMs ?? Date.now() + LOBSTERAI_RATE_LIMIT_FALLBACK_MS,
-            )
+    for (let attempt = 0; ; attempt++) {
+      if (response.ok) {
+        // 消费流。**只有在尚未产出任何内容时才允许换号** —— 见下方 catch 的说明。
+        let emitted = false
+        try {
+          for await (const chunk of this.consumeSse(response, options)) {
+            emitted = true
+            yield chunk
           }
-          // 必须把 `tried` 传给池：失败类别为 5xx / 请求错误时**不写限流标记**
-          // （它们不是限流，不该留徽章），刚失败的账号**仍在数组原位**（候选顺序
-          // 即用户手动顺序），不排除就会拿回同一个账号、命中下面的 `tried.has`
-          // 而**立即 break** —— 换号形同虚设。对齐 Go 的 `PickExcluding(tried)`
-          // （`pool.go:131`）。
-          const next = await this.options.accountPool.getAvailableAccount(
-            this.product.id, options.model, tried,
-          )
-          if (!next || tried.has(next.entry.id)) break
-          tried.add(next.entry.id)
-          credential = next.credential as LobsteraiCredential
-          currentAccountId = next.entry.id
-          response = await this.send(credential, body, options)
-          if (response.ok) {
-            yield* this.consumeSse(response, options)
-            return
-          }
-          // 覆盖成组状态：status / kind / body 三者必须一起更新，
-          // 否则下面抛出的错误码与实际原因会对不上（见上方说明）。
-          errorText = await response.text().catch(() => '')
-          lastStatus = response.status
-          lastKind = classifyLobsteraiError(response.status, errorText)
-          // 新账号也不可轮转时收手：两种情况，处置**完全不同**，故分开写。
+          return
+        } catch (error) {
+          // 传输/超时错误：如实抛出，由 harness 决定是否重试整个回合（不在这里换号）。
+          if (!(error instanceof LobsteraiStreamError)) throw error
+
+          // ⚠️ **已产出内容后绝不能换号**（真实缺陷，2026-09-23 修复）。
           //
-          // 1. `context-window` —— 必须在**这一轮**就把原始失败抛出去。
-          //    换号循环跑到这里说明「第一个账号已超限、又换了一个账号仍超限」，
-          //    而超限是**请求本身**的属性（prompt 太长），与账号无关：继续换下去
-          //    只会打出更多必然失败的请求，最后落到下面那句「所有账号均不可用」——
-          //    用户会以为是自己账号的问题，而真因（请求太长）被埋在终报里。
-          //    直接抛可让宿主立刻压缩上下文并重试。
-          // 2. 其它类别（理论上不该出现：`shouldRotate` 只对 `none` 与
-          //    `context-window` 为 false，而非 2xx 已排除 `none`）—— 留作防御，
-          //    避免将来改动引入死循环。
-          if (lastKind === 'context-window') throw contextWindowError(errorText, lastStatus)
-          if (!shouldRotateLobsteraiAccount(lastKind)) break
+          // 换号会重放一次请求，而新的 `consumeSse` 是**全新的生成器** ——
+          // 它的 `nextIndex` 从 0 重新开始，于是会**再发一次
+          // `block-start(index=0)`**。DSH 对重复块索引是**硬失败**：
+          //
+          //   `dsh-llm/lib/invariant.js`:
+          //     case "block-start":
+          //       if (open.has(chunk.index)) fail(`LLM stream repeated block-start index ${chunk.index}`)
+          //
+          // 也就是说：已产出内容后换号不仅会把两个账号的正文拼在一起，
+          // 还会把「额度耗尽」这个可读错误升级成 harness 的 invariant 崩溃 ——
+          // 比不换号更糟（用户看到一个与真实原因无关的内部错误）。
+          //
+          // 此时如实抛出即可：harness 会重试整个回合，而在那次请求里
+          // 本账号的失败通常发生在**首帧**（尚未产出内容），可干净换号。
+          if (emitted) throw error
+
+          // 流内业务错误（如额度耗尽）且**尚未产出任何内容**：换号重试。
+          // 这正是用户报障「一个账号用完出错但没有切换」的修复点 ——
+          // 额度耗尽的错误帧是流里的**第一帧**，此前却因为整段换号逻辑
+          // 位于 `if (!response.ok)` 之内而完全走不到。
+          lastFromStream = true
+          lastStatus = response.status
+          lastKind = error.kind
+          lastText = error.detail
         }
-        // 试遍候选：报「均不可用」，并带上**最后一次**的真实原因（不吞诊断信息）。
-        throw new LlmError(
-          `lobsterai: 模型 ${options.model} 所有账号均不可用（${errorDetail(errorText)}）`,
-          lobsteraiHarnessErrorCode(lastKind, lastStatus),
-          { status: lastStatus },
+      } else {
+        lastFromStream = false
+        lastText = await response.text().catch(() => '')
+        lastStatus = response.status
+        lastKind = classifyLobsteraiError(lastStatus, lastText)
+      }
+
+      // 上下文超限：**必须在换号之前就抛出去**，不能被卷进「所有账号均不可用」。
+      //
+      // 超限是**请求本身**的属性（prompt 太长），与账号无关：继续换下去只会打出
+      // 更多必然失败的请求，最后把真因埋在那句终报里 —— 用户会以为是自己账号的
+      // 问题，而实际需要的是宿主立刻压缩上下文并重试（`CONTEXT_WINDOW_EXCEEDED`
+      // 是 DSH 唯一的自动压缩入口，见 `lobsterai-errors.ts`）。
+      if (lastKind === 'context-window') throw contextWindowError(lastText, lastStatus)
+
+      // 用**本轮**的 kind 判断是否该记徽章：只有 Go 里真正 `Cooldown(...)`
+      // 的三类才记（见 `recordsLobsteraiRateLimit` 的说明），且必须记在
+      // **真正失败的那个账号**上 —— currentAccountId 在下面会被推进到下一个账号。
+      if (this.options.accountPool && currentAccountId && recordsLobsteraiRateLimit(lastKind)) {
+        // 两层取值：优先 `parseRateLimitError` 从错误体里抠出**服务端声明的**
+        // 重置时刻；抠不到则用本地兜底。两者都要能落地 ——
+        // 若在抠不到时直接跳过记录，UI 上就不会出现任何限流标记，
+        // 「重测/重置」按钮也就无从操作。
+        const parsed = parseRateLimitError(lastText, options.model)
+        await this.options.accountPool.updateModelRateLimit(
+          currentAccountId,
+          parsed?.modelId ?? options.model,
+          // `parseRateLimitError` 内部要求错误体是 JSON（它 `JSON.parse` 取 msg），
+          // 而部分上游/网关会用**纯文本** 429。此时它返回 null，这里用
+          // 「1 小时后」兜底 —— 与它自己 JSON 路径下的 fallback 同一口径，
+          // 也与本插件「标记只是快照、可主动重测」的语义一致。
+          parsed?.resetTimeMs ?? Date.now() + LOBSTERAI_RATE_LIMIT_FALLBACK_MS,
         )
       }
 
-      // 上下文超限但没进换号循环（未配账号池，或首个账号就命中）：立刻交给宿主
-      // 压缩上下文后重试。**不换号**的理由见 `shouldRotateLobsteraiAccount`。
-      if (lastKind === 'context-window') throw contextWindowError(errorText, lastStatus)
-
-      // 积分不足但无账号池（或只有一个账号）：用可读文案明确告知，
-      // 而不是抛一个泛泛的 HTTP 错误 —— 这是 LobsterAI 最主要的失败模式。
-      if (lastKind === 'hard-credit') {
-        throw new LlmError(`lobsterai: 积分不足（${errorDetail(errorText)}）`, 'QUOTA_EXCEEDED', { status: lastStatus })
+      // 无账号池（或策略判定不该轮转）：如实报错，不做换号。
+      if (!this.options.accountPool || !shouldRotateLobsteraiAccount(lastKind)) {
+        throw buildLobsteraiFailure({
+          kind: lastKind, status: lastStatus, text: lastText,
+          model: options.model, fromStream: lastFromStream, exhausted: false,
+        })
       }
-      throw new LlmError(
-        `lobsterai: ${errorDetail(errorText)}`,
-        lobsteraiHarnessErrorCode(lastKind, lastStatus),
-        { status: lastStatus },
-      )
-    }
 
-    // 5. 消费 SSE 流
-    yield* this.consumeSse(response, options)
+      // 换号次数上限，对齐 Go 的 `MaxRotate`（`handler.go:190` 的
+      // `for i := 0; i < h.cfg.MaxRotate; i++`，默认值 3 见
+      // `server.NewHandler`）。防雪崩：账号池很大时若逐个试完，
+      // 一次用户请求会打出 N 个上游请求，放大延迟与额度消耗。
+      //
+      // ⚠️ **减 1**：Go 的循环计数**包含首个账号**（它每次迭代都
+      // `PickExcluding` 取一个号），而本适配器在进入这个循环**之前**
+      // 已经用首个凭据发过一次请求了。若这里不减，总请求数会变成
+      // 1 + MaxRotate = 4，比 Go 多一次。
+      if (attempt >= LOBSTERAI_MAX_ROTATE - 1) {
+        throw buildLobsteraiFailure({
+          kind: lastKind, status: lastStatus, text: lastText,
+          model: options.model, fromStream: lastFromStream, exhausted: true,
+        })
+      }
+
+      // 必须把 `tried` 传给池：失败类别为 5xx / 请求错误时**不写限流标记**
+      // （它们不是限流，不该留徽章），刚失败的账号**仍在数组原位**（候选顺序
+      // 即用户手动顺序），不排除就会拿回同一个账号、命中下面的 `tried.has`
+      // 而**立即中断** —— 换号形同虚设。对齐 Go 的 `PickExcluding(tried)`
+      // （`pool.go:131`）。
+      const next = await this.options.accountPool.getAvailableAccount(
+        this.product.id, options.model, tried,
+      )
+      if (!next || tried.has(next.entry.id)) {
+        throw buildLobsteraiFailure({
+          kind: lastKind, status: lastStatus, text: lastText,
+          model: options.model, fromStream: lastFromStream, exhausted: true,
+        })
+      }
+      tried.add(next.entry.id)
+      credential = next.credential as LobsteraiCredential
+      currentAccountId = next.entry.id
+      response = await this.send(credential, body, options)
+    }
   }
 
   /** 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。 */
@@ -1012,7 +1132,24 @@ export class LobsteraiAdapter extends LlmAdapter {
 
     const blocks: Array<{ index: number; kind: 'text' | 'reasoning'; text: string }> = []
     let nextIndex = 0
-    const toolCalls = new Map<number, { index: number; text: string; callId?: string; name?: string }>()
+    /**
+     * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+     * reasoning 增量，收尾时发截断后的 block，并让 finish 报 max-tokens。
+     *
+     * 与 buddy 同因：`reasoning_tokens` **计入** `completion_tokens`，思考陷入
+     * 病态重复就把输出额度烧光、正文零产出，而 `finish` 若是 `stop`，
+     * UI 上完全看不出错误。
+     */
+    const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    let loopDetected = false
+    const toolCalls = new Map<number, {
+      index: number
+      text: string
+      callId?: string
+      name?: string
+      /** 是否已发过 `block-start`（名字可用的那一刻才发，见下方 tool_calls 分支）。 */
+      announced: boolean
+    }>()
     const toolOrder: number[] = []
     const toolIds = new Map<number, string>()
     let buffer = ''
@@ -1094,7 +1231,17 @@ export class LobsteraiAdapter extends LlmAdapter {
             continue
           }
           if (data.error !== undefined) {
-            throw new LlmError(`lobsterai: ${data.error.message ?? 'unknown error'}`, 'SERVER')
+            // ⚠️ 必须抛**可分类的** `LobsteraiStreamError`：额度耗尽正是以
+            // 这个形态下发的（HTTP 200 + `{error:{message:'免费额度已用完，请升级套餐'}}`），
+            // 而早期这里抛的是裸 `LlmError`（固定 SERVER），换号循环
+            // 既看不到它、也无法判断该不该换号 —— 用户报障
+            // 「一个账号用完出错但没有切换」的直接原因。
+            const detail = data.error.message ?? 'unknown error'
+            throw new LobsteraiStreamError(
+              `lobsterai: ${detail}`,
+              classifyLobsteraiStreamError(detail),
+              detail,
+            )
           }
           const choice = data.choices?.[0]
           const delta = choice?.delta
@@ -1131,14 +1278,28 @@ export class LobsteraiAdapter extends LlmAdapter {
           // 同上：`reasoning_content: null` 会让 `!== undefined` 守卫放行到 `.length`。
           const reasoningDelta = delta?.reasoning_content
           if (typeof reasoningDelta === 'string' && reasoningDelta.length > 0) {
-            let block = blocks.find(candidate => candidate.kind === 'reasoning')
-            if (block === undefined) {
-              block = { index: nextIndex++, kind: 'reasoning', text: '' }
-              blocks.push(block)
-              yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+            // 死循环守卫：命中后不再累积、不再发射。
+            //
+            // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` + `break`）在
+            // 本 chunk 的行循环**全部处理完之后**、外层 `for (;;)` 末尾执行（见下方
+            // ★ 止损块）—— 这样同一 chunk 里已到达的 usage / [DONE] 仍会被处理。
+            //
+            // ⚠️ 也**不能用 `continue`**：它会连带跳过本帧位于 reasoning 分支
+            // **之后**的 `usage`，导致 token 记账静默丢失。故用 `if (!loopDetected)`
+            // 守卫分支体。
+            if (loopGuard !== undefined) {
+              if (loopGuard.observe(reasoningDelta)) loopDetected = true
             }
-            block.text += reasoningDelta
-            yield { type: 'reasoning-delta', index: block.index, text: reasoningDelta }
+            if (!loopDetected) {
+              let block = blocks.find(candidate => candidate.kind === 'reasoning')
+              if (block === undefined) {
+                block = { index: nextIndex++, kind: 'reasoning', text: '' }
+                blocks.push(block)
+                yield { type: 'block-start', index: block.index, blockType: 'reasoning' }
+              }
+              block.text += reasoningDelta
+              yield { type: 'reasoning-delta', index: block.index, text: reasoningDelta }
+            }
           }
           for (const call of delta?.tool_calls ?? []) {
             const wireIndex = call.index ?? 0
@@ -1146,10 +1307,8 @@ export class LobsteraiAdapter extends LlmAdapter {
             const callId = toolIds.get(wireIndex) ?? `call_${wireIndex}`
             let block = toolCalls.get(wireIndex)
             if (block === undefined) {
-              block = { index: nextIndex++, text: '', callId }
+              block = { index: nextIndex++, text: '', callId, announced: false }
               toolCalls.set(wireIndex, block)
-              toolOrder.push(block.index)
-              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
             }
             block.callId = callId
             // 只允许非空名字覆盖：后续分片带空串 "" 会清空首个分片解析出的工具名，
@@ -1159,6 +1318,24 @@ export class LobsteraiAdapter extends LlmAdapter {
             }
             const fragment = call.function?.arguments ?? ''
             block.text += fragment
+            // ⚠️ **名称为空前不发射任何 chunk**（与 `openai-compat.ts` /
+            // `buddy-adapter.ts` 同因同修，见 `src/sse.ts`）。只跳过收尾的
+            // `block-end` 不够 —— `BlockAssembler` 会把没有 block-end 的 partial
+            // 也组装成 `name:''`，污染会话后让下游端点以 400 拒绝请求。
+            if (!block.announced) {
+              if (!hasUsableToolName(block.name)) continue
+              block.announced = true
+              toolOrder.push(block.index)
+              yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+              yield {
+                type: 'tool-call-delta',
+                index: block.index,
+                id: ToolCallId(callId),
+                name: block.name!,
+                argumentsDelta: block.text,
+              }
+              continue
+            }
             yield {
               type: 'tool-call-delta',
               index: block.index,
@@ -1187,6 +1364,21 @@ export class LobsteraiAdapter extends LlmAdapter {
             }
           }
         }
+        // ★ 止损：命中死循环后**中止上游**，否则输出额度照烧。
+        // 只跳过下行累积/发射、却把流读到底，则上游继续生成，额度照烧。
+        //
+        // ⚠️ 位置：内层行循环**之后**、外层 `for (;;)` 末尾 —— 同一 chunk 里已到达
+        // 的 `usage` / `[DONE]` 因此仍会被处理，但命中后**立即**退出，不再读下一块。
+        //
+        // ⚠️ 只 cancel **reader**，绝不 abort `options.signal`：后者是调用方信号，
+        // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+        // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+        // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+        // 「正常止损」变成一次失败。
+        if (loopDetected) {
+          await reader.cancel().catch(() => {})
+          break
+        }
       }
     } finally {
       reader.releaseLock()
@@ -1196,13 +1388,16 @@ export class LobsteraiAdapter extends LlmAdapter {
     const textBlock = blocks.find(block => block.kind === 'text')
     for (const index of toolOrder) {
       const block = [...toolCalls.values()].find(candidate => candidate.index === index)!
+      // `toolOrder` 只收「名字已可用」的块，故此处名字必然可用；不回退成
+      // `?? ''` —— 那会把空名字块写进会话，正是本次修复要根除的污染路径。
+      if (!hasUsableToolName(block.name)) continue
       yield {
         type: 'block-end',
         index,
         block: {
           type: 'tool-call',
           id: ToolCallId(block.callId ?? ''),
-          name: block.name ?? '',
+          name: block.name!,
           // 仅把「无参数工具下发的空分片」补成 {}；**残缺参数保持原样**，
           // 由 max-tokens 判定触发重试 —— 把残缺 JSON 补成 {} 会伪造出
           // 合法外观，让 harness 报 missing required property 而非重试。
@@ -1213,11 +1408,26 @@ export class LobsteraiAdapter extends LlmAdapter {
       }
     }
     if (textBlock !== undefined) {
-      yield { type: 'block-end', index: textBlock.index, block: { type: 'text', text: textBlock.text } }
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      yield {
+        type: 'block-end',
+        index: textBlock.index,
+        block: { type: 'text', text: stripCourseLeakIfEnabled(textBlock.text) },
+      }
     }
     const reasoningBlock = blocks.find(block => block.kind === 'reasoning')
     if (reasoningBlock !== undefined && reasoningBlock.text !== '') {
-      yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: reasoningBlock.text } }
+      // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
+      // **权威覆盖**：即便前面已 yield 了全部重复 delta，这里发截断后的 block
+      // 即可，无需撤回。
+      const reasoningText = loopDetected && loopGuard?.cutAt !== undefined
+        ? reasoningBlock.text.slice(0, loopGuard.cutAt)
+        : reasoningBlock.text
+      // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+      const cleanedReasoning = stripCourseLeakIfEnabled(reasoningText)
+      if (cleanedReasoning !== '') {
+        yield { type: 'block-end', index: reasoningBlock.index, block: { type: 'reasoning', text: cleanedReasoning } }
+      }
     }
     // 三种「不完整」都必须报告 max-tokens 而非 tool-calls：
     // - 'length'：被 max_tokens 显式截断；
@@ -1227,13 +1437,28 @@ export class LobsteraiAdapter extends LlmAdapter {
     // 模型收到莫名错误后陷入重试循环；报告 max-tokens 则丢弃并重试，
     // 实测一次即恢复。
     const argsTruncated = [...toolCalls.values()].some(block => isTruncatedArguments(block.text))
-    const reason = finishReason === 'length'
-      || (finishReason === undefined && toolOrder.length > 0)
-      || argsTruncated
+    /**
+     * 是否丢弃过**名称不可用**的 tool-call 块（见上方 tool_calls 分支）。
+     *
+     * 丢弃是对的（无名调用无法执行、留着会污染会话），但不能让它**静默地以
+     * `stop` 结束** —— 那正是「没有任何报错就中断」：模型本意要调工具，
+     * harness 却认为它「正常答完了」。故报 max-tokens（不完整、可重试）。
+     * 同批若还有可用调用，则照常报 tool-calls。
+     */
+    const droppedUnnamedCalls = [...toolCalls.values()].some(block => !block.announced)
+    const reason = loopDetected
+      // 思考死循环：截断并报可重试。**优先级最高**（高于 tool_calls）——
+      // 循环中生成的工具调用参数不可信；且若无可用调用，落到 `stop` 会让
+      // 任务静默中断。
       ? { kind: 'max-tokens' as const }
-      : finishReason === 'tool_calls' || toolOrder.length > 0
-        ? { kind: 'tool-calls' as const }
-        : { kind: 'stop' as const }
+      : finishReason === 'length'
+        || (finishReason === undefined && toolOrder.length > 0)
+        || argsTruncated
+        || (droppedUnnamedCalls && toolOrder.length === 0)
+        ? { kind: 'max-tokens' as const }
+        : finishReason === 'tool_calls' || toolOrder.length > 0
+          ? { kind: 'tool-calls' as const }
+          : { kind: 'stop' as const }
     yield { type: 'finish', reason }
   }
 }

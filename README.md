@@ -298,20 +298,32 @@ CodeBuddy 系（现 Buddy 系）、LobsterAI 完全一致（见 [AGENTS.md](AGEN
 `Chat-Id`/`Session-Id` 请求头。默认广告的模型为 GLM-5.2、GLM-5.1、
 GLM-5、GLM-5.3 Flash（`glm-5.3-flash`，1M 上下文）、盘古
 openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
-以及 DeepSeek V4 deepseek-v4-flash / deepseek-v4-pro（UI 标注每日 1000 万免费
-Tokens 福利）。
+以及 DeepSeek V4 deepseek-v4-flash / deepseek-v4-pro / deepseek-v4.1-flash（UI 标注
+每日 1000 万免费 Tokens 福利）。
 登录后在 dsh Models 页面选择该 provider 即可。
 
 > 注 1：CodeArts Agent IDE 模型列表显示的 flash ID 为 `deepseek-v4-flash-0731`
-> （带日期后缀），但后端实际注册的可用 ID 是 `deepseek-v4-flash`（无后缀）。
-> 用 `deepseek-v4-flash-0731` 调用会返回 `InferHub.002002009.404 The model is
-> not registered`，因此本插件只注册无后缀的 `deepseek-v4-flash`。
+> （带日期后缀）。**带后缀与无后缀是后端上两个不同的模型，均有注册，不能互相
+> 替代**：`deepseek-v4-flash-0731` / `deepseek-v4-pro-0813` 是 benefit 模型
+> （需 `maas_type: benefit`，见注 2），而无后缀的 `deepseek-v4-flash` /
+> `deepseek-v4-pro` 是**非 benefit** 模型（带上该头反而报 `unsupported model`）。
+> 早期「带后缀 404 = 后端未注册」的结论**有误** —— 那 404 的真实原因是**缺
+> `maas_type: benefit` 头**。本插件目录里保留无后缀形态（无后缀始终可用、
+> 不依赖该头）；远端 `gateway/config` 下发的带后缀 id 会在解析层归一化。
 >
-> 注 2：`glm-5.3-flash`（GLM-5.3 Flash，2026-08 加入，1M 上下文）是 benefit
-> （免费额度）模型：其 chat 请求必须携带 `maas_type: benefit` 请求头且该头
-> 参与 `SDK-HMAC-SHA256` 签名，否则后端返回 `InferHub.002002009.404 The model
-> is not registered`。适配器已自动处理，无需手动配置。
-> （逆向自 CodeArts Agent IDE mitmproxy 抓包，对齐 deveco-code-rust 90aeb17d。）
+> 注 2：benefit（免费额度）模型的 chat 请求必须携带 `maas_type: benefit` 请求头
+> 且该头参与 `SDK-HMAC-SHA256` 签名，否则后端返回
+> `InferHub.002002009.404 The model is not registered`。已知 benefit 模型：
+> `glm-5.3-flash`、`deepseek-v4.1-flash`。
+> **判定是动态的**（`src/models.ts` 的 `isCodeArtsBenefitModel`）：内存缓存 →
+> 磁盘缓存（`~/.cache/deveco/codearts_benefit_models.json`，由 gateway/config
+> 拉取所得）→ 静态兜底表，故后端新增 benefit 模型时**无需改代码**即自动识别。
+> 适配器已自动处理，无需手动配置。
+> （逆向自 CodeArts Agent IDE mitmproxy 抓包，对齐 deveco-code-rust 90aeb17d /
+> fb1b4a2。）
+> ⚠️ 只把**未被 `normalizeModelId` 改写**的 id 记入 benefit 集合：gateway 下发
+> 的是 `deepseek-v4-flash-0731`（benefit），归一化后落到无后缀 id（**非** benefit），
+> 连带标记会让无后缀模型多带该头而调用失败。
 
 凭据来自默认的新式 IAM OAuth 流程（含 `refresh_token`）。请求发起时会解析最新
 凭据，若已过期则先静默续期，再用新 AK/SK/SecurityToken 签名，无需重新打开浏览器。
@@ -350,6 +362,12 @@ Tokens 福利）。
   换取含 `refresh_token` 的凭据。
 - 凭据在过期前 1 小时静默续期（`getFirstRefreshTime` 语义：距过期 ≤1h 立即刷，
   否则 `now+1h` 叠加随机秒偏移），全程无浏览器、无人工操作。
+- **账号池用户同样成立**：池内账号（`CODEARTS_ACCOUNT_*`）由宿主每 30 分钟一轮的
+  批量续期（`refreshAll`）覆盖，判据只看 `refreshable`；插件启动、**storage 就绪后
+  立即补跑一轮**（不等那 30 分钟），此后每 30 分钟一轮。
+  > 该定时器曾因判据在 `apply()` 同步执行期就求值（此时 storage 尚未异步接管、
+  > 读不到池内账号）而**从未注册过** —— 池内账号的 `refresh_token` 会一路放到过期。
+  > 现已把判据整体移入 `pool.openStorage()` 的 `then` 链。
 - 刷新失败后 10 分钟重试（异常网络 1 分钟）；`refresh_token` 失效后停止续期并提示
   重新登录（原因会体现在 `status().refreshError` 中）。
 - 旧 ticket 流程保留为显式回退：`/codearts-login` 默认走 OAuth；编程式调用

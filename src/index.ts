@@ -244,6 +244,57 @@ export function makeCredentialResolver<T>(
   }
 }
 
+/**
+ * 构造 provider 的**续期回调**，与 {@link makeCredentialResolver} 配对使用。
+ *
+ * ## 为什么必须与 resolver 配对
+ *
+ * `resolveCredential` 优先从账号池取 `<PROVIDER>_ACCOUNT_XXX` 的凭据，而各 auth
+ * 服务的 `refresh()` 读写的是该 provider 的**默认单凭据 ref**（如
+ * `CODEARTS_ACCESS_TOKEN`）。两处错配的后果链（与 `lobsterai-wiring.spec.ts`
+ * 记录的 S1、以及 `src/account-hub-rpc.ts` 的 `account.refresh` 同一缺陷）：
+ * 适配器检测到池凭据过期 → 调 refresh → 刷的是**另一个** ref（池内账号用户那里
+ * 甚至不存在该 ref，直接抛「未配置凭据，请先登录」）→ 再 resolve 仍取到那份
+ * 未更新的过期凭据 → 带着过期凭据发请求。用户看到「刚在 Account Hub 登录好，
+ * 却一直认证失败 / 让我重新登录」，而日志里续期全绿，极难排查。
+ *
+ * 与 `account.refresh` RPC 的区别：RPC 那边**已经有** `accountId`（账号卡片的
+ * 目标账号是明确的），故直接按 `entry.credentialRef` 续期；而适配器回调只有
+ * **目标模型**这一个线索，必须走与 resolver **完全相同**的选号路径
+ * （同一个 `makeAccountPicker`、同一个 `model` 实参）才能保证挑到同一个账号。
+ *
+ * ## 两条刻意的退化（不要「顺手」删掉）
+ *
+ * 1. **池内无候选时回退 `refresh()`**：这是单凭据用户（`/codearts-login` 等旧
+ *    入口）的正常通路 —— 他们根本不在池里，只有默认 ref。若在这里抛错，
+ *    等于把「没配账号池」误报成故障。
+ * 2. **`model` 必须原样透传给选号器**：退回空 modelId 会挑回数组顺序最前的
+ *    账号（可能正是对该模型限流的那个），从而重新引入错配（见
+ *    {@link makeAccountPicker} 的说明）。
+ *
+ * @param pool - 账号池；省略/未提供时只用默认单凭据 `refresh()`。
+ * @param provider - provider id（`this.product.id`，不要写死字面量）。
+ * @param service - 必须同时提供 `refresh()` 与 `refreshAccountCredential(ref)`。
+ */
+export function makeAccountRefresher(
+  pool: AccountPool | undefined,
+  provider: string,
+  service: {
+    refresh: () => Promise<void>
+    refreshAccountCredential: (refName: string) => Promise<void>
+  },
+): (model?: string) => Promise<void> {
+  const pick = makeAccountPicker(pool, provider)
+  return async (model?: string) => {
+    const available = await pick(model)
+    if (available) {
+      await service.refreshAccountCredential(available.entry.credentialRef)
+      return
+    }
+    await service.refresh()
+  }
+}
+
 /** 注册 codeartsAuth 服务、命令以及 codearts LLM 路由。 */
 export function apply(ctx: Context): void {
   // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
@@ -370,7 +421,7 @@ export function apply(ctx: Context): void {
     resolveCredential: makeCredentialResolver<CodeArtsCredential>(
       ctx, pool, 'codearts', CODEARTS_CREDENTIAL_REF,
     ),
-    refresh: () => service.refresh(),
+    refresh: makeAccountRefresher(pool, CODEARTS_PROVIDER, service),
     fetchRemoteModels: () => service.refreshModels(),
     accountPool: pool,
   })
@@ -388,7 +439,7 @@ export function apply(ctx: Context): void {
     resolveCredential: makeCredentialResolver<BuddyCredential>(
       ctx, pool, BUDDY_CN.id, BUDDY_CREDENTIAL_REF,
     ),
-    refresh: () => buddyCn.refresh(),
+    refresh: makeAccountRefresher(pool, BUDDY_CN.id, buddyCn),
     fetchRemoteModels: () => buddyCn.fetchModels(pool),
     readImage: makeReadImage(ctx),
     accountPool: pool,
@@ -408,7 +459,7 @@ export function apply(ctx: Context): void {
     resolveCredential: makeCredentialResolver<BuddyCredential>(
       ctx, pool, BUDDY.id, BUDDY.defaultCredentialRef,
     ),
-    refresh: () => buddy.refresh(),
+    refresh: makeAccountRefresher(pool, BUDDY.id, buddy),
     fetchRemoteModels: () => buddy.fetchModels(pool),
     readImage: makeReadImage(ctx),
     accountPool: pool,
@@ -758,22 +809,42 @@ export function apply(ctx: Context): void {
   // 与「凭据是否需要保持新鲜」无关。早期这里写成 `a.refreshable && a.enabled`，
   // 于是**全部账号都被停用**时续期定时器根本不注册 —— 整个多账号续期静默失效，
   // 所有 refresh_token 一路放到过期，用户重新启用后只能重新登录（真实缺陷）。
-  pool.listAllAccounts().then(accounts => {
-    const hasRefreshable = accounts.some(a => a.refreshable)
-    if (hasRefreshable) {
-      const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
-      refreshTimer.unref?.()
-      ctx.effect(() => () => {
-        clearInterval(refreshTimer)
-        service.stop()
-        buddyCn.stop()
-        buddy.stop()
-        lobsterai.stop()
-        traeCn.stop()
-        qoder.stop()
-        qoderCn.stop()
-      }, 'account-hub: multi-account refresh scheduler')
-    }
+  //
+  // ⚠️⚠️ **判据必须在 storage 就绪之后才算**（本单修复的主因）：`apply()` 是同步
+  // 签名，而 `pool.openStorage()` 是异步的。历史接线在 apply 的**同步执行期**就
+  // 对 `pool.listAllAccounts()` 求值，此时 storage 尚未接管，读到的只有 settings
+  // 回退路径（或空表）—— `hasRefreshable` 恒为 false，**30 分钟续期定时器从未
+  // 注册过**。故这里照抄下方自动签到的 `void pool.openStorage().then(...)` 模式，
+  // 把「判据 + 注册」整体移进 then 链。
+  //
+  // ⚠️ **storage 就绪后要立即补跑一次 `refreshAllCredentials()`**：定时器的第一次
+  // 触发要等满 30 分钟，而登录后长时间不关机的用户在此期间若凭据先过期，就会带着
+  // 过期凭据发请求。立即补跑消除这 30 分钟空窗（与下方 Qoder 资料回填同因）。
+  // 补跑同样先过判据：没有可续期账号时一次网都不出。
+  void pool.openStorage().then(() => {
+    const hasRefreshable = pool.listAllAccountsSnapshot().some(a => a.refreshable)
+    if (!hasRefreshable) return
+    // 立即补跑：失败只记日志，**绝不炸启动**（下面各服务的 refreshAll 内部已自吞
+    // 单账号异常，这里只兜住意外抛出）。
+    void refreshAllCredentials().catch((error: unknown) => {
+      ctx.logger.warn(`[account-hub] 启动续期失败（不影响后续定时续期）：${String(error)}`)
+    })
+    const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
+    refreshTimer.unref?.()
+    ctx.effect(() => () => {
+      clearInterval(refreshTimer)
+      service.stop()
+      buddyCn.stop()
+      buddy.stop()
+      lobsterai.stop()
+      traeCn.stop()
+      qoder.stop()
+      qoderCn.stop()
+    }, 'account-hub: multi-account refresh scheduler')
+  }).catch((error: unknown) => {
+    // 判据读取本身失败（异常 storage 形状等）：记日志并放弃注册定时器，
+    // 绝不让它冒泡成 apply 的异常。
+    ctx.logger.warn(`[account-hub] 续期调度注册失败，本次不做定时续期：${String(error)}`)
   })
 
   // 保留旧的 stop scheduler（兼容旧命令）

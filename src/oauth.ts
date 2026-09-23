@@ -92,6 +92,38 @@ export class RefreshTokenExpiredError extends Error {
   }
 }
 
+/**
+ * refresh_token **已被使用过**（`STS5.1806 the refresh token has been used`）。
+ *
+ * ⚠️ **刻意不是** {@link RefreshTokenExpiredError}：刷新令牌是**一次性轮换**的，
+ * 「已使用」通常意味着**另一条并发路径刚刚成功消费了它并写回了新令牌** ——
+ * 那是「我们手里这份过期了」，而不是「登录失效了」。若把它归入终态，调度器会
+ * 停止续期并要求用户重新登录，而存储里其实躺着一份**完全可用**的新凭据。
+ *
+ * 正确的处置是**重读存储**：拿到别人写回的新 `refresh_token` 再试一次
+ * （见 `src/service.ts` 的 `exchangeWithReuseRetry`）。只有重读后**令牌没变**
+ * （说明没有并发消费者）才该走失败分类。
+ */
+export class RefreshTokenReusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RefreshTokenReusedError'
+  }
+}
+
+/**
+ * 判定错误体是否为「refresh_token 已被使用」（一次性轮换下的并发消费信号）。
+ *
+ * 判据取**后端错误码 `STS5.1806` 与英文原文**两条：前者与语言无关、是主判据；
+ * 后者是网关只回文案时的兜底（两者都未见反例）。
+ */
+export function isRefreshTokenReusedError(data: TokenResponse | null): boolean {
+  if (data === null) return false
+  const code = String(data.error_code ?? '')
+  const text = `${String(data.error ?? '')} ${String(data.error_msg ?? '')}`
+  return code.includes('STS5.1806') || /refresh\s+token\s+has\s+been\s+used/i.test(text)
+}
+
 /** 向 STS token 端点发起一次带 DPoP 的 token 请求。 */
 export async function requestToken(
   body: Record<string, string>,
@@ -121,6 +153,10 @@ export async function requestToken(
   }
   if (!response.ok || !data?.credentials) {
     const message = `CodeArts token request failed: ${response.status}${data ? ` ${JSON.stringify(data)}` : ''}`
+    // 「已被使用」**先于**下面的终态判定：一次性轮换下它多半意味着另一条并发
+    // 路径刚消费掉这份令牌并写回了新凭据（见 RefreshTokenReusedError 的说明）。
+    // 抛成**独立类型**，让调用方能「重读存储再试一次」而不是直接判终态。
+    if (isRefreshTokenReusedError(data)) throw new RefreshTokenReusedError(message)
     // 终态判定：invalid_grant 或后端错误码明确为 refresh_token 失效/DPoP 非法时，
     // 都视为 refresh_token 已失效（停止调度、refreshable:false、提示重新登录），
     // 避免 error_code 为 InvalidDPoPHeader 时每 10 分钟无限重试。

@@ -56,8 +56,16 @@
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import {
-  isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing,
+  hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing,
 } from './sse.js'
+import {
+  createReasoningLoopDetector,
+  isReasoningLoopGuardEnabled,
+} from './reasoning-loop-guard.js'
+import {
+  stripCourseLeakFromHistoryContent,
+  stripCourseLeakIfEnabled,
+} from './course-leak-strip.js'
 import {
   TRAE_CN_CONTEXT_OVERFLOW_CODES,
   classifyTraeCnError,
@@ -373,6 +381,8 @@ export interface TraeCnToolCallBlock {
   callId: string
   /** 工具名（只允许非空覆盖）。 */
   name?: string
+  /** 是否已发过 `block-start`（名字可用的那一刻才发，见 `accumulateTraeCnToolCall`）。 */
+  announced: boolean
 }
 
 /**
@@ -387,6 +397,13 @@ export interface TraeCnToolCallBlock {
  * - **`name` 只允许非空覆盖** —— 后续分片带的空串会清掉首片解析出的工具名，
  *   表现为 `unknown tool ""`；
  * - 参数片段**无条件拼接**（空串拼接是无副作用的）。
+ *
+ * ⚠️ **名字可用之前不发射任何 chunk**（与 `openai-compat.ts` /`buddy-adapter.ts`
+ * 同因同修，见 `src/sse.ts`）：本 provider 的首片**可能只带 id/参数、名字稍后
+ * 才到**，若在首片就发 `block-start`，一个**永远不带 name** 的调用会让
+ * `BlockAssembler` 组装出 `name:''` 的坏块并持久化进会话（下游端点随后
+ * 以 400 code 11133 拒绝每一次请求）。必须让该块一个 chunk 都不产出。
+ * 名字一旦可用就把**已累积的全部参数**一次性补发，正常形态行为不变。
  */
 function accumulateTraeCnToolCall(
   state: Map<number, TraeCnToolCallBlock>,
@@ -398,9 +415,14 @@ function accumulateTraeCnToolCall(
   let block = state.get(wireIndex)
   if (block === undefined) {
     const callId = delta.id ?? `call_${wireIndex}`
-    block = { index: allocateIndex(), text: '', callId, ...delta.name === undefined ? {} : { name: delta.name } }
+    block = {
+      index: allocateIndex(),
+      text: '',
+      callId,
+      announced: false,
+      ...delta.name === undefined ? {} : { name: delta.name },
+    }
     state.set(wireIndex, block)
-    chunks.push({ type: 'block-start', index: block.index, blockType: 'tool-call' })
   } else if (delta.id !== undefined) {
     block.callId = delta.id
   }
@@ -409,6 +431,20 @@ function accumulateTraeCnToolCall(
   if (delta.name !== undefined && delta.name.length > 0) block.name = delta.name
   const fragment = delta.argumentsDelta ?? ''
   block.text += fragment
+  if (!block.announced) {
+    // 名字仍不可用：一个 chunk 都不产出（连 block-start 都不能有）。
+    if (!hasUsableToolName(block.name)) return chunks
+    block.announced = true
+    chunks.push({ type: 'block-start', index: block.index, blockType: 'tool-call' })
+    chunks.push({
+      type: 'tool-call-delta',
+      index: block.index,
+      id: ToolCallId(block.callId),
+      name: block.name!,
+      argumentsDelta: block.text,
+    })
+    return chunks
+  }
   chunks.push({
     type: 'tool-call-delta',
     index: block.index,
@@ -460,10 +496,24 @@ export interface TraeCnStreamOutcome {
   done: boolean
   /** 是否产出过任何正文或思考片段。 */
   produced: boolean
-  /** 是否存在工具调用块。 */
+  /** 是否存在工具调用块（**只计已发射的块**，见 `droppedUnnamedCalls`）。 */
   hasToolCalls: boolean
   /** 是否有工具调用的参数无法解析（分片丢失 / 流被截断）。 */
   argumentsTruncated: boolean
+  /**
+   * 是否丢弃过**名称不可用**的 tool-call 分片（见 `accumulateTraeCnToolCall`）。
+   *
+   * 丢弃它们是对的（无名调用无法执行、留着会污染会话），但**不能让这一步
+   * 静默地以 `stop` 结束** —— 那正是「没有任何报错就中断」：模型本意要调工具，
+   * harness 却认为它「正常答完了」。适配器据此改报 `max-tokens`（可重试）。
+   */
+  droppedUnnamedCalls: boolean
+  /**
+   * 思考死循环命中（见 `src/reasoning-loop-guard.ts`）。命中后流是被**主动
+   * abort** 的，故 `done` 为 false —— 调用方必须**优先**据此报 `max-tokens`，
+   * 而不是当成「未收到 done 帧」的截断。
+   */
+  thoughtLoopDetected?: boolean
   /** 上游以 `event:error` 帧报错时填入（此时 `done` 为 false）。 */
   sseError?: TraeCnSseError
 }
@@ -521,6 +571,16 @@ export async function* consumeTraeCnStream(
   let produced = false
   let done = false
   let sseError: TraeCnSseError | undefined
+  /**
+   * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+   * reasoning 增量、中止上游（`reader.cancel()`），收尾时发截断后的思考块，
+   * 并让 finish 报 max-tokens。
+   *
+   * 本函数不产出 `finish`（reason 由调用方决定），故命中状态经
+   * {@link TraeCnStreamOutcome.thoughtLoopDetected} 旁路传出。
+   */
+  const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+  let loopDetected = false
   const toolCalls = new Map<number, TraeCnToolCallBlock>()
 
   try {
@@ -591,13 +651,27 @@ export async function* consumeTraeCnStream(
         if (eventName === TRAE_CN_THOUGHT_EVENT) {
           const piece = extractTraeCnThoughtFrameText(data)
           if (piece.length > 0) {
-            if (thoughtIndex === undefined) {
-              thoughtIndex = nextIndex++
-              yield { type: 'block-start', index: thoughtIndex, blockType: 'reasoning' }
+            // 死循环守卫（出口 ①：独立 `thought` 事件）：命中后不再累积、不再发射。
+            //
+            // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` + `break`）在
+            // 本 chunk 的行循环**全部处理完之后**、外层 `while` 末尾执行（见下方
+            // ★ 止损块）—— 这样同一 chunk 里已到达的 `token_usage` / `done` 仍会
+            // 被处理。
+            // ⚠️ 也**不能用 `continue`**：本分支的 `continue` 会跳过本帧之后的
+            // 处理（`thought` 事件本身不与其它内容同帧，但保持与出口 ② 同构的
+            // 写法可避免将来改动时踩坑）。故用 `if (!loopDetected)` 守卫分支体。
+            if (loopGuard !== undefined) {
+              if (loopGuard.observe(piece)) loopDetected = true
             }
-            produced = true
-            thought += piece
-            yield { type: 'reasoning-delta', index: thoughtIndex, text: piece }
+            if (!loopDetected) {
+              if (thoughtIndex === undefined) {
+                thoughtIndex = nextIndex++
+                yield { type: 'block-start', index: thoughtIndex, blockType: 'reasoning' }
+              }
+              produced = true
+              thought += piece
+              yield { type: 'reasoning-delta', index: thoughtIndex, text: piece }
+            }
           }
           continue
         }
@@ -632,13 +706,23 @@ export async function* consumeTraeCnStream(
             yield { type: 'text-delta', index: textIndex, text: piece }
           }
           if (thoughtPiece.length > 0) {
-            if (thoughtIndex === undefined) {
-              thoughtIndex = nextIndex++
-              yield { type: 'block-start', index: thoughtIndex, blockType: 'reasoning' }
+            // 死循环守卫（出口 ②：`output` 事件内嵌思考）：与出口 ① 同一判据。
+            //
+            // ⚠️ 也**不能用 `continue`**：它会连带跳过本帧位于思考分支**之后**的
+            // 工具调用解析（一个 `output` 事件确实可能同时携带思考与工具调用）。
+            // 故用 `if (!loopDetected)` 守卫分支体。
+            if (loopGuard !== undefined) {
+              if (loopGuard.observe(thoughtPiece)) loopDetected = true
             }
-            produced = true
-            thought += thoughtPiece
-            yield { type: 'reasoning-delta', index: thoughtIndex, text: thoughtPiece }
+            if (!loopDetected) {
+              if (thoughtIndex === undefined) {
+                thoughtIndex = nextIndex++
+                yield { type: 'block-start', index: thoughtIndex, blockType: 'reasoning' }
+              }
+              produced = true
+              thought += thoughtPiece
+              yield { type: 'reasoning-delta', index: thoughtIndex, text: thoughtPiece }
+            }
           }
           for (const entry of toolCallEntries) {
             const delta = parseTraeCnToolCall(entry.payload)
@@ -655,20 +739,39 @@ export async function* consumeTraeCnStream(
         // 其余事件（timing_cost / extra_info / suggested_questions / turn_completion …）
         // 直接忽略：它们不产出 harness 的块类型，也不影响流的完整性。
       }
+      // ★ 止损：命中死循环后**中止上游**，否则输出额度照烧。
+      // 只跳过下行累积/发射、却把流读到底，则上游继续生成，额度照烧。
+      //
+      // ⚠️ 位置：内层行循环**之后**、外层 `while` 末尾 —— 同一 chunk 里已到达的
+      // `token_usage` / `done` 事件因此仍会被处理，但命中后**立即**退出，不再读下一块。
+      //
+      // ⚠️ 只 cancel **reader**，绝不 abort `signal`：后者是调用方信号，
+      // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+      // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+      // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+      // 「正常止损」变成一次失败。
+      if (loopDetected) {
+        await reader.cancel().catch(() => {})
+        break
+      }
     }
   } finally {
     reader.releaseLock()
   }
 
   // 收尾：按创建顺序闭合已开启的块（harness 要求 block-end 携带拼装结果）。
+  // ⚠️ 只闭合**已发射**的块：名字始终不可用的块一个 chunk 都不该产出，否则
+  // `BlockAssembler` 会组装出 `name:''` 的坏块并污染会话（见
+  // `accumulateTraeCnToolCall` 的说明）。
   for (const block of toolCalls.values()) {
+    if (!block.announced || !hasUsableToolName(block.name)) continue
     yield {
       type: 'block-end',
       index: block.index,
       block: {
         type: 'tool-call',
         id: ToolCallId(block.callId),
-        name: block.name ?? '',
+        name: block.name!,
         // 仅把「无参数工具下发的空分片」补成 {}；**残缺参数保持原样**，
         // 由调用方的 max-tokens 判定触发重试 —— 把残缺 JSON 补成 {}
         // 会伪造出合法外观，让 harness 报 missing required property 而非重试。
@@ -677,16 +780,39 @@ export async function* consumeTraeCnStream(
     }
   }
   if (textIndex !== undefined) {
-    yield { type: 'block-end', index: textIndex, block: { type: 'text', text } }
+    // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+    yield { type: 'block-end', index: textIndex, block: { type: 'text', text: stripCourseLeakIfEnabled(text) } }
   }
   if (thoughtIndex !== undefined && thought.length > 0) {
-    yield { type: 'block-end', index: thoughtIndex, block: { type: 'reasoning', text: thought } }
+    // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
+    // **权威覆盖**：即便前面已 yield 了全部重复 delta，这里发截断后的 block
+    // 即可，无需撤回。
+    const thoughtText = loopDetected && loopGuard?.cutAt !== undefined
+      ? thought.slice(0, loopGuard.cutAt)
+      : thought
+    // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+    const cleanedThought = stripCourseLeakIfEnabled(thoughtText)
+    if (cleanedThought !== '') {
+      yield { type: 'block-end', index: thoughtIndex, block: { type: 'reasoning', text: cleanedThought } }
+    }
   }
   return {
     done,
     produced,
-    hasToolCalls: toolCalls.size > 0,
+    // 只计**已发射**的块：名字不可用的块被丢弃，不该算作「有工具调用」
+    // （否则调用方会报 tool-calls，让 harness 去执行一个并不存在的调用）。
+    hasToolCalls: [...toolCalls.values()].some(block => block.announced),
     argumentsTruncated: [...toolCalls.values()].some(block => isTruncatedArguments(block.text)),
+    /**
+     * 是否丢弃过**名称不可用**的 tool-call 块（见 `accumulateTraeCnToolCall`）。
+     *
+     * 丢弃是对的（无名调用无法执行、留着会污染会话），但不能让它**静默地以
+     * `stop` 结束** —— 那正是「没有任何报错就中断」。调用方据此改报 max-tokens。
+     */
+    droppedUnnamedCalls: [...toolCalls.values()].some(block => !block.announced),
+    // 命中死循环时流是被**主动 abort** 的（`done` 为 false），调用方必须
+    // **优先**据此报 `max-tokens`，而不是当成「未收到 done 帧」的截断。
+    ...loopDetected ? { thoughtLoopDetected: true } : {},
     ...sseError === undefined ? {} : { sseError },
   }
 }
@@ -736,7 +862,13 @@ export function serializeTraeCnMessages(
 
   for (const message of messages) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')

@@ -751,7 +751,18 @@ export class TraeCnAdapter extends LlmAdapter {
         }
         const outcome = cell.outcome!
 
-        if (outcome.sseError === undefined && outcome.produced) {
+        // ⚠️ `thoughtLoopDetected` 也必须能进入成功收尾分支：命中后流是被我们
+        // **主动 abort** 的，`done` 为 false；而若命中的是**首个**超长 delta
+        // （单帧就含 ≥40 个非空行），`produced` 也可能仍为 false —— 那种情况下
+        // 若只按 `produced` 判定，会把一次正常止损错报成「上游返回空回复」。
+        //
+        // ⚠️ 同理，**丢弃过无名 tool-call** 也必须进来：那种流里 `produced` 同样
+        // 可能为 false（无名块一个 chunk 都没产出），而它**不是**空回复 ——
+        // 模型明确要调工具，只是名字缺失。落进下面的 EMPTY_RESPONSE 分支会把
+        // 「模型本意调工具」错报成「上游什么都没回」，真因被掩盖。
+        const abandonedToolCall = outcome.droppedUnnamedCalls && !outcome.hasToolCalls
+        if (outcome.sseError === undefined
+          && (outcome.produced || outcome.thoughtLoopDetected === true || abandonedToolCall)) {
           // 成功收尾。三种「不完整」都必须报告 max-tokens 而非 tool-calls：
           // - 未收到 done 帧：连接被中途掐断，工具参数必然是半截 JSON；
           // - 工具参数无法解析：分片在流式下发中丢失。
@@ -760,9 +771,19 @@ export class TraeCnAdapter extends LlmAdapter {
           // 同策略）。
           yield {
             type: 'finish',
-            reason: !outcome.done || outcome.argumentsTruncated
+            reason: outcome.thoughtLoopDetected === true
+              // 思考死循环：截断并报可重试。**优先级最高**（高于 tool_calls）——
+              // 循环中生成的工具调用参数不可信；且若无可用调用，落到 `stop`
+              // 会让任务静默中断。
               ? { kind: 'max-tokens' }
-              : outcome.hasToolCalls ? { kind: 'tool-calls' } : { kind: 'stop' },
+              : !outcome.done || outcome.argumentsTruncated
+                ? { kind: 'max-tokens' }
+                // 丢弃了无名调用且没有留下任何可用调用：本步否则会以 `stop` 收场
+                // —— 模型本意要调工具、harness 却认为「正常答完了」，又是一次
+                // 无报错中断。报 max-tokens 让它重试（与其它 provider 同策）。
+                : abandonedToolCall
+                  ? { kind: 'max-tokens' }
+                  : outcome.hasToolCalls ? { kind: 'tool-calls' } : { kind: 'stop' },
           }
           return
         }

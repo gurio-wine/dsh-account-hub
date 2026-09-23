@@ -244,8 +244,20 @@ export class AccountPool {
   private scope: SettingsScopeLike | undefined
   /** 已打开的 storage 域句柄；不可用时为 undefined（回退 settings / 内存）。 */
   private storage: AccountHubStorage | undefined
-  /** 是否已尝试打开 storage（`openStorage` 幂等闸门）。 */
-  private storageOpened = false
+  /**
+   * **首次** `openStorage()` 的在途/已决 Promise（`openStorage` 的幂等闸门）。
+   *
+   * 为什么必须是 Promise 而不是布尔标记：只用布尔闸门时，第二次调用会立刻
+   * `return this.storage !== undefined` —— 若首次打开**仍在途**，此刻 `storage`
+   * 还是 undefined，第二次调用就以 `false` **提前 resolve**，于是挂在它
+   * `.then()` 上的启动逻辑会在 storage 接管**之前**跑（读到旧 settings/内存快照）。
+   * `apply()` 里几处 `void pool.openStorage().then(...)`（改名迁移、Qoder 资料
+   * 回填、自动签到 sweep，以及续期调度判据）全部踩这一条。
+   *
+   * 缓存 Promise 后，所有调用方拿到的是**同一个**「storage 真的就绪」信号，
+   * 与调用顺序无关。
+   */
+  private storagePromise: Promise<boolean> | undefined
   /**
    * 账号列表的**权威进程内副本**。
    *
@@ -311,14 +323,24 @@ export class AccountPool {
   /**
    * 打开 storage 域并（首次时）执行一次性迁移。
    *
-   * **幂等**：重复调用只打开一次。storage 不可用时静默返回 false，账号池继续用
-   * settings（回退路径）或纯内存 —— 绝不抛错、绝不阻断插件启动。
+   * **幂等且可重入**：重复调用返回**同一个** Promise（见 {@link storagePromise}）——
+   * 并发/后续调用不会在首次打开仍在途时提前拿到 false。storage 不可用时静默返回
+   * false，账号池继续用 settings（回退路径）或纯内存 —— 绝不抛错、绝不阻断插件启动。
+   *
+   * ⚠️ 因此调用方 `await pool.openStorage()` / `.then(...)` 拿到 true 时，
+   * **storage 一定已接管**（`this.storage` 已赋值、一次性迁移已跑完），
+   * 这正是 `src/index.ts` 里各处启动逻辑所依赖的时序保证。
    *
    * @returns 是否成功接管（true = storage 为主路径）。
    */
   async openStorage(): Promise<boolean> {
-    if (this.storageOpened) return this.storage !== undefined
-    this.storageOpened = true
+    if (this.storagePromise !== undefined) return this.storagePromise
+    this.storagePromise = this.openStorageOnce()
+    return this.storagePromise
+  }
+
+  /** `openStorage` 的**单次**实现；只由 {@link openStorage} 在首次调用时进入。 */
+  private async openStorageOnce(): Promise<boolean> {
     const storage = await openAccountHubStorage(this.ctx)
     if (storage === undefined) {
       // storage 缺席：只有连 settings 回退路径也没有时，才是真正的「仅内存」。
@@ -754,6 +776,21 @@ export class AccountPool {
   /** 列出所有 provider 的账号 */
   async listAllAccounts(): Promise<ProviderAccountEntry[]> {
     return this.readAccounts()
+  }
+
+  /**
+   * **同步**列出所有 provider 的账号（进程内权威副本）。
+   *
+   * 与 {@link listAllAccounts} 是同一份数据，唯一区别是**不需要 await** ——
+   * 供「判据本身就是同步逻辑」的调用点使用（如启动续期调度的 `hasRefreshable`
+   * 判定）。它读的就是 `ensureLoaded()` 之后的权威副本，因此**必须在
+   * `openStorage()` 之后调用**：在那之前副本来自 settings 回退路径或空表。
+   *
+   * 刻意返回**副本**而不是内部数组：调用方（含定时器回调）拿到的是快照，
+   * 就地改它不会污染池。
+   */
+  listAllAccountsSnapshot(): ProviderAccountEntry[] {
+    return [...this.readAccounts()]
   }
 
   /**

@@ -4,6 +4,7 @@ import {
   LOBSTERAI_HARD_CREDIT_MARKERS,
   LOBSTERAI_SESSION_DEAD_MARKERS,
   classifyLobsteraiError,
+  classifyLobsteraiStreamError,
   isLobsteraiContextWindowError,
   isLobsteraiTerminalError,
   lobsteraiHarnessErrorCode,
@@ -281,6 +282,70 @@ describe('关键词表完整性', () => {
   it('会话终止标记含两个业务码', () => {
     expect(LOBSTERAI_SESSION_DEAD_MARKERS).toContain('40100')
     expect(LOBSTERAI_SESSION_DEAD_MARKERS).toContain('40101')
+  })
+})
+
+/**
+ * 流内错误帧（HTTP 200 + SSE `{error:{message}}`）的分类。
+ *
+ * ⚠️ **不能复用 `classifyLobsteraiError(200, …)`**：那个函数的优先级里状态码
+ * 排在最前（402/429/404/4xx/5xx），而流内错误的 HTTP 状态恒为 **200** ——
+ * 那些分支全部失效，只剩关键词表可用；传 200 进去未命中关键词时只会得到
+ * `none`，而 `none` 意味着**不换号**，正是用户报障的行为。
+ */
+describe('流内错误分类（classifyLobsteraiStreamError）', () => {
+  /** 用户报障时 Web 上显示的原文（不得改写，它是判定关键词的依据）。 */
+  const QUOTA_MESSAGE = '免费额度已用完，请升级套餐'
+
+  it('⚠️ 真实文案「免费额度已用完，请升级套餐」判为 hard-credit', () => {
+    // 回归（用户报障）：关键词表早期只有「额度用尽」「积分用完」，
+    // 而实际文案是「额度**已用完**」——「已用完」与「用尽」字面不同，
+    // 于是这个最主要的失败模式判成 `none`（不换号、不记徽章），
+    // 用户看到「一个账号用完出错但没有切换」。
+    expect(classifyLobsteraiStreamError(QUOTA_MESSAGE)).toBe('hard-credit')
+  })
+
+  it('补充文案与既有中英关键词同样命中 hard-credit', () => {
+    for (const text of [
+      '额度已用完', '升级套餐', 'free quota exhausted',
+      'quota used up', 'please upgrade your plan', 'upgrade to continue',
+      // 既有词回归（补充不得挤掉它们）。
+      '积分不足', '额度用尽', 'free credits used',
+    ]) {
+      expect(classifyLobsteraiStreamError(text), text).toBe('hard-credit')
+    }
+  })
+
+  it('未命中关键词的流内业务错误仍可轮转（默认 client，不是 none）', () => {
+    // 对齐 Go `handler.go:218-243`：那个 switch 的每个分支都以 continue 结尾
+    // （含 default，注释明写「轮转下一个账号，不直接返回（防雪崩）」）。
+    // 流内错误既然是明确的业务失败，就不该原地抛给用户。
+    const kind = classifyLobsteraiStreamError('某种未登记的上游业务错误')
+    expect(kind).toBe('client')
+    // 关键：**不能**是 none —— none 会让 shouldRotate 为 false，等于不换号。
+    expect(kind).not.toBe('none')
+    expect(shouldRotateLobsteraiAccount(kind)).toBe(true)
+  })
+
+  it('默认类别**不记**限流徽章（徽章含义必须是「该模型受限」）', () => {
+    // 徽章的实际效果是让下一次选号跳过该账号，等价于一次隐式换号。
+    // 一个「这个账号出过错」的流内错误不该留下这种标记。
+    expect(recordsLobsteraiRateLimit(classifyLobsteraiStreamError('未登记业务错误'))).toBe(false)
+    // 而确证的额度耗尽要记（它是 Go 里真正 Cooldown 的类别）。
+    expect(recordsLobsteraiRateLimit(classifyLobsteraiStreamError(QUOTA_MESSAGE))).toBe(true)
+  })
+
+  it('session-dead 与 context-window 关键词同样能穿过流内路径', () => {
+    // 这两类在流内路径上的价值与 hard-credit 相同：一个决定「重试无意义」，
+    // 一个决定「换号无用，该交给宿主压缩上下文」。
+    expect(classifyLobsteraiStreamError('{"code":40100}')).toBe('session-dead')
+    expect(classifyLobsteraiStreamError('maximum context length is 1000000 tokens'))
+      .toBe('context-window')
+  })
+
+  it('空串安全（不抛异常，且不误判为成功）', () => {
+    expect(() => classifyLobsteraiStreamError('')).not.toThrow()
+    expect(classifyLobsteraiStreamError('')).toBe('client')
   })
 })
 

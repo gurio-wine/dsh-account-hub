@@ -89,8 +89,16 @@ import {
 } from './qoder-errors.js'
 import type { QoderErrorClassification, QoderQuotaVerdict } from './qoder-errors.js'
 import {
-  isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing,
+  hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing,
 } from './sse.js'
+import {
+  createReasoningLoopDetector,
+  isReasoningLoopGuardEnabled,
+} from './reasoning-loop-guard.js'
+import {
+  stripCourseLeakFromHistoryContent,
+  stripCourseLeakIfEnabled,
+} from './course-leak-strip.js'
 
 /**
  * 本适配器**默认产品**（`QODER`）的 provider 路由名。
@@ -344,7 +352,13 @@ export function serializeQoderMessages(
 
   for (const message of messages) {
     if (message.role === 'assistant') {
-      const content = Array.isArray(message.content) ? message.content : []
+      // 存量自愈：清洗历史里已持久化的行首 `course` / `课` 泄漏
+      // （见 `stripCourseLeakFromHistoryContent`）。只清 assistant ——
+      // 判据只对模型自己的输出成立，清洗用户输入等于篡改用户的话。
+      const content = stripCourseLeakFromHistoryContent(
+        message.role,
+        Array.isArray(message.content) ? message.content : [],
+      )
       const toolCalls = content
         .filter((block): block is { type: string; id: unknown; name: unknown; arguments: unknown } =>
           typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-call')
@@ -547,10 +561,27 @@ export interface QoderStreamOutcome {
   done: boolean
   /** 是否产出过任何正文、思考或工具块。 */
   produced: boolean
-  /** 是否存在工具调用块。 */
+  /** 是否存在工具调用块（**只计已发射的块**，见 `droppedUnnamedCalls`）。 */
   hasToolCalls: boolean
   /** 是否有工具调用的参数无法解析（分片丢失 / 流被截断）。 */
   argumentsTruncated: boolean
+  /**
+   * 是否丢弃过**名称不可用**的 tool-call 分片（见 `consumeQoderStream` 的说明）。
+   *
+   * 丢弃它们是对的（无名调用无法执行、留着会污染会话），但**不能让这一步
+   * 静默地以 `stop` 结束** —— 那正是「没有任何报错就中断」：模型本意要调工具，
+   * harness 却认为它「正常答完了」。适配器据此改报 `max-tokens`（可重试）。
+   *
+   * 仅当**没有任何可用调用留下来**时才该改报；同批还有可用调用时照常报
+   * `tool-calls`（那几个调用与无名块各自独立，没理由因一个坏块一起作废）。
+   */
+  droppedUnnamedCalls: boolean
+  /**
+   * 思考死循环命中（见 `src/reasoning-loop-guard.ts`）。命中后流是被**主动
+   * abort** 的，故 `done` 为 false —— 调用方必须**优先**据此报 `max-tokens`，
+   * 而不是当成「流被截断」去抛 TRANSPORT。
+   */
+  thoughtLoopDetected?: boolean
   /** 响应 `model` 回显值（真实模型在 `raw_usage.model`）。 */
   model?: string
   /** 流内错误（有则带；此时 `done` 为 false）。 */
@@ -618,7 +649,25 @@ export async function* consumeQoderStream(
   let done = false
   let model: string | undefined
   let error: QoderErrorClassification | undefined
-  const toolCalls = new Map<number, { index: number; text: string; callId: string; name?: string }>()
+  /**
+   * 思考死循环检测（见 `createReasoningLoopDetector`）。命中后丢弃后续
+   * reasoning 增量、中止上游（`reader.cancel()`），收尾时发截断后的思考块，
+   * 并让 finish 报 max-tokens。
+   *
+   * 本 provider 把 `finish` 交给调用方（`consumeQoderStream` 只做「帧 → 块」
+   * 的翻译），故命中状态经 {@link QoderStreamOutcome.thoughtLoopDetected}
+   * 旁路传出，由 `finish` 的发出者决定 reason。
+   */
+  const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+  let loopDetected = false
+  const toolCalls = new Map<number, {
+    index: number
+    text: string
+    callId: string
+    name?: string
+    /** 是否已发过 `block-start`（名字可用的那一刻才发，见下方 tool_calls 分支）。 */
+    announced: boolean
+  }>()
 
   try {
     while (!done && error === undefined) {
@@ -708,11 +757,36 @@ export async function* consumeQoderStream(
 
           // `event: error` **优先判错**（T3 勘误要点 4：按 `event:` 字段判错
           // 比只扫 `data:` 更直接）。载荷里带 error 结构同样判错。
-          const isErrorEvent = name === 'error' || record?.error !== undefined
+          //
+          // ⚠️ **网关形态的错误帧**（真机实测）：既没有 `code`、也没有 `error`、
+          // 也没有 `choices`，只带 `statusCodeValue` / `stackTrace` + `message`：
+          //
+          //   event:error
+          //   data:{"stackTrace":[…],"message":"…","statusCodeValue":400}
+          //
+          // 早期判定对这种帧**全部条件都不命中**，而下面「`choices` 不是数组
+          // ⇒ continue」会把它**整帧丢弃** —— 表现为「干净地停止、无任何报错」：
+          // 最坏收尾成笼统的「Stream ended without [DONE]」，真因（网关说了什么）
+          // 完全丢失。判据必须**显式覆盖**这一形态。
+          //
+          // 判据取 `statusCodeValue >= 400` **或**带 `stackTrace`（后者是网关错误帧
+          // 的稳定伴随字段），且都要求 `message` 是字符串 —— 三个条件缺一不可，
+          // 否则会把「只带 usage 的收尾帧」之类无 choices 的正常帧误判成错误。
+          const gatewayStatus = typeof record?.statusCodeValue === 'number'
+            ? record.statusCodeValue
+            : undefined
+          const isGatewayErrorFrame = record !== undefined
+            && record.choices === undefined
+            && typeof record.message === 'string'
+            && ((gatewayStatus !== undefined && gatewayStatus >= 400) || record.stackTrace !== undefined)
+          const isErrorEvent = name === 'error' || record?.error !== undefined || isGatewayErrorFrame
           if (isErrorEvent) {
             const frame = parseQoderStreamErrorPayload(parsed)
             error = classifyQoderError({
-              httpStatus: options.httpStatus,
+              // 网关帧**优先用帧里声明的状态码**：`options.httpStatus` 是恒为 200 的
+              // 传输层状态，拿它分类会把 400/500 的语义差异抹平（一个确定性失败会被
+              // 当成 200 走「未知」兜底）。帧里没有该字段时才回退传输层状态。
+              httpStatus: gatewayStatus ?? options.httpStatus,
               ...frame.code === undefined ? {} : { code: frame.code },
               message: frame.message,
               source: 'chat',
@@ -758,13 +832,25 @@ export async function* consumeQoderStream(
             ? payload.reasoning_content
             : (typeof payload.reasoning === 'string' && payload.reasoning.length > 0 ? payload.reasoning : '')
           if (thoughtPiece.length > 0) {
-            if (thoughtIndex === undefined) {
-              thoughtIndex = nextIndex++
-              yield { type: 'block-start', index: thoughtIndex, blockType: 'reasoning' }
+            // 死循环守卫：命中后不再累积、不再发射。
+            //
+            // ⚠️ 这里**只跳过发射**：真正的止损（`reader.cancel()` + 跳出读取
+            // 循环）在本帧行循环**全部处理完之后**、外层 `while` 末尾执行（见下方
+            // ★ 止损块）—— 这样同一帧里已到达的 `[DONE]` / usage 仍会被处理。
+            // ⚠️ 也**不能用 `continue`**：它会连带跳过本帧位于思考分支**之后**的
+            // 正文与 `tool_calls` 解析。故用 `if (!loopDetected)` 守卫分支体。
+            if (loopGuard !== undefined) {
+              if (loopGuard.observe(thoughtPiece)) loopDetected = true
             }
-            produced = true
-            thought += thoughtPiece
-            yield { type: 'reasoning-delta', index: thoughtIndex, text: thoughtPiece }
+            if (!loopDetected) {
+              if (thoughtIndex === undefined) {
+                thoughtIndex = nextIndex++
+                yield { type: 'block-start', index: thoughtIndex, blockType: 'reasoning' }
+              }
+              produced = true
+              thought += thoughtPiece
+              yield { type: 'reasoning-delta', index: thoughtIndex, text: thoughtPiece }
+            }
           }
 
           // 正文增量。
@@ -800,9 +886,14 @@ export async function* consumeQoderStream(
               let block = toolCalls.get(wireIndex)
               if (block === undefined) {
                 const callId = id ?? `call_${wireIndex}`
-                block = { index: nextIndex++, text: '', callId, ...name === undefined ? {} : { name } }
+                block = {
+                  index: nextIndex++,
+                  text: '',
+                  callId,
+                  announced: false,
+                  ...name === undefined ? {} : { name },
+                }
                 toolCalls.set(wireIndex, block)
-                yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
               } else if (id !== undefined) {
                 block.callId = id
               }
@@ -810,6 +901,37 @@ export async function* consumeQoderStream(
               // 工具名，表现为 `unknown tool ""`。
               if (name !== undefined) block.name = name
               block.text += args
+              // ⚠️ **名称为空前不发射任何 chunk**（2026-09-23 定位，用户报障）。
+              //
+              // 早期在这里**立即** `yield block-start` + `tool-call-delta`，名字稍后
+              // 才到。可上游偶发一个**永远不带 name** 的 tool-call 分片
+              // （实测 seq=693：`{index:2, id:'call_25e9…', args:[""]}`）——
+              // 于是 `BlockAssembler` 为它建了一个 partial，收尾时组装出
+              // `{type:'tool-call', name:''}`。这条空名字块被 harness 执行成
+              // `unknown tool ""`、**持久化进会话**，之后切到腾讯系端点时被每次
+              // 请求原样重放 → **HTTP 400 code 11133**，整条会话报废。
+              //
+              // 注意：**只跳过收尾的 `block-end` 是不够的** —— 上游
+              // `BlockAssembler.assemble()` 对没有 `block-end` 的 partial 同样会
+              // 组装出 `name: partial.toolCallName ?? ''`。必须让该块**一个 chunk
+              // 都不产出**，assembler 才会彻底看不见它。
+              //
+              // 名字一旦可用就把**已累积的全部参数**一次性补发，后续分片增量发送：
+              // 正常形态（首片即带 name）与旧行为完全一致。
+              if (!block.announced) {
+                if (!hasUsableToolName(block.name)) continue
+                block.announced = true
+                produced = true
+                yield { type: 'block-start', index: block.index, blockType: 'tool-call' }
+                yield {
+                  type: 'tool-call-delta',
+                  index: block.index,
+                  id: ToolCallId(block.callId),
+                  name: block.name!,
+                  argumentsDelta: block.text,
+                }
+                continue
+              }
               produced = true
               yield {
                 type: 'tool-call-delta',
@@ -839,20 +961,41 @@ export async function* consumeQoderStream(
         // 按「无分隔符直接拼」接回上一段（用 `\n` 拼会失败，那个 LF 不属于原文）。
         if (dataLines.length > 0) dataLines[dataLines.length - 1] += line;
       }
+      // ★ 止损：命中死循环后**中止上游**，否则 128000 token 照烧。
+      // 只跳过下行累积/发射、却把流读到底，则上游继续生成（实测上游 200 帧
+      // 被读 200 帧；守卫在 ~2304 字符即命中，即 99.5% 的额度仍被消耗）。
+      //
+      // ⚠️ 位置：内层行循环**之后**、外层 `while` 末尾 —— 同一 chunk 里已到达的
+      // `usage` / `[DONE]` 因此仍会被处理，但命中后**立即**退出，不再读下一块。
+      //
+      // ⚠️ 只 cancel **reader**，绝不 abort `signal`：后者是调用方信号，
+      // abort 会被上层报成「用户取消」而非**标记为不完整**的 `max-tokens`
+      // （DSH 在 `max-tokens` 时**不自动重试**，由用户/上层决定是否继续）。
+      // ⚠️ `.catch(() => {})` 不可省：连接已断时 `cancel()` 会抛错，不吞掉会把
+      // 「正常止损」变成一次失败。
+      if (loopDetected) {
+        await reader.cancel().catch(() => {})
+        break
+      }
     }
   } finally {
     reader.releaseLock()
   }
 
   // 收尾：按创建顺序闭合已开启的块（harness 要求 block-end 携带拼装结果）。
+  // ⚠️ 只闭合**已发射**的块（`announced`）：名字始终不可用的块一个 chunk 都不该
+  // 产出，否则 `BlockAssembler` 会组装出 `name:''` 的坏块并污染会话
+  // （见上方 tool_calls 分支的说明）。断言而非回退成 `?? ''` —— 回退正是本次
+  // 修复要根除的那条污染路径。
   for (const block of toolCalls.values()) {
+    if (!block.announced || !hasUsableToolName(block.name)) continue
     yield {
       type: 'block-end',
       index: block.index,
       block: {
         type: 'tool-call',
         id: ToolCallId(block.callId),
-        name: block.name ?? '',
+        name: block.name!,
         // 仅把「无参数工具下发的空分片」补成 {}；**残缺参数保持原样**，
         // 由调用方的 max-tokens 判定触发重试（见 `src/sse.ts`）。
         arguments: normalizeToolArguments(block.text),
@@ -860,16 +1003,44 @@ export async function* consumeQoderStream(
     }
   }
   if (textIndex !== undefined) {
-    yield { type: 'block-end', index: textIndex, block: { type: 'text', text } }
+    // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+    yield { type: 'block-end', index: textIndex, block: { type: 'text', text: stripCourseLeakIfEnabled(text) } }
   }
   if (thoughtIndex !== undefined && thought.length > 0) {
-    yield { type: 'block-end', index: thoughtIndex, block: { type: 'reasoning', text: thought } }
+    // 命中死循环时只保留循环前的干净前缀（`cutAt`）。`block-end` 是
+    // **权威覆盖**：即便前面已 yield 了全部重复 delta，这里发截断后的 block
+    // 即可，无需撤回。
+    const thoughtText = loopDetected && loopGuard?.cutAt !== undefined
+      ? thought.slice(0, loopGuard.cutAt)
+      : thought
+    // 行首 `course` / `课` 泄漏 token 清洗（见 `stripCourseLeak`）。
+    const cleanedThought = stripCourseLeakIfEnabled(thoughtText)
+    if (cleanedThought !== '') {
+      yield { type: 'block-end', index: thoughtIndex, block: { type: 'reasoning', text: cleanedThought } }
+    }
   }
   return {
     done,
     produced,
-    hasToolCalls: toolCalls.size > 0,
+    // 只计**已发射**的块：名字不可用的块被丢弃，不该算作「有工具调用」
+    // （否则调用方会报 tool-calls，让 harness 去执行一个并不存在的调用）。
+    hasToolCalls: [...toolCalls.values()].some(block => block.announced),
     argumentsTruncated: [...toolCalls.values()].some(block => isTruncatedArguments(block.text)),
+    /**
+     * 是否丢弃过**名称不可用**的 tool-call 块。
+     *
+     * 丢弃是对的（无名调用无法执行、留着会污染会话），但不能让它**静默地以
+     * `stop` 结束** —— 那正是「没有任何报错就中断」：模型本意要调工具，
+     * harness 却认为它「正常答完了」。故调用方据此改报 max-tokens（可重试）。
+     */
+    droppedUnnamedCalls: [...toolCalls.values()].some(block => !block.announced),
+    /**
+     * 思考死循环命中。**必须经 outcome 传给调用方**：本函数不产出 `finish`，
+     * reason 由调用方决定；而命中后流是被我们**主动 abort 的**，`done` 仍是
+     * false —— 若调用方不知道这件事，会把「正常止损」误判成「流被截断」
+     * 并抛 TRANSPORT（可重试但语义错误）。
+     */
+    ...loopDetected ? { thoughtLoopDetected: true } : {},
     ...model === undefined ? {} : { model },
     ...error === undefined ? {} : { error },
   }
@@ -968,10 +1139,21 @@ async function* consumeQoderJson(
   const record = parsed as Record<string, unknown>
 
   // 错误信封（400/401/402 的非流式分支会走到这里：网关直接回 JSON 错误体）。
-  if (record.error !== undefined && record.choices === undefined) {
+  //
+  // ⚠️ **网关形态**（与流式路径同源）：没有 `error`、没有 `choices`，只带
+  // `statusCodeValue` / `stackTrace` + `message`。早期只认 `record.error`，这类
+  // 信封会**落空**成「无 choices 的空回复」—— 用户拿到一句笼统的 EMPTY_RESPONSE，
+  // 而网关真正说了什么（`message`）完全丢失。判据与流式侧**逐字一致**。
+  const jsonGatewayStatus = typeof record.statusCodeValue === 'number' ? record.statusCodeValue : undefined
+  const isGatewayErrorEnvelope = record.error !== undefined
+    || (record.choices === undefined
+      && typeof record.message === 'string'
+      && ((jsonGatewayStatus !== undefined && jsonGatewayStatus >= 400) || record.stackTrace !== undefined))
+  if (isGatewayErrorEnvelope && record.choices === undefined) {
     const frame = parseQoderStreamErrorPayload(parsed)
     const error = classifyQoderError({
-      httpStatus: options.httpStatus,
+      // 同流式路径：帧里声明的状态码优先于恒为 200 的传输层状态。
+      httpStatus: jsonGatewayStatus ?? options.httpStatus,
       ...frame.code === undefined ? {} : { code: frame.code },
       message: frame.message,
       source: 'chat',
@@ -980,13 +1162,18 @@ async function* consumeQoderJson(
       ...options.afterJobTokenRetry === undefined ? {} : { afterJobTokenRetry: options.afterJobTokenRetry },
     })
     return {
-      done: false, produced: false, hasToolCalls: false, argumentsTruncated: false, error,
+      done: false, produced: false, hasToolCalls: false, argumentsTruncated: false,
+      droppedUnnamedCalls: false, error,
     }
   }
 
   const model = typeof record.model === 'string' && record.model.length > 0 ? record.model : undefined
   let produced = false
   let hasToolCalls = false
+  /** 是否丢弃过名称不可用的 tool-call（见 `tool_calls` 分支的说明）。 */
+  let droppedUnnamedCalls = false
+  /** 非流式路径的思考死循环命中（作用域需覆盖到函数末尾的 return）。 */
+  let thoughtLoopDetected = false
   const choices = record.choices
   const first = Array.isArray(choices) && choices.length > 0 ? choices[0] : undefined
   const message = typeof first === 'object' && first !== null
@@ -996,7 +1183,18 @@ async function* consumeQoderJson(
   if (typeof message === 'object' && message !== null) {
     const payload = message as Record<string, unknown>
     let nextIndex = 0
-    const thought = typeof payload.reasoning_content === 'string' ? payload.reasoning_content : ''
+    const rawThought = typeof payload.reasoning_content === 'string' ? payload.reasoning_content : ''
+    // 非流式路径同样接死循环守卫：整包回复里若有病态重复，整段思考都会被
+    // 写进块并落盘。这里只做**截断 + 清洗**（无流可 abort —— 正文一次到达，
+    // 上游早已生成完毕，止损无意义）。
+    const loopGuard = isReasoningLoopGuardEnabled() ? createReasoningLoopDetector() : undefined
+    thoughtLoopDetected = loopGuard !== undefined && rawThought.length > 0
+      ? loopGuard.observe(rawThought)
+      : false
+    const thoughtText = loopGuard?.cutAt !== undefined
+      ? rawThought.slice(0, loopGuard.cutAt)
+      : rawThought
+    const thought = stripCourseLeakIfEnabled(thoughtText)
     if (thought.length > 0) {
       produced = true
       const index = nextIndex++
@@ -1004,7 +1202,8 @@ async function* consumeQoderJson(
       yield { type: 'reasoning-delta', index, text: thought }
       yield { type: 'block-end', index, block: { type: 'reasoning', text: thought } }
     }
-    const text = typeof payload.content === 'string' ? payload.content : ''
+    const rawText = typeof payload.content === 'string' ? payload.content : ''
+    const text = stripCourseLeakIfEnabled(rawText)
     if (text.length > 0) {
       produced = true
       const index = nextIndex++
@@ -1022,6 +1221,14 @@ async function* consumeQoderJson(
           : undefined
         const callId = typeof call.id === 'string' && call.id.length > 0 ? call.id : 'call_0'
         const name = fn !== undefined && typeof fn.name === 'string' ? fn.name : ''
+        // ⚠️ **名称不可用的调用一个 chunk 都不产出**（与流式路径同因同修）：
+        // 早期它照样发 `block-start` + `name:''` 的 delta/block，harness 执行得到
+        // `unknown tool ""` 并把坏块**持久化进会话**，之后切到腾讯系端点时被
+        // 每次请求原样重放 → **HTTP 400 code 11133**。
+        if (!hasUsableToolName(name)) {
+          droppedUnnamedCalls = true
+          continue
+        }
         const args = fn !== undefined && typeof fn.arguments === 'string' ? fn.arguments : ''
         hasToolCalls = true
         produced = true
@@ -1045,6 +1252,12 @@ async function* consumeQoderJson(
     produced,
     hasToolCalls,
     argumentsTruncated: false,
+    // 丢弃了无名调用、且没有留下任何可用调用时，调用方据此改报 max-tokens
+    // 而非 stop（否则模型本意调工具、harness 却认为「正常答完了」）。
+    droppedUnnamedCalls,
+    // 非流式路径命中死循环时同样如实上报：思考已被我们**主动截断**，
+    // 语义上就是「不完整、可重试」，故 finish 也报 max-tokens（与流式路径一致）。
+    ...thoughtLoopDetected ? { thoughtLoopDetected: true } : {},
     ...model === undefined ? {} : { model },
   }
 }
@@ -1070,6 +1283,11 @@ export interface QoderAdapterOptions {
    * token 永不更新，用户看到「刚登录好却一直认证失败」而日志全绿。
    */
   refresh: (model?: string) => Promise<void>
+   // ⚠️ 死接线登记（2026-09-23 核对）：本适配器声明了 `options.refresh` 但消费循环
+   // 从不调用它——Qoder 的 401 由「重换 jt 一次」闭环处理（getJobToken /
+   // invalidateJobToken），PAT 本身不过期，续期语义与其余四家适配器（各 2 处调用）
+   // 不适配。保留声明以免破坏 options 形状；接线与否待 Qoder 侧出现真实需要
+   // PAT 续期的场景再议。
   /**
    * 取 job token（`jt-…`）。
    *
@@ -1629,7 +1847,12 @@ export class QoderAdapter extends LlmAdapter {
             ? { ...outcome.error, action: 'fail' }
             : await this.confirmQuota(outcome.error)
           lastMessage = lastClassification.message
-        } else if (!outcome.done) {
+        } else if (!outcome.done && outcome.thoughtLoopDetected !== true) {
+          // ⚠️ **思考死循环命中要排除在本分支之外**：那种情况下流是被我们
+          // **主动 abort** 的（`reader.cancel()`），`done` 必然为 false —— 落进来
+          // 就成了一次「流被截断」的 TRANSPORT（语义错误）。命中时的正确语义是
+          // `max-tokens`（标记为不完整、可重试），由下面的成功收尾分支发出。
+          //
           // ⚠️ **没有 `[DONE]` 就不是成功收尾**（模块头第 1 条）。
           // 两类错误都不出 `[DONE]`，所以静默当优雅结束＝把失败伪装成空回复。
           // 归类 TRANSPORT（可重试）：这是传输层的截断，不是业务终态。
@@ -1639,10 +1862,21 @@ export class QoderAdapter extends LlmAdapter {
             'TRANSPORT',
             { status: attempt.response.status },
           )
-        } else if (!outcome.produced) {
+        } else if (!outcome.produced
+          && outcome.thoughtLoopDetected !== true
+          && !(outcome.droppedUnnamedCalls && !outcome.hasToolCalls)) {
           // 收到 `[DONE]` 却一个内容块都没有：报 EMPTY_RESPONSE 让 DSH 重试，
           // 而不是把一条空 assistant 消息交给用户（那会静默结束本轮）。
           // **不换号** —— 空回复不是账号问题，换个账号只会再拿到一次空回复。
+          //
+          // ⚠️ 死循环命中**必须排除在外**：命中后流是被我们主动 abort 的，若命中
+          // 的是**首个**超长 delta（单帧就含 ≥40 个非空行），`produced` 可能仍为
+          // false —— 那种情况下报 EMPTY_RESPONSE 会把一次正常止损错报成空回复。
+          //
+          // ⚠️ **丢弃了无名 tool-call 同样必须排除**：那种流里 `produced` 也可能为
+          // false（无名块一个 chunk 都没产出），而它**不是**空回复 —— 模型明确要
+          // 调工具、只是名字缺失。落进本分支会把「模型本意调工具」错报成
+          // 「上游什么都没回」，真因被掩盖。它由下面的成功收尾分支报 max-tokens。
           throw new LlmError(
             `${this.product.id}: 上游返回空回复（[DONE] 后无任何内容块）`,
             'EMPTY_RESPONSE',
@@ -1659,9 +1893,23 @@ export class QoderAdapter extends LlmAdapter {
           // `raw_usage.model`，上游 `model` 字段回显的是**传入值**）。
           yield {
             type: 'finish',
-            reason: outcome.argumentsTruncated
+            reason: outcome.thoughtLoopDetected === true
+              // 思考死循环：截断并报可重试。**优先级最高**（高于 tool_calls）——
+              // 循环中生成的工具调用参数不可信；且若无可用调用，落到 `stop`
+              // 会让任务静默中断。
               ? { kind: 'max-tokens' }
-              : outcome.hasToolCalls ? { kind: 'tool-calls' } : { kind: 'stop' },
+              : outcome.argumentsTruncated
+                ? { kind: 'max-tokens' }
+                // 丢弃了无名 tool-call、且**没有**任何可用调用留下来时，本步否则会以
+                // `stop` 收场 —— 模型本意要调工具、harness 却认为「正常答完了」，
+                // 又是一次无报错中断。报 max-tokens 让它重试。
+                //
+                // 若同批还有可用调用（`hasToolCalls`），则照常报 `tool-calls`：
+                // 那几个调用与无名块各自独立，没理由因一个坏块把它们一起作废
+                // （实测线上形态正是「一个无名 + 一个合法 pwsh」）。
+                : outcome.droppedUnnamedCalls && !outcome.hasToolCalls
+                  ? { kind: 'max-tokens' }
+                  : outcome.hasToolCalls ? { kind: 'tool-calls' } : { kind: 'stop' },
             ...outcome.model === undefined ? {} : { replayState: { response: { model: outcome.model } } },
           }
           return

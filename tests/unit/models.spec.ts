@@ -1,5 +1,12 @@
-import { describe, expect, it } from 'vitest'
-import { fetchCodeArtsRemoteModels, OPENGW_GATEWAY_CONFIG_URL, SNAP_MODEL_BUILTIN_URL } from '../../src/models.js'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import {
+  fetchCodeArtsRemoteModels, isCodeArtsBenefitModel, loadBenefitCache, loadModelsCache,
+  OPENGW_GATEWAY_CONFIG_URL, saveBenefitCache, saveModelsCache, setBenefitMemoryCache,
+  SNAP_MODEL_BUILTIN_URL,
+} from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
 /** 构造一份最小可用凭据。 */
@@ -256,5 +263,108 @@ describe('fetchCodeArtsRemoteModels — context_window', () => {
     const models = await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
     expect(models[0]).not.toHaveProperty('maxTokens')
     expect(models[0]).toEqual({ id: 'deepseek-v4-flash', name: 'deepseek-v4-flash', contextWindow: 1048576 })
+  })
+})
+
+/**
+ * benefit（免费额度）模型判定与缓存。
+ *
+ * 真实缺陷（用户报障，对齐上游 83acea2 / deveco-code-rust fb1b4a2）：
+ * `deepseek-v4.1-flash` 是 benefit 模型，调用必须带 `maas_type: benefit`
+ * 请求头，而早期实现把该集合**硬编码**为只有 `glm-5.3-flash`
+ * → 发消息后调用失败。
+ */
+describe('isCodeArtsBenefitModel', () => {
+  let cacheDir: string
+  const originalDir = process.env.DSH_CODEARTS_CACHE_DIR
+
+  beforeEach(() => {
+    // 隔离磁盘缓存：否则会读到真实用户缓存（~/.cache/deveco），断言不稳定。
+    cacheDir = mkdtempSync(join(tmpdir(), 'codearts-benefit-'))
+    process.env.DSH_CODEARTS_CACHE_DIR = cacheDir
+    setBenefitMemoryCache(undefined)
+  })
+
+  afterEach(() => {
+    setBenefitMemoryCache(undefined)
+    if (originalDir === undefined) delete process.env.DSH_CODEARTS_CACHE_DIR
+    else process.env.DSH_CODEARTS_CACHE_DIR = originalDir
+    rmSync(cacheDir, { recursive: true, force: true })
+  })
+
+  it('兜底集合覆盖 gateway/config 的 benefit 模型', () => {
+    // 必须判定为 benefit（否则后端返回 404 not registered）。
+    expect(isCodeArtsBenefitModel('glm-5.3-flash')).toBe(true)
+    expect(isCodeArtsBenefitModel('deepseek-v4.1-flash')).toBe(true)
+  })
+
+  it('不把非 benefit 模型误判为 benefit（带 maas_type 会被拒）', () => {
+    // `deepseek-v4-flash` / `deepseek-v4-pro` 尤其关键：gateway 返回的是它们
+    // 的**带日期后缀**形态（`-0731` / `-0813`），normalizeModelId 会剥掉后缀
+    // 落到这两个 id —— 绝不能连带标成 benefit。
+    for (const model of [
+      'deepseek-v4-flash', 'deepseek-v4-pro', 'GLM-5.2', 'GLM-5.1', 'glm-5.3-flash-0101',
+    ]) {
+      expect(isCodeArtsBenefitModel(model), `${model} 不是 benefit 模型`).toBe(false)
+    }
+  })
+
+  it('远端拉取所得集合是超集：新增 benefit 模型无需改代码', async () => {
+    const { fetcher } = makeFetcher({
+      [OPENGW_GATEWAY_CONFIG_URL]: {
+        body: JSON.stringify({
+          result: {
+            models: [
+              { model_id: 'glm-5.3-flash', model_name: 'glm-5.3-flash' },
+              { model_id: 'brand-new-benefit-model', model_name: 'brand-new-benefit-model' },
+            ],
+          },
+        }),
+      },
+    })
+    await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    expect(isCodeArtsBenefitModel('brand-new-benefit-model')).toBe(true)
+    // 兜底集合在远端集合存在时依然生效（两者是并集语义）。
+    expect(isCodeArtsBenefitModel('deepseek-v4.1-flash')).toBe(true)
+  })
+
+  it('落盘的 benefit 集合不含归一化改写过的 id（钉死陷阱）', async () => {
+    // `deepseek-v4-flash-0731` 在 gateway 里是 benefit，但 normalizeModelId
+    // 会把它改写成 `deepseek-v4-flash` 后再发出，而两者在后端是**不同模型**、
+    // benefit 属性相反 —— 记录改写后的 id 会让无后缀模型多带 maas_type 而失败。
+    const { fetcher } = makeFetcher({
+      [OPENGW_GATEWAY_CONFIG_URL]: {
+        body: JSON.stringify({
+          result: {
+            models: [
+              { model_id: 'deepseek-v4-flash-0731', model_name: 'deepseek-v4-flash' },
+              { model_id: 'deepseek-v4.1-flash', model_name: 'deepseek-v4.1-flash' },
+            ],
+          },
+        }),
+      },
+    })
+    await fetchCodeArtsRemoteModels(makeCredential(), fetcher)
+    const saved: unknown = JSON.parse(readFileSync(join(cacheDir, 'codearts_benefit_models.json'), 'utf-8'))
+    expect(saved).toEqual(['deepseek-v4.1-flash'])
+    expect(isCodeArtsBenefitModel('deepseek-v4-flash')).toBe(false)
+  })
+
+  it('benefit 集合缓存读写往返：ESM 下 require 不可用的回归', () => {
+    // 真实缺陷：本包是 ESM（package.json `"type": "module"`），而缓存读写曾用
+    // `require('node:fs')` —— 在 ESM 下它未定义、抛 ReferenceError 并被 catch
+    // 吞掉，于是「写不进、也读不回」，benefit 判定恒回退静态兜底。
+    saveBenefitCache(['glm-5.3-flash', 'brand-new-benefit-model'])
+    setBenefitMemoryCache(undefined)
+    expect(loadBenefitCache()).toEqual(['glm-5.3-flash', 'brand-new-benefit-model'])
+    // 远端新增的 benefit 模型经磁盘缓存生效（无需改代码）。
+    expect(isCodeArtsBenefitModel('brand-new-benefit-model')).toBe(true)
+    // 兜底集合仍生效（并集语义）。
+    expect(isCodeArtsBenefitModel('deepseek-v4.1-flash')).toBe(true)
+  })
+
+  it('模型列表缓存读写往返（同一 require 缺陷）', () => {
+    saveModelsCache([{ id: 'GLM-5.2', name: 'GLM-5.2' }])
+    expect(loadModelsCache()).toEqual([{ id: 'GLM-5.2', name: 'GLM-5.2' }])
   })
 })

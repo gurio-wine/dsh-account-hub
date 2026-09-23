@@ -1,6 +1,7 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it } from 'vitest'
 import {
+  hasUsableToolName,
   isTruncatedArguments,
   normalizeToolArguments,
   readWithIdleTimeout,
@@ -148,6 +149,81 @@ describe('resolveToolPairing', () => {
     ])
     expect(keepCallIds.size).toBe(0)
     expect(keepResultIds.size).toBe(0)
+  })
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // 回归（真实缺陷，2026-09-23 用户报障）：**名称为空的 tool_call** 必须剔除。
+  //
+  // 根因链：
+  //   ① 上游偶尔吐出一个**完全没有 name 字段**的 tool-call 分片；
+  //   ② 消费端早期把它落成 `name:''` 的块，harness 执行得到 `unknown tool ""`，
+  //      并把这条坏块**持久化进会话历史**；
+  //   ③ 用户切到腾讯系端点后，坏块被每次请求原样重放 →
+  //      **HTTP 400 code 11133 model_param_invalid**，会话彻底报废。
+  //
+  // 实测最小复现（wire 上的 `function.name` → 结果）：
+  //   `"read"` / `"unknown_tool"` → 200（上游**只校验非空，不校验存在性**）
+  //   `""` / `null` / 缺失          → **400 code 11133**
+  // ─────────────────────────────────────────────────────────────────────────
+  it('drops a tool call whose name is an empty string', () => {
+    const { keepCallIds, keepResultIds } = resolveToolPairing([
+      { role: 'assistant', content: [
+        { type: 'tool-call', id: 'bad', name: '', arguments: '{}' },
+      ] },
+      { role: 'user', content: [{ type: 'tool-result', toolCallId: 'bad', content: [] }] },
+    ])
+    expect(keepCallIds.has('bad')).toBe(false)
+    expect(keepResultIds.has('bad')).toBe(false)
+  })
+
+  it('drops a tool call whose name is missing or null', () => {
+    const { keepCallIds } = resolveToolPairing([
+      { role: 'assistant', content: [
+        { type: 'tool-call', id: 'a', arguments: '{}' },
+        { type: 'tool-call', id: 'b', name: null, arguments: '{}' },
+        { type: 'tool-call', id: 'c', name: '   ', arguments: '{}' },
+      ] },
+      { role: 'user', content: [
+        { type: 'tool-result', toolCallId: 'a', content: [] },
+        { type: 'tool-result', toolCallId: 'b', content: [] },
+        { type: 'tool-result', toolCallId: 'c', content: [] },
+      ] },
+    ])
+    expect([...keepCallIds]).toEqual([])
+  })
+
+  // 关键：一个坏块**不得连累**同批的合法调用 —— 线上真实形态正是
+  // 「一个无名 call + 一个合法 pwsh」，若整批丢弃会白白损失一次有效调用。
+  it('keeps usable calls in a batch that also contains an unnamed one', () => {
+    const { keepCallIds, keepResultIds } = resolveToolPairing([
+      { role: 'assistant', content: [
+        { type: 'tool-call', id: 'bad', name: '', arguments: '{}' },
+        { type: 'tool-call', id: 'good', name: 'pwsh', arguments: '{"command":"ls"}' },
+      ] },
+      { role: 'user', content: [
+        { type: 'tool-result', toolCallId: 'bad', content: [] },
+        { type: 'tool-result', toolCallId: 'good', content: [] },
+      ] },
+    ])
+    expect(keepCallIds.has('bad')).toBe(false)
+    expect(keepCallIds.has('good')).toBe(true)
+    expect(keepResultIds.has('bad')).toBe(false)
+    expect(keepResultIds.has('good')).toBe(true)
+  })
+})
+
+describe('hasUsableToolName', () => {
+  // ⚠️ 这条判据**不能**写成 `String(name).length > 0`：`undefined` / `null`
+  // 经 String() 会变成 `"undefined"` / `"null"` 这类**非空**字符串，
+  // 于是「缺名字」被误判成「有名字」，原样发给上游照样 400。
+  it('rejects every value that is not a non-empty string', () => {
+    expect(hasUsableToolName('read')).toBe(true)
+    expect(hasUsableToolName('')).toBe(false)
+    expect(hasUsableToolName('   ')).toBe(false)
+    expect(hasUsableToolName(undefined)).toBe(false)
+    expect(hasUsableToolName(null)).toBe(false)
+    expect(hasUsableToolName(42)).toBe(false)
+    expect(hasUsableToolName({})).toBe(false)
   })
 })
 

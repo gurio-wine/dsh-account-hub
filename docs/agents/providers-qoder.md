@@ -85,3 +85,37 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 - **Qoder** —— `src/qoder-credits.ts`（两步，**两区同协议**，经传入 `product` 现算 host；**宿主侧 `credits.status` / `credits.claimAll` / `checkin.perform` 对两区均已接线、按 region 分派**）：`GET {openapiBase}/sash/api/v1/me/campaigns` → `POST …/{campaignId}/claim`（**body 空串**）。⚠️ 挂在 **`/sash/`** 而非 `/api/`、**不走 wasm 签名**（只需 Bearer jt）—— 只按 `/api/` 搜端点曾误判「Qoder 无签到」。⚠️ **幂等判据是响应体的 `replayed`，不是状态码**（重复领取同样回 200，但 `replayed:true`、无 `benefit`）⇒ 归一 `already-claimed`。⚠️ 只领 `CLAIM_BENEFIT` **且** `CLAIMABLE`（另有 `VIEW_DETAILS` 型）。⚠️「今天已领」时服务端**清空 `campaigns`** ⇒ `CheckinStatus.active` **恒 true**、空列表归一 `already-claimed`。
 
 积分能力取值矩阵（credits-capabilities.js 为唯一真相源）与两区口径见 docs/agents/credits.md。Qoder 专属要点：**国际版 `qoder` 与 CN `qoder-cn` 的 `dailyCheckin` 均为 true、协议共用** —— 国际版端点 `GET {openapiBase}/sash/api/v1/me/campaigns` 已于 **2026-09-23 真机探测 HTTP 200**、响应与 CN 逐字节同构（旧定性「国际版无此活动」不成立），活动以服务端下发为准、空列表归 `already-claimed`；qoder-cn 端点已由 keylog 真机验收（2026-09-21）。⚠️ **宿主侧**：`credits.status` / `credits.claimAll` / `checkin.perform` 对两区均已接线、按 region 分派（`src/account-hub-rpc.ts` 经 `qoderRegionFor`）；国际版端点 2026-09-23 真机验证 200 同构，`CLAIMABLE` 分支待活动刷新自然验证。
+
+## 上游 76069ce 差异登记
+
+上游提交 **`76069ce`（`fix(qoder):工具调用泄露xml`）** 与既有的 2026-09-21 真机定案**指向同一个问题**，但修复形态不同。本节登记该差异，**结论：语义等价，故不合并**。
+
+### 上游所针对的问题
+
+加密端点 `agent_chat_generation` 认**请求体顶层** `tools`，而上游早期实现把它**硬编码为 `[]`**（客户端源码 `tools: o?.tools ?? []`）。于是模型在 wire 上看不到任何函数 schema，只能用**正文里的 XML 文本臆造工具调用** —— 用户报障「qwen3.8-flash 执行任务出现任务调用 xml 泄露任务终止」。上游的修法是新增纯函数 `buildQoderTools()` 真正下发 tools，并把它接进 `QoderEncryptedInfer` / `buildQoderInferPayload()`（`src/qoder-wasm.ts`）。
+
+### 本仓的解法（形态不同，同一根因已修复）
+
+本仓**同样**解决了「模型拿不到 schema」这个根因，且落地早于上游（本仓 `699834f`，2026-09-20 提交 / 注释记的真机取证日为 2026-09-21；上游 `76069ce` 为 2026-09-23），但走的是另一条路：
+
+- `src/qoder-adapter.ts` 的 `buildQoderChatBody` 经 **`serializeQoderTools`** 下发 **OpenAI 标准包裹**的 tools（`{type:'function',function:{name,description,parameters}}`），其 JSDoc 里带**真机对照表**（原样透传 → HTTP 200 流内 `provider_error` + `'function' is a required property, expected an object - 'tools.0'`；包裹后 → `[DONE]=true` 正常收尾；不下发 → 同样正常）；
+- 同一请求体构造里 **`serializeQoderMessages` 已序列化 `tool_calls` 与 `tool_call_id`**（assistant 侧 `tool_calls`、`role:'tool'` 侧 `tool_call_id`），孤儿结果按 `resolveToolPairing` 剔除 —— 与上游 `QoderInferMessage` / `QoderInferToolCall` 的语义一致；
+- 上游所改的 **`src/qoder-wasm.ts:buildQoderInferPayload` 在本仓不存在**：本仓 wasm 层是**纯提取/加载**（`extractQoderWasm` / `verifyQoderWasm` / 三级降级链 / 缓存），**请求体由适配器构造**（`buildQoderChatBody`，导出的纯函数）。本仓也没有 `QoderEncryptedInfer` 这个类 —— 签名由 `src/qoder-wasm-context.ts` 的 `QoderWasmSigner` 提供，`prepareInferRequest` 只做**整包替换**（URL + headers + 密文 body），不参与 payload 构造。
+
+### 一处形态细节差异（实际等价）
+
+上游 `buildQoderTools` 在 `description` 为空串 / `parameters` 为 `undefined` 时**该键不出现**（逐字对齐客户端 `$Hc(A)`）；本仓 `serializeQoderTools` 的 `description` / `parameters` **恒在**。`ToolSchema` 里这两个字段都是必填（`description: string`、`parameters: Record<string, unknown>`），故**实际出站形态一致**，差异只在「字段缺省」这一不可达分支上。
+
+### 未引入的上游附带产物
+
+上游同批带的两个**一次性验证脚本** `scripts/verify-blockend-override.ts` / `scripts/verify-course-leak-e2e.ts` **未引入本仓**（本仓无 `scripts/` 目录）。⚠️ 核实事实：这两个脚本在上游**任何 ref 里都不存在**（`git log --all --diff-filter=A --name-only` 搜不到），只在 AGENTS.md 正文与代码注释里被引用 —— 即它们本就是**被 gitignore 的本地脚本**，从未入库。
+
+本仓由 `tests/unit` 覆盖同等语义，**合计 118 条运行时用例**：
+
+| 文件 | 运行时用例 | 构成 |
+|---|---|---|
+| `tests/unit/reasoning-loop-adapter.spec.ts` | **52** | 14 个 `it()` 声明，其中 3 处参数化：五个适配器 × 5 条（25）、同帧 usage × 3 个 provider（3，qoder/trae-cn 走独立帧故单列）、消费侧泄漏 × 5（5）、序列化侧接线 × 3 条 × 5 个 builder（15），加 4 条非参数化 |
+| `tests/unit/reasoning-loop-guard.spec.ts` | **27** | 阈值边界锁定 / 粒度无关性 / `resolveSliceChars` / 开关 / fixture |
+| `tests/unit/course-leak-strip.spec.ts` | **39** | 行首必删 / 正常用法不动 / 幂等 / 历史侧 / 开关 / fixture |
+
+其中「`block-end` 是权威覆盖」由「截断后是真前缀且严格短于已收增量之和」的断言钉死（只比长度不够 —— 未截断时块文本也只是**短了**），不需要端到端脚本。变异测试确有使用（`trae-cn-adapter.spec.ts` 有一条注释记录了变异验证），但**本仓没有 Stryker 一类变异测试配置**，故不宣称「变异测试覆盖」。

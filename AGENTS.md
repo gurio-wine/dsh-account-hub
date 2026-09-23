@@ -83,3 +83,5 @@
 - `docs/agents/credits.md` — 积分领域（五套共同约定 / 能力判定矩阵）
 - `docs/agents/account-hub-storage.md` — 账号池存储 / 两段式登录 / 模型黑名单 / 档位注册表 / 映射入口
 - `docs/agents/codearts-context-window.md` — CodeArts 上下文窗口接线
+- `docs/agents/reasoning-loop-guard.md` — 思考死循环止损（判据与阈值 / 五适配器接线 / 止损动作 / 开关 / 调参约束）
+- `docs/agents/course-leak-strip.md` — 行首 `课` / `course` 泄漏清洗（判据 / 两处落点 / 非幂等接线 / 开关）

@@ -2,6 +2,7 @@ import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { CHAT_API_BASE, CodeArtsAdapter, QUEUE_STATUS_BASE } from '../../src/llm-adapter.js'
+import { setBenefitMemoryCache, isCodeArtsBenefitModel } from '../../src/models.js'
 import type { RemoteModel } from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
@@ -298,6 +299,64 @@ describe('CodeArtsAdapter', () => {
     const adapter = makeAdapter({ fetchImpl })
     for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
     expect(fetchImpl).toHaveBeenCalled()
+  })
+
+  it('signs deepseek-v4.1-flash with maas_type: benefit（真实缺陷回归）', async () => {
+    // 真实缺陷（用户报障，对齐上游 83acea2）：`deepseek-v4.1-flash` 是 benefit
+    // 模型，必须带 `maas_type: benefit`，而早期实现把该集合硬编码为只有
+    // `glm-5.3-flash` → 发消息后调用失败（不带该头返回
+    // InferHub.002002009.404 "The model is not registered"，带上即成功）。
+    setBenefitMemoryCache([]) // 隔离磁盘缓存，只走静态兜底集合
+    try {
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = new Headers(init?.headers)
+        expect(headers.get('maas_type')).toBe('benefit')
+        // 必须参与 SDK-HMAC-SHA256 签名（出现在 SignedHeaders 中），
+        // 否则服务端验签失败。
+        expect(headers.get('Authorization') ?? '').toContain('maas_type')
+        return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+      })
+      const adapter = makeAdapter({ fetchImpl })
+      const texts: string[] = []
+      for await (const chunk of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) {
+        if (chunk.type === 'text-delta') texts.push(chunk.text)
+      }
+      expect(texts).toEqual(['ok'])
+    } finally {
+      setBenefitMemoryCache(undefined)
+    }
+  })
+
+  it('does not send maas_type for the suffix-less deepseek-v4-flash', async () => {
+    // 无后缀 `deepseek-v4-flash` 是**非 benefit** 模型（带 maas_type 反而报
+    // `unsupported model`）；它是 gateway 的 `-0731` 形态经归一化后的 id，
+    // 而 `-0731` 才是 benefit —— 两者是后端上不同的模型，不能混为一谈。
+    setBenefitMemoryCache([])
+    try {
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        expect(new Headers(init?.headers).get('maas_type')).toBeNull()
+        return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+      })
+      const adapter = makeAdapter({ fetchImpl })
+      for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4-flash' } as never)) { /* drain */ }
+      expect(fetchImpl).toHaveBeenCalled()
+    } finally {
+      setBenefitMemoryCache(undefined)
+    }
+  })
+
+  it('deepseek-v4-flash-0731 不入 benefit 集合：归一化后不得带 maas_type', () => {
+    // 钉死陷阱用例（纯判定层，不发请求）：`-0731` 是我们**根本不发送**的 id，
+    // 它无从决定我们发送的 id 的 benefit 属性；而 normalizeModelId 会把它
+    // 改写成无后缀形态，故判定层对带后缀 id 也必须是 false，避免任何调用方
+    // 误把后缀形态喂进来时多带 maas_type。
+    setBenefitMemoryCache([])
+    try {
+      expect(isCodeArtsBenefitModel('deepseek-v4-flash-0731')).toBe(false)
+      expect(isCodeArtsBenefitModel('deepseek-v4-pro-0813')).toBe(false)
+    } finally {
+      setBenefitMemoryCache(undefined)
+    }
   })
 
   it('refreshes the credential once when the chat request fails with APIG.0602 and retries successfully', async () => {

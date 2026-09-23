@@ -6,6 +6,8 @@
 
 **存储与通路**：账号池持久层是 **`ctx.storage` 的 storage 域**（`dsh_account_hub` → `$DSH_HOME/storages/dsh_account_hub.json`，single 布局 + 一个 global 单例文档，四件套 `accounts` / `disabledModels` / `contextBudgets` / `schemaVersion`）。`contextBudget` / `writeContextBudget` 读写第四件；`writeAccounts` / `writeModels` / `writeBudgets` / `replaceAll` **四件套互带**、都汇入唯一写落点 `persist()`，后三者都**先 `ensureLoaded()`**（它们不过读路径，漏了就整体写空）。**降级矩阵** = storage 为主 → 旧 settings（`jet-hub` namespace，**历史兼容读取，勿改**）回退 → 纯内存兜底；`apply()` 里 `await pool.openStorage()` **必须早于改名迁移**（它内部重置载入标记，切换点不留数据分叉）。**一次性迁移**（`account-hub-migration.ts`）：storage 无账号数据且能读到旧来源时把 `jet-hub` 段原样搬入，来源优先级 `settings.yaml.imported` → `settings.yaml` → 旧 scope；只读来源 / 幂等 / 空表不落 / 失败不半途覆盖。⚠️ **storage 域名只接受 `^[a-z][a-z0-9_]*$`（连字符不合法）**，故是 `dsh_account_hub` 而非插件 id；⚠️ 域打开后**必须 `ctx.effect` 登记 `domain.close`**（facility 按域名单开）；⚠️ **不引 YAML 依赖**：`simple-yaml.ts` 只取目标一节，不支持的构造（锚点/别名/块标量）显式抛错。⚠️ `LlmRuntime.listModels` 会重建条目、丢掉额外字段，`ctx` 也没有「按 provider 取适配器」的入口 ⇒ 由 `register*Llm` **返回适配器实例**经上述参数注入；省略时 `model.list` 不带窗口字段、`setContextBudget` 一律拒绝（headless / 测试的既定降级）。⚠️ **回填行（被关闭的模型）与目录行必须带同一组窗口字段**。⚠️ 客户端 `ModelToggle` 根节点是 `div`、`label` 只包「名称 + 显示开关」，**档位 radio 必须在 label 之外**（放进去会连带翻转显示开关）。
 
+⚠️ **`openStorage()` 返回被缓存的同一个 Promise，可安全重入**：早期实现只用布尔闸门（`if (storageOpened) return this.storage !== undefined`），于是**首次打开仍在途**时第二次调用会以 `false` **提前 resolve** —— 挂在它 `.then()` 上的启动逻辑（改名迁移、Qoder 资料回填、自动签到 sweep、续期调度判据）全都在 storage 真正接管**之前**跑，读到旧 settings/内存快照。**任何「读池前必须等 storage」的启动逻辑都必须挂在这个 Promise 上**，不要改回布尔闸门；也不要在 `apply()` 的**同步**执行期直接读池（那时 storage 一定还没接管）。
+
 ## 账号池与多账号
 
 `AccountPool`（`src/account-pool.ts`）在 **storage 域** `dsh_account_hub` 里保存账号索引（旧 settings 的 `jet-hub` namespace 仅作回退路径，见「存储与通路」），凭据本体存于 `ctx.credentials`：

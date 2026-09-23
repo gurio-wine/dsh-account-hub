@@ -72,7 +72,14 @@ export const LOBSTERAI_HARD_CREDIT_MARKERS: readonly string[] = [
   'insufficient credit', 'no credit', 'credit exhausted', 'out of credit',
   'quota exceeded', 'quota exhaust', 'payment required', 'credit not enough',
   'not enough credit', 'freecreditsused', 'free credits used',
+  // 2026-09 补充（真实缺陷，用户报障）：额度耗尽的**实际文案**是
+  // 「免费额度已用完，请升级套餐」，而早期表里只有「额度用尽」「积分用完」
+  // ——「已用完」与「用尽」字面不同，于是这个最主要的失败模式判成 `none`
+  // （不换号、不记徽章），用户看到「一个账号用完出错但没有切换」。
+  // 英文侧同理补上同类文案。
+  'free quota', 'quota used up', 'upgrade your plan', 'upgrade to continue',
   '积分不足', '额度不足', '余额不足', '积分用完', '额度用尽', '没有积分', '积分耗尽',
+  '额度已用完', '升级套餐',
 ]
 
 /**
@@ -220,6 +227,44 @@ export function classifyLobsteraiError(status: number, body: string): LobsteraiE
   if (status >= 500) return 'server'
   if (status >= 400) return 'client'
   return 'none'
+}
+
+/**
+ * 判定**流内错误帧**（HTTP 200 + SSE `{error:{message}}`）的类别。
+ *
+ * ## 为什么不能直接复用 {@link classifyLobsteraiError}
+ *
+ * 该函数的优先级里**状态码排在最前**（402 / 429 / 404 / 4xx / 5xx），
+ * 而流内错误的 HTTP 状态是 **200** —— 那些分支全部失效，只剩关键词表可用。
+ * 传 200 进去只会得到 `none`（未命中关键词时），而 `none` 意味着
+ * **不换号**，正是用户报障的行为。
+ *
+ * ## 真实缺陷（用户报障）
+ *
+ * 「lobsterai 一个账号用完出错但是没有从账号切换 …… 账号还有 2 个能用的」。
+ * 额度耗尽正是以 **HTTP 200 + 流内错误帧** 表达的，而换号循环整体位于
+ * `if (!response.ok)` 之内，流内错误根本走不到换号逻辑。
+ *
+ * ## 默认值为什么是 `client`（可轮转）而不是 `none`
+ *
+ * 对齐 Go `handler.go:218-243`：那个 switch 的**每个分支都以 `continue` 结尾**，
+ * 含 default 分支，注释明写「轮转下一个账号，不直接返回（防雪崩）」。
+ * 流内错误既然是明确的业务失败（该账号此刻没能服务这个请求），
+ * 就应当换号再试，而不是把错误原地抛给用户。
+ *
+ * 因此本函数只做两件事：
+ * 1. 命中 hard-credit / session-dead / context-window 关键词 → 返回对应类别
+ *    （用于**记徽章**与**映射错误码**）；
+ * 2. 其余一律 → `client`（可轮转，但**不**记徽章，见
+ *    {@link recordsLobsteraiRateLimit}：徽章的含义必须是「这个模型受限」，
+ *    而不是「这个账号出过错」）。
+ *
+ * @param message - 流内错误帧的 message 文本（**原文**，勿先改写）
+ */
+export function classifyLobsteraiStreamError(message: string): LobsteraiErrorKind {
+  // 传 200 表示「状态码不可用」，只让关键词分支参与判定。
+  const byKeyword = classifyLobsteraiError(200, message)
+  return byKeyword === 'none' ? 'client' : byKeyword
 }
 
 /**

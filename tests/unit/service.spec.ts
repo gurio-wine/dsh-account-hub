@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { runLoginFlow, runOAuthFlow } from '../../src/login.js'
-import { RefreshTokenExpiredError, exchangeRefreshToken, generateDpopKeyPair, type TokenResponse } from '../../src/oauth.js'
+import { RefreshTokenExpiredError, RefreshTokenReusedError, exchangeRefreshToken, generateDpopKeyPair, type TokenResponse } from '../../src/oauth.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from '../../src/service.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { fetchCodeArtsRemoteModels, saveModelsCache, setMemoryCache } from '../../src/models.js'
@@ -109,6 +109,48 @@ describe('CodeArtsAuth', () => {
     expect(await credentials.resolve(CODEARTS_CREDENTIAL_REF)).toEqual({ value: 'json-credential', source: 'fake' })
     expect(result).toMatchObject({ access: 'json-credential', expires: 1234, loginUrl: 'https://login' })
     expect(String(result.ref)).toBe(CODEARTS_CREDENTIAL_REF)
+  })
+
+  /**
+   * R3：`scheduleRefresh()` **只**按默认单凭据 ref 武装，故池内账号登录后
+   * 不得调用它。
+   *
+   * `scheduleRefresh` 的调度器回调是 `refresh()`，它读写 `CODEARTS_ACCESS_TOKEN`；
+   * 池内账号写的是 `CODEARTS_ACCOUNT_XXX`。历史实现在 `persistLoginResult` 里
+   * **无条件**调用 `scheduleRefresh()` —— 对池内账号而言，读到的要么是不存在的
+   * 默认 ref（不武装，看似无害），要么是**别的**旧凭据的过期时间（按错的凭据
+   * 武装）。池内账号的真实续期路径是 `refreshAll(pool)` 的 30 分钟定时器。
+   */
+  it('池内账号登录（带 refName）不武装单凭据续期调度器', async () => {
+    mockedRunOAuthFlow.mockResolvedValue({ access: codeartsCredentialJson(), expires: 1234, loginUrl: 'https://login' })
+    const { ctx, credentials } = makeContext()
+    // 默认单凭据 ref 里放一条**可续期且即将过期**的旧凭据：若实现无条件武装，
+    // 调度器就会按这条与本账号无关的凭据安排续期。
+    await credentials.set(CODEARTS_CREDENTIAL_REF, codeartsCredentialJson('OLD-AK', 'OLD-SK'))
+    const service = newService(ctx, { fetcher: mockFetcher })
+    const scheduleSpy = vi.spyOn(service, 'scheduleRefresh')
+
+    await service.persistLoginResult(
+      { access: codeartsCredentialJson('POOL-AK', 'POOL-SK'), expires: 1234, loginUrl: 'https://login' },
+      { refName: 'CODEARTS_ACCOUNT_POOL1' },
+    )
+
+    expect(scheduleSpy, '池内账号登录后不得按默认单凭据 ref 武装调度器').not.toHaveBeenCalled()
+    // 凭据本身正常落在池内账号的 ref 上。
+    expect(await credentials.resolve('CODEARTS_ACCOUNT_POOL1')).toBeDefined()
+  })
+
+  it('单凭据登录（不带 refName）仍照旧武装调度器', async () => {
+    // 反面判据：修 R3 不等于把单凭据路径的续期一起关掉 —— 那条路径上
+    // `scheduleRefresh()` 是**唯一**的续期来源（`refreshAll` 只遍历池内账号）。
+    mockedRunOAuthFlow.mockResolvedValue({ access: codeartsCredentialJson(), expires: 1234, loginUrl: 'https://login' })
+    const { ctx } = makeContext()
+    const service = newService(ctx, { fetcher: mockFetcher })
+    const scheduleSpy = vi.spyOn(service, 'scheduleRefresh')
+
+    await service.login()
+
+    expect(scheduleSpy).toHaveBeenCalledTimes(1)
   })
 
   it('login forwards flow options and propagates failures', async () => {
@@ -387,6 +429,97 @@ describe('CodeArtsAuth silent refresh', () => {
     expect(await credentials.resolve(CODEARTS_CREDENTIAL_REF)).toBeUndefined()
     // 调度未被重新武装。
     expect(scheduleSpy).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * `STS5.1806 the refresh token has been used` 的处置。
+ *
+ * 刷新令牌**一次性轮换**：并发续期同一凭据时，后到的那条必然拿到该错误，
+ * 而先到的那条已经把**新令牌**写回了存储。故正确处置是**重读存储再试一次**，
+ * 而不是判失败（更不是判终态、要求重新登录）。
+ */
+describe('CodeArtsAuth 续期 — refresh_token 已被使用时重读存储重试', () => {
+  it('重读到新令牌时用新令牌再试一次，并成功写回凭据', async () => {
+    const { ctx, credentials } = makeContext()
+    const pair = await generateDpopKeyPair()
+    await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
+      access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+      expires_at: '2026-08-14T12:00:00Z',
+      refresh_token: 'RT-OLD', code_verifier: 'VERIFIER', dpop_private_key_jwk: pair.privateKeyJwk,
+    }))
+
+    const seenTokens: string[] = []
+    mockedExchangeRefreshToken.mockImplementation(async (token: string) => {
+      seenTokens.push(token)
+      if (token === 'RT-OLD') {
+        // 第一次：后端说这份已被用掉；同时模拟并发路径已把新令牌写回存储。
+        await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
+          access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+          expires_at: '2026-08-14T12:00:00Z',
+          refresh_token: 'RT-NEW', code_verifier: 'VERIFIER', dpop_private_key_jwk: pair.privateKeyJwk,
+        }))
+        throw new RefreshTokenReusedError('STS5.1806 the refresh token has been used')
+      }
+      return {
+        credentials: {
+          access_key_id: 'AK2', secret_access_key: 'SK2', security_token: 'ST2',
+          expiration: '2026-08-16T00:00:00Z',
+        },
+        refresh_token: 'RT-NEXT',
+      }
+    })
+
+    const service = newService(ctx)
+    await service.refresh()
+
+    // 确实用了**重读所得**的新令牌重试。
+    expect(seenTokens).toEqual(['RT-OLD', 'RT-NEW'])
+    const stored = JSON.parse((await credentials.resolve(CODEARTS_CREDENTIAL_REF))!.value) as Record<string, unknown>
+    expect(stored['access_key_id']).toBe('AK2')
+    expect(stored['refresh_token']).toBe('RT-NEXT')
+  })
+
+  it('重读后令牌没变（无并发消费者）时原样抛出，不无限重试', async () => {
+    const { ctx, credentials } = makeContext()
+    const pair = await generateDpopKeyPair()
+    await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
+      access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+      expires_at: '2026-08-14T12:00:00Z',
+      refresh_token: 'RT-SAME', code_verifier: 'VERIFIER', dpop_private_key_jwk: pair.privateKeyJwk,
+    }))
+    let calls = 0
+    mockedExchangeRefreshToken.mockImplementation(async () => {
+      calls += 1
+      throw new RefreshTokenReusedError('STS5.1806 the refresh token has been used')
+    })
+
+    const service = newService(ctx)
+    await expect(service.refresh()).rejects.toBeInstanceOf(RefreshTokenReusedError)
+    // 令牌没变 ⇒ 只试一次（相同令牌再试只会再撞一次墙）。
+    expect(calls).toBe(1)
+  })
+
+  it('「已被使用」不把凭据判成失效终态（refreshable 不翻转）', async () => {
+    // 关键语义：并发消费不是「登录失效」。若误判终态，用户会被要求重新登录，
+    // 而存储里其实躺着一份可用凭据。
+    const { ctx, credentials } = makeContext()
+    const pair = await generateDpopKeyPair()
+    await credentials.set(CODEARTS_CREDENTIAL_REF, JSON.stringify({
+      access_key_id: 'AK', secret_access_key: 'SK', security_token: 'ST',
+      expires_at: '2026-08-14T12:00:00Z',
+      refresh_token: 'RT-SAME', code_verifier: 'VERIFIER', dpop_private_key_jwk: pair.privateKeyJwk,
+    }))
+    mockedExchangeRefreshToken.mockImplementation(async () => {
+      throw new RefreshTokenReusedError('STS5.1806 the refresh token has been used')
+    })
+
+    const service = newService(ctx)
+    await service.refresh().catch(() => {})
+    const status = await service.status()
+    // 凭据仍被视作可续期（未被标记失效）。
+    expect(status.refreshable).toBe(true)
+    expect(status.refreshError ?? '').not.toContain('已失效')
   })
 })
 
