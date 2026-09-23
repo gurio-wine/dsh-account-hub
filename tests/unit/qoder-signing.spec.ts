@@ -152,6 +152,66 @@ describe('readQoderUserIdentity：organization_id / tags / data_policy_agreed', 
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// B2. 可展示资料（昵称 / 邮箱 / 手机号）—— 账号卡片昵称的来源
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 为什么这三个字段长在**本**函数上（而不是另写一份解析）
+ *
+ * 账号卡片的昵称要取 `userinfo` 的 `name`，而**签名链已经在调本模块**了
+ * （`QoderSigningProvider.identity` 经 {@link fetchQoderUserIdentity}）。
+ * 两处分头解析同一个响应，将来字段名一变必然分叉 —— 一处改了、另一处还读旧键，
+ * 表现为「签名好了但昵称还是 UUID」这种极难归因的半失效。
+ * 故资料字段与 uid **同源同函数**，只是各自有各自的回退序。
+ */
+describe('readQoderUserIdentity：displayName / email / mobile（账号卡片资料）', () => {
+  it('真机 CN 响应：name 是可展示昵称，email 与 security_mobile 一并带出', () => {
+    const identity = readQoderUserIdentity({
+      ...CN_USERINFO,
+      name: '测试用户',
+      email: 'tester@example.test',
+      security_mobile: '18939953995',
+    })
+    expect(identity?.displayName).toBe('测试用户')
+    expect(identity?.email).toBe('tester@example.test')
+    expect(identity?.mobile).toBe('18939953995')
+  })
+
+  it('字段缺失 ⇒ 各回 undefined（**不编造**昵称，昵称回退序由调用方决定）', () => {
+    const identity = readQoderUserIdentity({ id: 'u-1' })
+    expect(identity?.displayName).toBeUndefined()
+    expect(identity?.email).toBeUndefined()
+    expect(identity?.mobile).toBeUndefined()
+  })
+
+  it('空白 / 非字符串不算资料（不能把 "   " 当成真名）', () => {
+    const identity = readQoderUserIdentity({
+      id: 'u-1', name: '   ', email: 123, security_mobile: '  ',
+    })
+    expect(identity?.displayName).toBeUndefined()
+    expect(identity?.email).toBeUndefined()
+    expect(identity?.mobile).toBeUndefined()
+  })
+
+  it('displayName 兼容 name / nickname / user_name 三种书写（官方键名漂移时的兜底）', () => {
+    // `name` 是实测键名（第一优先）；另两个是各端历史用过的写法。
+    expect(readQoderUserIdentity({ id: 'u', name: 'A' })?.displayName).toBe('A')
+    expect(readQoderUserIdentity({ id: 'u', nickname: 'B' })?.displayName).toBe('B')
+    expect(readQoderUserIdentity({ id: 'u', user_name: 'C' })?.displayName).toBe('C')
+  })
+
+  it('两端空白被裁掉（否则卡片上的名字带着看不见的空格）', () => {
+    const identity = readQoderUserIdentity({ id: 'u', name: '  河童  ', email: ' k@e.test ' })
+    expect(identity?.displayName).toBe('河童')
+    expect(identity?.email).toBe('k@e.test')
+  })
+
+  it('uid 读不到时**整条**返回 undefined（资料再全也不够 —— 签名缺它必回 101）', () => {
+    expect(readQoderUserIdentity({ name: '河童', email: 'k@e.test' })).toBeUndefined()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // C. userinfo 端点（URL / 头 / 失败形态）
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -58,13 +58,24 @@
  * 前者由 `collectCreditBalances` 填 `error` 文案，后者让
  * {@link applyQoderQuotaVerdict} **保守判「不换号」** —— 查不到 ≠ 耗尽。
  *
- * ## 身份回写（步骤 1 留下的缺口）
+ * ## 身份回写（`userId` / `userType`）
  *
  * `userId` / `userType` **不在 exchange 响应里**，但**在本端点响应里**
- * （T1 原文见上）。故本模块负责把它们回写进凭据的 `user_id` / `user_type`
- * 字段：纯函数 {@link applyQoderUserIdentity} 负责合并，接线层通过
- * {@link QoderCreditsOptions.persistIdentity} 落盘。账号卡片上的昵称因此
- * 从「账号 id」变成真实的用户 id。
+ * （T1 原文见上）。故本模块提供纯函数 {@link applyQoderUserIdentity} 做合并，
+ * 并由 {@link QoderCreditsOptions.persistIdentity} 这个**出口**交给接线层落盘。
+ *
+ * ⚠️ **该出口目前无人接线**（宿主侧 `credits.balances` 的
+ * `fetchBalance` 签名只拿得到凭据、拿不到凭据 ref，接不了）。这是**刻意留白**
+ * 而不是缺陷，理由有二：
+ *
+ * 1. `user_id` 对**登录链**没有影响 —— PAT 路径的 `user_id` 来自 exchange
+ *    响应（`buildQoderCredential` 早就写进去了），而签名链要的 uid 是
+ *    `GET /api/v1/userinfo` 现场取的，都不读这一个字段；
+ * 2. 账号卡片的**昵称**（当初想靠这个出口修的东西）改由 userinfo 的 `name`
+ *    提供，见 `qoder-product.ts` 的 `resolveQoderAccountNickname`。
+ *
+ * 故**不要再**把「昵称变成真实用户 id」当成该出口的用途：`user_id` 是
+ * UUIDv7，写成昵称正是用户报障「昵称是 UUID 码」的那个形态。
  *
  * ## 每日领取（签到）
  *

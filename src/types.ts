@@ -245,6 +245,16 @@ export interface RpcCreditsClaimSummary {
   totalCredit: number
   alreadyClaimed: number
   inactive: number
+  /**
+   * 服务端此刻暂不受理的账号数（`ClaimOutcome` 的 `unavailable`，目前只有
+   * Trae CN 的 `9074`）。
+   *
+   * **刻意独立计数而不并入 `failed`**：两者对用户的含义相反 —— `failed` 是
+   * 「你需要做点什么」（重新登录 / 校准设备头），`unavailable` 是「什么都不用做，
+   * 4 小时后的自动 sweep 会重试」。并进 `failed` 会让界面报出一个不需要行动的
+   * 「失败」，用户只会白折腾一轮。
+   */
+  unavailable: number
   failed: number
 }
 /** RPC: 一键领取积分响应 */

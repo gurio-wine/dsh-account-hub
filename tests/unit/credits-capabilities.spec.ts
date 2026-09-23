@@ -228,7 +228,7 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     expect(entries).toEqual(EXPECTED)
   })
 
-  it('没有条目声明 loginHint（每个面板都自带「+ 新建账号」入口）', () => {
+  it('没有条目声明 loginHint（每个面板都自带「登录账号」入口）', () => {
     // `loginHint` 曾用于「本面板没有登录入口、去隔壁面板登录」的共用账号
     // provider（TraeWork 路线，官方已把该通道并入通用通道，那条 provider 已
     // 整体移除）。字段本身留在匹配器里是因为**加回来是好设计**：新增共用账号的
@@ -236,7 +236,7 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
     //
     // 这条断言守的是**当前形态**：七个面板全部走浏览器设备流登录，
     // 谁都不该声明 loginHint —— 声明了会让 `canCreateAccount` 变 false、
-    // 「+ 新建账号」整块消失，而**不报任何错**，只是一个没有入口的死面板。
+    // 「登录账号」整块消失，而**不报任何错**，只是一个没有入口的死面板。
     const entries = [...source.matchAll(PROVIDER_FULL_ENTRY_PATTERN)]
     // 先钉死匹配器本身抓全了七条：漏抓的条目 `entry[5]` 恒为 undefined，
     // 会让下面那条断言在条目整个消失时反而是绿的。
@@ -310,7 +310,7 @@ describe('客户端 PROVIDERS 列表（新命名）', () => {
 describe('Account Hub 面板的结构（源码级回归）', () => {
   const source = readClientSource()
 
-  it('「+ 新建账号」无条件渲染，不按 provider 写分支', () => {
+  it('「登录账号」无条件渲染，不按 provider 写分支', () => {
     // 每个面板都有自己的登录入口（浏览器设备流），故按钮**不该**挂在任何
     // provider 条件上：曾经那套「共用账号的 provider 不渲染按钮、改渲染提示行」
     // 的分支已随 TraeWork 路线 provider 一起移除。
@@ -338,6 +338,123 @@ describe('Account Hub 面板的结构（源码级回归）', () => {
     // 过滤的分支就必须跟着改，同一件事写两遍且可能分叉。
     expect(source).toContain("rpcCall('account.list', { provider })")
     expect(source).not.toContain("rpcCall('account.list', { provider: 'trae-cn' })")
+  })
+})
+
+/**
+ * Hub 面板 UI 调整包（六项）的源码级回归。
+ *
+ * `plugin-src/` 不在 typecheck 视野、react 不在依赖里，故这一组和上面几组一样，
+ * 用**源码级断言**钉死可被正则确认的事实。样式三条尤其重要：`.dim-ah-page`
+ * 的 height / `.dim-ah-layout` 的 overflow / `.dim-ah-panel` 的 overflow-y
+ * 是**同一个机制的三条**，只改其中一条就会退化成「面板内没有滚动」或
+ * 「左栏按钮宽度随供应商漂移」（两者都真机报障过）。
+ */
+describe('Hub 面板 UI 调整包（源码级回归）', () => {
+  const source = readClientSource()
+  const styles = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/account-hub-styles.js'),
+    'utf8',
+  )
+
+  /** 取某条选择器的声明块（首个匹配）。 */
+  const ruleOf = (selector: string): string => {
+    const at = styles.indexOf(selector + ' {')
+    expect(at, `account-hub-styles.js 里找不到规则 ${selector}`).toBeGreaterThan(-1)
+    return styles.slice(at, styles.indexOf('}', at))
+  }
+
+  it('① 面板内滚动被保留，但滚动条视觉被隐藏（Firefox 与 Chromium 两条口径都写）', () => {
+    // 滚动能力：面板自身仍可滚（此前那笔提交把它删掉了，本轮恢复）。
+    expect(ruleOf('.dim-ah-panel')).toContain('overflow-y: auto')
+    // 隐藏视觉：Firefox 走 scrollbar-width，Chromium / Electron 走伪元素。
+    expect(ruleOf('.dim-ah-panel')).toContain('scrollbar-width: none')
+    expect(styles).toContain('.dim-ah-panel::-webkit-scrollbar { display: none; }')
+    // 右栏要滚得动，需要确定高度的父链：page 撑满、layout 裁掉溢出。
+    expect(ruleOf('.dim-ah-page')).toContain('height: 100%')
+    expect(ruleOf('.dim-ah-layout')).toContain('overflow: hidden')
+  })
+
+  it('② 供应商导航按钮恒等宽：左栏不被右栏内容挤压', () => {
+    // 根因（真机实测）：`.dim-ah-layout` 去掉 overflow:hidden 后，`.dim-ah-panel`
+    // 的 min-width:auto 解析为 min-content，右栏内容一宽就把 width:200px 且
+    // flex-shrink 默认 1 的左栏挤窄 —— 实测 rail 217→200、按钮 200→183，
+    // 而右栏内容随 provider 不同，表现就是「切换供应商时按钮宽度都变」。
+    expect(ruleOf('.dim-ah-layout')).toContain('overflow: hidden')
+    // 第二道保险：左栏自己不许收缩（光有 width 挡不住 flex-shrink）。
+    expect(ruleOf('.dim-ah-rail')).toContain('flex: none')
+    // 第三道：按钮的宽度计算方式固定，长名 / 选中态都撑不宽它。
+    expect(ruleOf('.dim-ah-provider')).toContain('box-sizing: border-box')
+  })
+
+  it('③ 单账号「重测 / 重置」按钮已从账号卡片移除，且不留死 handler', () => {
+    const cardStart = source.indexOf('function AccountCard(')
+    expect(cardStart).toBeGreaterThan(-1)
+    const card = source.slice(cardStart, cardStart + 4000)
+    // 卡片上不再有这两个按钮，也不再接这两个 prop。
+    expect(card).not.toContain("'重测'")
+    expect(card).not.toContain("'重置'")
+    expect(card).not.toContain('onRetest')
+    expect(card).not.toContain('onReset')
+    // 面板侧不再传这两个 prop（传了就是死代码，没人消费）。
+    expect(source).not.toContain('onRetest:')
+    expect(source).not.toContain('onReset:')
+    // 单账号 help 常量随之删除，两个 all 版本的保留。
+    expect(source).not.toMatch(/^const RETEST_HELP/m)
+    expect(source).not.toMatch(/^const RESET_HELP/m)
+    expect(source).toContain('RETEST_ALL_HELP')
+    expect(source).toContain('RESET_ALL_HELP')
+  })
+
+  it('③（反面）宿主侧的单账号 RPC 与供应商级「清除限额」能力一律保留', () => {
+    // ⚠️ 删的是 **UI 入口**，不是能力：`account.retest` / `account.reset` 两个
+    // 端点是库层能力（headless / 测试 / 将来形态都可用），宿主一行未动。
+    // 本用例读宿主源码，防止将来有人「顺手把没人用的端点删掉」。
+    const host = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../src/account-hub-rpc.ts'),
+      'utf8',
+    )
+    for (const endpoint of ["case 'account.retest'", "case 'account.reset'", "case 'account.retestAll'", "case 'account.resetAll'"]) {
+      expect(host, `宿主缺少端点 ${endpoint}`).toContain(endpoint)
+    }
+    // 供应商级「清除限额」仍走 resetAll。
+    expect(source).toContain("rpcCall('account.resetAll', { provider })")
+    expect(source).toContain("rpcCall('account.retestAll', { provider })")
+  })
+
+  it('④ 供应商级按钮文案为「清除限额」（功能仍走 account.resetAll）', () => {
+    expect(source).toContain("}, '清除限额')")
+    // 旧文案不得残留（它现在既不对应功能，也会让用户以为在重置整个面板）。
+    expect(source).not.toContain("'重置所有'")
+  })
+
+  it('⑤ 文案改为「模型列表」与「登录账号」', () => {
+    expect(source).toContain("}, '模型列表')")
+    expect(source).toContain("creating ? '正在登录…' : '登录账号'")
+    // 空列表的引导文案与错误前缀同步（否则会指向一个不存在的按钮名）。
+    expect(source).toContain("'点击\"登录账号\"进行浏览器登录。'")
+    expect(source).toContain("setError('登录失败：'")
+    // 旧文案不得残留在**代码**里。只查非注释行：文件里保留了叙述历史改名的
+    // 注释（「旧文案『+ 新建账号』」），注释提及旧名是合理且有益的。
+    const codeLines = source
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).not.toContain("'显示列表'")
+    expect(codeLines).not.toContain('+ 新建账号')
+    expect(codeLines).not.toContain('新建账号失败：')
+  })
+
+  it('⑥ 标题与设置页导航项都改为「账号中心」', () => {
+    // 页面标题。
+    expect(source).toContain("}, '账号中心')")
+    // 设置页 section 的 label（宿主 settings 侧边导航显示的就是它）。
+    const entry = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/index.js'),
+      'utf8',
+    )
+    expect(entry).toContain("label: () => '账号中心'")
+    expect(entry).not.toContain("'Account Hub'")
   })
 })
 
@@ -525,5 +642,104 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     expect(styles).toContain('.dim-ah-btn[data-kind="success"]:hover:not(:disabled)')
     // 禁用态继承通用 :disabled，不与 success 冲突。
     expect(styles).toContain('.dim-ah-btn:disabled')
+  })
+})
+
+/**
+ * 单账号签到的反馈与 `unavailable` 接线（源码级回归，2026-09-23）。
+ *
+ * ## 三个真实缺陷（用户报障）
+ *
+ * 1. **点了没反应**：`checkinAccount` 在 `claimingRef` 被自动补签占用时**静默
+ *    `return`**，用户点「签到」毫无反馈；
+ * 2. **成败全无声**：该函数此前只把 `outcome.kind` 用来更新状态，四种 outcome
+ *    一个字符都不弹给用户 —— 与「一键签到」（会弹 `claimNotice`）行为不一致；
+ * 3. **按钮可点但无效**：单片按钮的 `disabled` 不含 `claiming`，一键签到在跑时
+ *    按钮看起来能点、点下去被 ref 挡掉。
+ *
+ * ## 以及一个新接线
+ *
+ * `9074` 的定性改为「服务端名额/风控类拒绝」后归 **`unavailable`**：前端要能
+ * 显示「暂不可签，稍后自动重试」，而不是把它报成失败（那会让用户去排查凭据/设备，
+ * 而正确动作是等宿主 4h 的 sweep 自动重试）。
+ *
+ * `plugin-src/` 不在 typecheck/test 视野（react 不在依赖），故这里用**源码级
+ * 正则断言**钉死接线；纯函数的渲染行为由 `account-hub-claim-notice.spec.ts` 的
+ * 整树深比较覆盖（那份能真的调用组件）。
+ */
+describe('单账号签到反馈与 unavailable 接线（源码级回归）', () => {
+  const normalized = readClientSource().replace(/\r\n/g, '\n')
+
+  /** 取 `checkinAccount` 的函数体切片（到下一个顶层 const 为止）。 */
+  function checkinAccountBody(): string {
+    const start = normalized.indexOf('const checkinAccount = async')
+    expect(start, 'checkinAccount 未找到').toBeGreaterThan(-1)
+    const end = normalized.indexOf('const createAccount = async', start)
+    expect(end, 'checkinAccount 的结束边界未找到').toBeGreaterThan(start)
+    return normalized.slice(start, end)
+  }
+
+  it('① 四种 outcome 都交给 buildClaimNotice（不再是「只更新状态、不弹通知」）', () => {
+    const body = checkinAccountBody()
+    // 核心接线：响应直接喂给既有的通知构造器（`checkin.perform` 与
+    // `credits.claimAll` 响应同构，故不需要另写一套摘要逻辑）。
+    expect(body).toContain('setClaimNotice(buildClaimNotice(res))')
+    // 状态判定仍只认 claimed / already-claimed（unavailable 与 failed 不写已签）。
+    expect(body).toContain("outcome?.kind === 'claimed' || outcome?.kind === 'already-claimed'")
+  })
+
+  it('② claimingRef 被占用时不再静默 return（那正是「点了没反应」）', () => {
+    const body = checkinAccountBody()
+    // 守卫仍在（并发保护不能删），但分支里必须给用户一句话。
+    expect(body).toContain('if (claimingRef.current) {')
+    const guardIndex = body.indexOf('if (claimingRef.current) {')
+    const noticeIndex = body.indexOf('setClaimNotice(', guardIndex)
+    expect(noticeIndex, 'claimingRef 占用分支缺少用户可见反馈').toBeGreaterThan(guardIndex)
+    // 反向护栏：不得回到「守卫后直接裸 return」的旧形态。
+    expect(body).not.toContain('if (claimingRef.current) return;')
+  })
+
+  it('③ rpcCall 抛错时也弹通知（此前只有 console.error，页面无声）', () => {
+    const body = checkinAccountBody()
+    expect(body).toContain("console.error('[account-hub] checkin failed:', caught);")
+    const catchIndex = body.indexOf("console.error('[account-hub] checkin failed:', caught);")
+    expect(body.indexOf('setClaimNotice(', catchIndex)).toBeGreaterThan(catchIndex)
+    expect(body).toContain("tone: 'error'")
+  })
+
+  it('④ 单片按钮的 disabled 含面板级签到忙碌（claiming 折进 busy 传入）', () => {
+    // 账号卡片渲染处：`busy` 不再只是 probeBusy。
+    expect(normalized).toContain('busy: probeBusy || claiming')
+    // AccountCard 自身仍按 busy || 已签 || 本账号签到中 三态禁用。
+    expect(normalized).toContain('disabled: busy || checkedIn || checkingThisAccount')
+  })
+
+  it('⑤ unavailable 明细接线：收集、回退文案、独立成段、传给 ClaimNotice', () => {
+    // 收集函数存在，且只认 unavailable（与 failed 分开）。
+    expect(normalized).toContain("item?.outcome?.kind === 'unavailable'")
+    expect(normalized).toContain('function claimUnavailableLines(res)');
+    // 回退文案**不是**「领取失败」（这一档不是失败）。
+    expect(normalized).toContain("const CLAIM_UNAVAILABLE_FALLBACK = '服务端此刻暂不可签'")
+    // 摘要行：`?? 0` 兜底旧宿主响应（否则旧宿主会渲染出「NaN 个暂不可签」）。
+    expect(normalized).toContain('summary.unavailable ?? 0')
+    expect(normalized).toContain('个暂不可签')
+    // 独立成段渲染（不与失败明细共用一个列表）。
+    expect(normalized).toContain("'data-kind': 'unavailable'")
+    // 调用点把该字段透给 ClaimNotice。
+    expect(normalized).toContain('unavailableDetails: claimNotice.unavailableDetails')
+  })
+
+  it('⑥ `Array.map` 不得直接传 formatClaimFailureLine 引用（下标会被当成回退文案）', () => {
+    // 这是本次改动**真实踩到**的坑：新加的第二个形参（回退文案）与
+    // `Array.map` 的第二个实参（下标）撞位，首行回退文案会变成 `0`。
+    //
+    // 只查「非注释行」：源码注释里保留了叙述该缺陷的写法，注释提及不算违规
+    // （与上方 `CREDITS_PROVIDERS` 那条同款处理）。
+    const codeLines = normalized
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).not.toContain('.map(formatClaimFailureLine)')
+    expect(codeLines).toContain('.map((item) => formatClaimFailureLine(item))')
   })
 })

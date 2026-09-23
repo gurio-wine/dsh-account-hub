@@ -72,6 +72,15 @@ const QODER_USERINFO_TIMEOUT_MS = 20_000
  */
 const QODER_UID_KEYS: readonly string[] = ['id', 'user_id', 'uid']
 
+/**
+ * 昵称的候选键，**顺序即回退序**（`name` 是 2026-09 真机 CN 实测的顶层字段）。
+ *
+ * 另两个是各端历史用过的写法（`nickname` / `user_name`），与 uid 的三段回退
+ * 是**同一类防御**：上游对同一账号形态下发不同键名时，只认一个就会在某类账号上
+ * 静默退回兜底值（昵称显示成一串 UUID）。
+ */
+const QODER_DISPLAY_NAME_KEYS: readonly string[] = ['name', 'nickname', 'user_name']
+
 /** 归一化后的用户身份（`userInfoJson` 的四个业务字段）。 */
 export interface QoderUserIdentity {
   /** 用户 id（官方三段回退，**恒非空** —— 空的话本模块直接抛错）。 */
@@ -82,6 +91,32 @@ export interface QoderUserIdentity {
   organizationTags: readonly string[]
   /** 是否已同意数据策略。 */
   dataPolicyAgreed: boolean
+  /**
+   * **可展示的用户名**（`name`，真机实测的顶层字段）。
+   *
+   * ## 为什么它与签名字段同处一个结构
+   *
+   * 账号卡片的昵称要的正是它，而 userinfo **只有本模块在调**
+   * （`QoderSigningProvider.identity`）。若为昵称另写一份解析，同一个响应就会
+   * 有两套读法：将来官方改键名时必然只改一处，表现为「签名好了、昵称却还是
+   * UUID」这种极难归因的半失效。故**同一份解析、同一个结构**，
+   * 只是各自有各自的回退序（uid 走三段，昵称走 `resolveQoderAccountNickname`）。
+   *
+   * ⚠️ **缺字段即 `undefined`，绝不编造**：昵称的兜底是调用方的职责
+   * （回落到 email → 脱敏手机 → `uid`），在这里塞一个「未知用户」会让
+   * 每一张卡片都显示同一串假名字。
+   */
+  displayName?: string
+  /** 用户邮箱（`email`，有则带；昵称的第二档回退）。 */
+  email?: string
+  /**
+   * 手机号（`security_mobile`，**未脱敏原文**，有则带）。
+   *
+   * ⚠️ **存原文、不在这里脱敏**：脱敏是**展示层**的职责
+   * （`maskQoderMobile`）。在解析层就把中间四位抹掉，会让这个字段没法再用于
+   * 任何其它判断，而「解析诚实、展示克制」是本仓库其它 provider 的一贯口径。
+   */
+  mobile?: string
 }
 
 /** 判定值是否为「普通对象」（排除 null 与数组）。 */
@@ -107,6 +142,16 @@ function readNonEmptyText(source: Record<string, unknown>, keys: readonly string
  * `undefined` 抛错，而空串会让「没取到」与「取到了空」在下游无法区分 ——
  * 后者正是真机上必回 `101` 的那种请求。
  *
+ * ## 两条独立的回退序（不要合并）
+ *
+ * | 用途 | 回退序 | 缺值语义 |
+ * |---|---|---|
+ * | 签名（`uid`） | `id` → `user_id` → `uid` | **抛错**，缺它必回 `101` |
+ * | 展示（`displayName`） | `name` → `nickname` → `user_name` | `undefined`（由调用方兜底） |
+ *
+ * **uid 缺了就整条返回 `undefined`**（含资料字段）：资料再全也签不了名，
+ * 返回半个对象只会让调用方以为「取到了身份」。
+ *
  * ⚠️ **`dataPolicyAgreed` 缺省为 `true`**（本模块唯一的缺省值选择）：真机响应
  * **不含**该字段，而它是「已同意数据策略」的声明。能正常聊天就说明该账号已同意
  * （客户端不允许未同意的账号发请求）；若上游对此有校验，真机三档验证的首档就会
@@ -122,6 +167,11 @@ export function readQoderUserIdentity(payload: unknown): QoderUserIdentity | und
     ? rawTags.filter((tag): tag is string => typeof tag === 'string')
     : []
   const agreed = payload.data_policy_agreed
+  // 资料字段**各自独立缺省**（`undefined`）：账号卡片昵称的回退序在
+  // `resolveQoderAccountNickname` 里，这里是纯粹的事实读出。
+  const displayName = readNonEmptyText(payload, QODER_DISPLAY_NAME_KEYS)
+  const email = readNonEmptyText(payload, ['email'])
+  const mobile = readNonEmptyText(payload, ['security_mobile'])
 
   return {
     uid,
@@ -130,6 +180,9 @@ export function readQoderUserIdentity(payload: unknown): QoderUserIdentity | und
     organizationId: readNonEmptyText(payload, ['orgId', 'organization_id', 'organizationId']) ?? '',
     organizationTags,
     dataPolicyAgreed: typeof agreed === 'boolean' ? agreed : true,
+    ...displayName === undefined ? {} : { displayName },
+    ...email === undefined ? {} : { email },
+    ...mobile === undefined ? {} : { mobile },
   }
 }
 

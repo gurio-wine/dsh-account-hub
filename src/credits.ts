@@ -91,6 +91,58 @@ export type ClaimOutcome =
   | { kind: 'claimed'; credit: number; streakDays: number; isStreakDay: boolean; delayedMessage?: string }
   | { kind: 'already-claimed'; message: string }
   | { kind: 'inactive'; message: string }
+  /**
+   * 服务端**此刻暂不受理**这次领取（设备号被拉黑 / 名额类拒绝），稍后自动重试。
+   *
+   * ## 为什么既不是 `failed` 也不是 `inactive`
+   *
+   * - 与 `failed` 的区别：`failed` 是**需要用户做点什么**的失败（凭据失效要重新
+   *   登录、设备头不对要校准），用户看到它应当去排查；而 `unavailable` 的正确
+   *   动作是**什么都不做，等下一次自动重试** —— 报成 failed 会让用户以为插件坏了。
+   * - 与 `inactive` 的区别：`inactive` 是**活动层面的持续状态**（服务端说活动
+   *   未开启），重试也不会变；`unavailable` 是**服务端侧的拒绝**，同一个请求
+   *   换个时刻（或多试一次）就可能成功。两者对「要不要重试」的回答正好相反。
+   *
+   * ## 唯一的产生者：Trae CN 的 `9074`（换号重试之后仍被拒）
+   *
+   * 真机单变量矩阵（2026-09-23 **第五次定案**）：账号未签 + 设备号**被拉黑**
+   * → `9074`（「当前参与用户太多，请稍后再试」）。⚠️ 前四次定性（瞬时频次软限流
+   * / 活动级名额 / 设备身份 / 名额风控）**均已作废**，现行定性是**该设备号在
+   * 未产出奖励的 claim 中出现过、被服务端拉黑** —— 故签到侧**先换一个全新 16 位
+   * 号重试一次**（`src/trae-cn-credits.ts` 的 `rotateTraeCnCheckinDeviceId`），
+   * **只有换了号仍被拒**才落到本 kind。
+   *
+   * ⚠️ **新增产生者时要顺带改聚合点**：`src/qoder-credits.ts` 的
+   * `claimQoderDailyCheckin` 会把多个活动的结果**收敛成一条** outcome，而它只
+   * 识别 `claimed` / `failed` / 兜底 `already-claimed`。若将来 Qoder 也开始产出
+   * `unavailable`，那条兜底会把它误归成 `already-claimed` —— 界面显示「今天已领」，
+   * 而宿主会写今日状态 ⇒ 当天再也不会重试。故**先改聚合再看新产生者**。
+   *
+   * ## 语义约束（宿主侧必须遵守）
+   *
+   * **绝不写 `checkins` 状态**（与 `failed` / `inactive` 同待遇）—— 一旦按
+   * 「今天办过了」记下今日，4 小时的 sweep 就会短路跳过这个账号，当天再也不会
+   * 重试，等于把一次拒绝变成一个永久失败。判据见 `account-hub-rpc.ts` 的
+   * `performCheckinOnTargets`（它只对 `claimed` / `already-claimed` 写状态，
+   * 故本 kind 天然不命中；`tests/unit/checkin-rpc.spec.ts` 有用例钉死）。
+   */
+  | {
+    kind: 'unavailable'
+    /**
+     * 服务端业务码（Trae CN 的 `9074`）。
+     *
+     * 与 `failed` 同款带上：用户与日志都需要它才能把这次拒绝对回服务端语义。
+     */
+    code: number
+    message: string
+    /**
+     * 服务端日志追踪号（**可选**，同 `failed` 分支：只有服务端在响应头里给了才有）。
+     *
+     * `9074` 恰恰是最需要服务端日志的场景 —— 客户端看不到名额池的状态，只有
+     * logid 能让服务端查到这一次请求撞在了什么上面。
+     */
+    logid?: string
+  }
   | {
     kind: 'failed'
     code: number

@@ -53,43 +53,66 @@
  * | `x-device-brand` | 条件性发（`device_model` 非空才发） | **不发** | 刻意（不猜硬件型号，不发空串冒充） |
  * | `Accept` / `Origin` / `Referer` / `X-Ide-Token` / `X-Cloudide-Token` | **官方都不发** | 原多发 → **已删** | **已删**（对齐官方头集） |
  *
- * ⚠️ **`x-os-version` / `x-app-version` 的旧「身份保真」修复与 `9074` 无关**，
- * 本次定案的根因是**设备身份**（`x-device-id`），不是版本号形态。见下节。
+ * ⚠️ **`x-os-version` / `x-app-version` 的旧「身份保真」修复与 `9074` 无关**（第 4 次
+ * 定性说「根因是名额/风控」，第 5 次定性纠正为**设备号拉黑** —— 但两者都不是版本号
+ * 形态问题）。见下节。
  *
- * ## `9074` 的定性（2026-09-20 **第三次**修正，前两次均作废）
+ * ## `9074` 的定性（2026-09-23 **第五次**修正，前四次均作废）
  *
  * | 次序 | 定性 | 状态 |
  * |---|---|---|
  * | 第 1 次 | 瞬时频次软限流 | **作废**（8 秒退避重放仍 9074、三日 452 次报错） |
- * | 第 2 次 | 活动级当日容量/名额限制或账号侧风控 | **作废**（官方客户端同期可签成功；单变量 A/B 找到真变量） |
- * | **第 3 次（本次）** | **设备身份**：服务端按 `x-device-id` 记设备维度签到状态，我们发的 `BoundDeviceID` 不被活动系统认可 | 单变量隔离证据 |
+ * | 第 2 次 | 活动级当日容量/名额限制或账号侧风控 | **作废**（误读：当时见官方同期签成功，就以为「不是名额」） |
+ * | 第 3 次 | 设备身份：服务端按 `x-device-id` 记设备维度签到状态 | **作废**（判定矩阵：账号已签时任意设备号都 code:0） |
+ * | 第 4 次 | 名额/风控类拒绝，与设备号取值无关 | **作废**（见下方单变量矩阵） |
+ * | **第 5 次（本次，现行）** | **设备号拉黑**：服务端把「在**未产出奖励**的 claim 中出现过的设备号」拉黑 | 真机单变量矩阵（下述） |
  *
- * 决定性证据（status 端点 A/B，2026-09-20）：我们全套头不变 + **仅**把
- * `x-device-id` 换成官方客户端的 16 位号 → `did_checked_in` 由 `false` 翻转为
- * `true`。其余头差异（我们多发的 `Accept` / `Origin` / `Referer` /
- * `X-Ide-Token` / `X-Cloudide-Token`）已证明**不影响**结果。
+ * 真机**单变量矩阵**（2026-09-23，`POST …/checkin_credits/claim`）：
  *
- * 根因结构：官方登录 URL 的 `device_id` 与 claim 的 `x-device-id` 是**同一个稳定
- * AHA 号**；本插件此前两者不同源 —— 登录用现场随机号（用完即丢），claim 却发
- * exchange 返回的 `BoundDeviceID`，构成「与登录不匹配且每次登录都漂移的设备身份」。
- * 修复即 {@link TraeCnCredential.checkin_device_id}：把登录时的 16 位号落盘。
+ * | 账号级 `checked_in` | 设备级 `did_checked_in` | 响应 |
+ * |---|---|---|
+ * | 已签 | 任意 | `code:0`（成功 —— **任意设备号**都成功） |
+ * | 未签 | 已签 | `code:9095`「当前设备今日已经签到」 |
+ * | 未签 | 未签、设备号**干净** | `code:0`（**首次 claim 即成功**） |
+ * | 未签 | 未签、设备号**被拉黑** | `code:9074`「当前参与用户太多，请稍后再试」 |
  *
- * ⚠️ **待验证假设**：本次修复是「按证据最优假设落地 + 次日自然验证」——
- * 定案当天官方已签到成功（幂等挡路），claim 级验证需等次日名额重置。
- * 若明日仍 9074，后续路径是「读 Trae 客户端 AHA 设备号」（跨产品耦合，
- * 需用户拍板），而不是再改形态。
+ * 第 5 次定性的证据是**同一账号同一 token、11 秒间隔的对照**：换一个**全新 16 位
+ * 设备号**，首次 claim 直接 `code:0`；换回旧号立刻又是 `9074`（独立复现）。
+ * 故「名额/风控」那个第 4 次定性**也是错的** —— 服务端确实在认设备，只是它认的是
+ * **「这个号有没有在失败的 claim 里出现过」**，而不是「这个号是不是登录时那个」
+ * （第 3 次定性的错处在于把「必须与登录同源」当成了判据）。
  *
- * ## claim 段的有界重试（2026-09-20）
+ * 被反证的候选（矩阵已排除，不要再回头去查）：传输头 / 会话 / `req_source` / UA
+ * **都不是**条件；官方客户端用的是**机器级稳定 AHA 号**（每次登录都换号的实现因此
+ * 天然更容易撞上拉黑 —— 这正是「河童重登无效」之谜：那些账号的
+ * `checkin_device_id` 是 exchange 绑定的稳定号，重登并不换号）。
  *
- * 定性改变**不等于「不该重试」**：名额在同一分钟内也可能被释放（前一次请求
- * 恰好撞在桶满的瞬间），而 `9074` / `4007` / `3004` 这三个码本身都带「稍后再来」
- * 语义。故 claim 段做**有界**退避重试（1s → 3s，共 2 次，见
- * {@link TRAE_CN_CLAIM_RETRY_DELAYS_MS}）；**status 段不重试**（读接口没有名额
- * 问题，重试只是重复请求），`9004`（设备被拒）与 `1001`（凭据失效）**绝不**
- * 重试 —— 那是确定性失败，重试只会把同一个结果问三遍。
+ * ## 9074 的处置：换一个干净设备号重试一次（用户 2026-09-23 拍板）
  *
- * ⚠️ 第三次定性**不推翻**这段重试：设备身份错误虽然确定性，但「设备维度当日
- * 已签」与「名额释放」的边界在客户端不可见，保留有界重试的成本仍只有 4 秒。
+ * 既然 9074 是「这个号被拉黑了」，正确动作就是**换号**（而不是退避或等 sweep）：
+ * 见 {@link rotateTraeCnCheckinDeviceId}。重试**硬编码一次**，不做循环 ——
+ * 一个刚生成的全新号不该再被拉黑，若它仍回 9074，说明本次拒绝另有原因，
+ * 继续换号只是把随机号当骰子摇。
+ *
+ * ⚠️ **它不走** {@link TRAE_CN_CLAIM_RETRY_CODES}（那张表是「等几秒再问同一个请求」
+ * 的软限流退避）：退避再久也不会让一个被拉黑的号变得可用，换号则一次就够。
+ * 两条路径的**动作**与**次数**都不同，故刻意分开而不是把 9074 加回那张表。
+ *
+ * ## claim 段的请求内重试（2026-09-23 收窄）
+ *
+ * `9074` 已**退出**请求内退避表（见 {@link TRAE_CN_CLAIM_RETRY_CODES}）：它既不是
+ * 「等几秒就好」，在旧定性（名额/风控）下重试同一个请求也只是让用户对着转圈多等
+ * 4 秒。**它的重试是换号那一次**（见上节）；若换号后仍是 9074，才归 `unavailable`
+ * outcome —— **不写今日状态**，故宿主 4 小时的 sweep（`src/account-hub-rpc.ts`）
+ * 下一个周期仍会重新尝试（届时凭据里已是那个新号，不是被拉黑的旧号）。
+ *
+ * 退避表因此只剩 `4007` / `3004` 这类真正的**瞬时软限流**；**status 段不重试**
+ * （读接口没有名额问题，重试只是重复请求），`9004`（设备头）与 `1001`（凭据失效）
+ * **绝不**重试 —— 那是确定性失败，重试只会把同一个结果问三遍。
+ *
+ * ⚠️ `9074` 仍留在 **chat 侧**的共享退避表（`TRAE_CN_BACKOFF_CODES`）里：两条
+ * 协议线对「这个码该怎么处置」的回答不同（chat 侧动作仍是「退避、不换号」），
+ * 签到侧只是不再把它算作**可重试**。
  *
  * ## 与 `lobsterai-credits.ts` 的签名差异（刻意）
  *
@@ -111,10 +134,12 @@
 
 import { version as osVersion } from 'node:os'
 import {
+  TRAE_CN_DEVICE_SOURCE_ROTATED,
   TRAE_CN_REQUEST_TIMEOUT_MS,
   type TraeCnProduct,
 } from './trae-cn-product.js'
 import {
+  generateTraeCnDeviceId,
   traeCnCheckinDeviceId,
   type TraeCnCredential,
 } from './trae-cn-oauth.js'
@@ -218,58 +243,78 @@ export const TRAE_CN_CODE_CREDENTIAL_INVALID = 1001
  * 本模块**总是**带设备四件套，因此真机遇到它只可能是「服务端不认可我们构造的
  * 设备身份」（例如 {@link TRAE_CN_OS_VERSION} 的构建号形态不对）。故错误文案
  * 必须把这件事说清楚，而不是笼统报「领取失败」。
+ *
+ * ⚠️ **与 `9074` 无关**：2026-09-23 的判定矩阵推翻了「9074 = 设备身份」的旧定性
+ * （见文件头）。`9004` 才是**设备头本身**的判据 —— 两者此前被混为一谈。
  */
 export const TRAE_CN_CODE_DEVICE_REJECTED = 9004
 
 /**
- * 「当前参与用户太多，请稍后再试」码（**真根因：设备身份**）。
+ * 「当前设备今日已经签到」码（`9095`）。
  *
- * ⚠️ **定性已于 2026-09-20 第三次修正**（前两次均作废）：
+ * 真机判定矩阵（2026-09-23）：**账号级未签 + 设备级已签** → `9095`。
+ *
+ * 语义是「今天这个设备已经领过一份」—— 账号级的 `checked_in` 仍为 false，
+ * 但这份奖励今天确实已经到手，故归一 `already-claimed`（界面显示已签、
+ * 宿主写今日状态），**不是**失败、也**不重试**（确定性结果）。
+ */
+export const TRAE_CN_CODE_DEVICE_ALREADY_CLAIMED = 9095
+
+/**
+ * 「当前参与用户太多，请稍后再试」码（**真根因：设备号被服务端拉黑**）。
+ *
+ * ⚠️ **定性已于 2026-09-23 第五次修正**（前四次均作废，完整历次见文件头）：
  *
  * | 次序 | 定性 | 作废依据 |
  * |---|---|---|
  * | 1 | 瞬时频次软限流 | 8 秒退避重放**仍** 9074；三日 452 次报错 |
- * | 2 | 活动级当日容量/名额限制或账号侧风控 | 官方客户端同期签成功；单变量 A/B 定位到真变量 |
- * | **3（现行）** | **设备身份不被活动系统认可** | status 端点 A/B：仅换 `x-device-id` 即让 `did_checked_in` 由 false 翻转为 true |
+ * | 2 | 活动级当日容量/名额限制或账号侧风控 | 误读（官方同期可签成功 ⇒ 当时误判「不是名额」） |
+ * | 3 | 设备身份不被活动系统认可 | 判定矩阵：账号级已签时**任意设备号**都回 `code:0` |
+ * | 4 | 名额/风控类拒绝，与设备号取值无关 | 换**全新**设备号首次 claim 即 `code:0`（11 秒间隔对照） |
+ * | **5（现行）** | **设备号拉黑**：在**未产出奖励**的 claim 中出现过的号被拉黑 | 真机单变量矩阵（文件头） |
  *
- * 服务端按 `x-device-id` 做**设备维度**签到记账，我们发的 `BoundDeviceID`
- * 不在它的设备表里。修复见 {@link traeCnCreditsHeaders} /
- * {@link TraeCnCredential.checkin_device_id}。
+ * 故它与 {@link TRAE_CN_CODE_DEVICE_ALREADY_CLAIMED} 的分工是：
+ * 9095 = **这台设备今天拿到过奖励**（确定性、归 `already-claimed`）；
+ * 9074 = **这个设备号此前在失败的 claim 里出现过**（换一个干净号即可，见
+ * {@link rotateTraeCnCheckinDeviceId}）。
  *
- * ⚠️ **待验证假设**：claim 级验证需等次日名额重置（定案当天官方已签成功、
- * 幂等挡路）。若明日仍 9074，后续路径是「读 Trae 客户端 AHA 设备号」
- * （跨产品耦合，需用户拍板）。
+ * 处置：**换号重试一次**；仍是 9074 则归 `unavailable` —— **不写**签到状态
+ * （下次 sweep 重试，届时用的是已落盘的新号）、不标已签。用户文案见
+ * {@link describeFailureCode}。
  */
 export const TRAE_CN_CODE_TOO_MANY_USERS = 9074
 
 /** 传输层失败（网络异常 / 响应无法解析 / 信封与预期不符）的统一码。 */
 const CODE_TRANSPORT_FAILED = -1
 
-// ── claim 段的有界重试（2026-09-20） ──
+// ── claim 段的请求内重试（2026-09-23 收窄为两个软限流码） ──
 
 /**
  * claim 段可重试的业务码（**`TRAE_CN_BACKOFF_CODES` 的真子集**）。
  *
- * 刻意不是「整张退避码表」：那张表里还有 `3003`（`MODEL_FAIL`，
- * `all models failed`）—— 它是 **chat 通道**的基础设施故障码，签到端点上
- * 没有对应的观测，把它放进来只会让签到多等 4 秒再拿到同一个结果。
+ * ⚠️ **`9074` 已于 2026-09-23 移出本表**（原为 `[9074, 4007, 3004]`）：它既不是
+ * 「等几秒就好」（第五次定性：设备号被拉黑，等多久都不会变），也不是靠退避能
+ * 解决的事 —— **它的重试是换设备号那一次**（{@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT}
+ * 次，见 {@link claimTraeCnWithDeviceRotation}）。若换号后仍是 9074，才归
+ * `unavailable`、不写今日状态，由宿主 4 小时的 sweep 下个周期再试。
  *
- * 三个码在签到语境下都意味着「服务端此刻不受理这次写入，稍后再来」：
- * - `9074`：活动级当日名额已满 / 账号侧风控（新定性，见文件头注释）；
- * - `4007` / `3004`：服务端明确要求稍后重试。
+ * 留下的两个码在签到语境下都是真正的**瞬时软限流**：服务端明确要求稍后再来，
+ * 秒级重试有实际意义。`3003`（`MODEL_FAIL`，`all models failed`）**刻意不在**
+ * 本表内 —— 它是 **chat 通道**的基础设施故障码，签到端点上没有对应观测。
  *
  * ⚠️ 判定**同时**要求命中 {@link TRAE_CN_BACKOFF_CODES}（见
  * {@link isTraeCnClaimRetryable}）：上游若把某个码从共享退避表里移除
  * （即不再认为它可重试），签到侧的重试会**自动**跟着停 —— 一处定义，不会漂移。
+ * ⚠️ `9074` **仍在**那张共享表里（chat 侧动作不变），故这里必须是**独立的窄表**
+ * 而不是直接引用共享表 —— 两处要是写成一份，「签到不再重试 9074」就无从表达。
  */
-export const TRAE_CN_CLAIM_RETRY_CODES: readonly number[] = [9074, 4007, 3004]
+export const TRAE_CN_CLAIM_RETRY_CODES: readonly number[] = [4007, 3004]
 
 /**
  * 重试前的等待时长（指数退避，**共 2 次重试**：1s → 3s，累计 4s）。
  *
- * 上界刻意压得很小：`9074` 的新定性是**当日名额/风控**，不是「等几秒就好」，
- * 长时间重试只会让用户对着转圈等；这两次重试的真正价值是覆盖「撞在名额释放
- * 瞬间」的极小概率，以及 `4007` / `3004` 这类真正的瞬时软限流。
+ * 只服务 {@link TRAE_CN_CLAIM_RETRY_CODES} 里那两个瞬时软限流码。上界刻意压得很
+ * 小：真正的瞬时抖动在几秒内就会过去，长时间重试只会让用户对着转圈等。
  */
 export const TRAE_CN_CLAIM_RETRY_DELAYS_MS: readonly number[] = [1000, 3000]
 
@@ -277,12 +322,68 @@ export const TRAE_CN_CLAIM_RETRY_DELAYS_MS: readonly number[] = [1000, 3000]
  * 该业务码是否应触发 claim 段的退避重试。
  *
  * 两道判据缺一不可：本地清单（签到语境的相关码）+ 共享退避表（上游对
- * 「可重试」的权威定义）。`9004`（设备被拒）与 `1001`（凭据失效）**都**不在
- * 任何一张表里 —— 它们是确定性失败，重试只会把同一个结果问三遍。
+ * 「可重试」的权威定义）。`9004`（设备头）、`1001`（凭据失效）与 `9095`
+ * （设备今日已签）**都**不在任何一张表里 —— 它们是确定性结果，重试只会把同一个
+ * 结果问三遍。`9074` 在共享表里但**不在**本地清单里（见
+ * {@link TRAE_CN_CLAIM_RETRY_CODES}），故本函数对它返回 false。
  */
 export function isTraeCnClaimRetryable(code: number | undefined): boolean {
   if (code === undefined) return false
   return TRAE_CN_CLAIM_RETRY_CODES.includes(code) && TRAE_CN_BACKOFF_CODES.includes(code)
+}
+
+// ── 9074 换号重试（2026-09-23 用户拍板；整段可单独 revert） ──
+
+/**
+ * 9074 换号重试的**次数上限**（硬编码 1，不做循环）。
+ *
+ * 一个刚生成的全新 16 位号**不该**再被拉黑（真机矩阵：全新号首次 claim 即
+ * `code:0`）。若换了号仍是 9074，说明这次拒绝另有原因，继续摇随机号没有依据 ——
+ * 故不设可配置项、不写循环：改这个数字就等于改「换几次号」这条策略本身，
+ * 应当是一次显式改动而不是一个旋钮。
+ */
+export const TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT = 1
+
+/**
+ * 换一个全新的签到设备号（**9074 的唯一处置**，2026-09-23）。
+ *
+ * ## 为什么是「换号」而不是「退避」
+ *
+ * 真机单变量矩阵定案：`9074` = 服务端把「在**未产出奖励**的 claim 中出现过的
+ * 设备号」拉黑 —— 同一账号同一 token、11 秒间隔的对照里，**全新 16 位号首次
+ * claim 直接 `code:0`**，换回旧号立刻又是 `9074`。故这个码描述的是**设备号的
+ * 状态**，等多久都不会变；唯一有效的动作是换一个服务端没见过的号。
+ *
+ * ## 形态**复用登录时的生成器**（不发明新格式）
+ *
+ * 调 {@link generateTraeCnDeviceId}（登录 URL 的 `device_id` 用的同一个函数），
+ * 故新号与登录时那个**逐形态一致**：16 位纯十进制。刻意不另写一个生成器 ——
+ * 两份实现一旦漂移，就会出现「登录号合法、换号非法」这种只在一个入口复现的
+ * 失败，而那正是设备头类缺陷最难查的形态。
+ *
+ * ⚠️ **这不是 README 禁止的「伪造设备身份」**：那条禁令针对的是「拿 `machine_id`
+ * 之类**别的字段折算**出一个看起来合法的号来掩盖缺失」。这里换的是一个**真实
+ * 注册形态的随机设备号**，且是**用户 2026-09-23 明确拍板**的既定策略
+ * （见 `docs/agents/providers-trae-cn.md` 的拍板记录）。如实说明区别：前者是
+ * 「把没有的说成有」，后者是「换一个身份重新尝试」—— 服务端侧表现为
+ * `did_checked_in` 归 false，是**如实**的新设备，不是伪装成旧设备。
+ *
+ * ## 只动两个字段
+ *
+ * 返回的是**新对象**（不改入参）：`checkin_device_id` 换成新号、
+ * `device_id_source` 标记为 {@link TRAE_CN_DEVICE_SOURCE_ROTATED}，其余字段
+ * （含 exchange 绑定的 `device_id`）**逐字段原样保留** —— 换号是签到侧的事，
+ * 与 chat 侧的绑定标识无关，`traeCnAccessHeaders` 不受影响。
+ *
+ * @param credential - 旧凭据（不改动）。
+ * @returns 换号后的新凭据（调用方负责写回）。
+ */
+export function rotateTraeCnCheckinDeviceId(credential: TraeCnCredential): TraeCnCredential {
+  return {
+    ...credential,
+    checkin_device_id: generateTraeCnDeviceId(),
+    device_id_source: TRAE_CN_DEVICE_SOURCE_ROTATED,
+  }
 }
 
 // ── 积分池 ──
@@ -329,6 +430,24 @@ export interface TraeCnCreditsOptions {
    * 三处分发）；它**不**回传客户端，故校准看宿主日志。
    */
   onDebug?: (message: string) => void
+  /**
+   * 凭据写回出口（**9074 换号重试用**，2026-09-23）。
+   *
+   * 换设备号后必须把新号**持久化**，否则下一次 sweep 又拿被拉黑的旧号去签
+   * （每轮都白烧一次 9074 的往返）。本模块拿不到凭据 ref、也不该猜，故与
+   * `qoder-credits.ts` 的 `persistIdentity` 同款：**出口交给接线层**
+   * （`src/account-hub-rpc.ts` → `ctx.credentials.set(ref, …)`）。
+   *
+   * 调用时机：仅当 claim 真的因 9074 换过号时（首发就成功、或非 9074 的失败
+   * **都不会**调它）—— 每次签到都写一遍凭据是纯粹的磁盘抖动。
+   *
+   * ⚠️ **抛错不影响签到主流程**：写回失败只记一条 `onDebug`，重试照常进行。
+   * 写回的号只决定**下一轮**的起点，与本次领取是否成功无关；因为一次磁盘写
+   * 失败把已经成功的领取报成失败，是比「下轮起点脏」更坏的结果。
+   *
+   * 省略时整条换号重试路径**照常工作**（只是不落盘）—— 老宿主 / 单测无需接线。
+   */
+  persistCredential?: (credential: TraeCnCredential) => void | Promise<void>
 }
 
 /** 一次请求的解析结果（与 `credits.ts` 的 `PostResult` 同构，另带业务码）。 */
@@ -638,17 +757,25 @@ function describeFailureCode(code: number, message: string): string {
       + `x-app-version 为实测常量（${TRAE_CN_APP_VERSION}）`
   }
   if (code === TRAE_CN_CODE_TOO_MANY_USERS) {
-    // 服务端原文（「当前参与用户太多，请稍后再试」）说的是「稍后」，但实测证明
-    // 那不是几秒钟的事 —— 三日 452 次报错、8 秒退避重放仍 9074。
+    // 服务端原文是「当前参与用户太多，请稍后再试」—— 它就是**准确的**描述，
+    // 只是真因（第五次定性，2026-09-23）是**这个设备号在失败的 claim 里出现过、
+    // 被服务端拉黑了**，而不是「参与的人真的多」。
     //
-    // 2026-09-20 第三次定性：真根因是**设备身份**（服务端按 x-device-id 记设备
-    // 维度签到状态，我们发的 BoundDeviceID 不被活动系统认可）。故文案把用户
-    // 引向**可执行的动作**（重新登录以注册设备身份），而不是让他反复刷新等名额。
+    // 这条文案只在**换号重试之后仍是 9074** 时出现（首发 9074 已经换过号了），
+    // 故它描述的确实是「换了干净号也不行」的现场。
+    //
+    // ⚠️ 这里**刻意不给**任何「重新登录 / 登记设备身份」的指引：那个旧文案指向的
+    // 动作**治不了**它（账号级已签时任意设备号都回 code:0 —— 服务端认的是
+    // 「这个号有没有在黑名单里」，不是「它是不是登录时那个」）。错误指引比没有
+    // 指引更坏 —— 用户会照着做，做完仍然失败。
+    //
+    // 正确动作是「什么都不做，稍后自动重试」：它由宿主 4 小时的 sweep 承接
+    // （归 unavailable、不写今日状态），且届时凭据里已是换号后的新号。故文案把
+    // 这件事**明说**，让用户不必反复手点。
     //
     // 刻意**不在文案里重复 code**：前端 `formatClaimFailureLine` 会统一追加
     // `（code N）`，这里再写一次会显示成「…（code 9074）…（code 9074）」。
-    return `${message}（服务端按 x-device-id 记设备维度签到状态；`
-      + '若本账号是旧版凭据登录的，请重新登录一次以登记设备身份）'
+    return `${message}（服务端此刻暂不可签，稍后自动重试）`
   }
   return message
 }
@@ -824,6 +951,70 @@ async function claimTraeCnWithRetry(
 }
 
 /**
+ * 9074 的处置：**换一个全新设备号，重试一次 claim**（2026-09-23 用户拍板）。
+ *
+ * 真机单变量矩阵（见文件头）定案 `9074` = 该设备号已被服务端拉黑，故这里的动作
+ * 是**换号**而不是退避。返回的是「重试结果 + 重试用的凭据」——调用方两者都要：
+ * 结果决定 outcome，凭据决定写回什么（`checkin_device_id` 必须是**重试实际用的**
+ * 那个号，否则下一轮拿旧号起步，每次都要先撞一次 9074）。
+ *
+ * ## 三条刻意的边界
+ *
+ * 1. **只重试一次**（{@link TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT}），不做循环：
+ *    全新号不该再被拉黑；仍是 9074 说明另有原因，继续摇号没有依据。
+ * 2. **不进** {@link TRAE_CN_CLAIM_RETRY_CODES} 的退避路径：那张表是「等几秒再问
+ *    同一个请求」，与「换身份立刻重问」是两种动作，混在一起会让 9074 白等 4 秒。
+ * 3. **写回是尽力而为**：{@link TraeCnCreditsOptions.persistCredential} 抛错只记
+ *    一条调试行，重试照常返回 —— 写回只决定下一轮起点，与本次领取成败无关。
+ *
+ * ⚠️ **两个结果分支都要写回**（成功、以及仍是 9074 的 `unavailable` 都一样）：
+ * 失败分支尤其不能漏 —— 那正是「这个号被拉黑了，下轮别再拿它去撞」这件事的
+ * 唯一落点。漏掉它，4h sweep 的每一次重试都会先烧一发注定 9074 的请求。
+ */
+async function claimTraeCnWithDeviceRotation(
+  credential: TraeCnCredential,
+  product: TraeCnProduct,
+  options: TraeCnCreditsOptions,
+): Promise<{ result: CreditsCallResult; credential: TraeCnCredential }> {
+  const rotated = rotateTraeCnCheckinDeviceId(credential)
+  options.onDebug?.(
+    `[trae-cn] claim 返回 ${TRAE_CN_CODE_TOO_MANY_USERS}（设备号被拉黑），`
+    + `换成新的 16 位设备号重试一次（共 ${TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT} 次）`,
+  )
+  const result = await postJson(
+    TRAE_CN_CHECKIN_CLAIM_PATH, rotated, product, options,
+    JSON.stringify({ req_source: TRAE_CN_CHECKIN_REQ_SOURCE }),
+  )
+  // 写回**先于**结果分流：成功/失败两条路都要落盘（见函数注释的 ⚠️）。
+  await persistRotatedDeviceId(rotated, options)
+  return { result, credential: rotated }
+}
+
+/**
+ * 把轮换后的凭据交给接线层落盘；失败只记调试行，**绝不冒泡**。
+ *
+ * 与 `qoder-credits.ts` 的 `persistQoderIdentity` 同款取舍（那条路径的理由是
+ * 「身份字段只影响昵称显示」，这里更强：写回失败只影响**下一轮 sweep 的起点**）。
+ *
+ * ⚠️ 未接线 `persistCredential` 时**什么都不做**（而不是抛错或打日志）：那是
+ * 「本调用方不负责持久化」的既定形态（单测、老宿主），不是异常。
+ */
+async function persistRotatedDeviceId(
+  credential: TraeCnCredential,
+  options: TraeCnCreditsOptions,
+): Promise<void> {
+  if (options.persistCredential === undefined) return
+  try {
+    await options.persistCredential(credential)
+  } catch (error) {
+    options.onDebug?.(
+      '[trae-cn] 换号后的设备号写回失败（不影响本次签到，但下一轮仍会用旧号起步）：'
+      + `${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+}
+
+/**
  * 执行每日签到领取。
  *
  * 完整流程（**status → 未领则 claim → 补查 status**），返回与 `credits.ts`
@@ -834,8 +1025,15 @@ async function claimTraeCnWithRetry(
  * 1. 状态查询失败 → `failed`（转述底层原因；`code:1001` 译为「凭据已失效」）；
  * 2. `checked_in` 为真 → `already-claimed`（**不发领取请求**，也不补查）；
  * 3. 服务端显式 `enable:false` → `inactive`；
- * 4. 领取请求失败 → `failed`（`1001` 凭据失效 / `9004` 设备被拒各有专门文案）；
+ * 4. 领取请求返回失败码，按码分流（**四种，0 不等于「只有一种失败」**）：
+ *    - `9095`（设备今日已签）→ `already-claimed`（今天这份已经到手）；
+ *    - `9074`（**设备号被拉黑**）→ 换一个全新 16 位号**重试一次**，结果**按重试
+ *      自己的码**再走一遍本分流（成功 → `claimed`；仍 9074 → `unavailable`）；
+ *    - 其余（`1001` 凭据失效 / `9004` 设备头 / …）→ `failed`；
  * 5. 成功 → **补查一次 status 取 `credits`**（见下），然后 `claimed`。
+ *
+ * ⚠️ 第 4 步的 `already-claimed` **不补查 status**：这一份奖励不是本次领到的，
+ * 补查拿到的数字要么是上次的、要么没有，报出来只会误导。
  *
  * ## claim 成功后的补查（T8 定案，2026-09-20）
  *
@@ -852,11 +1050,17 @@ async function claimTraeCnWithRetry(
  * ## 只有 claim 段重试（status 段**一次都不重试**）
  *
  * 第 1 步的 status 是**读**接口：它没有名额问题（实测同一套设备头下 status
- * 恒成功、claim 恒 `9074`），失败即失败，重试只是把同一个结果再问一遍。
+ * 恒成功、claim 才可能被拒），失败即失败，重试只是把同一个结果再问一遍。
  * 第 4 步的 claim 是**写**接口，命中 {@link isTraeCnClaimRetryable} 时按
  * {@link TRAE_CN_CLAIM_RETRY_DELAYS_MS} 退避重试（1s → 3s，共 2 次）；
  * 重试**耗尽**后按**最后一次**尝试的 code / message / logid 返回 ——
  * 用户看到的是最近一次现场，而不是第一次的（logid 尤其如此：它标识单次请求）。
+ *
+ * ⚠️ `9074` **不在这张重试表里**（2026-09-23 收窄）：它既不是「等几秒就好」，
+ * 在处理上也不是退避 —— **它的重试是换设备号那一次**（见
+ * {@link claimTraeCnWithDeviceRotation}）。若换号后仍是 9074，才归 `unavailable`、
+ * 不写今日状态，故宿主 4 小时的 sweep 下个周期仍会被重新尝试（届时凭据里已是
+ * 那个新号，不是被拉黑的旧号）。
  *
  * ⚠️ 第 5 步的补查**不重试**：它是读接口，且它的失败不会改变 outcome 的 kind，
  * 重试只会拖长一次已经成功的领取。它的 `onDebug` 出口与上面共用。
@@ -894,15 +1098,79 @@ export async function claimTraeCnDailyCheckin(
   }
 
   const claimResult = await claimTraeCnWithRetry(credential, product, options)
-  if (!claimResult.ok) {
+  if (claimResult.ok) return await finishTraeCnClaim(claimResult, credential, product, options)
+  // `9074` = **设备号被拉黑**（第五次定性，见文件头）：先换一个全新号重试一次
+  // （真机矩阵：全新号首次 claim 即 `code:0`）。这是**唯一**会改写凭据的路径，
+  // 也是本改动相对既有行为的全部差异 —— 其余失败码直接走下面的分流。
+  if (claimResult.code === TRAE_CN_CODE_TOO_MANY_USERS) {
+    const rotated = await claimTraeCnWithDeviceRotation(credential, product, options)
+    // 重试成功 → 走与首发成功**同一个**收尾（否则这条路径会少一个积分数字）。
+    if (rotated.result.ok) {
+      return await finishTraeCnClaim(rotated.result, rotated.credential, product, options)
+    }
+    // 重试的失败**按它自己**的码分流，不是按首发那个 9074：重试撞上 9095 就该报
+    // 「今天已签到」——拿首发结果覆盖会把一次实际到手的结果报成「暂不可签」。
+    return traeCnClaimFailureOutcome(rotated.result)
+  }
+  return traeCnClaimFailureOutcome(claimResult)
+}
+
+/**
+ * 把一次**失败的** claim 结果归一到 {@link ClaimOutcome}。
+ *
+ * 抽出来是因为它有**两个调用点**：首发失败、以及 9074 换号重试后失败。两处的
+ * 分流规则必须逐字相同（`9095` → 已领、`9074` → 暂不可签、其余 → 失败），
+ * 各写一份必然漂移。
+ *
+ * ⚠️ **调用方必须先处理 9074 的换号重试**：本函数对 9074 直接返回 `unavailable`，
+ * 它是「换了号仍被拒」的落点，不负责触发轮换 —— 混在一起会让「是否已经换过号」
+ * 变成一个隐式状态。
+ */
+function traeCnClaimFailureOutcome(
+  result: Extract<CreditsCallResult, { ok: false }>,
+): ClaimOutcome {
+  // `9095` = 账号未签但**这台设备今天已经签过**（真机判定矩阵，2026-09-23）。
+  // 语义上这份奖励今天已经到手，只是账号级的 `checked_in` 还没翻 —— 归一
+  // `already-claimed`（界面显示已签、宿主写今日状态），而不是 failed。
+  if (result.code === TRAE_CN_CODE_DEVICE_ALREADY_CLAIMED) {
+    return { kind: 'already-claimed', message: '今天已签到' }
+  }
+  // `9074`（换了号仍被拒）：归 `unavailable` —— **不写**今日状态，故宿主 4h 的
+  // sweep 下个周期仍会重试（届时凭据里已是那个新号）。
+  if (result.code === TRAE_CN_CODE_TOO_MANY_USERS) {
     return {
-      kind: 'failed',
-      code: claimResult.code,
-      message: describeFailureCode(claimResult.code, claimResult.message),
-      // logid 透传：claim 失败是最需要服务端日志的场景（9074 就发生在这里）。
-      ...claimResult.logid === undefined ? {} : { logid: claimResult.logid },
+      kind: 'unavailable',
+      code: result.code,
+      message: describeFailureCode(result.code, result.message),
+      // logid 透传：设备号黑名单的状态客户端看不见，这是定位的唯一线索。
+      ...result.logid === undefined ? {} : { logid: result.logid },
     }
   }
+  return {
+    kind: 'failed',
+    code: result.code,
+    message: describeFailureCode(result.code, result.message),
+    // logid 透传：claim 失败是最需要服务端日志的场景。
+    ...result.logid === undefined ? {} : { logid: result.logid },
+  }
+}
+
+/**
+ * 领取已由服务端 `code:0` 确认后的收尾：补查 status 取积分，组装 `claimed`。
+ *
+ * 抽出来是因为它有**两个调用点**：首发成功、以及 9074 换号重试后成功。两处的
+ * 语义必须逐字相同（补查失败不改变 `claimed`、`delayedMessage` 来自服务端原文），
+ * 各写一份必然漂移 —— 而漂移的那一份会让「换号成功的领取」少一个积分数字。
+ *
+ * ⚠️ 补查用的是**换号后的凭据**（调用方传入）：补查虽只读，但设备头要自洽 ——
+ * 用旧号补查会让这一次请求带着刚被拉黑的身份，与本次领取的现场不符。
+ */
+async function finishTraeCnClaim(
+  claimResult: CreditsCallResult & { ok: true },
+  credential: TraeCnCredential,
+  product: TraeCnProduct,
+  options: TraeCnCreditsOptions,
+): Promise<ClaimOutcome> {
   // 补查一次 status 取本次积分（claim 响应里没有积分数，见函数注释）。
   const claimedStatus = await fetchTraeCnCheckinStatus(credential, product, options)
   if (claimedStatus === null) {

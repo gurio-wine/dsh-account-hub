@@ -317,13 +317,21 @@ describe('account.create —— qoder-cn 的 PAT 粘贴式登录', () => {
     const created = await h.call('account.create', { provider: 'qoder-cn', pat: 'pt-cn-token' })
     expect(created.ok).toBe(true)
 
-    expect(h.calls).toHaveLength(1)
-    const exchange = h.calls[0]!
+    // 按 endpoint 过滤而不是按下标取：改号期新增的 userinfo 请求（取真实昵称）
+    // 也在 CN 的 openapi host 上，按下标会让本用例断言到别的那一次。
+    const exchanges = h.calls.filter((c) => c.url.includes('/api/v1/jobToken/exchange'))
+    expect(exchanges).toHaveLength(1)
+    const exchange = exchanges[0]!
     expect(exchange.url).toBe(`${QODER_CN.openapiBase}/api/v1/jobToken/exchange`)
     expect(exchange.url).toContain('openapi.qoder.com.cn')
     // 反向锚点：绝不能是国际版那个 host。
     expect(exchange.url).not.toContain('openapi.qoder.sh')
     expect(exchange.url).not.toBe(`${QODER.openapiBase}/api/v1/jobToken/exchange`)
+    // 同理：userinfo（KYC 资料）也必须打 CN —— 两区令牌互不承认，
+    // 打错 host 的失败形态是「昵称静默退回 UUID」，不报任何错。
+    for (const call of h.calls) {
+      expect(new URL(call.url).hostname, call.url).toMatch(/\.qoder\.com\.cn$/)
+    }
   })
 
   it('载荷缺 pat 时按「PAT 格式不正确」拒绝，且一次网都不出', async () => {
@@ -660,14 +668,14 @@ describe('credits.status / credits.claimAll —— qoder-cn 走 CN host 正常�
 
     const result = await h.call<{
       results: Array<{ accountId: string; outcome: { kind: string; credit?: number } }>
-      summary: { claimed: number; totalCredit: number; alreadyClaimed: number; inactive: number; failed: number }
+      summary: { claimed: number; totalCredit: number; alreadyClaimed: number; inactive: number; unavailable: number; failed: number }
     }>('credits.claimAll', { provider: 'qoder-cn' })
 
     expect(result.ok, JSON.stringify(result)).toBe(true)
     if (!result.ok) return
     expect(result.value.results[0]!.outcome).toMatchObject({ kind: 'claimed', credit: 100 })
     expect(result.value.summary).toEqual({
-      claimed: 1, totalCredit: 100, alreadyClaimed: 0, inactive: 0, failed: 0,
+      claimed: 1, totalCredit: 100, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
     })
 
     const claim = h.calls.find((c) => c.method === 'POST' && c.url.includes('/claim'))
@@ -687,13 +695,13 @@ describe('credits.status / credits.claimAll —— qoder-cn 走 CN host 正常�
     }))
     await withCnAccount(h)
 
-    const result = await h.call<{ summary: { claimed: number; totalCredit: number; alreadyClaimed: number; failed: number } }>(
+    const result = await h.call<{ summary: { claimed: number; totalCredit: number; alreadyClaimed: number; unavailable: number; failed: number } }>(
       'credits.claimAll', { provider: 'qoder-cn' },
     )
     expect(result.ok, JSON.stringify(result)).toBe(true)
     if (!result.ok) return
     expect(result.value.summary).toEqual({
-      claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0,
+      claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, unavailable: 0, failed: 0,
     })
   })
 

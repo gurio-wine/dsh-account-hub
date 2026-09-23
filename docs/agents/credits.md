@@ -8,6 +8,18 @@
 
 五套共同约定：`credits.claimAll` / `credits.status` **处理该 provider 下的全部账号，含已停用**（停用只影响账号池的自动选择与限流切换）；逐账号**顺序执行**（并发易触发风控），单个账号失败不中断整批；返回同一个 `ClaimOutcome` 判别联合，使 `computeClaimSummary` 与前端摘要 UI 五套协议共用；**领取流程自带多步预检的 provider 传 `precheckStatus: false`**（LobsterAI / Trae CN / CodeArts / Qoder CN —— 它们的 `claim` 内部已查过状态）。
 
+**`ClaimOutcome` 的五个 kind 与「要不要重试」**（`src/credits.ts`，判别联合的语义边界）：
+
+| kind | 含义 | 宿主写今日状态？ | 用户该做什么 |
+|---|---|---|---|
+| `claimed` | 本次领到 | **写** | 无 |
+| `already-claimed` | 今天已领/已签（含 Trae CN `9095` 的设备级已签） | **写** | 无 |
+| `inactive` | 活动层面未开启（持续状态，重试不会变） | 不写 | 无（明天再来） |
+| `unavailable` | 服务端**此刻**暂不受理（名额/风控类拒绝，目前只有 Trae CN `9074`） | **不写** | **什么都不做**，等 4h sweep 自动重试 |
+| `failed` | 需要用户行动的失败（凭据失效 / 设备头不对 / 网络异常） | 不写 | 去排查（重登 / 校准） |
+
+⚠️ **写今日状态是白名单**（只认 `claimed` / `already-claimed`，`src/account-hub-rpc.ts` 的 `performCheckinOnTargets`）—— 新增 kind 时**默认不写**才是安全方向：一旦把 `unavailable` 写成「今天办过了」，4h sweep 的「今日未签」筛选当天就短路，一次**瞬时**拒绝变成**当天永久**失败。`unavailable` 与 `failed` **刻意不合并**：前者「不用管」，后者「要动手」，合并会让用户白折腾。新增产生者时还要顺带改聚合点（`claimQoderDailyCheckin` 把多活动收敛成一条 outcome，它目前只识别 `claimed` / `failed`）。
+
 各 provider 的签到/余额端点与判据细节见对应 docs/agents/providers-*.md（buddy / lobsterai / trae-cn / qoder / codearts）。
 
 ## 积分余额（通用约定）

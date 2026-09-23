@@ -58,7 +58,7 @@ import {
   type ContextTier,
   type ContextTierRegistry,
 } from './context-tiers.js'
-import type { TraeCnCredential, TraeCnPendingLogin } from './trae-cn-oauth.js'
+import { serializeTraeCnCredential, type TraeCnCredential, type TraeCnPendingLogin } from './trae-cn-oauth.js'
 import type { QoderDevicePendingLogin } from './qoder-device-flow.js'
 import type { TraeCnProduct } from './trae-cn-product.js'
 import {
@@ -338,7 +338,7 @@ function parseBuddyCredential(raw: string): BuddyCredential | undefined {
  */
 export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCreditsClaimSummary {
   const summary: RpcCreditsClaimSummary = {
-    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+    claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
   }
   for (const outcome of outcomes) {
     switch (outcome.kind) {
@@ -351,6 +351,13 @@ export function computeClaimSummary(outcomes: readonly ClaimOutcome[]): RpcCredi
         break
       case 'inactive':
         summary.inactive += 1
+        break
+      case 'unavailable':
+        // 独立计数而**不并入 failed**（2026-09-23）：两者对用户的含义正好相反 ——
+        // failed 是「你需要做点什么」，unavailable 是「什么都不用做，等自动重试」。
+        // 并进 failed 会让界面报出「1 个失败」，而用户照着一个不需要行动的数字
+        // 去排查凭据/设备，最后什么也修不了。
+        summary.unavailable += 1
         break
       case 'failed':
         summary.failed += 1
@@ -485,8 +492,31 @@ export interface CreditsEndpointDeps<
   resolve(ref: CredentialRef): Promise<{ value: string } | undefined>
   /** 查询签到状态；默认使用真实的 fetchCheckinStatus。 */
   fetchStatus?: (credential: TCredential, product: TProduct) => Promise<CheckinStatus | null>
-  /** 执行签到领取；默认使用真实的 claimDailyCheckin。 */
-  claim?: (credential: TCredential, product: TProduct) => Promise<ClaimOutcome>
+  /**
+   * 执行签到领取；默认使用真实的 claimDailyCheckin。
+   *
+   * 第三个参数是本账号的**凭据写回出口**（`undefined` = 该调用方不负责持久化）。
+   *
+   * ## 为什么它必须经形参传进来，而不是让 claim 自己写
+   *
+   * 只有本函数（{@link collectClaimResults}）知道**当前是哪个账号** —— 它在循环里
+   * 握着 `entry.credentialRef`，而注入的 `claim` 闭包只拿到凭据本身。Trae CN 的
+   * 「9074 换设备号」路径需要在领取过程中**改写凭据**（换号后落盘，下一轮才不用
+   * 旧号去撞黑名单），那个动作必须落到**这个账号自己的 ref** 上。
+   *
+   * 传**回调**而不是传 ref 名字：写什么（序列化格式、要不要顺带更新别的字段）是
+   * provider 的知识，由接线层（`src/index.ts` 的 `ctx.credentials`）持有；
+   * 本模块只负责「哪个账号」。
+   *
+   * ⚠️ 已注入两参 `claim` 的调用方**不受影响**（TS 允许少形参），它们是
+   * CodeArts / LobsterAI / Qoder 与 Buddy 系 —— 那几条协议都没有「领取中途改凭据」
+   * 的需求。
+   */
+  claim?: (
+    credential: TCredential,
+    product: TProduct,
+    persistCredential?: (credential: TCredential) => void | Promise<void>,
+  ) => Promise<ClaimOutcome>
   /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */
   fetchBalance?: (credential: TCredential, product: TProduct) => Promise<CreditBalance | null>
   /**
@@ -521,6 +551,19 @@ export interface CreditsEndpointDeps<
   fetcher?: typeof fetch
   /** 单账号异常时的告警出口（不参与控制流）。 */
   warn?: (message: string) => void
+  /**
+   * 账号凭据写回出口（**可选**，2026-09-23 新增）。
+   *
+   * 用途只有一个：Trae CN 的 **9074 换设备号**路径需要在领取过程中改写该账号的
+   * 凭据（换号后落盘，下一轮 sweep 才不用旧号去撞服务端的设备号黑名单）。
+   *
+   * `refName` 是**账号自己的** `credentialRef`（由 {@link collectClaimResults} 从
+   * 当前 `entry` 解出），实现方负责 `ctx.credentials.set(credentialRef(refName), …)`
+   * 与序列化格式 —— 本模块刻意不碰存储细节。
+   *
+   * 省略时该路径**照常工作**，只是不落盘（老宿主 / 单测的既定降级）。
+   */
+  persistCredential?: (refName: string, credential: TCredential) => void | Promise<void>
   /**
    * 领取前是否先查一次签到状态（默认 `true`）。
    *
@@ -640,9 +683,16 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
         outcome = { kind: 'failed', code: -1, message: '凭据未配置' }
       } else {
         const credential = JSON.parse(resolved.value) as TCredential
+        // 本账号的凭据写回出口（见 {@link CreditsEndpointDeps.claim} 的说明）：
+        // 只有这里知道 `entry.credentialRef`，故回调在此**按账号**闭包出来。
+        // 未接线 `deps.persistCredential` 时传 `undefined` —— 领取实现据此
+        // 跳过写回（而不是拿到一个注定抛错的回调）。
+        const persistCredential = deps.persistCredential === undefined
+          ? undefined
+          : (next: TCredential) => deps.persistCredential!(entry.credentialRef, next)
         if (!precheck) {
           // 领取流程自带状态判断（LobsterAI 的 slot/context 检查在 claim 内部）。
-          outcome = await claim(credential, product)
+          outcome = await claim(credential, product, persistCredential)
         } else {
           // 先查状态：活动未开启或今日已领则跳过领取请求，减少无效调用
           const status = await fetchStatus(credential, product)
@@ -653,7 +703,7 @@ export async function collectClaimResults<TCredential = BuddyCredential, TProduc
           } else {
             // 状态查询失败（status 为 null）时仍然尝试领取：
             // 无法确认不代表不能领，交给领取接口以响应体 code 定夺。
-            outcome = await claim(credential, product)
+            outcome = await claim(credential, product, persistCredential)
           }
         }
       }
@@ -879,8 +929,18 @@ async function runCreditsClaim(
     // `checked_in` 幂等预检 —— 外部再查一次纯属重复请求，故 precheckStatus: false。
     const value = await collectClaimResults<TraeCnCredential, TraeCnProduct>(accounts, TRAE_CN, {
       resolve: (ref) => ctx.credentials.resolve(ref),
-      claim: (credential, product) =>
-        claimTraeCnDailyCheckin(credential, product, { onDebug: (msg) => ctx.logger?.info?.(msg) }),
+      claim: (credential, product, persistCredential) =>
+        claimTraeCnDailyCheckin(credential, product, {
+          onDebug: (msg) => ctx.logger?.info?.(msg),
+          // 9074 换号后的落盘（见 `claimTraeCnWithDeviceRotation`）：只在这条
+          // 协议线上需要，故只在这里接线 —— 其余 provider 的 `claim` 仍是两参，
+          // 拿到的是 `undefined`（它们没有「领取中途改凭据」的需求）。
+          ...persistCredential === undefined ? {} : { persistCredential },
+        }),
+      // 写回**这台账号自己的 ref**：`collectClaimResults` 已按当前 `entry` 把
+      // refName 闭包进去了（本回调只需负责序列化与落盘）。
+      persistCredential: (refName, credential) =>
+        ctx.credentials.set(credentialRef(refName), serializeTraeCnCredential(credential)),
       precheckStatus: false,
       warn: (msg) => ctx.logger?.warn?.(msg),
     })
@@ -915,10 +975,23 @@ async function runCreditsClaim(
 }
 
 /**
- * 对**给定账号数组**执行一次自动签到：成功或已领都写今日，失败不写。
+ * 对**给定账号数组**执行一次自动签到：成功或已领都写今日，其余一律不写。
  *
- * 与 `credits.claimAll` 的核心差异只在写状态这一步。inactive / failed **不写**
- * （失败不写，下次 sweep 重试）——见设计文档 §2/§9。
+ * 与 `credits.claimAll` 的核心差异只在写状态这一步。inactive / unavailable /
+ * failed **不写**（失败不写，下次 sweep 重试）——见设计文档 §2/§9。
+ *
+ * ⚠️ **`unavailable` 也必须不写**（2026-09-23 新增该 kind 时同步钉死）：
+ * 它是「服务端此刻暂不受理」（Trae CN 的 `9074`，**换了设备号重试一次之后仍被拒**），
+ * 唯一的重试机会就是下一次 4h sweep 的「今日未签」筛选。一旦这里写了今日，
+ * `performCheckinSweep` 的 `checkinDay !== today` 判据当天就会短路跳过该账号，
+ * 把一次**瞬时**拒绝变成**当天永久**失败。下面的 `if` 只认
+ * `claimed` / `already-claimed` 两种，故 `unavailable` 天然不命中 ——
+ * 这是刻意的白名单形态，不要改成黑名单（新增 kind 时会静默写错状态）。
+ *
+ * ⚠️ **换号重试那一发不改变本规则**：它是 claim **内部**的一次重试，outcome 仍是
+ * `unavailable`（只是凭据里的设备号已经被换成新号，见 `runCreditsClaim` 的
+ * trae-cn 分支）。故「下轮 sweep 会重试」这条承诺同时靠两件事成立：不写今日状态
+ * **且**新号已落盘 —— 少了后者，每轮都会先拿旧号白撞一次 9074。
  *
  * @param targets - 本次实际要签的账号；空数组 = 无操作（不发起任何请求）。
  */
@@ -1799,8 +1872,9 @@ function registerAccountHubEndpoints(
       //     返回空 checkedIn（能力门控在客户端）。
       //   - `checkin.perform`：单账号（或 provider 全量）自动签到。**复用
       //     `credits.claimAll` 的同一份分派逻辑**（{@link runCreditsClaim}），差异仅
-      //     在写 `writeCheckinDay`：成功或 already-claimed 都写今日，failed/inactive
-      //     不写（下次 sweep 重试）。
+      //     在写 `writeCheckinDay`：成功或 already-claimed 都写今日，inactive /
+      //     unavailable / failed 不写（下次 sweep 重试）——`unavailable` 的完整
+      //     理由见 {@link performCheckinOnTargets}。
       //   - `checkin.sweep`：全量 sweep，遍历 {@link CHECKIN_ELIGIBLE_PROVIDERS}，
       //     每 provider 只签「今日未签」的账号。模块级互斥防 4h 定时器与页面触发并发。
       case 'credits.checkinStatus': {
@@ -1999,7 +2073,7 @@ function registerAccountHubEndpoints(
         //
         // 判据与目录侧**同源**（`isTraeCnJunkModelId`，见 src/trae-cn-models.ts），
         // 且只对 Trae 系 provider 生效：其它 provider 的黑名单语义没变（它们的
-        // 历史行为原样保留，见 README 的「显示列表的回填机制与过滤」）。
+        // 历史行为原样保留，见 README 的「模型列表的回填机制与过滤」）。
         const isTraeProvider = req.provider === TRAE_CN.id
         const junkBackfilled = (id: string): boolean => isTraeProvider && isTraeCnJunkModelId(id)
         // 全量目录（不套黑名单 / 不套门控），缺失时回退 `listModels` 的结果。
@@ -2105,7 +2179,7 @@ function registerAccountHubEndpoints(
                 await pool.setModelDisabled(req.provider, id, false)
               }
               ctx.logger?.info?.(
-                `[account-hub] 已从 ${req.provider} 显示列表清理 ${junkKeys.length} 个垃圾模型键`,
+                `[account-hub] 已从 ${req.provider} 模型列表清理 ${junkKeys.length} 个垃圾模型键`,
               )
             } catch (error) {
               ctx.logger?.warn?.(`[account-hub] 清理 ${req.provider} 垃圾模型键失败: ${String(error)}`)

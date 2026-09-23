@@ -120,7 +120,7 @@ export const QODER_MODELS_TTL_MS = 12 * 60 * 60 * 1000
  * ⚠️ **本提示只用于失败路径的文案，不用于 `resolveModel` 抛错** —— DSH 约定
  * `listModels` 仅供参考，表外 id 必须仍可路由（见 `qoder-adapter.ts` 模块头）。
  */
-export const QODER_OFF_CATALOG_HINT = '（该模型已不在 Qoder 可用目录中，请在 Hub 的显示列表里重选）'
+export const QODER_OFF_CATALOG_HINT = '（该模型已不在 Qoder 可用目录中，请在 Hub 的模型列表里重选）'
 
 /**
  * 静态兜底表的条目（**roster 浮动，故只放极少项**）。

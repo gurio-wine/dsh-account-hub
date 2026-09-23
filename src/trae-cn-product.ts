@@ -494,12 +494,43 @@ export const TRAE_CN_LOGIN_TIMEOUT_MS = 10 * 60 * 1000
  * （`TraeCnCredential.checkin_device_id`，见 `src/trae-cn-oauth.ts` 的
  * `traeCnCheckinDeviceId`）。
  *
- * 本类型**不**为那个字段扩展取值：`checkin_device_id` 是「登录 URL 的
- * `device_id` 原样落盘」，来源没有分叉，加一个恒为同一个值的标记只是噪声。
+ * ## ⚠️ 2026-09-23 起本标记**有第二个取值**（9074 换号重试）
+ *
+ * 原注释写的是「本类型**不**为那个字段扩展取值：`checkin_device_id` 是登录 URL
+ * 的 `device_id` 原样落盘，来源没有分叉」。**那个前提已经不再成立**：签到侧现在
+ * 有一条**换号重试**路径（claim 返回 `9074` 时换一个全新 16 位号重试一次，见
+ * `src/trae-cn-credits.ts` 的 `rotateTraeCnCheckinDeviceId`），落盘的
+ * `checkin_device_id` 因此有了第二种来历。
+ *
+ * 与其另起一个字段（凭据形态变更要牵动读写两侧与全部夹具），不如**扩展本标记的
+ * 值域**：它本来就是「这个设备号是怎么来的」这一格的诊断位，只是此前只有一个
+ * 可能的值。故它现在同时描述两个设备字段的来历：
+ *
+ * | 取值 | `device_id`（BoundDeviceID） | `checkin_device_id`（签到头） |
+ * |---|---|---|
+ * | `'exchange-bound-device-id'` | 本值即来自 exchange | 登录 URL 的 `device_id` 原样落盘 |
+ * | {@link TRAE_CN_DEVICE_SOURCE_ROTATED} | 同上（**不变**） | **9074 换号重试生成的新号**（非登录时那个） |
  *
  * @see TraeCnDeviceIdSource
  */
-export type TraeCnDeviceIdSource = 'exchange-bound-device-id'
+export type TraeCnDeviceIdSource =
+  /** 主路径：登录 exchange 绑定 / 登录 URL 的 16 位号原样落盘。 */
+  | 'exchange-bound-device-id'
+  /** 签到遇 `9074` 后**轮换生成**的新 16 位号（见 `rotateTraeCnCheckinDeviceId`）。 */
+  | 'rotated-after-9074'
+
+/**
+ * 签到遇 `9074` 后轮换设备号的来源标记值（2026-09-23）。
+ *
+ * ⚠️ **只在换号路径上写**：登录、续期、兼容分支一律写
+ * `'exchange-bound-device-id'`（它们那几个字面量**保持原样、一行未动**）——
+ * 那几条路径的设备号都是登录时那个，与轮换无关。
+ *
+ * 这个取值存在的意义，是让「凭据里这个 16 位号**已不是登录时那个**」这件事
+ * **在盘上可查**：事后看凭据时，两种来历否则完全无法区分 —— 而它们的后续
+ * 行为不同（轮换号是「上一轮被 9074 拒过」的痕迹，登录号不是）。
+ */
+export const TRAE_CN_DEVICE_SOURCE_ROTATED: TraeCnDeviceIdSource = 'rotated-after-9074'
 
 /**
  * Trae CN 产品配置。

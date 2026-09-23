@@ -39,13 +39,15 @@ try:
   if result.kind == 'claimed' || result.kind == 'already-claimed':
     await writeCheckinDay(provider, account.id, today)             // 成功或服务端已领 → 写今日
     return { outcome: 'checked-in', result }
-  else (inactive / failed):
-    return { outcome: result.kind, result }                        // 失败不写，下次触发再试
+  else (inactive / unavailable / failed):
+    return { outcome: result.kind, result }                        // 失败/暂不可签都不写，下次触发再试
 catch (network/凭据异常):
   return { outcome: 'failed', message }                            // 失败不写
 ```
 
-**判定规则落地**：`claimed`（签到成功）与 `already-claimed`（服务端 already-claimed）都写今日时间戳；`inactive`（活动未开）与 `failed`（含网络失败、凭据损坏）**一律不写** → 下次进入/定时触发重试。宿主侧不主动维护「今日已自动跑过」标志，幂等性由「服务端 already-claimed 也写今日」保证。
+**判定规则落地**：`claimed`（签到成功）与 `already-claimed`（服务端 already-claimed）都写今日时间戳；`inactive`（活动未开）、`unavailable`（服务端此刻暂不受理 —— Trae CN 的 `9074`，名额/风控类拒绝）与 `failed`（含网络失败、凭据损坏）**一律不写** → 下次进入/定时触发重试。宿主侧不主动维护「今日已自动跑过」标志，幂等性由「服务端 already-claimed 也写今日」保证。
+
+> ⚠️ **`unavailable` 的「不写」是硬要求，不是顺带**（2026-09-23 随该 kind 加入时钉死）：写状态的判据是**白名单**（只认 `claimed` / `already-claimed`），故它天然不命中。一旦写成黑名单（或错误地把它并入「已处理」），4h sweep 的「今日未签」筛选当天就会短路跳过该账号 —— 一次**瞬时**的服务端拒绝被固化成**当天永久**失败。用例见 `tests/unit/checkin-rpc.spec.ts` 的「unavailable 不写今日签到状态」组。
 
 ## 3. RPC 契约（`src/account-hub-rpc.ts`）
 

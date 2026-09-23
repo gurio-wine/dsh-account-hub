@@ -77,7 +77,7 @@ describe('积分领取结果汇总', () => {
       { kind: 'failed', code: 500, message: 'boom' },
     ]
     expect(computeClaimSummary(outcomes)).toEqual({
-      claimed: 2, totalCredit: 150, alreadyClaimed: 1, inactive: 0, failed: 1,
+      claimed: 2, totalCredit: 150, alreadyClaimed: 1, inactive: 0, unavailable: 0, failed: 1,
     })
   })
 
@@ -97,14 +97,37 @@ describe('积分领取结果汇总', () => {
     expect(computeClaimSummary(outcomes)).toMatchObject({ inactive: 1, failed: 1, claimed: 0 })
   })
 
+  /**
+   * `unavailable`（2026-09-23 新增，唯一生产者是 Trae CN 的 `9074`）**独立计数**，
+   * 不并入 `failed`。
+   *
+   * 这条断言守的是**语义**而不只是数字：两者对用户的含义相反 —— `failed` 是
+   * 「你需要做点什么」（重新登录 / 校准设备头），`unavailable` 是「什么都不用做，
+   * 4 小时后的自动 sweep 会重试」。并进 failed 会让界面报出一个不需要行动的
+   * 「失败」，用户只会白折腾一轮。
+   */
+  it('unavailable 独立计数，且**不**并入 failed（两者对用户的含义相反）', () => {
+    const outcomes: ClaimOutcome[] = [
+      { kind: 'unavailable', code: 9074, message: '当前参与用户太多，请稍后再试' },
+      { kind: 'failed', code: 1001, message: '凭据已失效' },
+      { kind: 'claimed', credit: 10, streakDays: 1, isStreakDay: false },
+    ]
+    expect(computeClaimSummary(outcomes)).toEqual({
+      claimed: 1, totalCredit: 10, alreadyClaimed: 0, inactive: 0, unavailable: 1, failed: 1,
+    })
+  })
+
   it('空数组返回全 0', () => {
     expect(computeClaimSummary([])).toEqual({
-      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
     })
   })
 
   it('未知 kind 兜底计入 failed，而不是被静默漏计', () => {
     // 模拟 ClaimOutcome 未来新增 kind、但汇总分支未同步更新的情况。
+    // ⚠️ 注意本兜底只覆盖「**运行期**出现了类型声明之外的 kind」；类型层面新增
+    // kind 会被 computeClaimSummary 的 `never` 穷尽性检查当场拦下（编译不过），
+    // 那条闸比这条运行期兜底更早生效。
     const unknown = { kind: 'brand-new-kind', message: 'x' } as unknown as ClaimOutcome
     expect(computeClaimSummary([unknown, { kind: 'inactive', message: 'i' }]))
       .toMatchObject({ failed: 1, inactive: 1, claimed: 0 })
@@ -274,7 +297,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     expect(response.results.map(r => r.accountId)).toEqual(['enabled-1', 'disabled-1', 'disabled-2'])
     expect(response.results.every(r => r.outcome.kind === 'claimed')).toBe(true)
     expect(response.summary).toEqual({
-      claimed: 3, totalCredit: 300, alreadyClaimed: 0, inactive: 0, failed: 0,
+      claimed: 3, totalCredit: 300, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
     })
   })
 
@@ -302,7 +325,7 @@ describe('credits.claimAll 单账号异常隔离与顺序性', () => {
     // 坏账号没有阻止后两个账号真正发起领取
     expect(claimed).toHaveLength(2)
     expect(response.summary).toEqual({
-      claimed: 2, totalCredit: 200, alreadyClaimed: 0, inactive: 0, failed: 1,
+      claimed: 2, totalCredit: 200, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1,
     })
   })
 
@@ -1671,7 +1694,7 @@ describe('积分端点的 provider 能力边界', () => {
     const call = registerCreditsEndpoints()
     const result = await call('credits.claimAll', { provider: 'codearts' })
     expect((result.value as { summary: unknown }).summary).toEqual({
-      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0,
+      claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0,
     })
   })
 })

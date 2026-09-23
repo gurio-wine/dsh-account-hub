@@ -3,25 +3,33 @@
  */
 
 const STYLES = `
-/* 页面随内容自然展开，不再套一层固定高度：
-   宿主 settings.section 的 .options 自带页面级滚动，账号多时列表撑开、
-   由宿主滚动，避免在本面板内再叠一层滚动条。 */
-.dim-ah-page { display: flex; flex-direction: column; min-height: 100%; }
+/* 页面撑满宿主 settings.section 的 .options：height（不是 min-height）给出
+   确定高度，右栏才有可滚动的边界。 */
+.dim-ah-page { display: flex; flex-direction: column; height: 100%; }
 .dim-ah-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--dsw-alias-border-default, #e5e5e5); }
 .dim-ah-brand { display: flex; flex-direction: column; }
 .dim-ah-brandName { font-size: 18px; font-weight: 600; color: var(--dsw-alias-label-primary, #1a1a1a); }
 .dim-ah-brandDesc { font-size: 13px; color: var(--dsw-alias-label-secondary, #555); margin: 2px 0 0; }
 
 /* 布局：对齐 dsh-im 的两栏。
-   去掉 overflow:hidden —— 配合页面 min-height 让内容自然撑开，
-   overflow 交给外层宿主的页面级滚动。 */
-.dim-ah-layout { display: flex; flex: 1; }
+   ⚠️ overflow:hidden 不是装饰，它是**左栏等宽的前提**：本行让面板成为
+   BFC / 滚动容器，.dim-ah-panel 的 min-width:auto 才会解析为 0 而不是
+   min-content。去掉它时面板内容（账号卡片那一长串）会把 width:200px 且
+   flex-shrink 默认 1 的左栏挤窄 —— 实测 rail 实宽 217→200、按钮 200→183，
+   而面板内容随 provider 不同，表现就是「切换供应商时所有按钮宽度都变」。 */
+.dim-ah-layout { display: flex; flex: 1; overflow: hidden; }
 
-/* 左侧导航：align dsh-im .dim-rail */
-.dim-ah-rail { width: 200px; border-right: 1px solid var(--dsw-alias-border-default, #e5e5e5); padding: 8px; overflow-y: auto; display: grid; align-content: start; gap: 8px; }
+/* 左侧导航：align dsh-im .dim-rail
+   flex:none 与上面那条 overflow:hidden 是同一件事的两道保险：左栏宽度
+   恒为 200px，不随右栏内容收缩（光有 width 挡不住 flex-shrink）。 */
+.dim-ah-rail { flex: none; width: 200px; border-right: 1px solid var(--dsw-alias-border-default, #e5e5e5); padding: 8px; overflow-y: auto; display: grid; align-content: start; gap: 8px; }
 
-/* 每个 provider 按钮：align dsh-im .dim-channel */
-.dim-ah-provider { width: 100%; min-height: 48px; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; color: inherit; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); font: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
+/* 每个 provider 按钮：align dsh-im .dim-channel
+   box-sizing 与栅格都是**等宽的组成部分**：左栏 200px 固定后，按钮宽度还要
+   不随「选中态 / 文本长度」变化。栅格首列恒 30px，第二列 minmax(0,1fr) 吃掉
+   剩余宽度，文字在 .dim-ah-providerLabel 里收敛 —— 长名（LobsterAI）不再
+   把按钮撑宽。 */
+.dim-ah-provider { box-sizing: border-box; width: 100%; min-height: 48px; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; color: inherit; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); font: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
 .dim-ah-provider:hover { border-color: color-mix(in srgb, #1677ff 25%, var(--dsw-alias-border-l2, #eef0f3)); background: color-mix(in srgb, #1677ff 2%, var(--dsw-alias-bg-layer-3, #fff)); box-shadow: 0 5px 16px rgb(31 35 41 / 5%); }
 .dim-ah-provider[aria-selected="true"] { border-color: color-mix(in srgb, #1677ff 43%, var(--dsw-alias-border-l2, #dfe1e5)); color: #1677ff; background: color-mix(in srgb, #1677ff 12%, var(--dsw-alias-bg-layer-3, #fff)); box-shadow: 0 3px 12px rgb(51 112 255 / 7%); }
 .dim-ah-provider:focus-visible { outline: none; border-color: color-mix(in srgb, #1677ff 72%, var(--dsw-alias-border-l2, #dfe1e5)); box-shadow: 0 0 0 1px color-mix(in srgb, #1677ff 24%, transparent) inset, 0 3px 12px rgb(51 112 255 / 7%); }
@@ -51,9 +59,15 @@ const STYLES = `
 .dim-ah-providerLabel { min-width: 0; display: grid; }
 .dim-ah-providerLabel strong { overflow: hidden; color: inherit; font-size: 14px; line-height: 20px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 右侧面板：去掉自身 overflow-y:auto，账号多时随内容自然展开，
-   不在此处再叠一层滚动条（页面级滚动由宿主 settings.section 负责）。 */
-.dim-ah-panel { flex: 1; padding: 24px; }
+/* 右侧面板：自身滚动，但**不显示滚动条**。
+   滚动条只是被隐藏，滚动能力原样保留（滚轮 / 键盘 / 触控板照常）。
+   两条路径都要写，且不是重复：scrollbar-width 是 Firefox 的口径，
+   ::-webkit-scrollbar 是 Chromium / Electron（DSH 桌面端）的口径。
+   ⚠️ 反过来也成立：Chromium 里一旦声明 scrollbar-width: none，本元素上的
+   ::-webkit-scrollbar* 规则会被整体丢弃 —— 这里不要紧（我们要的就是隐藏），
+   但**别**在这条规则上再加 hover 之类的伪元素定制。 */
+.dim-ah-panel { flex: 1; padding: 24px; overflow-y: auto; scrollbar-width: none; }
+.dim-ah-panel::-webkit-scrollbar { display: none; }
 .dim-ah-empty { text-align: center; padding: 40px; color: var(--dsw-alias-label-tertiary, #888); }
 .dim-ah-empty p { margin: 8px 0; font-size: 14px; }
 
@@ -116,12 +130,12 @@ const STYLES = `
 .dim-ah-panelHead { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
 .dim-ah-panelTitle { margin: 0; font-size: 16px; font-weight: 600; color: var(--dsw-alias-label-primary, #1f2329); }
 
-/* 面板标题下方的操作按钮组（显示列表 / 刷新积分 / 一键领取积分 / 重测所有 / 重置所有 / 新建账号）。
-   允许换行：按钮数量随 provider 变化（Buddy CN 有「一键领取积分」，其他没有），
+/* 面板标题下方的操作按钮组（模型列表 / 刷新积分 / 一键签到 / 重测所有 / 清除限额 / 登录账号）。
+   允许换行：按钮数量随 provider 变化（Buddy CN 有「一键签到」，其他没有），
    固定单行在窄面板下必然放不下。 */
 .dim-ah-headerActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
 
-/* 上一次「重测 / 重置」的结果提示 */
+/* 上一次「重测 / 清除限额」的结果提示 */
 .dim-ah-probeNotice { margin-bottom: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); background: var(--dsw-alias-bg-layer-2, #f7f8fa); font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-secondary, #646a73); }
 .dim-ah-probeNotice[data-tone="ok"] { border-color: color-mix(in srgb, #22c55e 35%, var(--dsw-alias-border-l2, #eef0f3)); background: rgb(34 197 94 / 8%); color: #15803d; }
 .dim-ah-probeNotice[data-tone="warn"] { border-color: color-mix(in srgb, #e37400 35%, var(--dsw-alias-border-l2, #eef0f3)); background: rgb(227 116 0 / 8%); color: #b45309; }

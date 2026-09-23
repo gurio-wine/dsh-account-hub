@@ -109,6 +109,24 @@ function stubFetcher(
   return { fetcher, calls }
 }
 
+/**
+ * userinfo 成功响应（**账号卡片昵称的来源**）。
+ *
+ * `name` 才是可展示的真实昵称（真机 CN 实测顶层字段）；`id` 是签名要的 uid，
+ * 而它与 exchange 的 `userId` 是同一个 UUID —— 把后者当昵称显示正是用户报障
+ * 「昵称是 UUID 码」的来路。
+ */
+function userinfoSuccess(overrides: Record<string, unknown> = {}): Response {
+  return new Response(JSON.stringify({
+    id: '01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e',
+    name: '河童',
+    username: 'kappa',
+    email: 'kappa@example.test',
+    security_mobile: '18939953995',
+    ...overrides,
+  }), { status: 200 })
+}
+
 afterEach(async () => {
   for (const service of services) {
     // 设备流用例可能留下未结算的会话（互斥槽位是模块级单例）：不取消会泄漏到
@@ -234,12 +252,16 @@ describe('QoderAuth 登录（PAT 粘贴）', () => {
 
     await service.loginWithPat(PAT)
 
-    expect(calls).toHaveLength(1)
-    expect(calls[0]!.url).toBe('https://openapi.qoder.sh/api/v1/jobToken/exchange')
-    expect(calls[0]!.init?.method).toBe('POST')
+    // ⚠️ 出网共两处：exchange + userinfo（取账号资料）。本用例断言的是
+    // **exchange 那一次**的形态，故按 endpoint 过滤而不是按下标取 ——
+    // 按下标会在将来任何一处新增请求时静默断言到别的请求上。
+    const exchange = calls.filter((c) => c.url.includes('/api/v1/jobToken/exchange'))
+    expect(exchange).toHaveLength(1)
+    expect(exchange[0]!.url).toBe('https://openapi.qoder.sh/api/v1/jobToken/exchange')
+    expect(exchange[0]!.init?.method).toBe('POST')
     // ⚠️ 键名必须 snake_case：camelCase 实测回 400。
-    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ personal_token: PAT })
-    const headers = (calls[0]!.init?.headers ?? {}) as Record<string, string>
+    expect(JSON.parse(String(exchange[0]!.init?.body))).toEqual({ personal_token: PAT })
+    const headers = (exchange[0]!.init?.headers ?? {}) as Record<string, string>
     expect(headers).not.toHaveProperty('Authorization')
     expect(headers['User-Agent']).toBe('qoder/1.1.16')
     expect(headers['Content-Type']).toBe('application/json')
@@ -303,9 +325,12 @@ describe('QoderAuth 登录（PAT 粘贴）', () => {
     expect(stored.access_token).toBe(PAT)
   })
 
-  it('accountId + pool 同时提供时登记账号，且**不写** expiresAt', async () => {
+  it('accountId + pool 同时提供时登记账号：昵称取 userinfo 的真实名', async () => {
     const { ctx } = makeContext()
-    const { fetcher } = stubFetcher(() => exchangeSuccess())
+    // userinfo 是**第二段**出网（exchange 在前），故这里按 URL 分派两种响应。
+    const { fetcher, calls } = stubFetcher((url) => (url.includes('/api/v1/userinfo')
+      ? userinfoSuccess()
+      : exchangeSuccess()))
     const service = newService(ctx, { fetcher })
     const added: Array<Record<string, unknown>> = []
 
@@ -321,10 +346,89 @@ describe('QoderAuth 登录（PAT 粘贴）', () => {
     expect(added[0]!.id).toBe('qoder-a1b2c3d4')
     expect(added[0]!.provider).toBe('qoder')
     expect(added[0]!.credentialRef).toBe('QODER_ACCOUNT_A1B2C3D4')
-    expect(added[0]!.nickname).toBe('01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e')
+    // ⚠️ **真实昵称**，不是 exchange 的 userId（UUID）—— 那正是用户报障的形态。
+    expect(added[0]!.nickname).toBe('河童')
     expect(added[0]!.refreshable).toBe(true)
     // PAT 的过期时间本地无从得知；写 jt 的 24h 进去会让账号卡片刻假过期。
     expect(added[0]).not.toHaveProperty('expiresAt')
+    // 两次出网：exchange → userinfo（都用 jt 作 Bearer，两令牌族同一套代码）。
+    expect(calls.map((c) => c.url)).toEqual([
+      'https://openapi.qoder.sh/api/v1/jobToken/exchange',
+      'https://openapi.qoder.sh/api/v1/userinfo',
+    ])
+    expect((calls[1]!.init?.headers as Record<string, string>).Authorization)
+      .toBe('Bearer jt-vuFDqRTQFaIblIxdalT2v5aJ')
+  })
+
+  it('userinfo 失败 ⇒ 昵称回落到 user_id，**不炸登录**（凭据照落、账号照建）', async () => {
+    const { ctx, credentials } = makeContext()
+    const { fetcher } = stubFetcher((url) => (url.includes('/api/v1/userinfo')
+      ? new Response('not found', { status: 404 })
+      : exchangeSuccess()))
+    const service = newService(ctx, { fetcher })
+    const added: Array<Record<string, unknown>> = []
+
+    await service.loginWithPat(PAT, {
+      accountId: 'qoder-a1b2c3d4',
+      refName: 'QODER_ACCOUNT_A1B2C3D4',
+      pool: {
+        async addAccount(entry: Record<string, unknown>) { added.push(entry) },
+      } as never,
+    })
+
+    // 登录本身**成功**：身份资料是增强信息，拿不到不该把一次成功的登录变成失败
+    // （否则 userinfo 一抖动用户就得重新走一遍授权页）。
+    expect(credentials.raw('QODER_ACCOUNT_A1B2C3D4')).toBeDefined()
+    expect(added).toHaveLength(1)
+    // 与改动前的行为**逐字一致**的兜底。
+    expect(added[0]!.nickname).toBe('01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e')
+  })
+
+  it('userinfo 返回 200 但缺 uid ⇒ 同样回落到 user_id（不因解析失败中断登录）', async () => {
+    const { ctx } = makeContext()
+    const { fetcher } = stubFetcher((url) => (url.includes('/api/v1/userinfo')
+      ? new Response(JSON.stringify({ name: '没有 id 的响应' }), { status: 200 })
+      : exchangeSuccess()))
+    const service = newService(ctx, { fetcher })
+    const added: Array<Record<string, unknown>> = []
+
+    await service.loginWithPat(PAT, {
+      accountId: 'qoder-a1b2c3d4',
+      refName: 'QODER_ACCOUNT_A1B2C3D4',
+      pool: {
+        async addAccount(entry: Record<string, unknown>) { added.push(entry) },
+      } as never,
+    })
+
+    expect(added[0]!.nickname).toBe('01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e')
+  })
+
+  it('userinfo **超时/挂住**也要完成登录（资料不该把登录拖死）', async () => {
+    // ⚠️ 这是「把 userinfo 算进登录耗时」这个取舍的**边界用例**：
+    // 资料只影响卡片上的一行字，丢掉它登录必须照常成功。用一个永不 resolve
+    // 的 fetch 模拟挂住的 userinfo —— 靠 `AbortSignal.timeout` 兜底。
+    const { ctx, credentials } = makeContext()
+    const { fetcher } = stubFetcher((url) => (url.includes('/api/v1/userinfo')
+      ? new Promise<Response>((_resolve, reject) => {
+          // 复刻 fetch 在 abort 时的行为：以 AbortError 拒绝。
+          setTimeout(() => reject(new DOMException('aborted', 'AbortError')), 1)
+        })
+      : exchangeSuccess()))
+    const service = newService(ctx, { fetcher })
+    const added: Array<Record<string, unknown>> = []
+
+    await service.loginWithPat(PAT, {
+      accountId: 'qoder-a1b2c3d4',
+      refName: 'QODER_ACCOUNT_A1B2C3D4',
+      pool: {
+        async addAccount(entry: Record<string, unknown>) { added.push(entry) },
+      } as never,
+    })
+
+    // 登录成功、凭据落盘、账号建出，昵称回落到 user_id。
+    expect(credentials.raw('QODER_ACCOUNT_A1B2C3D4')).toBeDefined()
+    expect(added).toHaveLength(1)
+    expect(added[0]!.nickname).toBe('01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e')
   })
 })
 
@@ -433,11 +537,12 @@ describe('QoderAuth getJobToken（jt 运行时缓存）', () => {
     const service = newService(ctx, { fetcher })
 
     await service.loginWithPat(PAT)
-    expect(calls).toHaveLength(1)
+    // 登录期出网两处（exchange + userinfo）；此处只关心之后**不再新增**。
+    const afterLogin = calls.length
 
     expect(await service.getJobToken(PAT)).toBe('jt-vuFDqRTQFaIblIxdalT2v5aJ')
     expect(await service.getJobToken(PAT)).toBe('jt-vuFDqRTQFaIblIxdalT2v5aJ')
-    expect(calls).toHaveLength(1)
+    expect(calls).toHaveLength(afterLogin)
   })
 
   it('缓存为空时打一次 exchange，并在后续调用中命中', async () => {
@@ -604,13 +709,18 @@ describe('QoderAuth 设备流登录（2026-09-21 400 报障的回归锚点）', 
   it('★ 设备流登录**绝不打** jobToken/exchange（400 报障的根因锚点）', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-login-'))
     tempHomes.push(homeDir)
-    const { fetcher, calls } = stubFetcher(() => devicePollSuccess())
+    // 出网两处：轮询 + userinfo（第二段取真实昵称）。userinfo **不是** exchange，
+    // 且它对 `dt-` 是原样 Bearer（`getJobToken` 的恒等分支，零额外往返）。
+    const { fetcher, calls } = stubFetcher((url) => (url.includes('/api/v1/userinfo')
+      ? userinfoSuccess()
+      : devicePollSuccess()))
 
     const { credentials } = await completeDeviceLogin({ fetcher, homeDir })
 
-    // 唯一该出网的是轮询。
-    expect(calls).toHaveLength(1)
-    expect(calls[0]!.url).toContain('/api/v1/deviceToken/poll')
+    expect(calls.map((c) => c.url.split('?')[0])).toEqual([
+      'https://openapi.qoder.sh/api/v1/deviceToken/poll',
+      'https://openapi.qoder.sh/api/v1/userinfo',
+    ])
     // ⚠️ 反向断言：exchange 端点是 **PAT 专用**。把设备令牌（`dt-…`）当
     // `personal_token` 提交过去，服务端回 HTTP 400 `{"errorCode":"BadRequest"}` ——
     // 那正是「浏览器授权成功、却卡在换令牌」的来路。
@@ -621,6 +731,13 @@ describe('QoderAuth 设备流登录（2026-09-21 400 报障的回归锚点）', 
     expect(stored.refresh_token).toBe('drt-Ym3pQw8tZc5vNb2kLd7xRf4hJs9gTe6a')
     expect(Number(stored.token_expires_at)).toBeGreaterThan(Date.now() + 29 * 86_400_000)
     expect(stored.user_id).toBe('01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e')
+    // userinfo 的真实资料一并落进凭据（下次展示不必再拉一次，账号卡片昵称取它）。
+    expect(stored.user_name).toBe('河童')
+    expect(stored.email).toBe('kappa@example.test')
+    // 设备令牌就是 userinfo 的 Bearer —— 一旦这里变成 `jt-…`，说明多打了一次 exchange。
+    const userinfo = calls.find((c) => c.url.includes('/api/v1/userinfo'))!
+    expect((userinfo.init?.headers as Record<string, string>).Authorization)
+      .toBe('Bearer dt-Kq7vRt2mXp9sLd4nBc6yZg1hJf8wQa3e')
   })
 
   it('设备令牌直接当 Bearer 取用：**零网络**（它自己就是可用令牌）', async () => {
@@ -731,10 +848,12 @@ describe('QoderAuth 设备流登录（2026-09-21 400 报障的回归锚点）', 
     expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ personal_token: PAT })
   })
 
-  it('设备流账号登记：nickname 取 user_id，且**不写** expiresAt（与 PAT 路径同口径）', async () => {
+  it('设备流账号登记：nickname 取 userinfo 真实名、expiresAt 取设备令牌有效期', async () => {
     const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-account-'))
     tempHomes.push(homeDir)
-    const { fetcher } = stubFetcher(() => devicePollSuccess())
+    const { fetcher } = stubFetcher((url) => (url.includes('/api/v1/userinfo')
+      ? userinfoSuccess()
+      : devicePollSuccess()))
     const added: Array<Record<string, unknown>> = []
     const pool = {
       async listAllAccounts() { return [] },
@@ -746,9 +865,38 @@ describe('QoderAuth 设备流登录（2026-09-21 400 报障的回归锚点）', 
 
     expect(added).toHaveLength(1)
     expect(added[0]!.provider).toBe('qoder')
-    expect(added[0]!.nickname).toBe('01a0bb7a-07d3-742f-b1d6-7bfc3d5f337e')
+    // ⚠️ **真实昵称**：改动前这里是 `credential.user_id`（UUIDv7），
+    // 正是用户报障「昵称是 UUID 码」的来路。
+    expect(added[0]!.nickname).toBe('河童')
     expect(added[0]!.refreshable).toBe(true)
-    expect(added[0]).not.toHaveProperty('expiresAt')
+    // 设备令牌的有效期是**可报告的事实**（≈30 天），必须写进账号卡片；
+    // 靠它客户端才会在有效期旁显示「· 自动续期」，而不是「未知」。
+    expect(Number(added[0]!.expiresAt)).toBeGreaterThan(Date.now() + 29 * 86_400_000)
+  })
+
+  it('设备流的**占位条目补全**路径同样写昵称与 expiresAt（两段式的第二段）', async () => {
+    // 与上一条的分支不同（这条走 `updateAccount`，上一条走 `addAccount`）：
+    // 两段式登录真正走的是**这一条** —— 占位条目在第一段就已经建好了。
+    const homeDir = await mkdtemp(join(tmpdir(), 'qoder-device-account-update-'))
+    tempHomes.push(homeDir)
+    const { fetcher } = stubFetcher((url) => (url.includes('/api/v1/userinfo')
+      ? userinfoSuccess()
+      : devicePollSuccess()))
+    const patches: Array<Record<string, unknown>> = []
+    const pool = {
+      async listAllAccounts() {
+        return [{ id: 'qoder-a1b2c3d4', provider: 'qoder', nickname: 'qoder-a1b2c3d4' }]
+      },
+      async addAccount() { throw new Error('占位已存在，不该再 addAccount') },
+      async updateAccount(_id: string, patch: Record<string, unknown>) { patches.push(patch) },
+    }
+
+    await completeDeviceLogin({ fetcher, homeDir, accountId: 'qoder-a1b2c3d4', pool })
+
+    expect(patches).toHaveLength(1)
+    expect(patches[0]!.nickname).toBe('河童')
+    expect(Number(patches[0]!.expiresAt)).toBeGreaterThan(Date.now() + 29 * 86_400_000)
+    expect(patches[0]!.refreshable).toBe(true)
   })
 })
 
@@ -947,11 +1095,12 @@ describe('QoderAuth 续期', () => {
     const service = newService(ctx, { fetcher })
 
     await service.loginWithPat(PAT)
-    expect(calls).toHaveLength(1)
+    const afterLogin = calls.length
     await service.logout()
     // 缓存已清：必须重新 exchange 才能拿到 jt。
     expect(await service.getJobToken(PAT)).toBe('jt-vuFDqRTQFaIblIxdalT2v5aJ')
-    expect(calls).toHaveLength(2)
+    expect(calls).toHaveLength(afterLogin + 1)
+    expect(calls[afterLogin]!.url).toContain('/api/v1/jobToken/exchange')
     expect(credentials.raw('QODER_PERSONAL_TOKEN')).toBeUndefined()
   })
 })

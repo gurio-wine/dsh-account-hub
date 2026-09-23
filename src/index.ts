@@ -735,6 +735,21 @@ export function apply(ctx: Context): void {
       // 漏掉这一行不会报错，只是 CN 账号永远等不到主动续期。
       await qoderCn.refreshAll(pool)
     } catch { /* 静默 */ }
+    // Qoder **存量账号资料回填**（昵称 / 有效期）：
+    //
+    // 只修登录链不够 —— 盘上已有的条目昵称**已经是 UUID 了**，且从没写过
+    // expiresAt，这两项都不会因为「以后新登录的账号是对的」而自愈。
+    //
+    // ⚠️ **挂在既有批量链上，不自造定时器**（插件已有一个每 30 分钟的续期
+    // 定时器，再加一个只会多一处 dispose 清理点与一类并发时序）。
+    // 判据幂等：昵称不是占位形、有效期已记 ⇒ 一次网都不出（见
+    // `needsQoderAccountProfileBackfill`）。两个 region 各调各的实例。
+    try {
+      await qoder.backfillAccountProfiles(pool)
+    } catch { /* 静默 */ }
+    try {
+      await qoderCn.backfillAccountProfiles(pool)
+    } catch { /* 静默 */ }
   }
 
   // 启动时如果有任何可续期账号，安排定期续期。
@@ -771,6 +786,25 @@ export function apply(ctx: Context): void {
     qoder.stop()
     qoderCn.stop()
   }, 'codearts-auth.scheduler (legacy)')
+
+  // ===== Qoder 存量账号资料回填（启动时一次） =====
+  //
+  // 上面的批量链每 30 分钟跑一趟已会回填，但**插件启动后要等 30 分钟**才轮到
+  // 第一次 —— 用户装上新版、打开设置页，看到的仍是 UUID 昵称与「未知」有效期，
+  // 会以为没修好。故这里在 storage 就绪后立刻跑一次。
+  //
+  // ⚠️ **必须等 `openStorage()`**：账号池在此之前只有内存降级副本（读不到
+  // settings 里那几条真实账号），跑一次等于什么都没做，且**不会**自动重试
+  // （判据是「条目里有什么」，空表 ⇒ 无待办 ⇒ 直接结束）。
+  // fire-and-forget：不 await、不阻塞 apply 返回（与自动签到启动 sweep 同款）。
+  void pool.openStorage().then(async () => {
+    try {
+      await qoder.backfillAccountProfiles(pool)
+    } catch { /* 静默 */ }
+    try {
+      await qoderCn.backfillAccountProfiles(pool)
+    } catch { /* 静默 */ }
+  })
 
   // ===== Account Hub RPC 注册 =====
   // 参数次序照既有惯例：provider 服务的排列顺序与上面注册顺序一致，

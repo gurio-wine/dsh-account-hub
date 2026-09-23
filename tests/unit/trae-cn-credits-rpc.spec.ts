@@ -17,6 +17,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { registerAccountHubRpc } from '../../src/account-hub-rpc.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
 import type { TraeCnCredential } from '../../src/trae-cn-oauth.js'
+import { TRAE_CN_DEVICE_SOURCE_ROTATED } from '../../src/trae-cn-product.js'
 
 /** 16 位十进制设备号（两个账号刻意不同，用于验证设备号取自各自的凭据）。 */
 const DEVICE_A = '7212345678901234'
@@ -64,6 +65,14 @@ function harness(options: {
   throwOnRef?: string
 }) {
   const calls: CapturedCall[] = []
+  /**
+   * 被写回的凭据（`ctx.credentials.set` 的调用记录）。
+   *
+   * 需要它是因为 9074 换号路径的**唯一持久化落点**就在这里：换号本身在
+   * `trae-cn-credits.ts` 里，但「落到哪个 ref、序列化成什么」由 RPC 层的
+   * `persistCredential` 回调决定 —— 只断言「发了两次 claim」会漏掉写回这一半。
+   */
+  const writes: Array<{ refName: string; credential: TraeCnCredential }> = []
   let handler: ((request: Request) => Promise<Response>) | undefined
 
   const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
@@ -99,6 +108,13 @@ function harness(options: {
         return credential === undefined ? undefined : { value: JSON.stringify(credential) }
       },
       describe: async () => ({ configured: true }),
+      // 9074 换号后的写回落点（见 `writes` 的说明）。`refName` 由 RPC 层按
+      // 当前账号闭包给出，故这里能断言「写的是不是这台账号」。
+      set: async (ref: { name?: string } | string, value: string) => {
+        const name = typeof ref === 'string' ? ref : String(ref.name ?? '')
+        writes.push({ refName: name, credential: JSON.parse(value) as TraeCnCredential })
+      },
+      unset: async () => {},
     },
     get: () => undefined,
   }
@@ -123,6 +139,7 @@ function harness(options: {
 
   return {
     calls,
+    writes,
     call: async (method: string, payload: unknown) => {
       const response = await handler!(new Request('http://127.0.0.1/api/account-hub', {
         method: 'POST',
@@ -288,6 +305,111 @@ describe('credits.claimAll 的 trae-cn 分派', () => {
     expect(value.results[0]!.outcome.kind).toBe('failed')
     expect(value.results[0]!.outcome.code).toBe(9004)
     expect(value.results[0]!.outcome.message).toContain('设备校验未通过')
+  })
+
+  /**
+   * `9095`：账号未签 + **设备已签**（真机判定矩阵，2026-09-23）。
+   *
+   * 这是本次修复的缺口之一：此前 claim 的失败分支没有 9095 判据，它掉进
+   * 默认的 `failed` —— 界面报「失败」，而实际上**今天这份奖励已经到手**。
+   */
+  it('claim 返回 9095 → already-claimed（设备今日已签，不是失败）', async () => {
+    const h = harness({
+      accounts: [entry('a')],
+      credentials: creds(['A', credentialOf(DEVICE_A, 'A')]),
+      responds: (url) => url.includes('/claim')
+        ? new Response(JSON.stringify({ code: 9095, message: '当前设备今日已经签到' }), { status: 200 })
+        : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }),
+    })
+    const result = await h.call('credits.claimAll', { provider: 'trae-cn' })
+    const value = result.value as {
+      results: Array<{ outcome: { kind: string } }>
+      summary: { alreadyClaimed: number; failed: number; unavailable: number }
+    }
+    expect(value.results[0]!.outcome.kind).toBe('already-claimed')
+    expect(value.summary).toMatchObject({ alreadyClaimed: 1, failed: 0, unavailable: 0 })
+  })
+
+  /**
+   * `9074`：**设备号被服务端拉黑**（2026-09-23 第五次定性，旧「名额/风控」已作废）。
+   *
+   * 归一 `unavailable`（既不是 failed 也不是已领），且走**换号重试一次** ——
+   * 真机矩阵：全新 16 位号首次 claim 即 `code:0`。本夹具恒定回 9074，故首发与
+   * 换号重试**两次都失败** ⇒ `unavailable`，共 2 次 claim。
+   */
+  it('claim 返回 9074 → 换号重试一次后仍拒 → unavailable', async () => {
+    const h = harness({
+      accounts: [entry('a')],
+      credentials: creds(['A', credentialOf(DEVICE_A, 'A')]),
+      responds: (url) => url.includes('/claim')
+        ? new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 })
+        : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }),
+    })
+    const result = await h.call('credits.claimAll', { provider: 'trae-cn' })
+    const value = result.value as {
+      results: Array<{ outcome: { kind: string; code: number; message: string } }>
+      summary: { unavailable: number; failed: number; claimed: number }
+    }
+    expect(value.results[0]!.outcome.kind).toBe('unavailable')
+    expect(value.results[0]!.outcome.code).toBe(9074)
+    // 新文案：说清「暂不可签 + 稍后自动重试」，且**不再**出现旧错误指引。
+    expect(value.results[0]!.outcome.message).toContain('稍后自动重试')
+    expect(value.results[0]!.outcome.message).not.toContain('重新登录')
+    // 独立计数，不并入 failed。
+    expect(value.summary).toMatchObject({ unavailable: 1, failed: 0, claimed: 0 })
+    // ⚠️ 共两次 claim（首发 + 换号重试一次）；**第二次带的是全新设备号** ——
+    // 这正是本改动在 RPC 分派层的落点（凭据由宿主写入）。
+    const claims = h.calls.filter((c) => c.url.includes('/claim'))
+    expect(claims).toHaveLength(2)
+    expect(claims[0]!.deviceId).toBe(DEVICE_A)
+    expect(claims[1]!.deviceId).toMatch(/^\d{16}$/)
+    expect(claims[1]!.deviceId).not.toBe(DEVICE_A)
+  })
+
+  /**
+   * 换号重试**成功**：RPC 层必须看到 `claimed`，且新设备号已**写回凭据**
+   * （`ctx.credentials.set` 落到该账号自己的 ref 上）。
+   *
+   * 这是「下一轮 sweep 用干净号起步」这条承诺的**唯一**落点：漏掉写回，
+   * 每一轮都得先撞一次 9074 —— 功能上仍会成功，但每轮白烧一次往返。
+   */
+  it('9074 换号后重试成功 → claimed，且新号写回该账号的凭据 ref', async () => {
+    let claimCount = 0
+    let statusCount = 0
+    const h = harness({
+      accounts: [entry('a')],
+      credentials: creds(['A', credentialOf(DEVICE_A, 'A')]),
+      responds: (url) => {
+        if (!url.includes('/claim')) {
+          // 第 1 次 status 是领取前的预检（未签），第 2 次是领取成功后的补查
+          // （已签 —— 与真机一致，积分从这一次的 `credits` 取）。
+          statusCount += 1
+          return new Response(JSON.stringify({
+            code: 0, data: { checked_in: statusCount > 1, enable: true, credits: 150 },
+          }), { status: 200 })
+        }
+        claimCount += 1
+        return claimCount === 1
+          ? new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 })
+          : new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 })
+      },
+    })
+    const result = await h.call('credits.claimAll', { provider: 'trae-cn' })
+    const value = result.value as { results: Array<{ outcome: { kind: string; credit?: number } }> }
+    expect(value.results[0]!.outcome).toMatchObject({ kind: 'claimed', credit: 150 })
+
+    // 写回落到了**这台账号**的 ref（不是别的账号、也不是默认单凭据 ref）。
+    expect(h.writes).toHaveLength(1)
+    expect(h.writes[0]!.refName).toBe('TRAE_CN_ACCOUNT_A')
+    const written = h.writes[0]!.credential
+    const claims = h.calls.filter((c) => c.url.includes('/claim'))
+    // 落盘的号**就是**重试实际用的那个 —— 否则下一轮起点与这一轮不一致。
+    expect(written.checkin_device_id).toBe(claims[1]!.deviceId)
+    expect(written.checkin_device_id).toMatch(/^\d{16}$/)
+    expect(written.device_id_source).toBe(TRAE_CN_DEVICE_SOURCE_ROTATED)
+    // 其余身份字段原样保留（换号只动签到设备号）。
+    expect(written.device_id).toBe(DEVICE_A)
+    expect(written.access_token).toBe('AT-A')
   })
 })
 

@@ -14,7 +14,7 @@
 - 限流后按池中「已启用且不在重置时间内」的下一个账号自动重试；全部耗尽才抛 `QUOTA_EXCEEDED`；**数组顺序即候选优先级**（`reorderAccounts` / RPC `account.reorder`），勿加按限流重置时间重排候选的 sort
 - **凭据必须在发请求前按目标模型挑选**：`resolveCredential` / `refresh` 都接受可选 `model` 参数，适配器的 `stream()` 必须把 `options.model` 传下去（`src/index.ts` 的 `makeCredentialResolver` / `makeAccountPicker` 是**各 provider 共用的唯一接线**，新增 provider 一律走它们，不要再写一份）。`getAvailableAccount` 的限流过滤是**逐模型**的，传空串时按设计不过滤 —— 传空串会让每次请求都先白跑一遍已限额/积分耗尽的账号。**仅 `fetchModels` 拉模型目录**（目录对所有模型一致）与「全部账号都在冷却期」的退化路径用空串，两者都刻意保留，不要改成「一并过滤」
 
-## 模型黑名单（Account Hub「显示列表」开关）
+## 模型黑名单（Account Hub「模型列表」开关）
 
 `disabledModels` 字段保存被关闭的模型（旧 `jet-hub` 仅作回退读取）：
 
@@ -47,4 +47,4 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
 
 ⚠️ **「选显示哪个积分池」不走 `poolProviderFor()`**：`traeCnPoolFor()` 已随 Work 路径删除，trae-cn 面板显示哪个池见 docs/agents/providers-trae-cn.md「积分余额」一节。账号映射与选池**不可合并** —— 用池键查账号会让面板空白；`TRAE_CN_POOL_WORK` / `TraeCnPoolId` **仍保留**（服务上游 `available_endpoint` 分池字段与礼包归类，非 provider 专属）。
 
-⚠️ **刻意不经过映射的两个入口**：**`account.create`**（它按 provider 解析产品配置决定「登录怎么做」，映射会给同一份凭据建出第二个占位账号，等于把一个账号建两遍）；**`model.list` / `model.setDisabled`**（黑名单按 provider id 存，映射会把一个 provider 的开关写进另一个的黑名单）。`credits-capabilities.spec.ts` 的「集合相等」断言已同步到七条，并断言**没有条目声明 `loginHint`**（每个面板都自带「+ 新建账号」入口）。
+⚠️ **刻意不经过映射的两个入口**：**`account.create`**（它按 provider 解析产品配置决定「登录怎么做」，映射会给同一份凭据建出第二个占位账号，等于把一个账号建两遍）；**`model.list` / `model.setDisabled`**（黑名单按 provider id 存，映射会把一个 provider 的开关写进另一个的黑名单）。`credits-capabilities.spec.ts` 的「集合相等」断言已同步到七条，并断言**没有条目声明 `loginHint`**（每个面板都自带「登录账号」入口）。

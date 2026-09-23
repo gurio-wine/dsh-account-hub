@@ -1,5 +1,5 @@
 /**
- * 「点击 + 新建账号 → 整个 Account Hub 白屏」的根因回归测试。
+ * 「点击 登录账号（旧文案「+ 新建账号」）→ 整个 Hub 白屏」的根因回归测试。
  *
  * ## 用户报障（2026-09-21）
  *
@@ -35,7 +35,7 @@
  *
  * 三元表达式的对象字面量**只在条件为真时求值**：
  *   - `loginChoiceOpen` 初始为 `false` → 整个 Hub 页面渲染正常，用户看到面板；
- *   - 点击「+ 新建账号」→ `setLoginChoiceOpen(true)` → 重新渲染 → 对象字面量
+ *   - 点击「登录账号」→ `setLoginChoiceOpen(true)` → 重新渲染 → 对象字面量
  *     求值 → `ReferenceError` 从 render 中抛出 → 该子树所属的 React 根没有错误
  *     边界 → **整棵树卸载** → 整页空白。
  *
@@ -399,8 +399,8 @@ function makeRpc() {
   return { calls, rpcCall }
 }
 
-describe('「+ 新建账号」点击后 Hub 白屏（真机首跑暴露的自由变量）', () => {
-  it('点击 qoder 的「+ 新建账号」不得抛错，且必须真的开窗', async () => {
+describe('「登录账号」点击后 Hub 白屏（真机首跑暴露的自由变量）', () => {
+  it('点击 qoder 的「登录账号」不得抛错，且必须真的开窗', async () => {
     // 根因叙述见文件头：当年崩在 `LoginChoiceForm` 的 props 对象字面量里那个
     // 自由变量上。PAT 形态移除后那条具体路径没有了，但**这一类**缺陷仍会在这
     // 三条断言上炸出来（渲染 → 点击 → 点击后重渲染）。
@@ -413,8 +413,8 @@ describe('「+ 新建账号」点击后 Hub 白屏（真机首跑暴露的自由
         client.hooks,
       )
 
-      const button = findButtonByText(tree, '+ 新建账号')
-      expect(button, '面板里找不到「+ 新建账号」按钮').toBeDefined()
+      const button = findButtonByText(tree, '登录账号')
+      expect(button, '面板里找不到「登录账号」按钮').toBeDefined()
 
       const onClick = button!.props.onClick as () => void
       expect(typeof onClick).toBe('function')
@@ -443,8 +443,8 @@ describe('「+ 新建账号」点击后 Hub 白屏（真机首跑暴露的自由
       for (const provider of ['qoder', 'qoder-cn']) {
         const { rpcCall } = makeRpc()
         const tree = await renderStable(client.ProviderPanel, { provider, rpcCall }, client.hooks)
-        const button = findButtonByText(tree, '+ 新建账号')
-        expect(button, `${provider} 缺少「+ 新建账号」按钮`).toBeDefined()
+        const button = findButtonByText(tree, '登录账号')
+        expect(button, `${provider} 缺少「登录账号」按钮`).toBeDefined()
 
         const before = windowStub.opened.length
         ;(button!.props.onClick as () => void)()
@@ -493,7 +493,7 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     const text = textsOf(expanded).join('')
 
     // 页面骨架必须在（这是「Hub 界面」本身）。
-    expect(text).toContain('Account Hub')
+    expect(text).toContain('账号中心')
     // 导航渲染的是**显示名**而不是 id（`label`），故这里逐个断言显示名 ——
     // 拿 id 去比会误报（第一版就是这么红的）。
     // 同时断言导航按钮的数量：只比文案的话，某个条目渲染成空壳也算过。
@@ -508,7 +508,7 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     expect(text).toContain('Codearts 账号管理')
   })
 
-  it('逐个 provider 渲染面板并点击「+ 新建账号」，一律不得抛错', async () => {
+  it('逐个 provider 渲染面板并点击「登录账号」，一律不得抛错', async () => {
     // 这是白屏缺陷的**通盘**闸门：不再只盯 qoder，而是把每个面板都真的渲染
     // 一遍、把每个能点的登录按钮都点一次。自由变量、未定义导出、缺字段的
     // 条目 —— 无论落在哪个 provider 上，都会在这里炸出来。
@@ -520,8 +520,8 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
         expect(() => expandTree(tree, client.hooks), `${provider} 渲染抛错`).not.toThrow()
 
         // 每个面板都有自己的登录入口，故按钮一律必须存在且能点。
-        const button = findButtonByText(tree, '+ 新建账号')
-        expect(button, `${provider} 缺少「+ 新建账号」按钮`).toBeDefined()
+        const button = findButtonByText(tree, '登录账号')
+        expect(button, `${provider} 缺少「登录账号」按钮`).toBeDefined()
         const openedBefore = windowStub.opened.length
         const onClick = button!.props.onClick as () => void
         expect(() => onClick(), `${provider} 点击抛错`).not.toThrow()
@@ -563,5 +563,94 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
       const tree = await renderStable(client.ProviderPanel, { provider, rpcCall }, client.hooks)
       expect(textsOf(tree).join(''), provider).toContain(`${DISPLAY[provider]} 账号管理`)
     }
+  })
+})
+
+/**
+ * 面板按钮集合的**渲染级**回归（Hub UI 调整包）。
+ *
+ * 与 `credits-capabilities.spec.ts` 里那组源码级断言互补：源码正则能证明
+ * 「某个字符串还在/不在了」，但证明不了**按钮真的按预期渲染出来**（比如把
+ * 卡片按钮删掉、却把 handler 接到了别处）。这里真的渲染面板，逐个按钮点名。
+ */
+describe('面板按钮集合（渲染级）', () => {
+  /** 带一个账号的 rpc 替身：卡片区才会真的渲染出来。 */
+  function makeRpcWithAccount() {
+    const calls: Array<{ method: string; payload: Record<string, unknown> }> = []
+    const rpcCall = async (method: string, payload: Record<string, unknown>) => {
+      calls.push({ method, payload })
+      if (method === 'account.list') {
+        return {
+          accounts: [{
+            id: 'acc-1',
+            nickname: 'BUDDY_CN_ACCOUNT_9F3A21C4',
+            enabled: true,
+            credentialRef: 'BUDDY_CN_ACCOUNT_9F3A21C4',
+            expiresAt: Date.now() + 86400000,
+            refreshable: true,
+            modelRateLimits: { 'glm-5.2-sft-harmony': Date.now() + 86400000 },
+          }],
+        }
+      }
+      if (method === 'credits.balances') return { accounts: [] }
+      return {}
+    }
+    return { calls, rpcCall }
+  }
+
+  /** 渲染树里全部 button 的可见文案。 */
+  const buttonTexts = (tree: unknown): string[] =>
+    flatten(expandTreeStub(tree))
+      .filter(isElement)
+      .filter((el) => el.type === 'button')
+      .map((el) => textsOf(el).join(''))
+      .filter((t) => t !== '')
+
+  /** `expandTree` 需要 hooks 实例，这里包一层省得每处都传。 */
+  const expandTreeStub = (tree: unknown): unknown => expandTree(tree, client.hooks)
+
+  it('供应商级按钮是「模型列表 / 重测所有 / 清除限额 / 登录账号」，旧文案一个不留', async () => {
+    const { rpcCall } = makeRpcWithAccount()
+    const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
+    const texts = buttonTexts(tree)
+    // 逐个点名本轮改名后的四个按钮。
+    for (const label of ['模型列表', '重测所有', '清除限额', '登录账号']) {
+      expect(texts, `头部按钮缺少「${label}」`).toContain(label)
+    }
+    // 旧文案不得出现在任何按钮上。
+    for (const stale of ['显示列表', '重置所有', '+ 新建账号']) {
+      expect(texts, `按钮里仍有旧文案「${stale}」`).not.toContain(stale)
+    }
+  })
+
+  it('账号卡片上只剩 签到 / 停用 / 删除，单账号「重测」「重置」已移除', async () => {
+    const { rpcCall } = makeRpcWithAccount()
+    const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
+    const expanded = expandTree(tree, client.hooks)
+    const card = flatten(expanded)
+      .filter(isElement)
+      .find((el) => typeof el.props.className === 'string' && el.props.className.includes('dim-ah-accountCard'))
+    expect(card, '没有渲染出账号卡片').toBeDefined()
+
+    const inCard = flatten(card!)
+      .filter(isElement)
+      .filter((el) => el.type === 'button')
+      .map((el) => textsOf(el).join(''))
+    // buddy-cn 支持签到 ⇒ 卡片上是这三个。
+    expect(inCard.sort()).toEqual(['停用', '删除', '签到'])
+    // 关键：单账号的清理入口确实没了（它们现在只在头部、且是 all 版本）。
+    expect(inCard).not.toContain('重测')
+    expect(inCard).not.toContain('重置')
+  })
+
+  it('卡片不再接收 onRetest / onReset（没有死 prop）', async () => {
+    // 源码级反面：面板传 prop 的那一段里不得再有这两个名字。渲染级断言只能
+    // 证明「按钮没渲染」，证明不了「prop 还在传但没人用」。
+    const source = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../../plugin-src/client/account-hub.js'),
+      'utf8',
+    )
+    expect(source).not.toContain('onRetest')
+    expect(source).not.toContain('onReset')
   })
 })

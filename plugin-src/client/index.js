@@ -23,7 +23,7 @@ export function apply(ctx) {
     name: 'settings.section',
     id: 'account-hub',
     order: 50,
-    label: () => 'Account Hub',
+    label: () => '账号中心',
     inject: () => ({ rpcCall }),
   }, AccountHubPage))
 }

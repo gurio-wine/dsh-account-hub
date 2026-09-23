@@ -74,9 +74,10 @@ function toCjs(source: string): string {
   }
   // `export function` / `export const` → 普通声明（模块作用域内仍互相可见）。
   out = out.replace(/\bexport\s+(?=(?:function|const|let|var|class)\s)/g, '')
-  // 暴露本次要测的两个纯函数。两者都是模块作用域的声明，故此处必然可见。
+  // 暴露本次要测的纯函数。它们都是模块作用域的声明，故此处必然可见。
   return out.concat(
-    '\nmodule.exports.__testExports = { ClaimNotice: ClaimNotice, buildClaimNotice: buildClaimNotice };\n',
+    '\nmodule.exports.__testExports = { ClaimNotice: ClaimNotice, buildClaimNotice: buildClaimNotice,'
+    + ' claimUnavailableLines: claimUnavailableLines, formatClaimUnavailableLine: formatClaimUnavailableLine };\n',
   )
 }
 
@@ -102,9 +103,16 @@ afterAll(() => {
   if (tempDir !== undefined) rmSync(tempDir, { recursive: true, force: true })
 })
 
-const { ClaimNotice, buildClaimNotice } = loadClientModule() as {
+const { ClaimNotice, buildClaimNotice, claimUnavailableLines, formatClaimUnavailableLine } = loadClientModule() as {
   ClaimNotice: (props: Record<string, unknown>) => TreeNode
-  buildClaimNotice: (res: unknown) => { tone: string; text: string; details: string[] }
+  buildClaimNotice: (res: unknown) => {
+    tone: string
+    text: string
+    details: string[]
+    unavailableDetails: string[]
+  }
+  claimUnavailableLines: (res: unknown) => string[]
+  formatClaimUnavailableLine: (result: unknown) => string
 }
 
 /** `createElement` 占位的产物形态。 */
@@ -173,7 +181,7 @@ function allClaimedResponse() {
       { accountId: 'acc-1', nickname: '账号一', outcome: { kind: 'claimed', credit: 100, streakDays: 1, isStreakDay: false } },
       { accountId: 'acc-2', nickname: '账号二', outcome: { kind: 'claimed', credit: 200, streakDays: 2, isStreakDay: true } },
     ],
-    summary: { claimed: 2, totalCredit: 300, alreadyClaimed: 0, inactive: 0, failed: 0 },
+    summary: { claimed: 2, totalCredit: 300, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0 },
   }
 }
 
@@ -189,7 +197,7 @@ describe('失败账号的服务端原文必须出现在渲染树里（本次修�
           outcome: { kind: 'failed', code: 9074, message: '当前参与用户太多，请稍后再试' },
         },
       ],
-      summary: { claimed: 1, totalCredit: 100, alreadyClaimed: 0, inactive: 0, failed: 1 },
+      summary: { claimed: 1, totalCredit: 100, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1 },
     })
 
     const all = textOf(tree).join('\n')
@@ -206,7 +214,7 @@ describe('失败账号的服务端原文必须出现在渲染树里（本次修�
         { accountId: 'acc-1', nickname: '账号一', outcome: { kind: 'failed', code: 9074, message: '当前参与用户太多，请稍后再试' } },
         { accountId: 'acc-2', nickname: '账号二', outcome: { kind: 'failed', code: 1001, message: '凭据已失效，请重新登录' } },
       ],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 2 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 2 },
     })
 
     expect(tree.children[1]).toMatchObject({ type: 'ul', props: { className: 'dim-ah-probeDetails' } })
@@ -219,7 +227,7 @@ describe('失败账号的服务端原文必须出现在渲染树里（本次修�
   it('message 为空时回退固定文案，不显示成空白', () => {
     const tree = render({
       results: [{ accountId: 'acc-9', nickname: '', outcome: { kind: 'failed', code: -1, message: '' } }],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1 },
     })
     const all = textOf(tree).join('\n')
     // 昵称为空 → 回退 accountId；message 为空 → 回退固定文案；code 仍保留。
@@ -233,7 +241,7 @@ describe('失败账号的服务端原文必须出现在渲染树里（本次修�
         { accountId: 'b', nickname: 'B', outcome: { kind: 'already-claimed', message: '今天已签到' } },
         { accountId: 'c', nickname: 'C', outcome: { kind: 'inactive', message: '签到未开启' } },
       ],
-      summary: { claimed: 1, totalCredit: 1, alreadyClaimed: 1, inactive: 1, failed: 0 },
+      summary: { claimed: 1, totalCredit: 1, alreadyClaimed: 1, inactive: 1, unavailable: 0, failed: 0 },
     })
     // 除摘要文本外没有任何子节点。
     expect(tree.children.filter((c) => c !== null && c !== undefined)).toHaveLength(1)
@@ -247,7 +255,7 @@ describe('失败账号的服务端原文必须出现在渲染树里（本次修�
     for (const results of [undefined, null, 'oops', 42]) {
       const notice = buildClaimNotice({
         results,
-        summary: { claimed: 1, totalCredit: 10, alreadyClaimed: 0, inactive: 0, failed: 0 },
+        summary: { claimed: 1, totalCredit: 10, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0 },
       })
       expect(notice.details, String(results)).toEqual([])
       expect(notice.text).toBe('1 个账号领取成功（+10 积分）')
@@ -276,7 +284,7 @@ describe('失败行的 logid 透传', () => {
         nickname: '我的 Trae 账号',
         outcome: { kind: 'failed', code: 9074, message: '当前参与用户太多，请稍后再试', logid: LOGID },
       }],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1 },
     })
     expect(textOf(tree)).toEqual([
       '1 个失败',
@@ -291,7 +299,7 @@ describe('失败行的 logid 透传', () => {
         nickname: '我的 Trae 账号',
         outcome: { kind: 'failed', code: 9074, message: '当前参与用户太多，请稍后再试' },
       }],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1 },
     })
     expect(textOf(tree)).toEqual([
       '1 个失败',
@@ -308,7 +316,7 @@ describe('失败行的 logid 透传', () => {
           nickname: 'A',
           outcome: { kind: 'failed', code: 1, message: 'x', logid },
         }],
-        summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1 },
+        summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1 },
       })
       expect(notice.details, String(logid)).toEqual(['A：x（code 1）'])
     }
@@ -321,7 +329,7 @@ describe('失败行的 logid 透传', () => {
         nickname: 'A',
         outcome: { kind: 'failed', code: 1, message: 'x', logid: `  ${LOGID}  ` },
       }],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1 },
     })
     expect(notice.details).toEqual([`A：x（code 1） · logid ${LOGID}`])
   })
@@ -333,7 +341,7 @@ describe('失败行的 logid 透传', () => {
         nickname: '',
         outcome: { kind: 'failed', code: -1, message: '', logid: LOGID },
       }],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1 },
     })
     expect(notice.details).toEqual([`acc-9：领取失败（code -1） · logid ${LOGID}`])
   })
@@ -372,7 +380,7 @@ describe('成功路径的渲染逐元素不变（纯增量护栏）', () => {
   it('全部今日已领取：文案与改动前一致（ok 色调）', () => {
     expect(snapshot(render({
       results: [{ accountId: 'a', nickname: 'A', outcome: { kind: 'already-claimed', message: '今天已签到' } }],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, failed: 0 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 1, inactive: 0, unavailable: 0, failed: 0 },
     }))).toEqual({
       type: 'div',
       className: 'dim-ah-probeNotice',
@@ -393,7 +401,7 @@ describe('成功路径的渲染逐元素不变（纯增量护栏）', () => {
   it('空结果：文案仍是「没有可领取的账号」，失败色调与 role 规则不变', () => {
     const tree = render({
       results: [],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 0 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0 },
     })
     expect(textOf(tree)).toEqual(['没有可领取的账号'])
     expect(tree.props['data-tone']).toBe('ok')
@@ -403,7 +411,7 @@ describe('成功路径的渲染逐元素不变（纯增量护栏）', () => {
   it('有失败账号时色调切 warn（既有行为，未改）', () => {
     const tree = render({
       results: [{ accountId: 'a', nickname: 'A', outcome: { kind: 'failed', code: 1, message: 'x' } }],
-      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, failed: 1 },
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 1 },
     })
     expect(tree.props['data-tone']).toBe('warn')
   })
@@ -412,5 +420,136 @@ describe('成功路径的渲染逐元素不变（纯增量护栏）', () => {
     const tree = ClaimNotice({ tone: 'error', text: '领取积分失败', details: [] }) as TreeNode
     expect(tree.props.role).toBe('alert')
     expect(textOf(tree)).toEqual(['领取积分失败'])
+  })
+})
+
+/**
+ * `unavailable`（「服务端此刻暂不可签」）的通知渲染。
+ *
+ * ## 为什么它不是「又一种失败」
+ *
+ * 这是 2026-09-23 新增的 outcome kind，唯一生产者是 Trae CN 的 `9074`
+ * （真机定案：**名额/风控类拒绝**，与设备号取值无关 —— 旧定性「设备身份」已作废）。
+ * 用户对它的正确动作是**什么都不做**：宿主会把它排除在今日签到状态之外，
+ * 4 小时后的 sweep 自动重试。
+ *
+ * 因此本组守两件事：
+ * 1. 它**独立成段**（不并进失败明细列表）—— 混进去用户会当成待处理的问题；
+ * 2. 它的回退文案**不是**「领取失败」—— 那会让用户去排查并不存在的问题。
+ */
+describe('unavailable（暂不可签）既不并进失败明detail，也不报成失败', () => {
+  /** 真机响应形态：一个账号被 9074 拒绝。 */
+  const unavailableResponse = () => ({
+    results: [{
+      accountId: 'acc-1',
+      nickname: '我的 Trae 账号',
+      outcome: { kind: 'unavailable', code: 9074, message: '当前参与用户太多，请稍后再试（服务端此刻暂不可签，稍后自动重试）' },
+    }],
+    summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 1, failed: 0 },
+  })
+
+  it('摘要行说「1 个暂不可签」，色调**仍是 ok**（不是失败）', () => {
+    const tree = render(unavailableResponse())
+    expect(textOf(tree)[0]).toBe('1 个暂不可签')
+    // 关键：`failed` 为 0 ⇒ 色调不变 warn。报成 warn 等于把「等一会儿就好」
+    // 渲染成「出问题了」。
+    expect(tree.props['data-tone']).toBe('ok')
+    expect(tree.props.role).toBe('status')
+  })
+
+  it('明细行独立成段（data-kind="unavailable"），**不**混进失败明细列表', () => {
+    const tree = render(unavailableResponse())
+    // 摘要 div + 一个 unavailable 列表 = 2 个子节点。
+    const children = childrenOf(tree)
+    expect(children).toHaveLength(2)
+    const list = children[1] as TreeNode
+    expect(list.type).toBe('ul')
+    expect(list.props['data-kind']).toBe('unavailable')
+    expect(textOf(children[1])).toEqual([
+      '我的 Trae 账号：当前参与用户太多，请稍后再试（服务端此刻暂不可签，稍后自动重试）（code 9074）',
+    ])
+  })
+
+  it('纯函数契约：details 为空、unavailableDetails 有值（两条通道互不污染）', () => {
+    const notice = buildClaimNotice(unavailableResponse())
+    expect(notice.details).toEqual([])
+    expect(notice.unavailableDetails).toHaveLength(1)
+    // 颜色由 failed 决定，不由 unavailable 决定。
+    expect(notice.tone).toBe('ok')
+  })
+
+  it('failed 与 unavailable 同时存在时各走各的段，摘要分别计数', () => {
+    const tree = render({
+      results: [
+        { accountId: 'a', nickname: 'A', outcome: { kind: 'unavailable', code: 9074, message: '暂不可签' } },
+        { accountId: 'b', nickname: 'B', outcome: { kind: 'failed', code: 1001, message: '凭据已失效，请重新登录' } },
+      ],
+      summary: { claimed: 0, totalCredit: 0, alreadyClaimed: 0, inactive: 0, unavailable: 1, failed: 1 },
+    })
+    expect(textOf(tree)[0]).toBe('1 个暂不可签，1 个失败')
+    // 有真失败 ⇒ 色调这才切 warn。
+    expect(tree.props['data-tone']).toBe('warn')
+    const children = childrenOf(tree)
+    // 摘要 + 失败明细 + 暂不可签明细 = 3 个。
+    expect(children).toHaveLength(3)
+    // 失败明细列表**不带** data-kind（保持改动前的形态逐元素不变）。
+    expect((children[1] as TreeNode).props['data-kind']).toBeUndefined()
+    expect(textOf(children[1])).toEqual(['B：凭据已失效，请重新登录（code 1001）'])
+    expect((children[2] as TreeNode).props['data-kind']).toBe('unavailable')
+    expect(textOf(children[2])).toEqual(['A：暂不可签（code 9074）'])
+  })
+
+  it('message 缺失时回退文案是「服务端此刻暂不可签」，**不是**「领取失败」', () => {
+    // 这一条是本次修复的核心之一：回退成「领取失败」会让用户去排查凭据/设备，
+    // 而那两件事都治不了 9074。
+    const line = formatClaimUnavailableLine({
+      accountId: 'acc-9',
+      nickname: '',
+      outcome: { kind: 'unavailable', code: 9074, message: '' },
+    })
+    expect(line).toBe('acc-9：服务端此刻暂不可签（code 9074）')
+    expect(line).not.toContain('领取失败')
+  })
+
+  it('logid 与失败行同款透传（9074 最需要服务端日志）', () => {
+    const LOGID = '20260923142909176141A5DE791F4FE75E'
+    const lines = claimUnavailableLines({
+      results: [{
+        accountId: 'acc-1',
+        nickname: 'Trae',
+        outcome: { kind: 'unavailable', code: 9074, message: '暂不可签', logid: LOGID },
+      }],
+    })
+    expect(lines).toEqual([`Trae：暂不可签（code 9074） · logid ${LOGID}`])
+  })
+
+  it('成功 / 已领 / 活动未开启都不产生 unavailable 行（只有该 kind 才有）', () => {
+    const res = {
+      results: [
+        { accountId: 'a', nickname: 'A', outcome: { kind: 'claimed', credit: 1, streakDays: 1, isStreakDay: false } },
+        { accountId: 'b', nickname: 'B', outcome: { kind: 'already-claimed', message: '今天已签到' } },
+        { accountId: 'c', nickname: 'C', outcome: { kind: 'inactive', message: '签到未开启' } },
+        { accountId: 'd', nickname: 'D', outcome: { kind: 'failed', code: 1, message: 'x' } },
+      ],
+      summary: { claimed: 1, totalCredit: 1, alreadyClaimed: 1, inactive: 1, unavailable: 0, failed: 1 },
+    }
+    expect(claimUnavailableLines(res)).toEqual([])
+    expect(buildClaimNotice(res).text).toBe('1 个账号领取成功（+1 积分），1 个今日已领取，1 个活动未开启，1 个失败')
+  })
+
+  it('results 缺失或不是数组时不抛错：unavailable 明细为空', () => {
+    for (const results of [undefined, null, 'oops', 42]) {
+      expect(claimUnavailableLines({ results }), String(results)).toEqual([])
+    }
+  })
+
+  it('旧宿主不返回 summary.unavailable 时摘要行不出现「NaN 个暂不可签」', () => {
+    // 兼容性护栏：`unavailable` 是本次新增字段，旧宿主响应里没有它。
+    const notice = buildClaimNotice({
+      results: [{ accountId: 'a', nickname: 'A', outcome: { kind: 'claimed', credit: 5, streakDays: 1, isStreakDay: false } }],
+      summary: { claimed: 1, totalCredit: 5, alreadyClaimed: 0, inactive: 0, unavailable: 0, failed: 0 },
+    })
+    expect(notice.text).toBe('1 个账号领取成功（+5 积分）')
+    expect(notice.text).not.toContain('NaN')
   })
 })

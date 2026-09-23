@@ -168,12 +168,12 @@ function errorDetail(body: string): string {
  * 2. **请求形态问题**（参数类型、body 字段等）—— 解法是改代码，与模型无关。
  *
  * 不区分的话，用户看到「4001 param is invalid」只会以为是插件坏了，而实际上
- * 他只需要在 Hub 的显示列表里换一个模型。故在**确认模型不在当前目录**时补一句。
+ * 他只需要在 Hub 的模型列表里换一个模型。故在**确认模型不在当前目录**时补一句。
  *
- * 措辞刻意指向「显示列表」：那是用户真正能操作的地方（Account Hub 的模型开关），
+ * 措辞刻意指向「模型列表」：那是用户真正能操作的地方（Account Hub 的模型开关），
  * 而不是让他去翻配置文件。
  */
-const TRAE_CN_OFF_CATALOG_HINT = '（该模型已不在 Trae CN 可用目录中，请在 Hub 的显示列表里重选）'
+const TRAE_CN_OFF_CATALOG_HINT = '（该模型已不在 Trae CN 可用目录中，请在 Hub 的模型列表里重选）'
 
 /** 将 HTTP 状态码映射为 harness 错误码（仅用于**无业务码**的兜底路径）。 */
 function httpErrorCode(status: number): string {

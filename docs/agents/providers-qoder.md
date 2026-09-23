@@ -68,6 +68,16 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 **CN 的三个出站身份标识**：UA **`qoder/1.1.58`**（官方模板 `` `qoder/${版本}` ``，**与 region 无关**；此前的 `qodercn/1.1.58` 是把 npm 包名当产品名的**推断错值**）、`client_type: "5"`、**Cosy 头**。⚠️ **签名路径下这三者的实际出站者都是 wasm**；适配器 `send()` 里的 Cosy 追加代码**对 CN 已无可达路径**，属残留。⚠️ `Cosy-MachineOS` / `Cosy-MachineHostname` **刻意不实现**（**不猜机器身份**）。
 
+## 账号卡片昵称与有效期
+
+两区账号卡片曾经显示「昵称是一串 UUID」「有效期未知」，真因与修法如下（两区共用一份实现）。
+
+**昵称**：登录链原先把 `credential.user_id`（UUIDv7）当昵称写进账号池，而真正的用户资料在 `GET {openapiBase}/api/v1/userinfo`（Bearer 用 `getJobToken(access_token)` —— **`dt-` 恒等零网络，`pt-` 先换 `jt-`**，两令牌族同一套代码）。⚠️ **该端点与签名链共用同一份解析**（`readQoderUserIdentity` 补出 `displayName` / `email` / `mobile`），**不要另写第二份** —— 两处分头解析同一个响应，字段名一变必然只改一处，表现为「签名好了但昵称还是 UUID」这种半失效。昵称取值优先级：`name` → `email` → **脱敏后**的 `security_mobile`（`189****3995`，对齐 buddy/lobsterai 卡片惯例）→ `user_id`（兜底，与改动前逐字一致）→ 账号 id。⚠️ **userinfo 取不到时绝不炸登录**（回落到 `user_id`）：资料只是显示用的字符串，把它升级成失败会让用户白走一遍授权页。脱敏是**展示层**职责（`maskQoderMobile`），解析层存原文。
+
+**有效期**：设备流凭据带 `token_expires_at`（≈30 天）。⚠️ **只有设备令牌族能写 `expiresAt`** —— `qoderAccountExpiresAtMs` 对 PAT 恒 `undefined`，因为 PAT 凭据里的 `token_expires_at` 记的是 **`jt-`（运行时缓存）** 的 24h，不是 PAT 的有效期；写进卡片会让它在闲置一天后显示「已过期」而实际请求完全正常。`refreshable` 为真时客户端会自动追加「· 自动续期」。设备令牌**续期成功后必须回写 `expiresAt`**（`refreshAll`），否则卡片一直停在旧的到期日——`expiresAt` 是账号条目的独立字段，不随凭据自动同步。⚠️ 续期回写**只写 `expiresAt`、绝不碰 `nickname`**：用户可手动改名，而续期链每 30 分钟跑一趟。
+
+**存量账号回填**：只修登录链不够（盘上条目的昵称**已经是** UUID、且从没写过 `expiresAt`）。`QoderAuth.backfillAccountProfiles(pool)` 做惰性回填，挂在**既有**的每 30 分钟批量续期链 + 插件启动时一次（`src/index.ts`），**不自造定时器**。判据收敛在 `needsQoderAccountProfileBackfill`，**幂等是唯一必须守住的性质**：昵称不是占位形、且（该凭据本来有可报告有效期时）有效期已记 ⇒ 一次网都不出。⚠️ 判据绝不能写成「昵称是 UUID **或** 缺 `expiresAt`」—— PAT 的 `expiresAt` 永远解析不出来，那会让每个 PAT 账号每 30 分钟白打一次 exchange + userinfo，**永不停止**。⚠️ userinfo 取不到时**整条跳过**（不写任何字段）：此时唯一写得出的昵称就是那个 UUID，写回去等于用一次白跑的网络把「待回填」标记擦掉，以后再也不修了。
+
 ## Qoder 积分领取与余额
 
 原文照搬 AGENTS.md「积分领取」「积分能力必须在请求前判定」中专属 Qoder 段。

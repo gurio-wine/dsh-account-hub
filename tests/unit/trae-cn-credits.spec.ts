@@ -10,6 +10,7 @@ import {
   TRAE_CN_CLAIM_RETRY_CODES,
   TRAE_CN_CLAIM_RETRY_DELAYS_MS,
   TRAE_CN_CODE_CREDENTIAL_INVALID,
+  TRAE_CN_CODE_DEVICE_ALREADY_CLAIMED,
   TRAE_CN_CODE_TOO_MANY_USERS,
   TRAE_CN_DEVICE_TYPE,
   TRAE_CN_OS_VERSION,
@@ -20,12 +21,14 @@ import {
   fetchTraeCnCheckinStatus,
   fetchTraeCnCreditBalance,
   isTraeCnClaimRetryable,
+  rotateTraeCnCheckinDeviceId,
   traeCnCreditsHeaders,
   traeCnOsVersion,
+  TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT,
 } from '../../src/trae-cn-credits.js'
-import { TRAE_CN, TRAE_CN_LOGIN_OS_VERSION } from '../../src/trae-cn-product.js'
+import { TRAE_CN, TRAE_CN_DEVICE_SOURCE_ROTATED, TRAE_CN_LOGIN_OS_VERSION } from '../../src/trae-cn-product.js'
 import { TRAE_CN_BACKOFF_CODES, recordsTraeCnCooldown } from '../../src/trae-cn-errors.js'
-import type { TraeCnCredential } from '../../src/trae-cn-oauth.js'
+import { generateTraeCnDeviceId, type TraeCnCredential } from '../../src/trae-cn-oauth.js'
 
 /**
  * 签到设备号（`x-device-id` 的来源）——**登录时注册的 16 位号**。
@@ -77,10 +80,14 @@ function headersOf(init?: RequestInit): Record<string, string> {
 /**
  * 在**假定时器**下跑一次 claim。
  *
- * 2026-09-20 起 claim 段对 `9074` / `4007` / `3004` 做有界退避重试
- * （1s → 3s），真等会让每条涉及 9074 的用例多花 4 秒。假定时器把这段等待
- * 压成零耗时，同时**不改变被测语义** —— 退避时长本身由
- * `TRAE_CN_CLAIM_RETRY_DELAYS_MS` 的常量断言守着。
+ * claim 段对 `4007` / `3004` 做有界退避重试（1s → 3s），真等会让每条涉及这两个
+ * 码的用例多花 4 秒。假定时器把这段等待压成零耗时，同时**不改变被测语义** ——
+ * 退避时长本身由 `TRAE_CN_CLAIM_RETRY_DELAYS_MS` 的常量断言守着。
+ *
+ * ⚠️ `9074` 已于 2026-09-23 **退出**这张重试表（新定性：名额/风控类拒绝，
+ * 重试同一个结果没有意义；4h 的 sweep 才是它的重试节奏），故涉及 `9074` 的
+ * 用例现在断言的是「**只发一次** claim」，而不是「三次」。假定时器对它们无害
+ * （本函数照样推进，只是没有退避定时器可烧）。
  *
  * 推进循环的写法：`advanceTimersByTimeAsync` 每次都会顺带 flush 微任务，
  * 于是「上一发请求落定 → 排入下一次退避定时器 → 下一轮推进把它烧掉」
@@ -508,8 +515,61 @@ describe('claimTraeCnDailyCheckin', () => {
     const message = (outcome as { message: string }).message
     expect(message).toContain('9004')
     expect(message).toContain('x-os-version')
-    // 9004 是**设备身份**问题（确定性失败）：重试只会把同一个结果问三遍。
+    // 9004 是**设备头缺失/不被接受**问题（确定性失败）：重试只会把同一个结果问三遍。
     expect(calls.filter((call) => call.url.includes('/claim'))).toHaveLength(1)
+  })
+
+  /**
+   * 账号未签 + **设备已签** → `9095`（2026-09-23 真机判定矩阵）。
+   *
+   * 语义是「今天这个设备已经领过一份」——账号级的 `checked_in` 仍为 false，
+   * 但这份奖励今天确实已经到手，故归一 `already-claimed`（界面显示已签、
+   * 宿主写今日状态），而不是 failed。
+   */
+  it('领取 code:9095（设备今日已签）→ already-claimed，不再重试', async () => {
+    const { fetcher, calls } = stubFetch((url) => url.includes('/claim')
+      ? new Response(JSON.stringify({
+        code: TRAE_CN_CODE_DEVICE_ALREADY_CLAIMED,
+        message: '当前设备今日已经签到',
+      }), { status: 200 })
+      : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }))
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome).toEqual({ kind: 'already-claimed', message: '今天已签到' })
+    // 9095 是**确定性**结果（这台设备今天已经领过），重试只会得到同一个回答。
+    expect(calls.filter((call) => call.url.includes('/claim'))).toHaveLength(1)
+  })
+
+  /**
+   * `9074` 的新定性（2026-09-23 真机定案，**第四次修正**）：服务端名额/风控类
+   * 拒绝，与 `x-device-id` 取值**无关**（旧定性「设备身份」被证伪）。
+   *
+   * 故归**新 outcome `unavailable`**：它既不是「成功/已领」（不能写今日状态，
+   * 否则当天就再也不会重试），也不是 `failed`（那会让用户以为要去排查凭据或
+   * 设备）。正确定位是「服务端此刻不受理，稍后自动重试」——重试节奏交给宿主
+   * 4 小时的 sweep，请求内不再退避。
+   */
+  it('领取 code:9074 → unavailable（换号重试后仍被拒，不是 failed）', async () => {
+    const { fetcher, calls } = stubFetch((url) => url.includes('/claim')
+      ? new Response(JSON.stringify({
+        code: TRAE_CN_CODE_TOO_MANY_USERS,
+        message: '当前参与用户太多，请稍后再试',
+      }), { status: 200 })
+      : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }))
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome.kind).toBe('unavailable')
+    expect((outcome as { code: number }).code).toBe(TRAE_CN_CODE_TOO_MANY_USERS)
+    const message = (outcome as { message: string }).message
+    // 文案：说清「服务端此刻暂不可签」+「稍后自动重试」这个可执行事实。
+    expect(message).toContain('暂不可签')
+    expect(message).toContain('稍后自动重试')
+    // 旧文案的错误指引必须消失：重新登录**治不了** 9074。
+    expect(message).not.toContain('重新登录')
+    expect(message).not.toContain('登记设备身份')
+    // ⚠️ **共两次** claim（2026-09-23 第五次定性后）：首发 9074 → 换设备号重试一次
+    // → 仍是 9074 ⇒ unavailable。本夹具恒定回 9074，故两次都失败。
+    // 「不是退避重试」这一点由**耗时**保证（换号是立刻重问，不烧 4 秒退避），
+    // 由下面「9074 不烧退避」那条用例钉死 —— 这里只断言次数。
+    expect(calls.filter((call) => call.url.includes('/claim'))).toHaveLength(2)
   })
 
   /**
@@ -632,13 +692,22 @@ function jsonWithLogId(body: unknown, logid: string): Response {
 describe('logid 透传（失败诊断的关键线索）', () => {
   it('claim 失败时把响应头 x-tt-logid 透传到 outcome.logid', async () => {
     const { fetcher } = stubFetch((url) => url.includes('/claim')
-      // 真机场景：HTTP 200 + code 9074（活动级名额限制）+ logid。
+      // 真机场景：HTTP 200 + code 9074（名额/风控类拒绝）+ logid。
       ? jsonWithLogId({ code: 9074, message: '当前参与用户太多，请稍后再试' }, REAL_LOGID)
       : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }))
-    const outcome = await claimWithFakeTimers({ fetcher })
-    expect(outcome).toMatchObject({ kind: 'failed', code: 9074, logid: REAL_LOGID })
-    // 文案在服务端原文之后补了**定性**（见下一条用例）。
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome).toMatchObject({ kind: 'unavailable', code: 9074, logid: REAL_LOGID })
+    // 文案保留服务端原文（用户判断「是名额还是风控」的唯一依据）。
     expect((outcome as { message: string }).message).toContain('当前参与用户太多，请稍后再试')
+  })
+
+  it('9095（设备今日已签）不带 logid 需求：成功路径的 already-claimed 不含该字段', async () => {
+    const { fetcher } = stubFetch((url) => url.includes('/claim')
+      ? jsonWithLogId({ code: 9095, message: '当前设备今日已经签到' }, REAL_LOGID)
+      : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }))
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    // already-claimed 是**业务正常态**，不带诊断字段（与 claimed 同款）。
+    expect(outcome).toEqual({ kind: 'already-claimed', message: '今天已签到' })
   })
 
   it('status 失败时同样透传 logid（两步里任一步失败都带得上）', async () => {
@@ -653,7 +722,7 @@ describe('logid 透传（失败诊断的关键线索）', () => {
 
   it('响应头没有 logid 时 outcome **不含** logid 字段（不是空串）', async () => {
     const { fetcher } = stubFetch((url) => url.includes('/claim')
-      ? new Response(JSON.stringify({ code: 9074, message: '限流' }), { status: 200 })
+      ? new Response(JSON.stringify({ code: 4008, message: '限流' }), { status: 200 })
       : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }))
     const outcome = await claimWithFakeTimers({ fetcher })
     expect(outcome.kind).toBe('failed')
@@ -664,7 +733,7 @@ describe('logid 透传（失败诊断的关键线索）', () => {
 
   it('logid 为空白串时视为没有（不显示一个空的 logid 尾巴）', async () => {
     const { fetcher } = stubFetch((url) => url.includes('/claim')
-      ? jsonWithLogId({ code: 9074, message: '限流' }, '   ')
+      ? jsonWithLogId({ code: 4008, message: '限流' }, '   ')
       : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }))
     const outcome = await claimWithFakeTimers({ fetcher })
     expect('logid' in outcome).toBe(false)
@@ -672,7 +741,7 @@ describe('logid 透传（失败诊断的关键线索）', () => {
 
   it('logid 两侧空白被 trim（服务端偶尔带空格）', async () => {
     const { fetcher } = stubFetch((url) => url.includes('/claim')
-      ? jsonWithLogId({ code: 9074, message: '限流' }, `  ${REAL_LOGID}  `)
+      ? jsonWithLogId({ code: 4008, message: '限流' }, `  ${REAL_LOGID}  `)
       : new Response(JSON.stringify({ code: 0, data: { checked_in: false, enable: true } }), { status: 200 }))
     const outcome = await claimWithFakeTimers({ fetcher })
     expect((outcome as { logid?: string }).logid).toBe(REAL_LOGID)
@@ -687,7 +756,7 @@ describe('logid 透传（失败诊断的关键线索）', () => {
       headers.set('X-TT-LogId', REAL_LOGID)
       return new Response(JSON.stringify({ code: 9074, message: '限流' }), { status: 200, headers })
     })
-    const outcome = await claimWithFakeTimers({ fetcher })
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
     expect((outcome as { logid?: string }).logid).toBe(REAL_LOGID)
   })
 
@@ -750,21 +819,26 @@ function sequenceClaimFetch(sequence: Array<() => Response>) {
   return { fetcher, calls, claimCalls }
 }
 
-describe('claim 段有界重试（9074 定性的配套处置）', () => {
-  it('重试判据：只有 9074 / 4007 / 3004 可重试，且必须在共享退避表里', () => {
+describe('claim 段有界重试（4007 / 3004 两个软限流码）', () => {
+  it('重试判据：只有 4007 / 3004 可重试，且必须在共享退避表里', () => {
     for (const code of TRAE_CN_CLAIM_RETRY_CODES) {
       expect(isTraeCnClaimRetryable(code), String(code)).toBe(true)
       // 双向钉死：本地清单**必须**是共享退避表的子集（上游移除即自动停重试）。
       expect(TRAE_CN_BACKOFF_CODES, String(code)).toContain(code)
     }
-    // 9004（设备身份）/ 1001（凭据失效）是确定性失败 —— 重试只会问三遍同一个结果。
-    for (const code of [9004, 1001, 1002, 4010, 4014, 4008, 4200, 4001, 4006, 4023, -1, 99999, undefined]) {
+    // 9004（设备头）/ 1001（凭据失效）/ 9074（名额风控）都是确定性失败 ——
+    // 重试只会问三遍同一个结果。9074 的确定性由 2026-09-23 真机判定矩阵钉死
+    // （账号级已签→code:0 任意设备号；设备已签→9095；两者都未签→9074）。
+    for (const code of [9074, 9095, 9004, 1001, 1002, 4010, 4014, 4008, 4200, 4001, 4006, 4023, -1, 99999, undefined]) {
       expect(isTraeCnClaimRetryable(code), String(code)).toBe(false)
     }
     // 3003 在共享退避表里（chat 通道的 MODEL_FAIL），但签到端点没有对应观测，
     // 刻意不放进本地清单 —— 否则签到会白等 4 秒。
     expect(TRAE_CN_BACKOFF_CODES).toContain(3003)
     expect(isTraeCnClaimRetryable(3003)).toBe(false)
+    // ⚠️ 9074 仍在 **chat 侧**共享退避表里（动作仍是「退避、不换号」），
+    // 退出的只是**签到专用**的那张更窄的清单 —— 两条协议线刻意分开。
+    expect(TRAE_CN_BACKOFF_CODES).toContain(9074)
   })
 
   it('退避是 1s → 3s 共 2 次（总等待 4s，有界）', () => {
@@ -772,10 +846,10 @@ describe('claim 段有界重试（9074 定性的配套处置）', () => {
     expect(TRAE_CN_CLAIM_RETRY_DELAYS_MS.reduce((sum, ms) => sum + ms, 0)).toBeLessThanOrEqual(10_000)
   })
 
-  it('9074 两次重试后成功 → claimed（前两次失败不返回给调用方）', async () => {
+  it('4007 两次重试后成功 → claimed（前两次失败不返回给调用方）', async () => {
     const { fetcher, claimCalls } = sequenceClaimFetch([
-      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
-      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 4007, message: '请求过于频繁' }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 4007, message: '请求过于频繁' }), { status: 200 }),
       () => new Response(JSON.stringify({ code: 0, data: { credit: 150 } }), { status: 200 }),
     ])
     const outcome = await claimWithFakeTimers({ fetcher })
@@ -784,7 +858,7 @@ describe('claim 段有界重试（9074 定性的配套处置）', () => {
     expect(claimCalls()).toHaveLength(1 + TRAE_CN_CLAIM_RETRY_DELAYS_MS.length)
   })
 
-  it('9074 三次全失败 → 返回**最后一次**的 code / message / logid', async () => {
+  it('4007 三次全失败 → 返回**最后一次**的 code / message / logid', async () => {
     // 三次的 logid 各不相同：能区分「取最后一次」与「取第一次」。
     const logids = ['LOGID-FIRST', 'LOGID-SECOND', 'LOGID-LAST']
     let index = 0
@@ -792,17 +866,12 @@ describe('claim 段有界重试（9074 定性的配套处置）', () => {
       if (!url.includes('/claim')) return statusOk()
       const logid = logids[Math.min(index, logids.length - 1)]!
       index += 1
-      return jsonWithLogId({ code: 9074, message: '当前参与用户太多，请稍后再试' }, logid)
+      return jsonWithLogId({ code: 4007, message: '请求过于频繁' }, logid)
     })
     const outcome = await claimWithFakeTimers({ fetcher })
     expect(calls.filter((call) => call.url.includes('/claim'))).toHaveLength(3)
-    expect(outcome).toMatchObject({ kind: 'failed', code: 9074, logid: 'LOGID-LAST' })
-    // 文案里带上新定性：不是「等名额」，而是指向**设备身份**这个真根因，
-    // 并给出可执行动作（重新登录以登记设备身份）。
-    expect((outcome as { message: string }).message)
-      .toContain('x-device-id')
-    expect((outcome as { message: string }).message)
-      .toContain('重新登录')
+    expect(outcome).toMatchObject({ kind: 'failed', code: 4007, logid: 'LOGID-LAST' })
+    expect((outcome as { message: string }).message).toContain('请求过于频繁')
   })
 
   it('4007 触发重试（同属共享退避表里的软限流）', async () => {
@@ -815,7 +884,30 @@ describe('claim 段有界重试（9074 定性的配套处置）', () => {
     expect(claimCalls()).toHaveLength(2)
   })
 
-  it('9004 不重试（设备身份问题，重试只会问三遍同一个结果）', async () => {
+  it('9074 **不**走退避重试：只发一次换号重试，不烧 4 秒退避', async () => {
+    const { fetcher, claimCalls } = sequenceClaimFetch([
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+    ])
+    // ⚠️ 判据是「**零时钟推进**下就能跑完」：换号重试是立刻的（纯微任务），而退避
+    // 重试必须先把 `sleep(1000)` 烧掉。故这里只推进 **0 毫秒**（`advanceTimersByTimeAsync(0)`
+    // 会反复 flush 微任务但不走时钟）—— 若实现误把 9074 放进退避表，两次 `sleep`
+    // 都不会到期，claim 只会发出一次，下面的断言随即失败。
+    vi.useFakeTimers()
+    let outcome: Awaited<ReturnType<typeof claimTraeCnDailyCheckin>>
+    try {
+      const promise = claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+      await vi.advanceTimersByTimeAsync(0)
+      outcome = await promise
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(outcome.kind).toBe('unavailable')
+    // 两次 claim：首发 + 换号重试一次（**不是**由 delays 长度决定的三次）。
+    expect(claimCalls()).toHaveLength(2)
+    expect(claimCalls()).toHaveLength(1 + TRAE_CN_ROTATE_DEVICE_RETRY_LIMIT)
+  })
+
+  it('9004 不重试（设备头问题，重试只会问三遍同一个结果）', async () => {
     const { fetcher, claimCalls } = sequenceClaimFetch([
       () => new Response(JSON.stringify({ code: 9004, msg: 'device not allowed' }), { status: 200 }),
     ])
@@ -847,7 +939,7 @@ describe('claim 段有界重试（9074 定性的配套处置）', () => {
 
   it('重试次数上界与 delays 长度同源（改常量即改行为，不会各写一份）', async () => {
     const { fetcher, claimCalls } = sequenceClaimFetch([
-      () => new Response(JSON.stringify({ code: 9074 }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 4007 }), { status: 200 }),
     ])
     await claimWithFakeTimers({ fetcher })
     expect(claimCalls()).toHaveLength(1 + TRAE_CN_CLAIM_RETRY_DELAYS_MS.length)
@@ -856,32 +948,187 @@ describe('claim 段有界重试（9074 定性的配套处置）', () => {
   it('重试过程留下脱敏调试行（便于真机核对节奏）', async () => {
     const debug: string[] = []
     const { fetcher } = sequenceClaimFetch([
-      () => new Response(JSON.stringify({ code: 9074 }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 4007 }), { status: 200 }),
       () => new Response(JSON.stringify({ code: 0, data: { credit: 150 } }), { status: 200 }),
     ])
     await claimWithFakeTimers({ fetcher, onDebug: (message) => debug.push(message) })
     const joined = debug.join('\n')
-    expect(joined).toContain('9074')
+    expect(joined).toContain('4007')
     expect(joined).toContain('1000ms 后重试')
   })
 })
 
-describe('9074 不记冷却徽章（定性已改为设备身份）', () => {
-  it('recordsTraeCnCooldown(9074) 为 false —— 设备身份不是「该模型限流 N 分钟」', () => {
-    // 徽章语义是「这个模型受限，等一会儿自动解除」。9074 的现行定性是
-    // **设备身份不被活动系统认可**（2026-09-20 单变量 A/B 定案）——
-    // 它与具体模型无关，且等多久都不会自愈（要么重新登录登记设备身份，
-    // 要么走后续路径），记徽章是虚假信息。
+describe('9074 不记冷却徽章（定性为名额/风控类拒绝）', () => {
+  it('recordsTraeCnCooldown(9074) 为 false —— 它不是「该模型限流 N 分钟」', () => {
+    // 徽章语义是「这个模型受限，等一会儿自动解除」。9074 的现行定性
+    // （2026-09-23 真机判定矩阵）是**服务端名额/风控类拒绝**，与 `x-device-id`
+    // 取值无关、也与具体模型无关 —— 它不由本机决定何时解除，记徽章是虚假信息。
     expect(recordsTraeCnCooldown(TRAE_CN_CODE_TOO_MANY_USERS)).toBe(false)
     expect(recordsTraeCnCooldown(9074)).toBe(false)
     // 反向对照：限流码确实会记（证明上面的 false 不是「判据整体失效」）。
     expect(recordsTraeCnCooldown(4008)).toBe(true)
   })
 
-  it('9074 常量与真机原文对应，且仍是共享退避表成员', () => {
+  it('9074 常量与真机原文对应，且仍在 chat 侧共享退避表里', () => {
     expect(TRAE_CN_CODE_TOO_MANY_USERS).toBe(9074)
     expect(TRAE_CN_BACKOFF_CODES).toContain(9074)
-    expect(TRAE_CN_CLAIM_RETRY_CODES).toContain(9074)
+    // ✅ 与旧的相反：9074 **已退出**签到专用重试清单（2026-09-23）。
+    expect(TRAE_CN_CLAIM_RETRY_CODES).not.toContain(9074)
+  })
+
+  it('9095 是真机判定矩阵里的「设备今日已签」码', () => {
+    expect(TRAE_CN_CODE_DEVICE_ALREADY_CLAIMED).toBe(9095)
+    // 它是**确定性**结果，任何时候都不该进任何重试表。
+    expect(TRAE_CN_CLAIM_RETRY_CODES).not.toContain(9095)
+    expect(isTraeCnClaimRetryable(9095)).toBe(false)
+  })
+})
+
+// ─────────────────────────────────────────────────────────────
+// 9074 换新设备号重试一次（2026-09-23 用户拍板）
+// ─────────────────────────────────────────────────────────────
+//
+// 真机单变量矩阵（2026-09-23）推翻了「9074 = 名额/风控」的旧定性：
+// **9074 = 服务端把「在未产出奖励的 claim 中出现过的设备号」拉黑** ——
+// 全新 16 位设备号**首次 claim 即 code:0**（同账号同 token、11 秒间隔对照，
+// 独立复现）。故 9074 的正确处置是**换一个干净的设备号重试一次**，而不是
+// 退避（旧定性下的做法）。
+//
+// ⚠️ 它与 `TRAE_CN_CLAIM_RETRY_CODES` 是**两回事**，刻意不混：
+// - 那张表是「等几秒再问同一个请求」（软限流，退避 1s → 3s）；
+// - 本路径是「换一个设备身份，立刻重问」——退避再久也不会改变被拉黑的号，
+//   换号则一次就够。故 9074 **不回**通用重试表，重试次数**硬编码 1 次**。
+//
+// ⚠️ 本组用例与实现同属一个**可整体 revert** 的改动：明天真机实测若无效，
+// 回退这一组 + `rotateTraeCnCheckinDeviceId` + claim 里那段 `if` 即可。
+
+describe('9074 换设备号重试一次（设备号拉黑矩阵的落地）', () => {
+  it('rotateTraeCnCheckinDeviceId 换出新 16 位号、标记来源，其余字段原样保留', () => {
+    // 与登录时同一个生成器 ⇒ 形态必须与 `generateTraeCnDeviceId()` 的输出一致
+    // （16 位纯十进制）。**不发明新格式**是这条断言的要点。
+    expect(generateTraeCnDeviceId()).toMatch(/^\d{16}$/)
+
+    const rotated = rotateTraeCnCheckinDeviceId(makeCredential())
+    expect(rotated.checkin_device_id).toMatch(/^\d{16}$/)
+    expect(rotated.checkin_device_id).not.toBe(CHECKIN_DEVICE_ID)
+    expect(rotated.device_id_source).toBe(TRAE_CN_DEVICE_SOURCE_ROTATED)
+    // 只动「签到设备号 + 来源标记」，其余字段（含 BoundDeviceID）逐字段不变：
+    // 换号是**签到侧**的事，`device_id` 是 exchange 的绑定标识，与它无关。
+    expect({ ...rotated, checkin_device_id: '', device_id_source: '' })
+      .toEqual({ ...makeCredential(), checkin_device_id: '', device_id_source: '' })
+    expect(rotated.device_id).toBe(BOUND_DEVICE_ID)
+  })
+
+  it('两次换号得到不同的号（不是常量、也不是旧号）', () => {
+    const first = rotateTraeCnCheckinDeviceId(makeCredential()).checkin_device_id
+    const second = rotateTraeCnCheckinDeviceId(makeCredential()).checkin_device_id
+    expect(first).not.toBe(second)
+  })
+
+  it('9074 → 换号重试**一次**，第二次 claim 带的是全新 16 位号', async () => {
+    const { fetcher, claimCalls } = sequenceClaimFetch([
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+    ])
+    const outcome = await claimWithFakeTimers({ fetcher })
+
+    expect(outcome.kind).toBe('unavailable')
+    // **恰好两次**：首发 + 一次换号重试（硬编码 1 次，不做循环）。
+    expect(claimCalls()).toHaveLength(2)
+    const deviceIds = claimCalls().map((call) => headersOf(call.init)['x-device-id'])
+    expect(deviceIds[0]).toBe(CHECKIN_DEVICE_ID)
+    expect(deviceIds[1]).toMatch(/^\d{16}$/)
+    expect(deviceIds[1]).not.toBe(CHECKIN_DEVICE_ID)
+    // 反向护栏：绝不能退化成 BoundDeviceID（那是 9004 的坑，不是解药）。
+    expect(deviceIds[1]).not.toBe(BOUND_DEVICE_ID)
+  })
+
+  it('重试成功 → claimed，且新号已写回凭据（下一轮用干净号起步）', async () => {
+    const persisted: TraeCnCredential[] = []
+    const { fetcher, claimCalls } = sequenceClaimFetch([
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 }),
+    ])
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, {
+      fetcher, persistCredential: (credential) => { persisted.push(credential) },
+    })
+
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 150 })
+    expect(persisted).toHaveLength(1)
+    const newId = headersOf(claimCalls()[1]!.init)['x-device-id']!
+    // 写回的号**就是**重试用的那个号（不是另生成一个）。
+    expect(persisted[0]!.checkin_device_id).toBe(newId)
+    expect(persisted[0]!.device_id_source).toBe(TRAE_CN_DEVICE_SOURCE_ROTATED)
+  })
+
+  it('重试仍是 9074 → unavailable，新号同样写回（否则下轮又用被拉黑的号）', async () => {
+    const persisted: TraeCnCredential[] = []
+    const { fetcher } = sequenceClaimFetch([
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+    ])
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, {
+      fetcher, persistCredential: (credential) => { persisted.push(credential) },
+    })
+
+    expect(outcome).toMatchObject({ kind: 'unavailable', code: TRAE_CN_CODE_TOO_MANY_USERS })
+    expect(persisted).toHaveLength(1)
+    expect(persisted[0]!.checkin_device_id).toMatch(/^\d{16}$/)
+    expect(persisted[0]!.checkin_device_id).not.toBe(CHECKIN_DEVICE_ID)
+  })
+
+  it('最终结果决定分流：换号后重试命中 9095 → already-claimed', async () => {
+    // 全新号撞上 9095 在真机上几乎不可能，但分流必须看**最后一次**的结果 ——
+    // 否则「换号成功但结果是已签」会被报成首发那个 9074。
+    const { fetcher } = sequenceClaimFetch([
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 9095, message: '当前设备今日已经签到' }), { status: 200 }),
+    ])
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome).toEqual({ kind: 'already-claimed', message: '今天已签到' })
+  })
+
+  it('非 9074 的失败**不**换号（9004 → failed，只发一次 claim，也不写回）', async () => {
+    const persisted: TraeCnCredential[] = []
+    const { fetcher, claimCalls } = sequenceClaimFetch([
+      () => new Response(JSON.stringify({ code: 9004, msg: 'device not allowed' }), { status: 200 }),
+    ])
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, {
+      fetcher, persistCredential: (credential) => { persisted.push(credential) },
+    })
+
+    expect(outcome).toMatchObject({ kind: 'failed', code: 9004 })
+    expect(claimCalls()).toHaveLength(1)
+    expect(persisted).toHaveLength(0)
+  })
+
+  it('凭据写回失败不影响换号重试（钩子抛错仍重试、仍是 claimed）', async () => {
+    const debug: string[] = []
+    const { fetcher, claimCalls } = sequenceClaimFetch([
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 }),
+    ])
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, {
+      fetcher,
+      onDebug: (message) => debug.push(message),
+      persistCredential: async () => { throw new Error('credentials locked') },
+    })
+
+    // 写回是**尽力而为**：它失败只影响下一轮 sweep 的起点，不该让这次签到失败。
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 150 })
+    expect(claimCalls()).toHaveLength(2)
+    expect(debug.join('\n')).toContain('写回')
+    expect(debug.join('\n')).toContain('credentials locked')
+  })
+
+  it('未接线 persistCredential 时照样换号重试（既不写回也不炸）', async () => {
+    const { fetcher, claimCalls } = sequenceClaimFetch([
+      () => new Response(JSON.stringify({ code: 9074, message: '当前参与用户太多，请稍后再试' }), { status: 200 }),
+      () => new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 }),
+    ])
+    const outcome = await claimTraeCnDailyCheckin(makeCredential(), TRAE_CN, { fetcher })
+    expect(outcome).toMatchObject({ kind: 'claimed', credit: 150 })
+    expect(claimCalls()).toHaveLength(2)
   })
 })
 

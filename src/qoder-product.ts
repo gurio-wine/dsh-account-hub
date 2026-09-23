@@ -489,6 +489,19 @@ export interface QoderCredential {
   user_id?: string
   /** 服务端返回的用户类型（如 `personal_standard`，有则存）。 */
   user_type?: string
+  /**
+   * **可展示的用户名**（userinfo 的 `name`，有则存）。
+   *
+   * 账号卡片的昵称优先取它 —— `user_id` 是 UUIDv7，把它当昵称正是
+   * 「昵称显示成一串码」的来路（见 {@link resolveQoderAccountNickname}）。
+   *
+   * ⚠️ **与 `user_id` 分开存**（不要合并成一个字段）：`user_id` 是签名链要的
+   * 真实 uid 的一部分（空 uid 必回 `101 Signature invalid`），把它换成
+   * 「好看的昵称」会让签名静默失败。
+   */
+  user_name?: string
+  /** 用户邮箱（userinfo 的 `email`，有则存；昵称的第二档回退）。 */
+  email?: string
 }
 
 /** 从 JSON 安全读取字符串字段（兼容后端把数字返回成 number）。 */
@@ -566,6 +579,9 @@ export function buildQoderDeviceCredential(
     refresh_token: payload.refreshToken,
     ...payload.expiresAtMs === undefined ? {} : { token_expires_at: String(payload.expiresAtMs) },
     ...payload.userId === undefined ? {} : { user_id: payload.userId },
+    // poll / refresh 响应里的 `user_name` 是可展示名（有则带）：账号卡片昵称的
+    // 第一档就是它。**没带就不编造** —— 由 userinfo 那一趟补。
+    ...payload.userName === undefined ? {} : { user_name: payload.userName },
   }
 }
 
@@ -585,6 +601,9 @@ export function applyQoderDeviceRefresh(
     refresh_token: payload.refreshToken.length > 0 ? payload.refreshToken : previous.refresh_token,
     ...payload.expiresAtMs === undefined ? {} : { token_expires_at: String(payload.expiresAtMs) },
     ...payload.userId === undefined ? {} : { user_id: payload.userId },
+    // 续期响应带了新 `user_name` 就取新值（响应没带则**沿用旧的** ——
+    // 设备流登录时 userinfo 已经写进去过一份，覆盖成 undefined 等于白丢）。
+    ...payload.userName === undefined ? {} : { user_name: payload.userName },
   }
 }
 
@@ -773,6 +792,176 @@ export function isQoderRefreshable(credential: QoderCredential): boolean {
   return credential.access_token.length > 0
 }
 
+// ── 账号卡片资料（昵称 / 有效期） ───────────────────────────────────────────
+//
+// 本节的四个纯函数服务**同一件事**：让账号卡片显示真实昵称与真实有效期，
+// 且**不改动任何出站协议**。它们都放在产品层而不是 `qoder-auth.ts`，因为
+// 「什么算占位昵称」「设备令牌的有效期怎么算」是**两区共用**的口径 ——
+// 放进 auth 会让 CN / 国际版各有一份可独立漂移的副本。
+
+/**
+ * 手机号脱敏（`18939953995` → `189****3995`）。
+ *
+ * 对齐 buddy / lobsterai 卡片里既有的 `189****3995` 惯例
+ * （`src/simple-yaml.ts` 的注释里就有这个真实数据形态）。
+ *
+ * **位数不足或没有足够数字时返回 `undefined`**（而不是「尽力脱敏」）：
+ * 一个长度不对的串很可能不是手机号（是邮箱、是用户名），把它按手机号规则切
+ * 会产出一个既不像手机号、又泄露了原文首尾的怪东西。
+ *
+ * 分隔符（空格 / 连字符）先剔除再判定 —— 真机上带国家码的书写很常见，
+ * 但因为**只**接受「剔除分隔符后恰好 11 位数字」，带国家码（13 位）的形态
+ * 仍然会被判 `undefined`，不会切出一个错位的结果。
+ */
+export function maskQoderMobile(raw: string): string | undefined {
+  const digits = raw.replace(/[\s-]/g, '')
+  if (!/^\d{11}$/.test(digits)) return undefined
+  return `${digits.slice(0, 3)}****${digits.slice(-4)}`
+}
+
+/**
+ * 账号卡片昵称的取值来源（**四档回退**，顺序即优先级）。
+ *
+ * | 档 | 来源 | 说明 |
+ * |---|---|---|
+ * | 1 | `displayName` | userinfo 的 `name` —— 唯一的「真实昵称」 |
+ * | 2 | `email` | 有些账号形态没有 `name` |
+ * | 3 | `mobile` | **脱敏后**的手机号（`189****3995`） |
+ * | 4 | `userId` | 服务端 user_id —— **与改动前逐字一致**的兜底 |
+ *
+ * 四档全空时用 `accountId`（账号池自己的 id）。
+ *
+ * ⚠️ **这不是「宁可显示点什么都行」**：第 4 档正是要修的那个形态
+ * （UUIDv7 当昵称）。保留它是因为**它比空白好**，且回填链（
+ * `QoderAuth.backfillAccountProfiles`）会在一轮之内把它换成真名 ——
+ * 拿掉这一档会让 userinfo 挂掉时的卡片直接变成空标题。
+ */
+export interface QoderNicknameSource {
+  /** userinfo 的 `name`（真实昵称）。 */
+  displayName?: string
+  /** userinfo 的 `email`。 */
+  email?: string
+  /** userinfo 的 `security_mobile`（**未脱敏**原文）。 */
+  mobile?: string
+  /** 服务端 user_id。 */
+  userId?: string
+}
+
+/** 判定一个候选值是不是「有内容」（非空、非纯空白）。 */
+function nonEmpty(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined
+  return value.trim().length > 0 ? value.trim() : undefined
+}
+
+/**
+ * 按 {@link QoderNicknameSource} 的四档回退算出账号卡片昵称。
+ *
+ * @param source - 身份来源；未取到资料时传 `undefined`（照样回 `accountId`）。
+ * @param accountId - 账号池条目 id（最后一档）。
+ */
+export function resolveQoderAccountNickname(
+  source: QoderNicknameSource | undefined,
+  accountId: string,
+): string {
+  if (source !== undefined) {
+    const display = nonEmpty(source.displayName)
+    if (display !== undefined) return display
+    const email = nonEmpty(source.email)
+    if (email !== undefined) return email
+    const mobile = nonEmpty(source.mobile)
+    if (mobile !== undefined) {
+      const masked = maskQoderMobile(mobile)
+      if (masked !== undefined) return masked
+    }
+    const userId = nonEmpty(source.userId)
+    if (userId !== undefined) return userId
+  }
+  return accountId
+}
+
+/**
+ * UUID 形（含 32 位无连字符形态）—— 登录链写进昵称的正是那个值。
+ *
+ * ⚠️ **只认「完整的 UUID 串」，不做「像不像 id」的模糊判定**：模糊判定会把
+ * 用户自己起的名字（如 `test-1234-5678-9012-345678901234`）当成占位，
+ * 于是回填链每次跑都改一遍昵称 —— 用户手动改的名字被机器覆盖，且**不报错**。
+ */
+const QODER_UUID_PATTERN = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i
+
+/**
+ * 判定昵称是否仍是**占位形**（UUID / 空串）。
+ *
+ * 回填链的触发判据一半靠它，另一半靠 {@link needsQoderAccountProfileBackfill}
+ * 的 expiresAt 判定。**幂等的全部依据**就在这里：一旦被改写成真名
+ * （或邮箱 / 脱敏手机号），本函数立刻返回 false，回填链此后一次网都不出。
+ */
+export function isQoderNicknamePlaceholder(nickname: string): boolean {
+  const trimmed = nickname.trim()
+  if (trimmed.length === 0) return true
+  return QODER_UUID_PATTERN.test(trimmed)
+}
+
+/**
+ * 取账号卡片该显示的**凭据有效期**（毫秒）；无可报告的有效期时 `undefined`。
+ *
+ * ⚠️ **只有设备令牌族有值**，PAT 恒 `undefined` —— 这是本函数存在的全部理由。
+ *
+ * `QoderCredential.token_expires_at` 对 PAT 记的是 **`jt-`（运行时缓存）** 的
+ * 过期时刻（24h），不是 PAT 的有效期（PAT 的过期时间本地无从得知）。把它写进
+ * 账号卡片会让卡片在闲置 24h 后显示「已过期」，而实际上一次 `getJobToken()`
+ * 就能自愈 —— 那是纯粹的假警报（`QoderAuth.checkExpired` 的注释同因）。
+ *
+ * 设备令牌族则相反：`token_expires_at` **就是**这张凭据自己的到期时刻
+ * （≈30 天），是可报告的事实。
+ */
+export function qoderAccountExpiresAtMs(credential: QoderCredential): number | undefined {
+  if (!isQoderDeviceToken(credential.access_token)) return undefined
+  return qoderCredentialExpiresAtMs(credential)
+}
+
+/** {@link needsQoderAccountProfileBackfill} 读得到的账号条目最小字段集。 */
+export interface QoderAccountProfileView {
+  /** 账号池里的昵称（可能是登录链写下的 UUID）。 */
+  nickname: string
+  /**
+   * 账号池里的有效期（设备令牌账号应当有）。
+   *
+   * ⚠️ **没有 `refreshable`**：它看着像判据，实际不是 —— 停用/不可续期的账号
+   * 其凭据往往仍然有效，而卡片的昵称该修还是要修。把它收进来只会诱导后来者
+   * 加一条「不可续期就跳过」的过滤，让那些账号的昵称永远是 UUID。
+   */
+  expiresAt?: number
+}
+
+/**
+ * 判定一个账号是否需要**资料回填**（惰性回填链的触发闸门）。
+ *
+ * ## 为什么必须幂等（这是本函数最容易写错的地方）
+ *
+ * 回填链挂在**每 30 分钟的批量续期**上。若判据写成「昵称是 UUID **或**
+ * 缺 expiresAt」，PAT 账号就会**永远**命中第二条 ——
+ * {@link qoderAccountExpiresAtMs} 对 PAT 恒回 `undefined`，于是每个 PAT 账号
+ * 每 30 分钟白打一次 exchange + userinfo，**永不停止**。
+ *
+ * 故两条判据各自有明确的「改过就不再触发」依据：
+ * 1. 昵称占位 → 回填后是真名，`isQoderNicknamePlaceholder` 恒 false；
+ * 2. 缺 expiresAt → **只对「本来就有可报告有效期」的凭据成立**
+ *    （设备令牌族）；PAT 族根本没有这个值，不参与判定。
+ *
+ * 凭据取不到（`undefined`）时只按昵称判 —— 不回填一个没有凭据的条目。
+ */
+export function needsQoderAccountProfileBackfill(
+  entry: QoderAccountProfileView,
+  credential: QoderCredential | undefined,
+): boolean {
+  if (isQoderNicknamePlaceholder(entry.nickname)) return true
+  if (credential === undefined) return false
+  // ⚠️ 判据是「**该凭据有可报告的有效期**，而账号上还没记」——
+  // 不是「账号上没记有效期」（后者对 PAT 恒真，会变成死循环）。
+  if (qoderAccountExpiresAtMs(credential) === undefined) return false
+  return entry.expiresAt === undefined
+}
+
 // ── exchange 响应 ──
 
 /**
@@ -857,6 +1046,31 @@ export function buildQoderCredential(pat: string, payload: QoderJobTokenPayload)
     token_expires_at: String(payload.expiresAtMs),
     ...payload.userId === undefined ? {} : { user_id: payload.userId },
     ...payload.userType === undefined ? {} : { user_type: payload.userType },
+  }
+}
+
+/**
+ * 把 userinfo 的可展示资料并进凭据（**登录链与回填链共用这一处**）。
+ *
+ * 三条合并规则与 {@link applyQoderUserIdentity} 同构：
+ * - 入参没带该字段（`undefined`）→ 沿用旧值；
+ * - 与旧值相同 → 返回**原对象引用**（调用方可用 `===` 判「无需落盘」）；
+ * - **不做任何出站行为**，也不碰令牌字段。
+ *
+ * ⚠️ `user_id` **不在**本函数职责内：它是签名要的 uid，由 exchange / quota
+ * 那条线维护。这里只加「给人看」的两个字段。
+ */
+export function applyQoderProfile(
+  credential: QoderCredential,
+  profile: { displayName?: string; email?: string },
+): QoderCredential {
+  const userName = nonEmpty(profile.displayName)
+  const email = nonEmpty(profile.email)
+  if (userName === credential.user_name && email === credential.email) return credential
+  return {
+    ...credential,
+    ...userName === undefined ? {} : { user_name: userName },
+    ...email === undefined ? {} : { email },
   }
 }
 

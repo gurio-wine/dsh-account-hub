@@ -66,6 +66,14 @@ class ScriptedFetcher {
   readonly calls: string[] = []
   /** `/daily-checkin` 返回的业务码；0=成功、10001=已领、999=失败。 */
   claimCode = 0
+  /**
+   * Trae CN 的 `checkin_credits/claim` 返回的业务码（本次新增）。
+   *
+   * 需要它是因为 `unavailable` 这个 kind 目前**只有 Trae CN 的 `9074` 会产出**，
+   * 而 Buddy 那条最短路径造不出它 —— 用 Buddy 测「unavailable 不写状态」等于
+   * 测一条永远走不到的分支。
+   */
+  traeClaimCode = 0
 
   readonly fetch: typeof fetch = (async (input: string | URL | Request) => {
     const url = String(input)
@@ -76,6 +84,21 @@ class ScriptedFetcher {
         code: 0,
         data: { active: true, today_checked_in: false, streak_days: 0, daily_credit: 100 },
       }), { status: 200 })
+    }
+    if (url.includes('/checkin_credits/status')) {
+      // Trae CN 的预检：账号级未签 ⇒ 会走到 claim。
+      return new Response(JSON.stringify({
+        code: 0, data: { checked_in: false, enable: true },
+      }), { status: 200 })
+    }
+    if (url.includes('/checkin_credits/claim')) {
+      if (this.traeClaimCode !== 0) {
+        return new Response(JSON.stringify({
+          code: this.traeClaimCode,
+          message: this.traeClaimCode === 9074 ? '当前参与用户太多，请稍后再试' : undefined,
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 0, message: 'success' }), { status: 200 })
     }
     if (url.includes('/daily-checkin')) {
       if (this.claimCode === 10001) {
@@ -256,6 +279,89 @@ describe('checkin.perform 端点（单账号）', () => {
     const result = await h.call('checkin.perform', { provider: 'not-a-provider', accountId: 'x' })
     expect(result.ok).toBe(false)
     expect((result as { error: { message: string } }).error.message).toBe('unsupported provider: not-a-provider')
+  })
+})
+
+// ── unavailable（2026-09-23 新增的第五个 outcome kind）──────────────────────
+//
+// 这一档目前**只有 Trae CN 的 `9074` 会产出**（服务端名额/风控类拒绝），故用例
+// 走真实的 trae-cn 分派链路（`registerAccountHubRpc` 的 `runCreditsClaim` 分支），
+// 而不是给 Buddy 打桩 —— 后者造不出这个 kind，测的会是一条永远走不到的分支。
+//
+// 本组守的是**状态写入**这一条最容易写错的规则：`unavailable` 必须与
+// `failed` / `inactive` 同待遇（**不写** checkins）。一旦写入，4h sweep 的
+// 「今日未签」筛选当天就会短路跳过该账号 —— 一次**瞬时**拒绝被固化成
+// **当天永久**失败。
+
+describe('unavailable 不写今日签到状态（否则当天再也不会重试）', () => {
+  /** 一个 trae-cn 账号（凭据由 FakeCredentials 统一伪造，字段够用即可）。 */
+  const traeEntry = (id: string): ProviderAccountEntry => makeEntry(id, {
+    provider: 'trae-cn',
+    credentialRef: `TRAE_CN_ACCOUNT_${id.toUpperCase()}`,
+  })
+
+  it('9074 → outcome.kind 为 unavailable，且 checkins 里**没有**该账号', async () => {
+    const h = createHarness([traeEntry('t1')])
+    h.fetcher.traeClaimCode = 9074
+
+    const result = await h.call<any>('checkin.perform', { provider: 'trae-cn', accountId: 't1' })
+
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    const value = (result as { value: { results: Array<{ outcome: { kind: string; code: number; message: string } }> } }).value
+    expect(value.results[0]!.outcome).toMatchObject({ kind: 'unavailable', code: 9074 })
+    // ✅ 核心断言：**不写**今日 —— 这是「下次 sweep 会重试」的唯一保障。
+    expect(h.pool.checkinDay('trae-cn', 't1')).toBeUndefined()
+  })
+
+  it('9074 → summary 计入独立的 unavailable 栏，**不**并入 failed', async () => {
+    // 两者对用户的含义相反：failed 要用户行动，unavailable 什么都不用做。
+    // 并进 failed 会让界面报出「1 个失败」，用户照着一个不需要行动的数字去排查。
+    const h = createHarness([traeEntry('t1')])
+    h.fetcher.traeClaimCode = 9074
+
+    const result = await h.call<any>('checkin.perform', { provider: 'trae-cn', accountId: 't1' })
+
+    const summary = (result as { value: { summary: Record<string, number> } }).value.summary
+    expect(summary.unavailable).toBe(1)
+    expect(summary.failed).toBe(0)
+    expect(summary.claimed).toBe(0)
+  })
+
+  it('unavailable 的账号在下一次 sweep 里**仍然会被尝试**（不写状态的实际价值）', async () => {
+    const h = createHarness([traeEntry('t1')])
+    h.fetcher.traeClaimCode = 9074
+    // 第一趟：被服务端拒绝 → unavailable、不写状态。
+    await h.call<any>('checkin.sweep', {})
+    const callsAfterFirst = h.fetcher.calls.filter((u) => u.includes('/checkin_credits/claim')).length
+    // ⚠️ **两次**（2026-09-23 第五次定性后）：首发 9074 → 换设备号重试一次 →
+    // 仍是 9074 ⇒ unavailable。这里断言的是**第一趟确实试过**，次数由
+    // `trae-cn-credits.spec.ts` 的重试用例精确钉死。
+    expect(callsAfterFirst).toBe(2)
+    expect(h.pool.checkinDay('trae-cn', 't1')).toBeUndefined()
+
+    // 第二趟：服务端恢复 → 真的领到了。若第一趟写了今日，这一趟会被
+    // 「今日未签」筛选短路掉，claim 一次都不会发 —— 那正是本组要防的缺陷。
+    h.fetcher.traeClaimCode = 0
+    await h.call<any>('checkin.sweep', {})
+    const claims = h.fetcher.calls.filter((u) => u.includes('/checkin_credits/claim'))
+    // 第一趟 2 次（首发 + 换号重试）+ 第二趟 1 次（首发即成功）。
+    expect(claims).toHaveLength(3)
+    expect(h.pool.checkinDay('trae-cn', 't1')).toBe(todayDayNumber())
+  })
+
+  it('9095（设备今日已签）→ 归一 already-claimed，**写**今日（这份已经到手）', async () => {
+    // 与 unavailable 正好相反的一档：奖励今天确实已经领过，故按已签处理、
+    // 写今日，后续 sweep 不再为它发请求。
+    const h = createHarness([traeEntry('t1')])
+    h.fetcher.traeClaimCode = 9095
+
+    const result = await h.call<any>('checkin.perform', { provider: 'trae-cn', accountId: 't1' })
+
+    const value = (result as { value: { results: Array<{ outcome: { kind: string } }>; summary: Record<string, number> } }).value
+    expect(value.results[0]!.outcome.kind).toBe('already-claimed')
+    expect(h.pool.checkinDay('trae-cn', 't1')).toBe(todayDayNumber())
+    expect(value.summary.alreadyClaimed).toBe(1)
+    expect(value.summary.unavailable).toBe(0)
   })
 })
 

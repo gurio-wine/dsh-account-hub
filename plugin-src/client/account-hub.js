@@ -89,7 +89,8 @@ const PROVIDERS = Object.freeze([
  * `createAccountWithPat` / `PatLoginForm` / `LoginChoiceForm` 任何一项。
  *
  * 用户原话：「我说不要pat登录，只要浏览器登录了」。故 Qoder 两个 region 的
- * 「+ 新建账号」现在**只有一条路**：直接走 `createAccount()`（浏览器设备流）。
+ * 「登录账号」（旧文案「+ 新建账号」）现在**只有一条路**：直接走 `createAccount()`
+ * （浏览器设备流）。
  * 曾经的二选一选择器与它带来的 `loginChoiceOpen` 状态一并删除 ——
  * 保留了选择器却只留一个选项，等于多一次无意义的点击。
  *
@@ -114,7 +115,7 @@ const PROVIDERS = Object.freeze([
  * 登录弹窗的固定窗口名。
  *
  * 固定名字（而非 `_blank`）有两个作用：
- * 1. **重复点击不开新窗** —— 同名窗口会被浏览器复用，用户连点「+ 新建账号」
+ * 1. **重复点击不开新窗** —— 同名窗口会被浏览器复用，用户连点「登录账号」
  *    也不会攒出一堆登录标签页；
  * 2. 它与 `createAccount` 里 `window.open('')` 的空窗用的是同一个名字，因此
  *    「先开空窗占住用户手势、后填 URL」不会再多开一个窗口。
@@ -152,17 +153,15 @@ function formatTime(ts) {
   return d.toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-// 四个限流标记操作的 hover 帮助文案。抽成常量以便按钮与说明共用同一份措辞。
-const RETEST_HELP = '对本账号每个「限额重置」标记的模型真实发送一条最小消息：'
-  + '正常返回则清除该标记，仍被限流则保留。会消耗少量模型额度。';
+// 两个**供应商级**限流标记操作的 hover 帮助文案。抽成常量以便按钮与说明共用。
+// 单账号的「重测 / 重置」按钮已按用户要求从账号卡片移除（入口只在供应商级），
+// 故 `RETEST_HELP` / `RESET_HELP` 一并删除。
 const RETEST_ALL_HELP = '对本页全部账号（含已停用）执行「重测」：'
   + '逐个模型真实发送一条最小消息，正常返回才清除标记。停用账号同样会发送。会消耗模型额度。';
-const RESET_HELP = '直接清除本账号的全部「限额重置」标记，不发送任何请求。'
-  + '适用于你已确认额度恢复、只想清掉显示的情况。';
 const RESET_ALL_HELP = '直接清除本页全部账号（含已停用）的「限额重置」标记，不发送任何请求。';
 
 /**
- * 「显示列表」按钮的说明。
+ * 「模型列表」按钮的说明。
  *
  * 措辞必须讲清两点，否则用户会以为关掉开关就等于删除模型：
  * - 关闭只是**从对话框的模型选择里隐藏**，模型本身仍然存在、可随时再打开；
@@ -223,6 +222,30 @@ function formatPackageLine(pkg) {
 const CLAIM_FAILURE_FALLBACK = '领取失败';
 
 /**
+ * `unavailable` outcome **没有** `message` 时的回退文案。
+ *
+ * 与 `CLAIM_FAILURE_FALLBACK` 分开是刻意的：这一档**不是失败**，用「领取失败」
+ * 会让用户去排查并不存在的问题。宿主侧（`src/trae-cn-credits.ts`）总会带上
+ * message，这里只是字段缺失时的兜底。
+ */
+const CLAIM_UNAVAILABLE_FALLBACK = '服务端此刻暂不可签';
+
+/**
+ * 把一次 `unavailable` 的领取结果格式化成一行「账号：原因（code N）」。
+ *
+ * `unavailable` 是「服务端此刻暂不受理这次领取」——目前唯一的生产者是 Trae CN
+ * 的 `9074`（名额/风控类拒绝，2026-09-23 真机定案）。它**不是失败**：正确动作是
+ * 「什么都不做，等 4 小时后的自动重试」，故文案与色调都与 failed 行分开。
+ *
+ * 与 {@link formatClaimFailureLine} 的差异只有**回退文案**与语义标签 ——
+ * `message` / `code` / `logid` 三件事的读法与渲染逐字相同（同一个服务端信封），
+ * 故复用同一个格式化函数并传入不同的回退文案，而不是复制一份。
+ */
+function formatClaimUnavailableLine(result) {
+  return formatClaimFailureLine(result, CLAIM_UNAVAILABLE_FALLBACK);
+}
+
+/**
  * 把一次失败的领取结果格式化成一行「账号：原因（code N）」，
  * 有 logid 时在末尾追加「· logid …」。
  *
@@ -234,18 +257,22 @@ const CLAIM_FAILURE_FALLBACK = '领取失败';
  * 服务端原文（`message`，如「当前参与用户太多，请稍后再试」）是用户判断
  * 「是风控限流、凭据失效还是活动结束」的**唯一依据** —— 只报一个「1 个失败」
  * 等于让用户去翻日志。`code` 一并带上（如 `code 9074`）便于对着服务端文档
- * 或插件日志核对；Trae CN 的 `9074` 就在 `src/trae-cn-errors.ts` 的软限流码表里。
+ * 或插件日志核对；Trae CN 的 `9074` 就在 `src/trae-cn-errors.ts` 的退避码表里。
  *
  * **logid** 只有 Trae CN 会填（响应头 `x-tt-logid`），它是向服务端追查这一次
  * 请求的唯一线索 —— 用户报障时给出这一串，服务端才查得到当时发生了什么。
  * 其余协议没有这个字段，渲染逐字不变；为空串或缺失时**不追加**，避免行尾挂
  * 一个空的「logid 」。
+ *
+ * @param fallback - `message` 缺失或为空白时的回退文案。默认
+ *        {@link CLAIM_FAILURE_FALLBACK}；`unavailable` 行传入它自己的文案
+ *        （那一档不是失败，回退成「领取失败」会误导）。
  */
-function formatClaimFailureLine(result) {
+function formatClaimFailureLine(result, fallback = CLAIM_FAILURE_FALLBACK) {
   const outcome = result?.outcome ?? {};
   const label = result?.nickname || result?.accountId || '未知账号';
   const raw = typeof outcome.message === 'string' ? outcome.message.trim() : '';
-  const message = raw !== '' ? raw : CLAIM_FAILURE_FALLBACK;
+  const message = raw !== '' ? raw : fallback;
   const code = typeof outcome.code === 'number' && Number.isFinite(outcome.code)
     ? String(outcome.code)
     : '未知';
@@ -266,7 +293,25 @@ function claimFailureLines(res) {
   if (!Array.isArray(results)) return [];
   return results
     .filter((item) => item?.outcome?.kind === 'failed')
-    .map(formatClaimFailureLine);
+    // ⚠️ 必须写成箭头函数而不是 `.map(formatClaimFailureLine)`：`Array.map` 会把
+    // **下标**作为第二个实参传进去，而本函数的第二个形参是回退文案 —— 直接传
+    // 函数引用会让第一行的回退文案变成 `0`（「acc-9：0（code -1）」）。
+    .map((item) => formatClaimFailureLine(item));
+}
+
+/**
+ * 从响应里取出 `unavailable` 账号的原因行（「服务端此刻暂不可签」）。
+ *
+ * 与 {@link claimFailureLines} 分开收集、分开渲染：这一档**不是失败**，
+ * 混进失败列表会让用户以为需要排查（凭据/设备），而正确动作是「等自动重试」。
+ * 目前唯一的生产者是 Trae CN 的 `9074`（名额/风控类拒绝，2026-09-23 定案）。
+ */
+function claimUnavailableLines(res) {
+  const results = res?.results;
+  if (!Array.isArray(results)) return [];
+  return results
+    .filter((item) => item?.outcome?.kind === 'unavailable')
+    .map(formatClaimUnavailableLine);
 }
 
 /**
@@ -275,6 +320,10 @@ function claimFailureLines(res) {
  * 摘要行只讲各档计数（「3 个账号领取成功（+300 积分），1 个失败」），
  * 失败账号的**服务端原文**另走 `details` —— 计数回答「有几个」，原文才回答
  * 「为什么」，而后者决定用户下一步做什么（等一会儿重试 / 重新登录 / 明天再来）。
+ *
+ * **`unavailable` 单独成行**（`unavailableDetails`，2026-09-23）：它不是失败，
+ * 用户的正确动作是「什么都不做，稍后自动重试」，故既不并进失败计数、也不并进
+ * 失败明细列表 —— 它的文案里已经写清了「稍后自动重试」。
  *
  * 纯函数、不依赖 hooks，故可在单测里直接喂响应做整树深比较。
  * `res.summary` 刻意不做兜底：宿主必然返回它，真缺了就让异常走 `claimCredits`
@@ -286,12 +335,17 @@ function buildClaimNotice(res) {
   if (summary.claimed > 0) parts.push(`${summary.claimed} 个账号领取成功（+${summary.totalCredit} 积分）`);
   if (summary.alreadyClaimed > 0) parts.push(`${summary.alreadyClaimed} 个今日已领取`);
   if (summary.inactive > 0) parts.push(`${summary.inactive} 个活动未开启`);
+  // `?? 0`：旧宿主（不返回该字段）的响应不该让摘要行变成「NaN 个暂不可签」。
+  const unavailableCount = summary.unavailable ?? 0;
+  if (unavailableCount > 0) parts.push(`${unavailableCount} 个暂不可签`);
   if (summary.failed > 0) parts.push(`${summary.failed} 个失败`);
   return {
     tone: summary.failed > 0 ? 'warn' : 'ok',
     text: parts.length > 0 ? parts.join('，') : '没有可领取的账号',
     // 成功 / 已领 / 活动未开启都不产生明细行，故那些路径的渲染逐元素不变。
     details: claimFailureLines(res),
+    // 暂不可签同样**不并入** details：它不是失败，混进去会让用户去排查。
+    unavailableDetails: claimUnavailableLines(res),
   };
 }
 
@@ -307,7 +361,7 @@ function buildClaimNotice(res) {
  * 的说明）；抽出来才能对这棵树做**整树深比较**，把「成功路径一个字符都不变」
  * 变成可执行的断言，而不是靠肉眼看源码。
  */
-function ClaimNotice({ tone, text, details }) {
+function ClaimNotice({ tone, text, details, unavailableDetails }) {
   return React.createElement('div', {
     className: 'dim-ah-probeNotice',
     'data-tone': tone,
@@ -319,6 +373,15 @@ function ClaimNotice({ tone, text, details }) {
   (details?.length ?? 0) > 0
     ? React.createElement('ul', { className: 'dim-ah-probeDetails' },
         details.map((line, i) => React.createElement('li', { key: i }, line)))
+    : null,
+  // 「暂不可签」单独一段，**不复用**失败明细那个列表：它与失败是两种东西，
+  // 混在一个 <ul> 里用户会一并当成待处理的问题。
+  (unavailableDetails?.length ?? 0) > 0
+    ? React.createElement('ul', {
+        className: 'dim-ah-probeDetails',
+        'data-kind': 'unavailable',
+      },
+      unavailableDetails.map((line, i) => React.createElement('li', { key: i }, line)))
     : null);
 }
 
@@ -375,14 +438,19 @@ function CreditBalanceRow({ balance, error, loading }) {
       : null));
 }
 
-function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, credits, creditsLoading, showCredits, showCheckin, checkedIn, checkingThisAccount, onCheckin }) {
+/**
+ * 账号卡片。
+ *
+ * ⚠️ 卡片上**只有**签到 / 启用停用 / 删除三类按钮：单账号的「重测」「重置」
+ * 已按用户要求移除，限流标记的清理入口只保留面板标题栏的供应商级那两个。
+ * 宿主侧的 `account.retest` / `account.reset` 两个 RPC **一行未动**（它们是
+ * 库层能力，服务 headless / 测试等其它调用方），删的只是 UI 入口。
+ */
+function AccountCard({ account, onToggle, onDelete, busy, credits, creditsLoading, showCredits, showCheckin, checkedIn, checkingThisAccount, onCheckin }) {
   const rateLimits = account.modelRateLimits
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
   const expired = typeof account.expiresAt === 'number' && account.expiresAt > 0 && account.expiresAt <= Date.now();
-  // 只要存在**任何**标记（即使已过期）就允许重测/重置——过期记录正是
-  // 用户最想清理的对象，而 UI 的 rateLimits 只显示未到期的。
-  const hasAnyLimit = Boolean(account.modelRateLimits && Object.keys(account.modelRateLimits).length > 0);
 
   return React.createElement('div', {
     className: 'dim-ah-accountCard',
@@ -437,22 +505,16 @@ function AccountCard({ account, onToggle, onDelete, onRetest, onReset, busy, cre
             className: 'dim-ah-btn',
             'data-kind': 'success',
             title: checkedIn ? '今日已签到' : `为 ${account.nickname || account.id} 执行每日签到`,
+            // `busy` 是面板级忙碌 —— 由调用方传入，`ProviderPanel` 已把它算成
+            // `probeBusy || claiming`（重测/清除限额 **或** 签到进行中）。
+            // ⚠️ 此前它**不含**签到本身：一键签到或自动补签在跑时，单片按钮看起来
+            // 可点、点下去却被 `claimingRef` 静默挡掉 —— 「点了没反应」的缺陷形态。
+            // `checkingThisAccount` 是本账号自己的签到中态（本卡片局部），
+            // 与面板级 `claiming` 是两个维度，两个都要判。
             disabled: busy || checkedIn || checkingThisAccount,
             onClick: () => onCheckin(account.id),
           }, checkedIn ? '已签' : checkingThisAccount ? '签到中…' : '签到')
         : null,
-      React.createElement('button', {
-        className: 'dim-ah-btn',
-        title: RETEST_HELP,
-        disabled: busy || !hasAnyLimit,
-        onClick: () => onRetest(account.id),
-      }, '重测'),
-      React.createElement('button', {
-        className: 'dim-ah-btn',
-        title: RESET_HELP,
-        disabled: busy || !hasAnyLimit,
-        onClick: () => onReset(account.id),
-      }, '重置'),
       React.createElement('button', {
         className: 'dim-ah-btn',
         onClick: () => onToggle(account.id, !account.enabled),
@@ -637,7 +699,7 @@ function ModelToggle({ model, busy, onToggle, tierBusy, onSelectTier }) {
 }
 
 /**
- * 模型列表弹窗：点击「显示列表」后以 modal 形式浮出。
+ * 模型列表弹窗：点击「模型列表」后以 modal 形式浮出。
  *
  * 数据全部来自 `model.list` RPC —— 也就是适配器 `listModels()` 播报的同一份
  * 目录（对话框模型选择器读的正是它）。因此这里列出的模型与可选模型一一对应，
@@ -848,9 +910,10 @@ function ProviderPanel({ provider, rpcCall }) {
   const [phase, setPhase] = React.useState('loading');
   const [error, setError] = React.useState(null);
   const [creating, setCreating] = React.useState(false);
-  // 正在进行的限流操作：null | 'one' | 'all'。用于禁用按钮并显示进度。
-  const [probeBusy, setProbeBusy] = React.useState(null);
-  // 上一次重测/重置的结果文案（成功或失败）。
+  // 正在进行的限流操作。账号卡片上的单账号「重测 / 重置」已移除，故只剩
+  // 「有一个供应商级操作在跑」这一个布尔维度（原先还要区分 one / all）。
+  const [probeBusy, setProbeBusy] = React.useState(false);
+  // 上一次重测/清除限额的结果文案（成功或失败）。
   const [probeNotice, setProbeNotice] = React.useState(null);
   // 积分余额：accountId → { balance, error }。与账号列表分开加载——余额要逐
   // 账号发网络请求，不能拖慢账号列表本身的渲染。
@@ -937,7 +1000,7 @@ function ProviderPanel({ provider, rpcCall }) {
    * react 不在依赖里，既有单测只能做源码切片与正则断言（从不真的渲染它）；
    * 而 `build:client` 的冒烟只求值 bundle **顶层**，函数体从未被调用。
    * 于是它一路活到真机：那个对象字面量在条件为假时不求值 ⇒ 页面正常；
-   * 用户点「+ 新建账号」⇒ 重渲染时求值 ⇒ `ReferenceError` 从 render 抛出 ⇒
+   * 用户点「登录账号」（旧文案「+ 新建账号」）⇒ 重渲染时求值 ⇒ `ReferenceError` 从 render 抛出 ⇒
    * 整棵 React 树（无错误边界）卸载 ⇒ **Hub 整页空白**。
    *
    * 故这里统一用 `providerLabel` 这一个绑定（与 `ModelListPanel` 的写法一致），
@@ -1060,7 +1123,7 @@ function ProviderPanel({ provider, rpcCall }) {
   // 积分领取状态：claiming 用于禁用按钮，claimNotice 展示上一次领取的结果摘要。
   const [claiming, setClaiming] = React.useState(false);
   const [claimNotice, setClaimNotice] = React.useState(null);
-  // 「显示列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
+  // 「模型列表」：控制模型列表面板的展开状态。关闭时不挂载面板，避免
   // 每次进入面板都白白发一次 model.list 请求。
   const [showModels, setShowModels] = React.useState(false);
 
@@ -1170,16 +1233,41 @@ function ProviderPanel({ provider, rpcCall }) {
    *
    * 调 `checkin.perform` 携带 accountId；响应里的 `checkedInToday` 仅作参考，
    * 关键是用 `results[].outcome` 判定后续状态。**已签或签到成功都算成功**（宿主
-   * 对服务端 already-claimed 也已写今日），失败/未开启不回写为「已签」，下次
-   * 进入/触发重试。成功后局部更新该账号状态，并联动头部按钮（若全签则变「全部
-   * 已签」禁用）。
+   * 对服务端 already-claimed 也已写今日），失败/未开启/暂不可签都不回写为「已签」，
+   * 下次进入/触发重试。成功后局部更新该账号状态，并联动头部按钮（若全签则变
+   * 「全部已签」禁用）。
+   *
+   * ## 四种 outcome 都要有反馈（2026-09-23 修复）
+   *
+   * `checkin.perform` 的响应与 `credits.claimAll` **同构**（`results[]` +
+   * `summary`），故 {@link buildClaimNotice} 可以直接吃它 —— 本次改动的核心就是
+   * **把 outcome 交给那个既有的通知构造器**。此前这里只用了 `outcome.kind`
+   * 更新状态，一个字符都不弹给用户：单账号签约**成败全无声**，点了按钮像没反应。
+   *
+   * 反馈分档（与 {@link buildClaimNotice} 一致，本函数不另造一套文案）：
+   * - `claimed` → 「1 个账号领取成功（+N 积分）」；
+   * - `already-claimed` → 「1 个今日已领取」；
+   * - `unavailable` → 「1 个暂不可签」+ 明细行「…（服务端此刻暂不可签，稍后自动
+   *   重试）（code 9074）」——**不**报成失败（那会让用户去排查凭据/设备，
+   *   而正确动作是等宿主 4h sweep 自动重试）；
+   * - `failed` → warn 色调 + 明细行（服务端原文 + code + logid）。
+   *
+   * ⚠️ 与自动补签（{@link autoCheckinOnEntry}）**刻意不同**：那是用户进页面时
+   * 被动触发的，失败必须静默；这里是用户**主动点的按钮**，无声才是缺陷。
    *
    * 注意：单片签到也会把 `claimingRef` 置真（用于与自动补签互斥），但只禁用它
-   * 自己的按钮、不置面板级 `claiming`（那只归头部「一键签到」与自动补签共用）。
+   * 自己的按钮（`checkingThisAccount`）、不置面板级 `claiming`（那只归头部
+   * 「一键签到」与自动补签共用）。
    */
   const checkinAccount = async (accountId) => {
     if (!supportsCredits) return;
-    if (claimingRef.current) return;
+    // 互斥时**不再静默 return**：那种「点了没反应」正是本次要修的缺陷之一。
+    // 正常路径下按钮此时已被 disabled（`claiming` 进了 disabled 条件），
+    // 故这里只是键盘/程序化调用等旁路的兜底 —— 给一句话，而不是装作没发生。
+    if (claimingRef.current) {
+      setClaimNotice({ tone: 'warn', text: '已有签到正在进行，请稍候', details: [] });
+      return;
+    }
     claimingRef.current = true;
     setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: false, checking: true } }));
     try {
@@ -1188,11 +1276,19 @@ function ProviderPanel({ provider, rpcCall }) {
       const outcome = res?.results?.[0]?.outcome;
       const done = outcome?.kind === 'claimed' || outcome?.kind === 'already-claimed';
       setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: done, checking: false } }));
+      // 四种 outcome 的反馈统一走既有构造器（响应同构，直接喂）。
+      // `unavailable` 在这里 `done` 为 false ⇒ 状态不写、按钮回到「签到」，
+      // 用户可再手试，后台 4h sweep 也会自动重试（不新造三态状态机）。
+      // `res.summary` 是 buildClaimNotice 的必需输入（它刻意不做兜底）：响应当前
+      // 必然带它，真缺了就跳过通知而不是让异常冒到下面那个 catch 里去 ——
+      // 那会把一次**成功**的签到报成「签到失败」。
+      if (outcome !== undefined && res?.summary !== undefined) setClaimNotice(buildClaimNotice(res));
       if (canLoadCredits) void loadCredits();
     } catch (caught) {
       console.error('[account-hub] checkin failed:', caught);
       if (!mounted.current) return;
       setCheckinsByAccount(prev => ({ ...prev, [accountId]: { checkedInToday: false, checking: false } }));
+      setClaimNotice({ tone: 'error', text: caught?.message || '签到失败', details: [] });
     } finally {
       claimingRef.current = false;
     }
@@ -1301,10 +1397,10 @@ function ProviderPanel({ provider, rpcCall }) {
       if (caught?.code === 'login-in-progress') {
         // 宿主侧的 provider 级互斥（lobsterai / codearts）：已有未结算的登录会话。
         // 这不是「失败」，而是一句给用户的状态说明，故直接展示后端 message
-        // （它已是可直接展示的中文文案），不加「新建账号失败：」前缀，也不再开窗。
+        // （它已是可直接展示的中文文案），不加「登录失败：」前缀，也不再开窗。
         setError(caught.message || '已有登录进行中');
       } else {
-        setError('新建账号失败：' + (caught?.message || '未知错误'));
+        setError('登录失败：' + (caught?.message || '未知错误'));
       }
       setPhase('error');
     } finally {
@@ -1332,28 +1428,25 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   /**
-   * 重测 / 重置的统一入口。
+   * 重测 / 清除限额的统一入口（**只剩供应商级两条**）。
    *
    * kind 决定调用哪个 RPC：
-   * - 'retest'    account.retest    对单个账号发真实请求
    * - 'retestAll' account.retestAll 对本页全部账号（含停用）发真实请求
-   * - 'reset'     account.reset     单账号直接清除标记
    * - 'resetAll'  account.resetAll  本页全部账号（含停用）直接清除标记
    *
+   * 单账号的 'retest' / 'reset' 两条分支已随账号卡片上的按钮一并移除。
    * 重测会真实消耗模型额度，因此「重测所有」在执行前要求确认。
    */
-  const runLimitAction = async (kind, accountId) => {
+  const runLimitAction = async (kind) => {
     if (kind === 'retestAll' && !confirm('将对本页全部账号（含已停用）各发送一条真实消息来验证限流状态，会消耗模型额度。继续？')) {
       return;
     }
-    setProbeBusy(kind === 'retestAll' || kind === 'resetAll' ? 'all' : 'one');
+    setProbeBusy(true);
     setProbeNotice(null);
     try {
-      let res;
-      if (kind === 'retest') res = await rpcCall('account.retest', { accountId });
-      else if (kind === 'retestAll') res = await rpcCall('account.retestAll', { provider });
-      else if (kind === 'reset') res = await rpcCall('account.reset', { accountId });
-      else res = await rpcCall('account.resetAll', { provider });
+      const res = kind === 'retestAll'
+        ? await rpcCall('account.retestAll', { provider })
+        : await rpcCall('account.resetAll', { provider });
 
       if (!mounted.current) return;
       // 仍受限的模型要如实列出原因，否则用户只看到"没清除"会以为按钮失灵。
@@ -1367,7 +1460,7 @@ function ProviderPanel({ provider, rpcCall }) {
       if (!mounted.current) return;
       setProbeNotice({ tone: 'error', text: `操作失败：${caught?.message || '未知错误'}`, details: [] });
     } finally {
-      if (mounted.current) setProbeBusy(null);
+      if (mounted.current) setProbeBusy(false);
     }
   };
 
@@ -1383,7 +1476,7 @@ function ProviderPanel({ provider, rpcCall }) {
           className: 'dim-ah-btn',
           title: MODEL_LIST_HELP,
           onClick: () => setShowModels(true),
-        }, '显示列表'),
+        }, '模型列表'),
         canLoadCredits
           ? React.createElement('button', {
               className: 'dim-ah-btn',
@@ -1404,16 +1497,16 @@ function ProviderPanel({ provider, rpcCall }) {
         React.createElement('button', {
           className: 'dim-ah-btn',
           title: RETEST_ALL_HELP,
-          disabled: probeBusy !== null || accounts.length === 0,
+          disabled: probeBusy || accounts.length === 0,
           onClick: () => void runLimitAction('retestAll'),
-        }, probeBusy === 'all' ? '重测中…' : '重测所有'),
+        }, probeBusy ? '重测中…' : '重测所有'),
         React.createElement('button', {
           className: 'dim-ah-btn',
           title: RESET_ALL_HELP,
-          disabled: probeBusy !== null || accounts.length === 0,
+          disabled: probeBusy || accounts.length === 0,
           onClick: () => void runLimitAction('resetAll'),
-        }, '重置所有'),
-        // 「+ 新建账号」：登录形态**只剩浏览器设备流一种**（PAT 粘贴已于
+        }, '清除限额'),
+        // 「登录账号」：登录形态**只剩浏览器设备流一种**（PAT 粘贴已于
         // 2026-09-21 按用户要求移除），故这里直接接 `createAccount()`，
         // 不再有选择器、也没有「点了做什么」的分支。
         React.createElement('button', {
@@ -1422,7 +1515,7 @@ function ProviderPanel({ provider, rpcCall }) {
           title: '通过浏览器登录一个新的账号并加入账号池。',
           onClick: () => void createAccount(),
           disabled: creating,
-        }, creating ? '正在登录…' : '+ 新建账号'))),
+        }, creating ? '正在登录…' : '登录账号'))),
     probeNotice
       ? React.createElement('div', {
           className: 'dim-ah-probeNotice',
@@ -1440,6 +1533,9 @@ function ProviderPanel({ provider, rpcCall }) {
           tone: claimNotice.tone,
           text: claimNotice.text,
           details: claimNotice.details,
+          // 暂不可签明细（`unavailable`）：旧通知对象没有该字段时为 undefined，
+          // ClaimNotice 按「无」渲染 —— 既有路径的树逐元素不变。
+          unavailableDetails: claimNotice.unavailableDetails,
         })
       : null,
     // 弹窗被拦截时的兜底入口。刻意**不做成按钮 + window.open(url)**：
@@ -1466,12 +1562,16 @@ function ProviderPanel({ provider, rpcCall }) {
               React.createElement('p', null, '尚未配置账号'),
               // 每个 provider（含 Qoder 两区）都是**在本面板浏览器登录**：
               // PAT 形态移除后文案只剩这一种，不再按登录形态分支。
-              React.createElement('p', null, '点击"+ 新建账号"进行浏览器登录。'))
+              React.createElement('p', null, '点击"登录账号"进行浏览器登录。'))
           : React.createElement('div', null,
               accounts.map(account => React.createElement(AccountCard, {
                 key: account.id,
                 account,
-                busy: probeBusy !== null,
+                // 面板级忙碌**含签到本身**（`claiming`）：一键签到或自动补签在跑时
+                // 单片按钮必须 disabled，否则用户点下去只会被 `claimingRef` 挡掉
+                // —— 那正是「点了没反应」的缺陷形态。`claiming` 是 state（可渲染），
+                // `claimingRef` 是它的实时镜像（给闭包里的自动补签读）。
+                busy: probeBusy || claiming,
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
@@ -1481,8 +1581,6 @@ function ProviderPanel({ provider, rpcCall }) {
                 onCheckin: (id) => void checkinAccount(id),
                 onToggle: toggleAccount,
                 onDelete: deleteAccount,
-                onRetest: (id) => void runLimitAction('retest', id),
-                onReset: (id) => void runLimitAction('reset', id),
               }))),
     // 模型列表以 modal 渲染：它是覆盖层，放在账号区之后只是组件树的书写顺序，
     // 实际靠 fixed 定位浮在整个面板之上，不再挤占账号池的版面。
@@ -1505,10 +1603,10 @@ export function AccountHubPage({ close, rpcCall }) {
     setVersion(v => v + 1);
   };
 
-  return React.createElement('section', { className: 'dim-ah-page', 'aria-label': 'Account Hub 账号管理' },
+  return React.createElement('section', { className: 'dim-ah-page', 'aria-label': '账号中心' },
     React.createElement('header', { className: 'dim-ah-header' },
       React.createElement('div', { className: 'dim-ah-brand' },
-        React.createElement('strong', { className: 'dim-ah-brandName' }, 'Account Hub'),
+        React.createElement('strong', { className: 'dim-ah-brandName' }, '账号中心'),
         React.createElement('p', { className: 'dim-ah-brandDesc' }, 'Provider 凭据管理与多账号支持')),
       close ? React.createElement('button', {
         className: 'dim-ah-btn',

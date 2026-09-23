@@ -43,23 +43,30 @@ import {
   QODER_JOB_TOKEN_REFRESH_LEAD_MS,
   QODER_REQUEST_TIMEOUT_MS,
   applyQoderDeviceRefresh,
+  applyQoderProfile,
   applyQoderRefresh,
   buildQoderCredential,
   buildQoderDeviceCredential,
   isQoderDeviceToken,
+  isQoderNicknamePlaceholder,
   isQoderPersonalToken,
   isQoderRefreshable,
+  needsQoderAccountProfileBackfill,
   parseQoderCredential,
   parseQoderDeviceTokenPayload,
   parseQoderJobTokenPayload,
   qoderAnonymousHeaders,
+  qoderAccountExpiresAtMs,
   qoderCredentialExpiresAtMs,
+  resolveQoderAccountNickname,
   serializeQoderCredential,
   type QoderCredential,
   type QoderDeviceTokenPayload,
   type QoderJobTokenPayload,
+  type QoderNicknameSource,
   type QoderProduct,
 } from './qoder-product.js'
+import { fetchQoderUserIdentity, type QoderUserIdentity } from './qoder-signing.js'
 
 /**
  * 凭据已失效（需重新粘贴 PAT）时抛出的错误。
@@ -400,6 +407,87 @@ export class QoderAuth extends Service {
   }
 
   /**
+   * 取账号的**可展示资料**（昵称 / 邮箱）；失败一律返回 `undefined`。
+   *
+   * ## 为什么它绝不抛错（与签名链的同名调用恰好相反）
+   *
+   * 签名链取 userinfo 是为了 `uid`：**取不到就不许签**（空 uid 必回
+   * `101 Signature invalid`），故那里抛错是硬约束。而这里的用途是
+   * **账号卡片上的一个名字** —— 把一次 userinfo 抖动升级成「登录失败」，
+   * 会让用户白白重走一遍浏览器授权页，只为拿一个显示用的字符串。
+   *
+   * 故三层失败全部吞掉、只是不返回资料：
+   * 1. **取令牌失败**（PAT 的 exchange 401/断网）—— 不改变登录结果，
+   *    登录链自己会再打一次 exchange 并把真正的失败如实抛出；
+   * 2. **userinfo 非 200 / 非 JSON / 缺 uid**（`fetchQoderUserIdentity` 抛）；
+   * 3. 任何其它意外。
+   *
+   * ## 令牌族由 `getJobToken` 分派（本方法不重复实现）
+   *
+   * `dt-` 恒等返回（零网络）、`pt-` 换 `jt-`，两条路的出口是同一个
+   * `jobToken` 变量 —— 这正是「两令牌族同一套代码」的落点。
+   */
+  private async fetchProfile(credential: QoderCredential): Promise<QoderUserIdentity | undefined> {
+    try {
+      const jobToken = await this.getJobToken(credential.access_token)
+      return await fetchQoderUserIdentity(jobToken, this.product, this.fetchImpl)
+    } catch (error) {
+      // 资料是**增强信息**：拿不到就回落到 user_id / 账号 id（与改动前一致），
+      // 绝不因此让一次成功的登录变成失败。
+      this.ctx.logger?.debug?.(
+        `[${this.product.id}] 取账号资料失败（不影响登录/续期，昵称回落到后备值）: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+      return undefined
+    }
+  }
+
+  /**
+   * 组装昵称取值来源（userinfo 现场值优先，其次凭据里已存的那份）。
+   *
+   * 抽出来是让**登录链与回填链共用同一份口径** —— 两处各写一份必然分叉，
+   * 而分叉的表现是「新登录的账号有真名、回填过的账号没有」这种只在特定路径
+   * 出现的不一致，且**不报任何错**。
+   *
+   * ⚠️ **优先取凭据里已存的** `user_name` / `email`：回填过的账号第二轮就不必
+   * 再拉一次 userinfo（这正是幂等的实现方式），而现场值缺失时也不会把已经
+   * 拿到过的好名字冲掉。
+   */
+  private nicknameSource(
+    credential: QoderCredential,
+    profile: QoderUserIdentity | undefined,
+  ): QoderNicknameSource {
+    return {
+      displayName: profile?.displayName ?? credential.user_name,
+      email: profile?.email ?? credential.email,
+      mobile: profile?.mobile,
+      userId: credential.user_id,
+    }
+  }
+
+  /**
+   * 由凭据 + 资料算出账号池条目的**资料字段**（昵称 + 有效期）。
+   *
+   * 登录链的两个落点（`persistDeviceToken` / `loginWithPat`）共用它，
+   * 与回填链的昵称解析走同一个 {@link nicknameSource}。
+   *
+   * ⚠️ **`expiresAt` 只对设备令牌族有值**（见 `qoderAccountExpiresAtMs`）：
+   * PAT 的那个字段是 jt 的 24h，写进去会让卡片在闲置一天后显示「已过期」。
+   */
+  private profilePatch(
+    credential: QoderCredential,
+    profile: QoderUserIdentity | undefined,
+    accountId: string,
+  ): { nickname: string; expiresAt?: number } {
+    const expiresAt = qoderAccountExpiresAtMs(credential)
+    return {
+      // 昵称四档回退：userinfo 真名 → 邮箱 → 脱敏手机 → user_id → accountId。
+      nickname: resolveQoderAccountNickname(this.nicknameSource(credential, profile), accountId),
+      ...expiresAt === undefined ? {} : { expiresAt },
+    }
+  }
+
+  /**
    * PAT 签发页 URL（供 Account Hub 的 Qoder 面板展示）。
    *
    * 本 provider 没有浏览器登录流程，用户必须先去这个页面拿到 PAT ——
@@ -571,7 +659,20 @@ export class QoderAuth extends Service {
     // 表现为「浏览器授权成功、却卡在换令牌」。
     //
     // 旧实现在这里调了一次 `this.exchange(payload.token)`，正是那个 400 的来源。
-    const credential = buildQoderDeviceCredential(payload.token, payload)
+    // ⚠️ **`getJobToken('dt-…')` 是恒等返回（零网络）**，故下面那次 userinfo
+    // 不会引入任何额外的 exchange —— 它不是旧的 exchange 调用换了个马甲。
+    let credential = buildQoderDeviceCredential(payload.token, payload)
+    // 取可展示资料（昵称 / 邮箱）。**失败不抛**：拿不到就沿用 user_id，
+    // 与改动前的行为逐字一致（详见 `fetchProfile`）。
+    //
+    // ⚠️ **这次 userinfo 排在凭据落盘之前**，即把它算进了「登录完成」的耗时：
+    // `login.poll` 以「该 ref 能否解析到凭据」为完成判据，故最坏情况下用户会
+    // 多等一个 `QODER_USERINFO_TIMEOUT_MS`（20s，有超时上限，且客户端窗口是
+    // 5 分钟）。这是**刻意的取舍**：换取「凭据一旦落盘就带着真名」——
+    // 反过来先落凭据再补名字，会在两次写之间留下「凭据没有名字、账号却有」
+    // 的中间态，而那个中间态正是回填链要处理的形态（多一类不确定状态）。
+    const profile = await this.fetchProfile(credential)
+    if (profile !== undefined) credential = applyQoderProfile(credential, profile)
     await this.ctx.credentials.set(ref, serializeQoderCredential(credential))
     this.credentialInvalid = false
     this.lastRefreshError = undefined
@@ -579,18 +680,21 @@ export class QoderAuth extends Service {
 
     if (options.accountId !== undefined && options.pool !== undefined) {
       const existing = (await options.pool.listAllAccounts()).find((a) => a.id === options.accountId)
+      // 昵称取真实账号名（userinfo 的 `name`），有效期取设备令牌的到期时刻 ——
+      // 两者都靠 `profilePatch` 单一来源，与回填链同口径。
+      const patch = this.profilePatch(credential, profile, options.accountId)
       // 两段式：占位条目已存在则**补全**，否则新建（`AccountPool.addAccount`
       // 不按 id 去重，重复 add 会让池里出现同 id 的两条记录）。
       if (existing) {
         await options.pool.updateAccount(options.accountId, {
-          nickname: credential.user_id ?? options.accountId,
+          ...patch,
           refreshable: isQoderRefreshable(credential),
         })
       } else {
         await options.pool.addAccount({
           id: options.accountId,
           provider: this.product.id,
-          nickname: credential.user_id ?? options.accountId,
+          ...patch,
           enabled: true,
           credentialRef: options.refName ?? this.credentialRefName,
           createdAt: Date.now(),
@@ -642,7 +746,11 @@ export class QoderAuth extends Service {
 
     const ref = options.refName ? credentialRef(options.refName) : credentialRef(this.credentialRefName)
     const payload = await this.exchange(token)
-    const credential = buildQoderCredential(token, payload)
+    let credential = buildQoderCredential(token, payload)
+    // 取可展示资料（昵称 / 邮箱）。此时 jt 已在 `exchange` 里缓存好，
+    // 故这次 userinfo **不会再打一次 exchange**。失败不抛（见 `fetchProfile`）。
+    const profile = await this.fetchProfile(credential)
+    if (profile !== undefined) credential = applyQoderProfile(credential, profile)
     await this.ctx.credentials.set(ref, serializeQoderCredential(credential))
     // 缓存刚换到的 jt：登录本身已经付过一次 exchange 的钱，
     // 立刻丢掉会让登录后的第一个请求再换一次。
@@ -655,13 +763,15 @@ export class QoderAuth extends Service {
       await options.pool.addAccount({
         id: options.accountId,
         provider: this.product.id,
-        nickname: credential.user_id ?? options.accountId,
+        // 昵称取真实账号名（userinfo 的 `name` → 邮箱 → 脱敏手机 → user_id）。
+        ...this.profilePatch(credential, profile, options.accountId),
         enabled: true,
         credentialRef: options.refName ?? this.credentialRefName,
         createdAt: Date.now(),
         // **不写 expiresAt**：PAT 的过期时间本地无从得知，而 jt 的 24h 是
         // 运行时缓存的有效期。把后者写进账号卡片会让它在闲置 24h 后显示
         // 「已过期」，而实际上 getJobToken() 会按需重换、一切正常。
+        // `profilePatch` 已保证 PAT 族不带该字段（见 `qoderAccountExpiresAtMs`）。
         refreshable: isQoderRefreshable(credential),
       })
     }
@@ -984,6 +1094,30 @@ export class QoderAuth extends Service {
           if (lead > QODER_DEVICE_TOKEN_REFRESH_LEAD_MS) continue
           const refreshed = await this.refreshCredential(credential)
           await this.ctx.credentials.set(credentialRef(entry.credentialRef), serializeQoderCredential(refreshed))
+          // ⚠️ **账号卡片的有效期必须跟着新凭据走**：续期把到期日往后推了 30 天，
+          // 而 `expiresAt` 是账号条目的独立字段（不随凭据自动同步）。不回写的话
+          // 卡片会一直显示**旧的**到期日，并在越过它之后显示「已过期」——
+          // 而那次请求其实完全正常。这是「续期成功但 UI 说已过期」的来路。
+          //
+          // ⚠️ **只写 expiresAt，绝不碰 nickname**：用户可以在设置页手动改名，
+          // 而续期链每 30 分钟跑一趟 —— 顺手回写昵称会把用户起的名字按
+          // 「凭据里有什么」冲掉（凭据没存 user_name 时就是那个 UUID）。
+          // 昵称的修复是**回填链**的职责，它的触发判据（占位形）天然不会
+          // 碰到用户改过的名字。
+          //
+          // 单独 try：写账号失败不该被下面那个 catch 报成「续期失败」（凭据
+          // 其实已经续期成功了，报文与事实不符会带偏排查方向）。
+          const nextExpiresAt = qoderAccountExpiresAtMs(refreshed)
+          if (nextExpiresAt !== undefined) {
+            try {
+              await pool.updateAccount(entry.id, { expiresAt: nextExpiresAt })
+            } catch (error) {
+              this.ctx.logger?.warn?.(
+                `[${this.product.id}] 账号 ${entry.id} 续期成功但有效期回写失败：`
+                + `${error instanceof Error ? error.message : String(error)}`,
+              )
+            }
+          }
           continue
         }
         await this.getJobToken(credential.access_token)
@@ -1006,6 +1140,84 @@ export class QoderAuth extends Service {
           )
         }
         // 单账号失败不中断循环
+      }
+    }
+  }
+
+  /**
+   * **存量账号的资料回填**（惰性、幂等、零出网即完成）。
+   *
+   * ## 为什么需要它
+   *
+   * 只修登录链是不够的：盘上已有的账号条目**昵称已经是 UUID 了**
+   * （改动前的 `persistDeviceToken` 写的就是 `credential.user_id`），而
+   * `expiresAt` 压根没写过。这两项都不会因为「以后新登录的账号是对的」而自愈
+   * —— 用户必须重新登录一遍才能看到真名。回填链让它们在一轮之内自动修好。
+   *
+   * ## 为什么挂在「批量续期」上而不是自造定时器
+   *
+   * `src/index.ts` 已经有一个每 30 分钟的 `refreshAllCredentials()`，且它已经
+   * 按 provider 调了 {@link refreshAll}。挂在那里意味着：
+   * - **不新增定时器**（插件的定时器数量与 dispose 清理点都是既有事实）；
+   * - 触发时机与用户预期一致（打开设置页时账号列表已经跑过至少一轮）。
+   *
+   * ## 幂等（这是唯一必须守住的性质）
+   *
+   * 判据全部收敛在 {@link needsQoderAccountProfileBackfill}：昵称不是占位形、
+   * 且（该凭据本来有可报告有效期时）有效期已记 ⇒ **跳过，一次网都不出**。
+   * 故稳态下本方法是个纯粹的遍历，代价是 N 次内存比较。
+   *
+   * ⚠️ **PAT 账号天然稳态**：`qoderAccountExpiresAtMs` 对 PAT 恒 `undefined`，
+   * 所以「缺 expiresAt」对它们**不构成**待回填条件 —— 否则每 30 分钟都会为
+   * 每个 PAT 账号白打一次 exchange + userinfo，永不停止。
+   *
+   * ## 失败一律静默
+   *
+   * 单账号失败只记日志、继续下一个（与 {@link refreshAll} 同语义）。
+   * 这里**不能抛**：它是挂在批量链上的增强步骤，让一次 userinfo 抖动把
+   * 整轮续期变成未捕获拒绝，会让其它账号的续期也被跳过。
+   */
+  async backfillAccountProfiles(pool: AccountPool): Promise<void> {
+    const accounts = await pool.listAccounts(this.product.id)
+    for (const entry of accounts) {
+      try {
+        const resolved = await this.ctx.credentials.resolve(credentialRef(entry.credentialRef))
+        const credential = resolved ? parseQoderCredential(resolved.value) : undefined
+        if (credential === undefined) continue
+        if (!needsQoderAccountProfileBackfill(entry, credential)) continue
+
+        const patch: { nickname?: string; expiresAt?: number } = {}
+        if (isQoderNicknamePlaceholder(entry.nickname)) {
+          // ⚠️ **先试零网络的本地来源**：凭据里可能已经存着 `user_name` / `email`
+          // （登录链写过、而账号条目的补全那一步失败过）。这时能直接算出真名，
+          // 没有理由为它再打一次 userinfo。
+          const local = resolveQoderAccountNickname(this.nicknameSource(credential, undefined), entry.id)
+          if (!isQoderNicknamePlaceholder(local)) {
+            patch.nickname = local
+          } else {
+            const profile = await this.fetchProfile(credential)
+            // ⚠️ 取不到资料时**整条跳过**，不写任何字段：此时唯一能写出的昵称
+            // 就是那个 UUID（`resolveQoderAccountNickname` 的第四档），把它写回去
+            // 等于用一次白跑的网络把「待回填」标记擦掉 —— 以后再也不修了。
+            if (profile === undefined) continue
+            const next = applyQoderProfile(credential, profile)
+            // `applyQoderProfile` 在无变化时返回**原对象引用** ⇒ 不白写一次盘
+            // （每 30 分钟一轮，稳态下不该有任何写入）。
+            if (next !== credential) {
+              await this.ctx.credentials.set(credentialRef(entry.credentialRef), serializeQoderCredential(next))
+            }
+            patch.nickname = resolveQoderAccountNickname(this.nicknameSource(credential, profile), entry.id)
+          }
+        }
+        const expiresAt = qoderAccountExpiresAtMs(credential)
+        if (expiresAt !== undefined && entry.expiresAt === undefined) patch.expiresAt = expiresAt
+        if (Object.keys(patch).length > 0) await pool.updateAccount(entry.id, patch)
+      } catch (error) {
+        // 单账号失败不中断循环，也不上抛（见方法注释）。
+        this.ctx.logger?.warn?.(
+          `[${this.product.id}] 账号 ${entry.id} 资料回填失败（下次续期再试）: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
       }
     }
   }

@@ -369,7 +369,7 @@ describe('Trae CN 终报文案（积分耗尽 vs 限流冷却）', () => {
     expect(hint).toBe('')
     const limited = traeCnCreditsExhaustedHint(4021, '通用积分', 'pool-exhausted')
     expect(limited).toMatch(/均在冷却或限额中/)
-    expect(limited).toMatch(/可在 Account Hub 查看重置时刻/)
+    expect(limited).toMatch(/可在账号中心查看重置时刻/)
     expect(limited).not.toMatch(/均已耗尽/)
   })
 
@@ -2214,7 +2214,7 @@ describe('TraeCnAdapter 流内错误与换号', () => {
     // 原始诊断信息**必须保留**（不能只留提示），否则真机排障失去依据。
     expect(error?.message).toMatch(/code=4001/)
     expect(error?.message).toMatch(/参数错误/)
-    expect(error?.message).toMatch(/不在 Trae CN 可用目录中，请在 Hub 的显示列表里重选/)
+    expect(error?.message).toMatch(/不在 Trae CN 可用目录中，请在 Hub 的模型列表里重选/)
   })
 
   it('表外模型**在动态目录里**时不追加提示（判定与 function 路由同源）', async () => {
