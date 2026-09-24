@@ -760,7 +760,7 @@ describe('model.list / model.setDisabled 端点', () => {
     /** 预置上下文窗口预算（按 provider → 模型存）。 */
     contextBudgets?: Record<string, Record<string, number>>
     /**
-     * 窗口档位来源（`registerAccountHubRpc` 的第 10 个参数）—— **按 provider id 分键**
+     * 窗口档位来源（`registerAccountHubRpc` 的 `contextTiers` 字段）—— **按 provider id 分键**
      * 的注册表，缺省的键就是「该 provider 不参与档位机制」。
      *
      * 省略即「未接线」：`model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝
@@ -837,14 +837,16 @@ describe('model.list / model.setDisabled 端点', () => {
       logger: { warn: () => {}, info: () => {} },
     }
 
-    registerAccountHubRpc(
-      ctx as never, pool, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
+    registerAccountHubRpc({
+      ctx: ctx as never, pool, codearts: {} as never, buddyCn: {} as never, buddy: {} as never,
+      lobsterai: {} as never, traeCn: {} as never, qoder: {} as never, qoderCn: {} as never,
       // 生产路径传的是 `createContextTierRegistry(...)` 的产物；这里**走同一个
       // 构造函数**，而不是手搓一个带 `sourceFor` 的对象 —— 否则测试可能在一个
       // 与生产不同的分派实现上通过（注册表的丢弃 undefined 键等语义要一起覆盖）。
-      options.contextTiers === undefined ? undefined : createContextTierRegistry(options.contextTiers) as never,
-    )
+      contextTiers: options.contextTiers === undefined
+        ? undefined
+        : createContextTierRegistry(options.contextTiers) as never,
+    })
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     /** 调用一个端点方法，返回解包后的 result。 */
@@ -1633,10 +1635,11 @@ describe('积分端点的 provider 能力边界', () => {
     // 把「provider 被误拒」这类真缺陷伪装成替身不完整。
     const pool = { listAccounts: async () => [], recordBalances: () => {} }
 
-    registerAccountHubRpc(
-      ctx as never, pool as never, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
-    )
+    registerAccountHubRpc({
+      ctx: ctx as never, pool: pool as never, codearts: {} as never, buddyCn: {} as never,
+      buddy: {} as never, lobsterai: {} as never, traeCn: {} as never, qoder: {} as never,
+      qoderCn: {} as never,
+    })
     if (handler === undefined) throw new Error('endpoint handler was not registered')
 
     return async (method: string, payload: unknown) => {
@@ -1769,7 +1772,12 @@ describe('account.reorder 端点', () => {
       logger: { warn: () => {}, info: () => {} },
       credentials: { resolve: async () => undefined },
     }
-    registerAccountHubRpc(ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never)
+    // 只给原实参给到的前六项（ctx / pool / codearts / buddyCn / buddy / lobsterai），
+    // **不补全字段**：这条用例刻意只依赖前段依赖，补全会改变它的覆盖意图。
+    registerAccountHubRpc({
+      ctx: ctx as never, pool: pool as never, codearts: {} as never, buddyCn: {} as never,
+      buddy: {} as never, lobsterai: {} as never,
+    })
 
     const call = async (method: string, payload: unknown) => {
       if (handler === undefined) throw new Error('endpoint handler was not registered')

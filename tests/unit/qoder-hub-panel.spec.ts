@@ -78,7 +78,7 @@ function codeLinesOf(source: string): string {
 function makeHarness(
   accounts: ProviderAccountEntry[],
   overrides: {
-    /** 注入的档位来源（第 10 参注册表只含它；缺省 = 未注册，与旧形态一致）。 */
+    /** 注入的档位来源（`contextTiers` 注册表只含它；缺省 = 未注册，与旧形态一致）。 */
     tierSource?: unknown
     /** `ctx.llm.listModels` 替身返回的目录（缺省为旧的硬编码一项）。 */
     models?: Array<{ id: string; name: string }>
@@ -136,24 +136,24 @@ function makeHarness(
     },
   }
 
-  registerAccountHubRpc(
-    ctx as never,
-    pool as never,
-    {} as never,
-    {} as never,
-    {} as never,
-    {} as never,
-    {} as never,
+  registerAccountHubRpc({
+    ctx: ctx as never,
+    pool: pool as never,
+    codearts: {} as never,
+    buddyCn: {} as never,
+    buddy: {} as never,
+    lobsterai: {} as never,
+    traeCn: {} as never,
     // qoder / qoderCn：本文件只断 `account.list` / `model.*` / `poolProviderFor`
     // 的分派（不建号、不查余额），两条 Qoder 分支都不会被进入。
-    {} as never,
-    {} as never,
-    // 档位来源注册表（第 10 参，可选）：注入时按 provider 恒返回同一个来源 ——
+    qoder: {} as never,
+    qoderCn: {} as never,
+    // 档位来源注册表（可选）：注入时按 provider 恒返回同一个来源 ——
     // 生产形态是「provider id → 适配器」，这里只需要「有没有被问到」。
     ...(overrides.tierSource === undefined
-      ? []
-      : [{ sourceFor: () => overrides.tierSource }]),
-  )
+      ? {}
+      : { contextTiers: { sourceFor: () => overrides.tierSource } }),
+  })
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 
   return {

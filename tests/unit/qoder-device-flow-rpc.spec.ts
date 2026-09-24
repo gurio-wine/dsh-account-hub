@@ -188,10 +188,11 @@ function createHarness(
     get: () => undefined,
   }
 
-  registerAccountHubRpc(
-    rpcCtx as never, pool, {} as never, {} as never, {} as never,
-    {} as never, {} as never, qoder, qoderCn,
-  )
+  registerAccountHubRpc({
+    ctx: rpcCtx as never, pool,
+    codearts: {} as never, buddyCn: {} as never, buddy: {} as never, lobsterai: {} as never,
+    traeCn: {} as never, qoder, qoderCn,
+  })
   if (handler === undefined) throw new Error('Account Hub 端点未注册')
 
   const call = async <T>(method: string, payload: unknown): Promise<RpcResult<T>> => {

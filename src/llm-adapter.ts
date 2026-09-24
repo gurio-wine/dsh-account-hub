@@ -23,7 +23,7 @@ import {
   stripCourseLeakIfEnabled,
 } from './course-leak-strip.js'
 import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
-import type { CodeArtsCredential } from './types.js'
+import type { CodeArtsCredential, LlmSettingsAddress } from './types.js'
 
 export const CHAT_API_BASE = 'https://snap-access.cn-north-4.myhuaweicloud.com/api/v2'
 export const PROVIDER = 'codearts'
@@ -128,6 +128,14 @@ export interface CodeArtsAdapterOptions {
   sessionId?: string
   /** 多账号池（用于限流时切换账号） */
   accountPool?: AccountPool
+  /**
+   * 该 provider 目录项在 settings 里的**成对地址**（namespace + 分槽路径）。
+   *
+   * 由 `src/index.ts` 的 `apply()` 按探测到的契约现算后传入（见
+   * `LlmSettingsAddress` 与 `registerCodeArtsLlm` 的说明）。**省略时回退到
+   * 0.1.6 形态**（`llm-codearts` + `[]`），使直接构造的单元测试无需关心契约。
+   */
+  settingsAddress?: LlmSettingsAddress
 }
 
 /**
@@ -496,7 +504,7 @@ function readCodeArtsChunk(
   signal?: AbortSignal,
   phase: 'first-token' | 'chunk' = 'chunk',
 ): Promise<{ done: boolean; value: Uint8Array | undefined }> {
-  return readWithIdleTimeout(reader, timeoutMs, 'codearts', signal, phase)
+  return readWithIdleTimeout(reader, timeoutMs, PROVIDER, signal, phase)
 }
 
 /**
@@ -972,7 +980,7 @@ export class CodeArtsAdapter extends LlmAdapter {
     if (this.options.accountPool && credential?.access_key_id) {
       try {
         currentAccountId = await this.options.accountPool.findAccountIdByCredential(
-          'codearts',
+          PROVIDER,
           credential.access_key_id,
         )
       } catch (error) {
@@ -1154,7 +1162,7 @@ export class CodeArtsAdapter extends LlmAdapter {
                 currentAccountId, parsed.modelId, parsed.resetTimeMs,
               )
             }
-            const next = await this.options.accountPool.getAvailableAccount('codearts', options.model)
+            const next = await this.options.accountPool.getAvailableAccount(PROVIDER, options.model)
             if (next && !rateLimitTried.has(next.entry.id)) {
               rateLimitTried.add(next.entry.id)
               credential = next.credential as CodeArtsCredential
@@ -1749,10 +1757,23 @@ export class CodeArtsAdapter extends LlmAdapter {
  * `listAllModels()`（不套用户黑名单、也不套目录门控的完整目录，带最终展示名）。
  * DSH 的 `ctx.llm` 只保证 `listModels`、且会把条目重建后丢掉额外字段，故实例
  * 必须由调用方持有并注入 RPC 层（见 `src/account-hub-rpc.ts` 的 `ModelCatalogSource`）。
+ *
+ * ## settings 地址由调用方**按契约现算**后传入
+ *
+ * 目录项的 `settingsNs` / `settingsPath` 两版契约成对不同（0.1.6：
+ * `llm-codearts` + `[]`；0.1.7：entry id + `['providers', 'codearts']`），
+ * 而**探测只在 `src/index.ts` 的 `apply()` 里做一次**（见 `LlmSettingsAddress`）：
+ * 适配器自己不做探测、也不认识契约版本，只把成对地址原样转交 —— 这样它既能在
+ * 单测里直接注入地址，也不会因为「每个适配器各探一次」而在同一进程里得到两种答案。
+ *
+ * 省略 `settingsAddress` 时回退到 **0.1.6 形态**（`llm-codearts` + `[]`）：
+ * 那是本 provider 在旧契约下的地址，`src/index.ts` 的 `legacy` 分支算出来的
+ * 就是它，故直接调用本函数的单测与旧接线行为逐字一致。
  */
 export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOptions): CodeArtsAdapter {
+  const address = options.settingsAddress ?? { settingsNs: `llm-${PROVIDER}`, settingsPath: [] }
   ctx.llm.registerConfigurableProviders([
-    { provider: PROVIDER, displayName: 'Codearts', settingsNs: 'llm-codearts', settingsPath: [] },
+    { provider: PROVIDER, displayName: 'Codearts', settingsNs: address.settingsNs, settingsPath: address.settingsPath },
   ])
   const adapter = new CodeArtsAdapter(options)
   ctx.llm.registerAdapter([PROVIDER], adapter)

@@ -4,10 +4,10 @@
   "description": "deepseek-harness plugin: CodeArts (Huawei Cloud) browser login, storing the temporary credential via ctx.credentials",
   "type": "module",
   "main": "lib/index.js",
-  "types": "lib/types/index.d.ts",
+  "types": "lib/index.d.ts",
   "exports": {
     ".": {
-      "types": "./lib/types/index.d.ts",
+      "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
     "./client": "./lib/client/account-hub.js",

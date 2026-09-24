@@ -147,10 +147,10 @@ function makeHarness(options: HarnessOptions = {}) {
   const newPool = (): AccountPool => new AccountPool(ctx as never)
 
   const register = (pool: AccountPool): void => {
-    registerAccountHubRpc(
-      ctx as never, pool, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
-    )
+    registerAccountHubRpc({
+      ctx: ctx as never, pool, codearts: {} as never, buddyCn: {} as never, buddy: {} as never,
+      lobsterai: {} as never, traeCn: {} as never, qoder: {} as never, qoderCn: {} as never,
+    })
   }
 
   const call = async (method: string, payload: unknown) => {
@@ -313,11 +313,11 @@ describe('autoroute.get / autoroute.set 端点', () => {
     const h = makeHarness()
     const pool = h.newPool()
     await pool.openStorage()
-    registerAccountHubRpc(
-      h.ctx as never, pool, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
-      undefined, undefined, () => { calls++ },
-    )
+    registerAccountHubRpc({
+      ctx: h.ctx as never, pool, codearts: {} as never, buddyCn: {} as never, buddy: {} as never,
+      lobsterai: {} as never, traeCn: {} as never, qoder: {} as never, qoderCn: {} as never,
+      onAutoRouteChanged: () => { calls++ },
+    })
 
     const rejected = await h.call('autoroute.set', 42)
 
@@ -487,10 +487,11 @@ describe('autoRoute 的持久化互带（漏一处就被静默清空）', () => 
   })
 })
 
-// ──────────────────────────── 配置变更通知（第 12 实参）────────────────────────────
+// ──────────────────────────── 配置变更通知（`onAutoRouteChanged`）────────────────────────────
 
 /**
- * `registerAccountHubRpc(…, onAutoRouteChanged?)` 的**第 12 个实参**。
+ * `registerAccountHubRpc({ …, onAutoRouteChanged })` 的**可选字段**
+ * （参数对象化之前是第 12 个位置实参）。
  *
  * 它连接的是「配置面」与「运行面」这两处**不同所有者**的状态：配置写在池上，
  * 而降级队列握在聚合适配器手里（见 `src/account-hub-rpc.ts` 的 `@param`）。
@@ -499,17 +500,17 @@ describe('autoRoute 的持久化互带（漏一处就被静默清空）', () => 
  * 本组用例守三件事：**成功才通知**、**通知失败不上抛**（fire-and-forget 自吞异常）、
  * **失败路径不通知**（配置没写进去就不该让运行时去重建）。
  */
-describe('autoroute.set：第 12 实参（配置变更通知）', () => {
-  /** 与生产 `apply()` 同序：建池 → 打开持久层 → 注册（带第 12 实参）。 */
+describe('autoroute.set：配置变更通知（onAutoRouteChanged）', () => {
+  /** 与生产 `apply()` 同序：建池 → 打开持久层 → 注册（带该通知字段）。 */
   const setupWithNotify = async (onAutoRouteChanged?: () => void) => {
     const h = makeHarness()
     const pool = h.newPool()
     await pool.openStorage()
-    registerAccountHubRpc(
-      h.ctx as never, pool, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
-      undefined, undefined, onAutoRouteChanged,
-    )
+    registerAccountHubRpc({
+      ctx: h.ctx as never, pool, codearts: {} as never, buddyCn: {} as never, buddy: {} as never,
+      lobsterai: {} as never, traeCn: {} as never, qoder: {} as never, qoderCn: {} as never,
+      onAutoRouteChanged,
+    })
     return { h, pool }
   }
 
@@ -549,7 +550,7 @@ describe('autoroute.set：第 12 实参（配置变更通知）', () => {
     expect(pool.autoRouteConfig()).toEqual({ enabled: false, models: [] })
   })
 
-  it('省略第 12 实参（headless / 既有调用点）→ 配置照常写入，不抛错', async () => {
+  it('省略该通知字段（headless / 既有调用点）→ 配置照常写入，不抛错', async () => {
     const { h } = await setupWithNotify(undefined)
 
     const result = await h.call('autoroute.set', { enabled: true, models: [DEFINITION] })

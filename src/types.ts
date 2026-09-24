@@ -1,4 +1,78 @@
 import type { DpopPrivateJwk } from './oauth.js'
+// 各产品配置的 id 常量（全部 `import type`：只为 `typeof` 取类型，运行期完全擦除，
+// 不引入任何实际依赖，也不构成运行期循环）。
+import type { PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
+import type { BUDDY, BUDDY_CN } from './product.js'
+import type { LOBSTERAI } from './lobsterai-product.js'
+import type { TRAE_CN } from './trae-cn-product.js'
+import type { QODER, QODER_CN } from './qoder-product.js'
+
+/**
+ * 本插件七个 LLM provider 的 id 联合（**共享类型层的唯一真相源**）。
+ *
+ * ## 为什么是「并集」而不是逐值推导
+ *
+ * 七个 id 分散在四份产品配置里，且声明形态**不一致**：
+ *
+ * | 来源 | 声明 | `typeof X.id` |
+ * |---|---|---|
+ * | `CODEARTS_PROVIDER`（`src/llm-adapter.ts`） | `const PROVIDER = 'codearts'` | `'codearts'`（窄） |
+ * | `LOBSTERAI.id` / `TRAE_CN.id` | 各自接口里写死单个字面量 | 窄 |
+ * | `BUDDY_CN.id` / `BUDDY.id` | `BuddyProduct.id: 'buddy-cn' \| 'buddy'` | **宽联合** |
+ * | `QODER.id` / `QODER_CN.id` | `QoderProduct.id: 'qoder' \| 'qoder-cn'` | **宽联合** |
+ *
+ * ⚠️ **后两组是宽联合**：`typeof QODER.id` 单独取出来是 `'qoder' | 'qoder-cn'`
+ * （国际版与国内版互相不可区分），`typeof BUDDY_CN.id` 同理。故**不能**把本类型
+ * 简化成「某个配置的 id 类型」—— 那会丢掉 region 区分或漏掉其它产品线。七路并集
+ * 里宽联合各自贡献两个成员、重复项自动合并，最终恰好收敛为下面这七个。
+ *
+ * ## 用途：两套 provider 分键映射的**组装点**保护
+ *
+ * Account Hub 有两套按 provider id 分键的映射（档位注册表与模型目录适配器），
+ * 此前都是 `Record<string, …>`：**键拼错不报错**，只表现为该 provider 静默退化
+ * （模型列表不显示档位 / 关闭项退回裸 id）。改用 `Partial<Record<ProviderId, …>>`
+ * 后，组装点（`src/index.ts`）的对象字面量会被 excess property check 拦下。
+ *
+ * ⚠️ **两道限制是刻意的**：
+ * - `Partial` 允许子集 —— 档位注册表本来就只登记有档位数据源的 provider
+ *   （5/7），**漏登记不报错**，由 `registerAccountHubRpc` 入口的运行时 warn 兜底；
+ * - 仅对**对象字面量**生效 —— 先赋给 `Record<string, …>` 变量再传进来就绕过了
+ *   （故 `src/index.ts` 的映射注解必须与本类型同步收窄）。
+ */
+export type ProviderId =
+  | typeof CODEARTS_PROVIDER
+  | typeof BUDDY_CN.id
+  | typeof BUDDY.id
+  | typeof LOBSTERAI.id
+  | typeof TRAE_CN.id
+  | typeof QODER.id
+  | typeof QODER_CN.id
+
+/**
+ * 一个可配置 provider 目录项的 settings 地址（namespace + 分槽路径）。
+ *
+ * ## 为什么是一个「值对象」而不是两个独立字段
+ *
+ * namespace 与 path **必须成对**：0.1.6 的地址是 `{ ns: 'llm-<id>', path: [] }`
+ * （整节就是该 provider 的 profile），0.1.7 的是
+ * `{ ns: <entry id>, path: ['providers', <id>] }`（整节是插件的 `providers` 字典、
+ * 每个 provider 占一个槽）。两者只有配对出现才自洽 —— 拆成两个可选字段就允许
+ * 「新 namespace + 老空 path」这种半迁移状态被静默接受，而它的表现是模型设置页
+ * 读到 undefined 的 profile（**不报错**，只是配置项凭空消失）。
+ *
+ * ## 谁算、谁用
+ *
+ * `src/index.ts` 在 `apply()` 里**探测一次**（见 `detectSettingsContract`），
+ * 把结果按 provider 现算成地址，经各 `registerXxxLlm` 的 `settingsAddress` 选项
+ * 传入。适配器自己**不做探测**、也不认识契约版本 —— 它只把地址原样交给
+ * `ctx.llm.registerConfigurableProviders`，从而保持可单测（单测直接给地址或省略）。
+ */
+export interface LlmSettingsAddress {
+  /** settings namespace：0.1.6 是 `llm-<provider>`，0.1.7 是 profile entry id。 */
+  settingsNs: string
+  /** 从该 namespace 的节根到**本 provider 的 profile 对象**的路径。 */
+  settingsPath: readonly string[]
+}
 
 /** snap-manager ticket 端点响应的传输格式。 */
 export interface CodeArtsCredentialResponse {

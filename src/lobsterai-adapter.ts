@@ -43,6 +43,7 @@ import {
   type LobsteraiCredential,
 } from './lobsterai.js'
 import { LOBSTERAI, type LobsteraiFallbackModel, type LobsteraiProduct } from './lobsterai-product.js'
+import type { LlmSettingsAddress } from './types.js'
 import {
   LOBSTERAI_CONTEXT_OVERFLOW_HINT,
   classifyLobsteraiError,
@@ -405,6 +406,19 @@ export interface LobsteraiAdapterOptions {
   accountPool?: AccountPool
   /** 产品配置；默认 {@link LOBSTERAI}。 */
   product?: LobsteraiProduct
+  /**
+   * 本 provider 目录项的 settings 地址（`settingsNs` + `settingsPath` 成对）。
+   *
+   * 由 `src/index.ts` 的 `apply()` **按探测到的契约现算**后传入（见
+   * `LlmSettingsAddress`）：0.1.6 得 `llm-lobsterai` + `[]`，0.1.7 得 entry id +
+   * `['providers', 'lobsterai']`。适配器自己不做探测、也不认识契约版本，只把成对
+   * 地址原样转交 `registerConfigurableProviders` —— 这样它既能在单测里直接注入
+   * 地址，也不会因「每个适配器各探一次」而在同一进程里得到两种答案。
+   *
+   * 省略时回退到 **0.1.6 形态**（`llm-lobsterai` + `[]`）：那是本插件迁移前的
+   * 既有行为，也让不关心契约的单测保持原样可跑。
+   */
+  settingsAddress?: LlmSettingsAddress
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -800,24 +814,6 @@ export class LobsteraiAdapter extends LlmAdapter {
       }
     }
     return resolved
-  }
-
-  /**
-   * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
-   * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本
-   * 基类尚未提供该方法，缺少时会在每轮请求开始时抛
-   * `registration.adapter.prepareCall is not a function`。
-   * 与 `BuddyAdapter` 同款 shim。
-   */
-  async prepareCall(
-    provider: string,
-    model: string,
-    signal?: AbortSignal,
-  ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
-    return {
-      model: await this.resolveModel(provider, model, signal),
-      stream: (options: GenerateOptions) => this.stream(options),
-    }
   }
 
   /** 解析客户端版本号（未注入时用兜底值）。 */
@@ -1487,8 +1483,12 @@ export class LobsteraiAdapter extends LlmAdapter {
  */
 export function registerLobsteraiLlm(ctx: Context, options: LobsteraiAdapterOptions): LobsteraiAdapter {
   const product = options.product ?? LOBSTERAI
+  // settings 地址**由调用方按契约现算后传入**（见 `LlmSettingsAddress`）：0.1.6 得
+  // `llm-lobsterai` + `[]`，0.1.7 得 entry id + `['providers', 'lobsterai']`。
+  // 适配器不做探测、不认识契约版本，只把成对地址原样转交；省略时回退 0.1.6 形态。
+  const address = options.settingsAddress ?? { settingsNs: `llm-${product.id}`, settingsPath: [] }
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    { provider: product.id, displayName: product.displayName, settingsNs: address.settingsNs, settingsPath: address.settingsPath },
   ])
   const adapter = new LobsteraiAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

@@ -1,7 +1,8 @@
 # 自动签到（Auto Check-in）设计方案
 
 本次为**只读调查 + 设计文档**，不改任何代码。本文定稿各落定点与分叉，供实现阶段照做。
-能力范围：`buddy-cn` / `lobsterai` / `trae-cn` / `codearts` / `qoder-cn`（有 `dailyCheckin`）；`qoder` 国际版接入由并行任务定，**本文只留占位，不接线**。
+能力范围：`buddy-cn` / `lobsterai` / `trae-cn` / `codearts` / `qoder` / `qoder-cn`（有 `dailyCheckin`）。
+⚠️ 本文写作时 `qoder` 国际版的接入尚未拍板，只留了占位；**现已接入**（宿主 `CHECKIN_ELIGIBLE_PROVIDERS` 六条、两区同协议共用一份 claim），下面各节按最新口径叙述。
 
 ## 1. 状态存储：storage 域第五字段
 
@@ -82,13 +83,13 @@ catch (network/凭据异常):
 
 ## 5. sweep 执行序（`checkInIfDue` 编排复用 claim 流程）
 
-新增 `async function sweepAllCheckins(pool, ctx)`，遍历顺序：**按 provider 逐个**（固定序：codearts → buddy-cn → lobsterai → trae-cn → qoder-cn，qoder 跳过），每 provider **按账号数组顺序**（即池的候选优先级顺序）逐账号 `await checkInIfDue`。**复用现有 claim 流程**：直接复用 `collectClaimResults` 式的 deps 注入（`resolveCreditsDeps` + 各 provider 的 claim/fetcher），或更省事地——让 `checkInIfDue` 内部调用与 `credits.claimAll` 分支完全相同的 claim（Buddy 系 `claimDailyCheckin`、CodeArts `claimCodeArtsDailyCheckin`、LobsterAI `claimLobsteraiDailyCheckin`、Trae `claimTraeCnDailyCheckin`、Qoder CN `claimQoderDailyCheckin`），以 `precheckStatus` 与既有分支一致（多步预检的传 false）。LobsterAI 需要 `resolveClientVersion()`，CodeArts 用 `claimCodeArtsDailyCheckin(credential)`，与 claimAll 分支**逐字相同**，只是把「全账号数组」换成「单账号或单 provider 数组」。
+新增 `async function sweepAllCheckins(pool, ctx)`，遍历顺序：**按 provider 逐个**（固定序：codearts → buddy-cn → lobsterai → trae-cn → qoder → qoder-cn），每 provider **按账号数组顺序**（即池的候选优先级顺序）逐账号 `await checkInIfDue`。**复用现有 claim 流程**：直接复用 `collectClaimResults` 式的 deps 注入（`resolveCreditsDeps` + 各 provider 的 claim/fetcher），或更省事地——让 `checkInIfDue` 内部调用与 `credits.claimAll` 分支完全相同的 claim（Buddy 系 `claimDailyCheckin`、CodeArts `claimCodeArtsDailyCheckin`、LobsterAI `claimLobsteraiDailyCheckin`、Trae `claimTraeCnDailyCheckin`、Qoder 两区 `claimQoderDailyCheckin` 按 region 分派），以 `precheckStatus` 与既有分支一致（多步预检的传 false）。LobsterAI 需要 `resolveClientVersion()`，CodeArts 用 `claimCodeArtsDailyCheckin(credential)`，与 claimAll 分支**逐字相同**，只是把「全账号数组」换成「单账号或单 provider 数组」。
 
 ## 6. 能力真相源共用（宿主侧怎么知道哪些 provider 可签到）
 
 `credits-capabilities.js` 是**客户端文件**（esbuild 进 bundle），宿主 TS 无法 import。**结论：不迁移真相源，宿主保持一份独立常量 + 单测锁一致**。理由：
 - 迁移真相源意味着改 `src/` 里建一份镜像又要维持双份同步，违背「单真相源」初衷；宿主抽 `credits.ts` 的 provider 分派本就要按 provider 写死 claim 分支（协议不同无法靠一张布尔表驱动），额外一张 bool 表收益为零。
-- **方案**：在 `src/credits.ts`（或新建 `src/checkin-eligible.ts`）导出 `const CHECKIN_ELIGIBLE_PROVIDERS: ReadonlySet<string>`（五条），sweep 只遍历它；`tests/unit/credits-capabilities.spec.ts` 补一条断言：宿主集合与客户端 `supportsDailyCheckin` 为 true 的集合**相等**，且包含恰好这五个（qoder 不在内）。这样两处漂移会被测试当场抓红，而能力语义仍各自清晰。
+- **方案**：在 `src/credits.ts`（或新建 `src/checkin-eligible.ts`）导出 `const CHECKIN_ELIGIBLE_PROVIDERS: ReadonlySet<string>`（六条），sweep 只遍历它；`tests/unit/credits-capabilities.spec.ts` 补一条断言：宿主集合与客户端 `supportsDailyCheckin` 为 true 的集合**相等**，且包含恰好这六个。这样两处漂移会被测试当场抓红，而能力语义仍各自清晰。
 
 ## 7. 客户端触发（挂载点）
 
@@ -131,7 +132,7 @@ if (supportsCredits) void rpcCall('credits.checkinStatus', { provider })
 3. `checkInIfDue-dispatch`：day===today 短路不调 claim；day!==today → 调 claim；`claimed` 与 `already-claimed` 都写今日；`inactive`/`failed`/网络异常不写（注入 mock claim/凭据解析）；
 4. `sweep-order`：仅遍历 `CHECKIN_ELIGIBLE_PROVIDERS`、无账号跳过、含停用、互斥信号量防重入（并发两路 only 跑一次）；
 5. `rpc-case`：`credits.checkinStatus` / `checkin.perform` / `checkin.sweep` 请求/响应形态（复用既有 `collect*` 测试的注入手法）；
-6. 能力一致断言（第 6 节）：宿主集合 === 客户端 `supportsDailyCheckin` 真集合，且恰为五条（qoder 不在）。
+6. 能力一致断言（第 6 节）：宿主集合 === 客户端 `supportsDailyCheckin` 真集合，且恰为六条。
 客户端 `plugin-src/` 不在 typecheck/test 视野（vitest 只跑 `tests/unit/**`，`plugin-src` 不在 tsconfig include，react 不在依赖）——**客户端只能靠 `build:client` 顶层求值冒烟**（`plugin-src/client/build.mjs` 的 stub 闸门，现有 `pnpm build:all` 已含）+ 既有 `credits-capabilities.spec.ts` 的**源码级正则断言织补**（新增断言守「单片按钮存在且走 `supportsDailyCheckin` 门控」「`checkinStatus` RPC 字符串存在」「成功 data-kind」），写明这是**唯一语义防线**。
 
 ## 11. 留给本体拍板的分叉清单
@@ -140,5 +141,5 @@ if (supportsCredits) void rpcCall('credits.checkinStatus', { provider })
 2. **schemaVersion**：bump 到 2（推荐）——是否值得动（影响不大）。
 3. **停用账号是否自动签**：参与（推荐，对齐 claimAll）vs 跳过（省请求）。
 4. **头部「一键签到」**：复用 `credits.claimAll` 只改文案/色（改动最小）vs 改调 `checkin.perform`（无 accountId，复用携带状态的返回）。建议复用 claimAll + 事后刷新状态。
-5. **qoder 国际版**：是否接入（并行任务定，本文仅留 `CHECKIN_ELIGIBLE_PROVIDERS` 占位）。
+5. **qoder 国际版**：**已接入**（2026-09-23 拍板，两区同协议、共用一份 claim，`CHECKIN_ELIGIBLE_PROVIDERS` 六条）。
 6. **孤儿清理时机**：仅账号删除时 vs 删除 + 面板打开时兜底（推荐后者）。

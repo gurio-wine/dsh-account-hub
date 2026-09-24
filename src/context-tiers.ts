@@ -32,6 +32,10 @@
  * `build*ChatBody` 字段全集不变（各有逐字节比对用例钉死）。
  */
 
+// 只为 {@link createContextTierRegistry} 的**形参键类型**引入 —— `import type` 在
+// 运行期完全擦除，本模块对产品配置零运行期依赖（它至今一行 import 都没有）。
+import type { ProviderId } from './types.js'
+
 /**
  * 一个模型在**当前生效目录**里的上下文窗口档位。
  *
@@ -206,7 +210,14 @@ export interface ContextTierSource {
  * 的面板上，且不报错）。
  */
 export interface ContextTierRegistry {
-  /** 该 provider 的档位来源；未注册返回 `undefined`（不是抛错）。 */
+  /**
+   * 该 provider 的档位来源；未注册返回 `undefined`（不是抛错）。
+   *
+   * ⚠️ **入参刻意是宽 `string` 而不是 {@link ProviderId}**：查询方拿到的 provider
+   * 来自 RPC 请求（`model.list` 的 `req.provider`），那**不受 `ProviderId` 约束**
+   * —— DSH 内置 provider 与其它插件的 provider 也会走到这里。收窄入参只会逼每个
+   * 调用点加断言。类型保护落在**构造点**（见 {@link createContextTierRegistry}）。
+   */
   sourceFor(provider: string): ContextTierSource | undefined
 }
 
@@ -216,9 +227,23 @@ export interface ContextTierRegistry {
  * 值为 `undefined` 的键**直接丢弃**：组装点常常要按条件传适配器（例如某个
  * provider 未接线），让调用方写 `...(x === undefined ? {} : {p: x})` 只会在每个
  * 调用点重复一遍同样的判断。
+ *
+ * ## 键收窄为 {@link ProviderId}：这是拼错键**唯一**能拿到编译期报错的地方
+ *
+ * 本函数是档位注册表的**唯一构造点**，且调用方传的是对象字面量 —— 故把
+ * `ProviderId` 约束加在**形参**上，`src/index.ts` 里写错的键会被 excess property
+ * check 当场拦下（`TS2353`）。
+ *
+ * ⚠️ **加在 `registerAccountHubRpc` 的 `contextTiers` 字段上是无效的**：那里的
+ * 类型是 {@link ContextTierRegistry}（只有 `sourceFor(provider: string)`），键信息
+ * 在构造完就已擦除 —— 事后无法校验。保护必须落在**键还存在的那一刻**。
+ *
+ * ⚠️ **`Partial` 允许子集 ⇒ 漏登记不报错**：档位注册表本来就只登记有档位数据源的
+ * provider（5/7，codearts 与 lobsterai 刻意不在其中）。「有目录却漏登记档位」由
+ * `src/account-hub-rpc.ts` 的 `warnMissingTierSources` 在注册入口运行时告警兜底。
  */
 export function createContextTierRegistry(
-  sources: Readonly<Record<string, ContextTierSource | undefined>>,
+  sources: Readonly<Partial<Record<ProviderId, ContextTierSource | undefined>>>,
 ): ContextTierRegistry {
   const table = new Map<string, ContextTierSource>()
   for (const [provider, source] of Object.entries(sources)) {

@@ -33,7 +33,7 @@ import { checkQoderQuotaExhausted } from './qoder-credits.js'
 import { QoderSigningProvider, qoderDirectorySigningSource } from './qoder-signing.js'
 import { extractQoderWasm } from './qoder-wasm.js'
 import { instantiateQoderWasm } from './qoder-wasm-glue.js'
-import type { CodeArtsCredential, BuddyCredential } from './types.js'
+import type { CodeArtsCredential, BuddyCredential, LlmSettingsAddress, ProviderId } from './types.js'
 import type { LobsteraiCredential } from './lobsterai.js'
 import type { TraeCnCredential } from './trae-cn-oauth.js'
 import type { QoderCredential } from './qoder-product.js'
@@ -82,40 +82,346 @@ export const name = 'codearts-auth'
 export const inject = ['credentials', 'commands', 'llm']
 
 /**
- * Provider 配置 namespace 的 schema。
+ * 把 schema 节点标记为 volatile（宿主 settings 的「进 describe() + 可热改」判据）。
  *
- * `registerConfigurableProviders` 声明的 `settingsNs` 必须真实存在于
- * settings 服务中，否则模型设置页读到 undefined 的 namespace，
- * 在 `refFor → deriveKeyRef(provider)` 处会以
- * `provider.toUpperCase is not a function` 崩溃。
- * 两者都只需承接一个可选的 `providers` 映射，故共用同一宽松 schema。
+ * ## 为什么不用 `.volatile()`
  *
- * 注意：`settings.register()` 要求 schemastery schema —— `describe()` 会对每个
- * 注册项无条件调用 `schema.toJSON()` 与 `redactSecrets(schema, value)`。
- * 传入裸函数（`(value) => ...`）会让 `describe()` 抛
- * `TypeError: registration.schema.toJSON is not a function`，进而使所有
- * 依赖 settings 的界面（模型设置页、主题、sidebar 的 settings.get/shell.get）
- * 全部失败。因此这里必须用 `Schema.object({...})` 构造。
+ * 宿主第一方（`llm-pi-ai` / `llm-deepseek`）写的是 `z.dict(profile).default({}).volatile()`，
+ * 那是 schemastery **3.18.4** 才引入的模式方法。本插件的 devDependency 解析到
+ * **3.18.2**，该版本没有这个方法（调用即 `TypeError: ... .volatile is not a function`），
+ * 而 `package.json` 不在本次改动范围内。
+ *
+ * 宿主真正读的是 `schema.meta.volatile`（`packages/settings/settings/src/schema.ts`
+ * 的 `volatileForm` / `isVolatilePath` / `plainSchema`），故直接写 meta 键在
+ * 3.18.2 与 3.18.4 上语义完全一致。唯一的差别是 3.18.4 的 volatile 模式还会把
+ * **解析结果**包成 Volatile 访问器（`.get()`）—— 本插件**不读** provider profile
+ * （配置由设置页直接写 entry config，凭据一律走账号池），不需要那个访问器。
+ *
+ * 用 `Reflect` 而不是 `.extra('volatile', true)`：本地 3.18.2 的
+ * `Schemastery.Meta` 接口里没有 `volatile` 键，`.extra()` 的泛型约束会把
+ * 合法调用判成类型错误（写成 `as never` 才能过），而 meta 是运行期的普通对象，
+ * 直接写键既无类型谎报、也与 `.extra()` 的实现逐字等价（它内部就是
+ * `schema.meta = { ...schema.meta, [key]: value }`）。
+ *
+ * @param schema - 待标记的 schema 节点（原地标记并原样返回，便于内联）。
+ * @returns 同一个 schema 实例。
  */
-const providerSettingsSchema = Schema.object({
-  providers: Schema.dict(Schema.any()).default({}),
+function markVolatile<T extends object>(schema: T): T {
+  const meta = Reflect.get(schema, 'meta') as Record<string, unknown> | undefined
+  if (meta !== undefined) Reflect.set(meta, 'volatile', true)
+  return schema
+}
+
+/**
+ * 插件配置 schema —— **0.1.7 settings 契约的接线本体**。
+ *
+ * ## 为什么「导出一份 Config」就能修好 namespace 注册不上
+ *
+ * DSH 0.1.7 把 settings 服务里 `register(ns, schema) → owner scope` 整套 seam
+ * **删除**了（不是改签名），namespace 语义改为「**profile entry id 的 Config
+ * 投影**」：宿主 `describe()` 遍历 `configEditor.configuration()`，对每个 entry
+ * 取 `entry.fiber.runtime.Config`，只有 `volatileForm(schema)` 返回非 undefined
+ * （即 schema 上**至少有一个 volatile 字段**）的 entry 才会进 descriptors，而
+ * descriptors 里的 `ns` 就是 **entry id**（`cordis.patch.yml` 里的 `codearts-auth`）。
+ *
+ * 于是「模型设置页要的 namespace 存在」这件事在 0.1.7 下**完全由这份 Config
+ * 决定**：没有 volatile 字段 ⇒ entry 不进 describe() ⇒ namespace 不存在 ⇒
+ * 模型设置页读到 undefined 的 profile，在 `refFor → deriveKeyRef(provider)` 处以
+ * `provider.toUpperCase is not a function` 崩溃。这正是 7 个 provider namespace
+ * 在 0.1.7 上永远注册不上的根因。
+ *
+ * ## 形态与语义等价性
+ *
+ * 与宿主第一方逐字对齐：`providers` 是一个 dict，**每个 provider 占一个槽**，
+ * 目录项的 `settingsPath` 因此是 `['providers', <provider id>]`（见
+ * {@link makeSettingsAddressResolver}）。
+ *
+ * 值 schema 仍是宽松的 `Schema.dict(Schema.any())`，与 0.1.6 时代那 7 份
+ * per-namespace schema（各自 `{ providers: dict(any) }`）语义等价 —— 两者都只是
+ * 「承接一个可选的 providers 映射」的占位：本插件从不读 provider profile，
+ * 它解析凭据一律走账号池。差别只在**承载粒度**：老契约是 7 个 namespace 各一份，
+ * 新契约是 1 个 namespace 下 7 个槽。
+ *
+ * 注意：schema 必须是真正的 schemastery schema，不能是裸函数 —— 宿主会对每个
+ * 进 describe() 的表单无条件调用 `schema.toJSON()` 与 `redactSecrets(schema, value)`，
+ * 裸函数会让 `describe()` 抛 `TypeError: schema.toJSON is not a function`，
+ * 进而使所有依赖 settings 的界面（模型设置页、主题、sidebar）全部失败。
+ */
+export const Config: Schema = Schema.object({
+  providers: markVolatile(Schema.dict(Schema.any()).default({})),
 })
 
-/** 注册 provider 配置 namespace（已存在时忽略重复注册错误）。 */
-function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
-  const settings = ctx.get('settings') as
-    | {
-      register: (ns: string, schema: unknown) => unknown
-      describe?: (options?: { redactSecrets?: boolean }) => Array<{ ns: string }>
-    }
-    | undefined
-  if (!settings || typeof settings.register !== 'function') {
-    ctx.logger.warn('[codearts-auth] settings 服务不可用，provider namespace 未注册')
+/**
+ * `Config` 的**输出类型**（与上面的 schema 同名，类型位与值位各占一处）。
+ *
+ * 与宿主第一方同款形态（`llm-pi-ai` 的 `export interface Config` 与
+ * `export const Config` 并存）：`apply(ctx, config)` 的形参要能写出类型，而
+ * schema 常量本身是值。两处同名不冲突 —— TypeScript 的类型空间与值空间分开。
+ *
+ * 只有一个可选的 `providers` 字典，是因为本插件**从不读 provider profile**：
+ * 凭据一律由账号池解析。这个字段存在的唯一理由是让宿主 settings 有一个
+ * **volatile** 的字段可以投影（见 {@link Config} 的说明）—— 设置页把用户填的
+ * 值写进 entry config 的 `providers.<id>` 槽，模型设置页按目录项的
+ * `settingsPath` 读回。
+ */
+export interface Config {
+  /** provider id → 该 provider 的 profile（内容由设置页写入，本插件不解析）。 */
+  providers?: Record<string, unknown>
+}
+
+/**
+ * settings 服务的**结构化契约视图**。
+ *
+ * 刻意不用 `import type {} from '@deepseek-ai/dsh-settings'`（宿主第一方的写法）：
+ * 那要求把该包加进 devDependencies，而 `package.json` 不在本次改动范围内；且
+ * 本插件要同时面对 0.1.6 / 0.1.7 **两套不兼容**的 settings 契约，用一个版本的
+ * 类型描述两者本身就是错的。这里只声明「两版并集」里被真正用到的成员，
+ * 全部可选，由 {@link detectSettingsContract} 在运行期判别实际形态。
+ */
+interface SettingsServiceLike {
+  /** 0.1.6 契约：注册一个 namespace，返回 owner scope。 */
+  register?: (ns: string, schema: unknown) => unknown
+  /** 两版都有：回读已生效的 namespace 快照。 */
+  describe?: (options?: { redactSecrets?: boolean }) => Array<{ ns: string }>
+  /** 0.1.7 新增：登记本插件实例的设置页呈现策略（`auto: false` 关闭自动生成页）。 */
+  configure?: (presentation: { auto?: boolean }, owner?: unknown) => unknown
+}
+
+/** `ctx.get('settings')` 的窄化读取（服务缺失时返回 undefined）。 */
+function settingsServiceOf(ctx: Context): SettingsServiceLike | undefined {
+  return ctx.get('settings') as SettingsServiceLike | undefined
+}
+
+/**
+ * 本插件面对的 settings 契约版本（**运行期探测的唯一结果**）。
+ *
+ * - `legacy` —— 0.1.6：`settings.register(ns, schema)` 存在，namespace 要自己注册；
+ * - `projection` —— 0.1.7：注册方法已被删除，namespace 是 entry id 的 Config 投影；
+ * - `absent` —— settings 服务根本不在（headless / 未装载该服务）。
+ *
+ * ⚠️ **三者必须区分开**：`absent` 与 `projection` 都会让 `typeof register` 不是
+ * 函数，但处置完全相反 —— 前者无计可施（只能提示），后者是正常路径（什么都不用
+ * 注册）。早期代码把两者混成一句「settings 服务不可用」，于是 0.1.7 上那句
+ * 「服务不可用」把排查方向整个引偏（服务好端端在，只是方法没了）。
+ */
+export type SettingsContract = 'legacy' | 'projection' | 'absent'
+
+/**
+ * 探测当前 profile 的 settings 契约（**只在 `apply()` 里调一次**）。
+ *
+ * 判据只有一条：`register` 是不是函数。这正是 0.1.7 删除的那个方法，也是两版
+ * 唯一互斥的特征；不去嗅探 0.1.7 才有的 `configure`/`update`，因为那会让
+ * 「服务在但两个特征都没有」的未知中间态落进错误分支。
+ *
+ * @param ctx - 插件上下文。
+ * @returns 契约版本；settings 服务缺失时为 `absent`。
+ */
+export function detectSettingsContract(ctx: Context): SettingsContract {
+  const settings = settingsServiceOf(ctx)
+  if (settings === undefined || settings === null) return 'absent'
+  return typeof settings.register === 'function' ? 'legacy' : 'projection'
+}
+
+/**
+ * 解析**本插件实例的 profile entry id**（0.1.7 下它**就是** namespace）。
+ *
+ * `ctx.fiber.entry` 由 `@deepseek-ai/cordis-plugin-loader` 增强而来，本插件的
+ * 依赖树里没有那个包（它的类型在 `node_modules/@deepseek-ai/cordis` 里查不到），
+ * 故这里用一次结构化窄化读取，而不是 `import type {} from '@deepseek-ai/cordis-plugin-loader'`。
+ *
+ * 回退值是模块级 `name`（`'codearts-auth'`）—— 与 `cordis.patch.yml` 里那行
+ * `id: codearts-auth` 同源，因此即使在没有 loader 的测试上下文里也得到同一个 id。
+ *
+ * @param ctx - 插件上下文。
+ * @returns 非空 entry id。
+ */
+export function resolveSettingsEntryId(ctx: Context): string {
+  const entry = (ctx.fiber as unknown as { entry?: { options?: { id?: unknown } } }).entry
+  const id = entry?.options?.id
+  return typeof id === 'string' && id.length > 0 ? id : name
+}
+
+/**
+ * 逐 provider 的 settings 地址解析器。
+ *
+ * ## 为什么地址必须「按契约现算」而不是写死
+ *
+ * 两版契约的地址形态**成对不同**，不能各改一半：
+ *
+ * | 契约 | `settingsNs` | `settingsPath` |
+ * |---|---|---|
+ * | 0.1.6 `legacy` | `llm-<provider>`（7 个独立 namespace） | `[]`（整节就是该 provider 的 profile） |
+ * | 0.1.7 `projection` | entry id（**七个 provider 共用**） | `['providers', <provider>]`（整节是插件的 providers 字典） |
+ *
+ * 配错一半的形态（如新 namespace + 老空 path）**不会报错**，只会让模型设置页
+ * 读到 undefined 的 profile —— 配置项凭空消失，是最难查的那类故障。故这里
+ * 由一份解析器统一产出成对的地址，适配器侧只负责原样转交。
+ *
+ * `legacy` 分支同时覆盖 `absent`：settings 服务不在时地址无人消费，
+ * 但保持 0.1.6 形态可让「服务后到」的场景（可选注入）行为一致。
+ *
+ * @param contract - 探测到的契约版本。
+ * @param entryId - 0.1.7 下的 namespace（即 profile entry id）。
+ * @returns 传 `provider id` 得到该 provider 的成对地址。
+ */
+export function makeSettingsAddressResolver(
+  contract: SettingsContract,
+  entryId: string,
+): (provider: ProviderId) => LlmSettingsAddress {
+  return (provider: ProviderId): LlmSettingsAddress => contract === 'projection'
+    ? { settingsNs: entryId, settingsPath: ['providers', provider] }
+    : { settingsNs: `llm-${provider}`, settingsPath: [] }
+}
+
+/**
+ * 关闭 settings 的**自动生成页**（0.1.7 才有的呈现策略）。
+ *
+ * 本插件有自己的 Account Hub 面板，宿主的自动生成页只会把同一份 provider 字典
+ * 再渲染一遍（重复入口 + 与面板语义不符的表单），故关掉它。`auto: false` 只影响
+ * **自动生成页**，不影响模型设置页：那两处走的是 `listConfigurableProviders()` +
+ * `settingsNs`/`settingsPath`，与这里的呈现策略无关（宿主第一方的 `llm-pi-ai` /
+ * `llm-deepseek` 同样在 `auto: false` 下被模型设置页正常列出）。
+ *
+ * ⚠️ **三条防御，缺一都会在旧契约或测试环境里炸**：
+ * 1. `configure` 不存在就整体跳过 —— 0.1.6 的 settings 没有这个方法；
+ * 2. 用 `ctx.inject(['settings'], ...)` 惰性注入而不是直接调用 —— settings 缺失
+ *    时子 fiber 静静 pending，不影响本插件加载；
+ * 3. `configure` 包在 try/catch 里 —— 同一个 fiber 重复配置会抛
+ *    `Settings presentation is already configured`，那只是重复登记，不该让
+ *    插件报错。
+ *
+ * @param ctx - 插件上下文（owner 取 `ctx.fiber`，即本插件实例）。
+ */
+function installSettingsPresentation(ctx: Context): void {
+  ctx.inject(['settings'], (child) => {
+    const settings = settingsServiceOf(child)
+    if (settings === undefined || typeof settings.configure !== 'function') return
+    child.effect(() => {
+      try {
+        return settings.configure?.({ auto: false }, ctx.fiber) as () => void
+      } catch (error) {
+        child.logger?.debug?.(
+          `[codearts-auth] settings 自动生成页策略登记失败（不影响功能）: ${String(error)}`,
+        )
+        return () => {}
+      }
+    }, 'codearts-auth: settings presentation')
+  })
+}
+
+/**
+ * 在本插件 fiber 进入 **ACTIVE** 之后执行一次回调。
+ *
+ * ## 为什么必须等（不是防御性编程，是实测出来的硬约束）
+ *
+ * 宿主 settings 的 `describe()` 会**跳过** `entry.fiber.state !== ACTIVE` 的
+ * entry（`packages/settings/settings/src/index.ts:306-307`），而 `apply()` 执行
+ * 期间本 fiber 还是 **LOADING** —— 实测 `ctx.fiber.state`：apply 内 `LOADING`、
+ * 微任务里仍 `LOADING`、宏任务起 `ACTIVE`（状态写入发生在 emit 之前，而
+ * LOADING→ACTIVE 的迁移在 apply 返回之后）。
+ *
+ * 所以在 apply() 里**同步**回读 `describe()` 必然看不到自己的 entry —— 那不是
+ * 「投影失败」，只是还没激活。早期实现正是如此，会让每一次 0.1.7 启动都误报
+ * 一条「未出现在 describe() 中」。
+ *
+ * 反过来，单测直接在 root context 上 `apply(ctx)` 时 fiber **已经** ACTIVE
+ * （root fiber 不经历加载迁移），此时立即执行才是对的。故两种情况都覆盖：
+ * 已 ACTIVE 就同步跑，否则挂到 `internal/status` 上等状态迁移。
+ *
+ * @param ctx - 插件上下文。
+ * @param run - 进入 ACTIVE 后执行一次的回调。
+ */
+function whenFiberActive(ctx: Context, run: () => void): void {
+  /** cordis 的 `FiberState.ACTIVE`（const enum 无法运行期引用，故取字面量）。 */
+  const ACTIVE = 2
+  const stateOf = (value: unknown): number | undefined => (value as { state?: number } | undefined)?.state
+  if (stateOf(ctx.fiber) === ACTIVE) {
+    run()
     return
   }
+  let done = false
+  ctx.on('internal/status', (fiber: unknown) => {
+    if (done || fiber !== ctx.fiber || stateOf(fiber) !== ACTIVE) return
+    done = true
+    run()
+  })
+}
+
+/**
+ * 让 provider 配置 namespace 在**当前契约**下真实存在。
+ *
+ * 两条路各自完整、互不掺杂（见 {@link SettingsContract}）：
+ *
+ * - `legacy`（0.1.6）：沿用 `settings.register(ns, providerSettingsSchema)` 注册
+ *   7 个独立 namespace，并回读 `describe()` 自检 —— 一字未改地保留原逻辑；
+ * - `projection`（0.1.7）：**没有可注册的东西**，namespace 由 {@link Config} 的
+ *   volatile 字段投影而来，故只在 fiber 激活后做一次回读自检（entry id 必须出现
+ *   在 describe() 中，否则模型设置页会崩）；
+ * - `absent`：只提示一次，不抛错（headless profile 的既定降级）。
+ *
+ * ⚠️ 措辞是本函数的一半职责：`absent` 与 `projection` 的症状（register 不是函数）
+ * 相同但含义相反，混为一句「settings 服务不可用」会把排查引偏 —— 这条历史教训
+ * 写在 {@link SettingsContract} 上。
+ *
+ * @param ctx - 插件上下文。
+ * @param contract - 探测到的契约版本。
+ * @param entryId - 0.1.7 下的 namespace（即 profile entry id）。
+ * @param namespaces - 0.1.6 下要注册的 7 个 namespace。
+ */
+function registerProviderSettings(
+  ctx: Context,
+  contract: SettingsContract,
+  entryId: string,
+  namespaces: readonly string[],
+): void {
+  const settings = settingsServiceOf(ctx)
+  if (contract === 'absent') {
+    ctx.logger.warn(
+      '[codearts-auth] settings 服务不存在（当前 profile 未装载 @deepseek-ai/dsh-settings）：'
+      + 'provider 配置 namespace 既无法注册（0.1.6 契约）也无法投影（0.1.7 契约），'
+      + '模型设置页不会列出本插件的 provider 配置。账号池、登录与模型路由均不受影响。',
+    )
+    return
+  }
+  if (contract === 'projection') {
+    // 0.1.7：namespace = profile entry id，由 Config 的 volatile 字段投影而来，
+    // 此处**没有可注册的东西**。唯一能做也该做的是回读确认它真的出现了 ——
+    // 没出现就是模型设置页要崩的前兆，必须报出来而不是静默。
+    //
+    // ⚠️ **自检必须等本 fiber 进入 ACTIVE**（见 {@link whenFiberActive}）：宿主
+    // `describe()` 跳过非 ACTIVE 的 entry，而 `apply()` 期间本 fiber 还是
+    // LOADING —— 同步回读必然看不到自己，从而每次启动都误报一条「未出现在
+    // describe() 中」。那不是投影失败，只是还没激活。
+    //
+    // 注意：describe() 会遍历全部 entry 并调用各自 schema 的 toJSON()/redactSecrets()，
+    // 任一 entry 的 schema 不合规都会让整条调用抛错，故这里必须把异常打出来。
+    whenFiberActive(ctx, () => {
+      try {
+        const descriptors = settingsServiceOf(ctx)?.describe?.({ redactSecrets: true })
+        if (descriptors === undefined) return
+        const projected = descriptors.map(v => v.ns)
+        if (!projected.includes(entryId)) {
+          ctx.logger.warn(
+            `[codearts-auth] settings namespace "${entryId}"（0.1.7：profile entry id 的 Config 投影）`
+            + `未出现在 describe() 中，模型设置页会因未注册 namespace 崩溃；`
+            + `已投影的 namespace: ${projected.join(', ') || '(空)'}`,
+          )
+          return
+        }
+        ctx.logger.info(`[codearts-auth] settings namespace 投影就绪: ${entryId}`)
+      } catch (error) {
+        ctx.logger.error(
+          `[codearts-auth] settings.describe 失败（将导致模型设置页/sidebar settings API 不可用）: `
+          + `${error instanceof Error ? error.stack ?? error.message : String(error)}`,
+        )
+      }
+    })
+    return
+  }
+  // ---- 0.1.6 契约：注册 7 个独立 namespace（逻辑与迁移前逐字一致）----
   for (const ns of namespaces) {
     try {
-      settings.register(ns, providerSettingsSchema)
+      settings?.register?.(ns, providerSettingsSchema())
     } catch (error) {
       ctx.logger.warn(`[codearts-auth] settings namespace "${ns}" 注册失败: ${String(error)}`)
     }
@@ -125,7 +431,7 @@ function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
   // toJSON()/redactSecrets()，任一注册项的 schema 不合规都会让整条调用抛错。
   // 因此这里必须把异常打出来，而不是静默吞掉。
   try {
-    const descriptors = settings.describe?.({ redactSecrets: true }) ?? []
+    const descriptors = settings?.describe?.({ redactSecrets: true }) ?? []
     const registered = descriptors.map(v => v.ns)
     const missing = namespaces.filter(ns => !registered.includes(ns))
     if (missing.length > 0) {
@@ -138,6 +444,26 @@ function registerProviderSettings(ctx: Context, ...namespaces: string[]): void {
       + `${error instanceof Error ? error.stack ?? error.message : String(error)}`,
     )
   }
+}
+
+/**
+ * 0.1.6 契约下每个 namespace 各自的 provider 配置 schema。
+ *
+ * 每次调用返回**新实例**（8 个 namespace 各持一份，避免共享同一个 schema 对象
+ * 在宿主 `plainSchema`/`redactSecrets` 侧被就地改写时互相串味）。
+ *
+ * 之所以要 `Schema.object({...})` 而不能是裸函数：`describe()` 会对每个注册项
+ * 无条件调用 `schema.toJSON()` 与 `redactSecrets(schema, value)` —— 传入
+ * `(value) => ...` 会让 `describe()` 抛
+ * `TypeError: registration.schema.toJSON is not a function`，进而使所有依赖
+ * settings 的界面（模型设置页、主题、sidebar 的 settings.get/shell.get）全部失败。
+ *
+ * @returns `{ providers: dict(any) }` 的宽松占位 schema。
+ */
+function providerSettingsSchema(): unknown {
+  return Schema.object({
+    providers: Schema.dict(Schema.any()).default({}),
+  })
 }
 
 /**
@@ -340,26 +666,57 @@ export function makeAccountRefresher(
   }
 }
 
-/** 注册 codeartsAuth 服务、命令以及 codearts LLM 路由。 */
-export function apply(ctx: Context): void {
-  // provider 的 settingsNs 必须已注册，否则模型设置页会因未注册 namespace 崩溃。
-  // 六个 namespace 分别对应：codearts 路由、Buddy CN（buddy-cn）路由、
-  // Buddy（buddy）路由、LobsterAI（lobsterai）路由、Trae CN（trae-cn）路由、
-  // Qoder 两区（qoder / qoder-cn）路由
-  // —— 后五个由 registerXxxLlm 以 `llm-${product.id}` 派生，漏注册会让模型设置页在
+/**
+ * 注册 codeartsAuth 服务、命令以及 codearts LLM 路由。
+ *
+ * @param ctx - 插件上下文。
+ * @param config - 宿主按 {@link Config} 校验后的插件配置。本插件**不读**它
+ *   （凭据一律由账号池解析），参数存在的意义是让 cordis 把本 entry 认成
+ *   「有 Config 的插件」—— 0.1.7 的 settings 投影正是按 `runtime.Config` 取
+ *   schema 的（见 {@link Config}）。省略时不报错（与宿主第一方同款可选形参）。
+ */
+export function apply(ctx: Context, config?: Config): void {
+  void config
+  // ===== settings 契约探测（**全流程只做这一次**）=====
+  //
+  // 0.1.6 与 0.1.7 的 settings 契约不兼容：老版要 `register(ns, schema)` 逐个注册
+  // namespace，新版把这套 seam 删了、namespace 改为「profile entry id 的 Config
+  // 投影」。探测结果同时决定两件事：
+  // ① namespace 怎么来（见 registerProviderSettings）；② 每个 provider 目录项的
+  // settings 地址形态（见 makeSettingsAddressResolver）—— 二者必须同源，否则会
+  // 出现「namespace 是新的、path 是老的」这种半迁移态，且**不报错**，只让模型
+  // 设置页读到 undefined 的 profile（配置项凭空消失）。
+  const contract = detectSettingsContract(ctx)
+  const entryId = resolveSettingsEntryId(ctx)
+  // 逐 provider 的成对地址（namespace + 分槽路径）。7 处 registerXxxLlm 各自取自己
+  // 那一份传进 `settingsAddress` 选项 —— 适配器不做探测、不认识契约版本，只原样
+  // 转交给 `registerConfigurableProviders`。
+  const settingsAddressFor = makeSettingsAddressResolver(contract, entryId)
+  // 0.1.7 专属：关掉宿主 settings 的自动生成页（本插件有自己的 Account Hub 面板）。
+  // 0.1.6 下 `configure` 不存在，函数内部整体跳过。
+  installSettingsPresentation(ctx)
+
+  // provider 的 settingsNs 必须真实存在，否则模型设置页会因未注册 namespace 崩溃。
+  // 七条路由分别是：codearts、Buddy CN（buddy-cn）、Buddy（buddy）、
+  // LobsterAI（lobsterai）、Trae CN（trae-cn）、Qoder 两区（qoder / qoder-cn）。
+  // 0.1.6 下这七个 namespace 由下面的调用逐个注册；0.1.7 下它们合并为**一个**
+  // namespace（本插件的 entry id，见 `Config`）。
+  // ⚠️ 无论哪一版，namespace 都必须与各 registerXxxLlm 交给
+  // `registerConfigurableProviders` 的 `settingsNs` 一致 —— 不一致时模型设置页在
   // `refFor → deriveKeyRef(provider)` 处以
   // `provider.toUpperCase is not a function` 崩溃。
-  // 注意 `llm-trae-cn` / `llm-buddy-cn` 里的连字符是**正确**的：namespace 是
-  // 字符串键而非标识符，与 cordis 服务名（`traeCnAuth` / `buddyCnAuth`）
+  // 注意 `llm-trae-cn` / `llm-buddy-cn` 里的连字符是**正确**的：0.1.6 的 namespace
+  // 是字符串键而非标识符，与 cordis 服务名（`traeCnAuth` / `buddyCnAuth`）
   // 走的是两套命名规则。
   // Qoder 与 Qoder **CN**（`qoder-cn`）是**同协议双 region**，
   // 但两区的账号、用量、PAT **互不相通**，故是**两个独立 provider**
-  // （详见 `src/qoder-product.ts` 的模块头）。namespace 用连字符是**正确**的：
-  // 它是字符串键而非标识符，与 cordis 服务名 `qoderCnAuth` 走两套命名规则。
+  // （详见 `src/qoder-product.ts` 的模块头）。
   registerProviderSettings(
     ctx,
-    'llm-buddy-cn', 'llm-buddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae-cn',
-    'llm-qoder', 'llm-qoder-cn',
+    contract,
+    entryId,
+    ['llm-buddy-cn', 'llm-buddy', 'llm-codearts', 'llm-lobsterai', 'llm-trae-cn',
+      'llm-qoder', 'llm-qoder-cn'],
   )
   const service = new CodeArtsAuth(ctx)
   const pool = new AccountPool(ctx)
@@ -484,6 +841,10 @@ export function apply(ctx: Context): void {
     refresh: makeAccountRefresher(pool, CODEARTS_PROVIDER, service),
     fetchRemoteModels: () => service.refreshModels(),
     accountPool: pool,
+    // settings 地址**按探测到的契约现算**（0.1.6：`llm-codearts` + `[]`；
+    // 0.1.7：entry id + `['providers', 'codearts']`）。适配器不做探测、
+    // 也不认识契约版本，只把成对地址原样转交（见 `LlmSettingsAddress`）。
+    settingsAddress: settingsAddressFor(CODEARTS_PROVIDER),
   })
 
   // ===== Buddy CN (腾讯 CodeBuddy 中国版) 服务 =====
@@ -504,6 +865,7 @@ export function apply(ctx: Context): void {
     readImage: makeReadImage(ctx),
     accountPool: pool,
     product: BUDDY_CN,
+    settingsAddress: settingsAddressFor(BUDDY_CN.id),
   })
 
   // ===== Buddy (腾讯 WorkBuddy 国际版) 服务 =====
@@ -524,6 +886,7 @@ export function apply(ctx: Context): void {
     readImage: makeReadImage(ctx),
     accountPool: pool,
     product: BUDDY,
+    settingsAddress: settingsAddressFor(BUDDY.id),
   })
 
   // ===== LobsterAI (有道龙虾) 服务 =====
@@ -532,10 +895,6 @@ export function apply(ctx: Context): void {
   // 服务名由 LobsteraiAuth 依 product.id 派生，注册为 ctx.lobsteraiAuth。
   // 与其他 provider 一样不注册斜杠命令：入口在 Account Hub 的 LobsterAI 面板。
   const lobsterai = new LobsteraiAuth(ctx)
-  // 与 resolveCredential 共用同一个选号器：两者必须挑到**同一个**账号，
-  // 否则「刷新的是解析凭据时所用的那个账号」这条不变量会被打破
-  // （详因见 makeAccountPicker 的说明）。
-  const pickLobsteraiAccount = makeAccountPicker(pool, LOBSTERAI.id)
   // 适配器实例要交给 RPC 层：Account Hub 的「显示列表」用它拿**不套用户黑名单、
   // 也不套目录门控**的完整目录（`listAllModels`），被关闭的模型才有正确的展示名。
   const lobsteraiAdapter = registerLobsteraiLlm(ctx, {
@@ -547,31 +906,18 @@ export function apply(ctx: Context): void {
     resolveCredential: makeCredentialResolver<LobsteraiCredential>(
       ctx, pool, LOBSTERAI.id, LOBSTERAI.defaultCredentialRef,
     ),
-    refresh: async (model?: string) => {
-      // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
-      //
-      // 为什么：resolveCredential（上面）优先从账号池取
-      // `LOBSTERAI_ACCOUNT_XXX` 的凭据，而 `lobsterai.refresh()` 读写的是
-      // `LOBSTERAI_ACCESS_TOKEN`。两者错配的后果是 —— 适配器检测到池凭据
-      // 过期 → 调 refresh → 成功回写到**另一个** ref → 再 resolve 仍取到
-      // 那份未更新的过期凭据 → 带着过期 token 发请求 → 401。
-      // 用户看到的是「刚在 Account Hub 登录好，却一直认证失败」，
-      // 而日志里续期全是成功的，极难排查。
-      //
-      // 与 Go 一致：`handler.go:197-209` 也是先 Pick 出账号、再对该账号
-      // `RefreshToken(acct)`（而非某个全局单例）。
-      //
-      // **必须用同一个 model 选号**：resolveCredential 已按目标模型过滤，
-      // 若这里退回空 modelId，就会挑回数组顺序最前的（可能正是对 M 限流的那个）
-      // 账号，从而重新引入上面那段错配。
-      const available = await pickLobsteraiAccount(model)
-      if (available) await lobsterai.refreshAccountCredential(available.entry.credentialRef)
-      else await lobsterai.refresh()
-    },
+    // 接线理由（为什么必须刷解析时所用的那个账号）与回归测试见
+    // makeAccountRefresher / lobsterai-wiring.spec.ts。
+    // 与 Go 一致：`handler.go:197-209` 也是先 Pick 出账号、再对该账号
+    // `RefreshToken(acct)`（而非某个全局单例）。
+    refresh: makeAccountRefresher(pool, LOBSTERAI.id, lobsterai),
     fetchRemoteModels: () => lobsterai.fetchModels(pool),
     resolveClientVersion: () => lobsterai.resolveClientVersion(),
     accountPool: pool,
     product: LOBSTERAI,
+    // settings 地址按契约现算（0.1.6：`llm-lobsterai` + `[]`；
+    // 0.1.7：entry id + `['providers', 'lobsterai']`）。
+    settingsAddress: settingsAddressFor(LOBSTERAI.id),
   })
 
   // ===== Trae CN (字节跳动 Trae 国内版) 服务 =====
@@ -583,10 +929,6 @@ export function apply(ctx: Context): void {
   // 带连字符的 `trae-cnAuth`。服务名由产品配置的 serviceName 显式给出
   // `traeCnAuth`，与另外四个 provider 的命名风格保持一致。
   const traeCn = new TraeCnAuth(ctx)
-  // 与 resolveCredential 共用同一个选号器：两者必须挑到**同一个**账号，
-  // 否则「刷新的是解析凭据时所用的那个账号」这条不变量会被打破
-  // （详因见 makeAccountPicker 的说明，回归测试在 lobsterai-wiring.spec.ts）。
-  const pickTraeCnAccount = makeAccountPicker(pool, TRAE_CN.id)
   // 适配器实例要交给 RPC 层：Account Hub 的「显示列表」需要逐模型的窗口档位
   // （dev / Max），而那是**目录持有者**独有的数据 —— `ctx.llm.listModels()` 会把
   // 适配器返回的额外字段丢掉，ctx 上也没有「按 provider 取适配器」的入口。
@@ -599,25 +941,15 @@ export function apply(ctx: Context): void {
     resolveCredential: makeCredentialResolver<TraeCnCredential>(
       ctx, pool, TRAE_CN.id, TRAE_CN.defaultCredentialRef,
     ),
-    refresh: async (model?: string) => {
-      // 必须刷新**解析凭据时所用的那一个**账号，而不是默认单凭据 ref。
-      // 为什么：resolveCredential（上面）优先从账号池取 `TRAE_CN_ACCOUNT_XXX`
-      // 的凭据，而 `traeCn.refresh()` 读写的是 `TRAE_CN_ACCESS_TOKEN`。两者错配
-      // 的后果是 —— 适配器检测到池凭据过期 → 调 refresh → 成功回写到**另一个**
-      // ref → 再 resolve 仍取到那份未更新的过期凭据 → 带着过期 token 发请求 →
-      // 401。用户看到「刚在 Account Hub 登录好，却一直认证失败」，而日志里续期
-      // 全是成功的，极难排查。
-      //
-      // **必须用同一个 model 选号**：resolveCredential 已按目标模型过滤，若这里
-      // 退回空 modelId，就会挑回数组顺序最前的（可能正是对 M 限流的那个）账号，
-      // 从而重新引入上面那段错配。
-      const available = await pickTraeCnAccount(model)
-      if (available) await traeCn.refreshAccountCredential(available.entry.credentialRef)
-      else await traeCn.refresh()
-    },
+    // 接线理由（为什么必须刷解析时所用的那个账号）与回归测试见
+    // makeAccountRefresher / lobsterai-wiring.spec.ts。
+    refresh: makeAccountRefresher(pool, TRAE_CN.id, traeCn),
     accountPool: pool,
     readImage: makeReadImage(ctx),
     product: TRAE_CN,
+    // settings 地址按契约现算（0.1.6：`llm-trae-cn` + `[]`；
+    // 0.1.7：entry id + `['providers', 'trae-cn']`）。
+    settingsAddress: settingsAddressFor(TRAE_CN.id),
   })
 
   // ===== Qoder (PAT 粘贴式登录) 服务 =====
@@ -632,10 +964,6 @@ export function apply(ctx: Context): void {
   // 判据**（那条是因为机械派生会得到 `trae-cnAuth`），不要为「形态统一」给
   // 无连字符的产品也加一个字段。
   const qoder = new QoderAuth(ctx)
-  // 与 resolveCredential 共用同一个选号器：两者必须挑到**同一个**账号，
-  // 否则「刷新的是解析凭据时所用的那个账号」这条不变量会被打破
-  // （详因见 makeAccountPicker 的说明，回归测试在 lobsterai-wiring.spec.ts）。
-  const pickQoderAccount = makeAccountPicker(pool, QODER.id)
   // 适配器与 quotaVerdict **共用同一个凭据解析器**：两处各写一份必然分叉
   // （理由同上）。
   const resolveQoderCredential = makeCredentialResolver<QoderCredential>(
@@ -668,13 +996,9 @@ export function apply(ctx: Context): void {
     resolveCredential: resolveQoderCredential,
     // 续期对 Qoder 就是**重打 exchange**（PAT 不变，随时可重打），不是
     // 「refresh_token 换新」——见 `src/qoder-auth.ts` 的 refresh 说明。
-    refresh: async (model?: string) => {
-      // 与 resolveCredential 用**同一个**选号器与同一个 model：否则会出现
-      // 「解析到 B、却刷新了 A」，B 的过期 jt 永不更新（历史 S1 缺陷）。
-      const available = await pickQoderAccount(model)
-      if (available) await qoder.refreshAccountCredential(available.entry.credentialRef)
-      else await qoder.refresh()
-    },
+    // 接线理由（为什么必须刷解析时所用的那个账号）与回归测试见
+    // makeAccountRefresher / lobsterai-wiring.spec.ts。
+    refresh: makeAccountRefresher(pool, QODER.id, qoder),
     // job token 提供者：chat 与额度端点**只认 `jt-`**（PAT 直打 chat 恒 401、
     // 打额度端点回 401 `TOKEN_EXPIRE`），故必须注入。
     // ⚠️ 省略时适配器会抛 `MISSING_CREDENTIAL` —— 那会把「没接线」这个明确的
@@ -703,6 +1027,11 @@ export function apply(ctx: Context): void {
     },
     accountPool: pool,
     product: QODER,
+    // settings 地址按契约现算（0.1.6：`llm-qoder` + `[]`；
+    // 0.1.7：entry id + `['providers', 'qoder']`）。两个 region 各取自己那份 ——
+    // 0.1.7 下它们共用同一个 namespace（entry id）但**分槽不同**，这正是
+    // `settingsPath` 存在的理由。
+    settingsAddress: settingsAddressFor(QODER.id),
     // 设备流目录链（dt- → wasm 签名目录）：本 region 专用实例。⚠️ chat 的
     // `signing` 位**刻意留空**（国际版 chat 是 REST，一行不动）。
     directorySigning: qoderDirectorySigningSource(qoderSigning),
@@ -744,10 +1073,6 @@ export function apply(ctx: Context): void {
   // 那条判据的**正面用例**（国际版 `qoder` 不声明该字段，是反面用例）。
   // 构造时 `QoderAuth` 自动读取 `product.serviceName`，本段**不另写派生**。
   const qoderCn = new QoderAuth(ctx, { product: QODER_CN })
-  // 与 resolveCredential 共用同一个选号器：两者必须挑到**同一个**账号，
-  // 否则「刷新的是解析凭据时所用的那个账号」这条不变量会被打破
-  // （详因见 makeAccountPicker 的说明，回归测试在 lobsterai-wiring.spec.ts）。
-  const pickQoderCnAccount = makeAccountPicker(pool, QODER_CN.id)
   // 适配器与 quotaVerdict **共用同一个凭据解析器**：两处各写一份必然分叉
   // （理由同上）。
   const resolveQoderCnCredential = makeCredentialResolver<QoderCredential>(
@@ -785,11 +1110,9 @@ export function apply(ctx: Context): void {
     resolveCredential: resolveQoderCnCredential,
     // 续期同样是**重打 exchange**，打的却是 CN 自己的 openapi 基址
     // （`product.openapiBase`，A 段已让 exchange 走产品配置）。
-    refresh: async (model?: string) => {
-      const available = await pickQoderCnAccount(model)
-      if (available) await qoderCn.refreshAccountCredential(available.entry.credentialRef)
-      else await qoderCn.refresh()
-    },
+    // 接线理由（为什么必须刷解析时所用的那个账号）与回归测试见
+    // makeAccountRefresher / lobsterai-wiring.spec.ts。
+    refresh: makeAccountRefresher(pool, QODER_CN.id, qoderCn),
     // job token 提供者：**必须是 CN 的 auth 实例** —— jt 缓存按实例持有，
     // 用国际版实例换来的 jt 打 CN 端点只会得到一次 401。
     getJobToken: (pat: string) => qoderCn.getJobToken(pat),
@@ -806,6 +1129,10 @@ export function apply(ctx: Context): void {
     },
     accountPool: pool,
     product: QODER_CN,
+    // settings 地址按契约现算（0.1.6：`llm-qoder-cn` + `[]`；
+    // 0.1.7：entry id + `['providers', 'qoder-cn']`）。两区各占一个槽，
+    // 不能共用国际版那一份。
+    settingsAddress: settingsAddressFor(QODER_CN.id),
     // 签名来源（本 region 专用实例，见上方的构造点）。
     signing: qoderCnSigning,
     // 设备流目录链：CN 的目录 host 与 chat 签名是**同一个** gateway（
@@ -977,23 +1304,28 @@ export function apply(ctx: Context): void {
   })
 
   // ===== Account Hub RPC 注册 =====
-  // 参数次序照既有惯例：provider 服务的排列顺序与上面注册顺序一致，
-  // 新增的 `qoderCn` 排在尾（`qoder` 之后）；其后的两个可选实参都是
-  // **按 provider 分派**的注册表：
-  // - 第 10 个是窗口档位表（见 `ContextTierRegistry`），省略时 `model.list`
+  // 传参形态是**单一 options 对象**（见 `AccountHubRpcOptions`）：字段名与顺序无关，
+  // 新增 provider 时只加字段、不再动签名（此前的 12 个位置实参每加一个 provider
+  // 都要改签名与全部转发点）。其后的两个可选字段都是**按 provider 分派**的注册表：
+  // - `contextTiers` 是窗口档位表（见 `ContextTierRegistry`），省略时 `model.list`
   //   不带窗口字段、`model.setContextBudget` 一律拒绝；
-  // - 第 11 个是适配器映射（见 `ModelCatalogSource`），省略时「显示列表」退化为
-  //   「`listModels` 结果 + 黑名单裸 id 回填」的历史行为。
+  // - `modelAdapters` 是适配器映射（见 `ModelCatalogSource`），省略时「显示列表」
+  //   退化为「`listModels` 结果 + 黑名单裸 id 回填」的历史行为。
   // 两者都是 headless / 测试场景的既定降级。
   //
   // ## 键 = provider id（**不是**面板 id、不是池键）
   //
   // 与 `contextBudgets` 的存储分键同构。故：
-  // - CodeArts / LobsterAI **刻意不在表里**：它们的目录根本没有窗口元数据，
+  // - CodeArts / LobsterAI **刻意不在档位表里**：它们的目录根本没有窗口元数据，
   //   「无数据不显示」是铁律，不是漏接线。
   //
   // 用 `*.id` 而不是字面量：写死字面量在改名 / 多产品场景下会静默不匹配
   // （本插件在 workbuddy 改名上踩过同类坑）。
+  //
+  // ⚠️ 两个映射的键现由 `ProviderId` 联合（`src/types.ts`）约束，**键拼错在此处
+  // 由 excess property check 直接报错**（`createContextTierRegistry` 的形参也已
+  // 同步收窄）。注意只防「拼错」不防「漏登记」—— `Partial` 允许子集，漏登记由
+  // `registerAccountHubRpc` 入口的运行时 warn 兜底。
   const contextTierRegistry = createContextTierRegistry({
     [TRAE_CN.id]: traeCnAdapter,
     [BUDDY_CN.id]: buddyCnAdapter,
@@ -1015,7 +1347,10 @@ export function apply(ctx: Context): void {
   // 制约，见 `src/account-hub-rpc.ts` 的 `ModelCatalogSource`）。
   //
   // 键取 `*.id` / 常量，别写字面量（理由同上）。
-  const modelAdapters: Record<string, ModelCatalogSource> = {
+  // ⚠️ 注解必须是 `Partial<Record<ProviderId, …>>`（**不能**写宽成
+  // `Record<string, …>`）：宽注解会让下面这个对象字面量在赋值处就被接受，
+  // 拼错的键再也拿不到 excess property check —— 类型保护在传参前就失效了。
+  const modelAdapters: Partial<Record<ProviderId, ModelCatalogSource>> = {
     [CODEARTS_PROVIDER]: codeartsAdapter,
     [BUDDY_CN.id]: buddyCnAdapter,
     [BUDDY.id]: buddyAdapter,
@@ -1024,12 +1359,22 @@ export function apply(ctx: Context): void {
     [QODER.id]: qoderAdapter,
     [QODER_CN.id]: qoderCnAdapter,
   }
-  registerAccountHubRpc(
-    ctx, pool, service, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn, contextTierRegistry, modelAdapters,
-    // 第 12 个实参：`autoroute.set` 成功后的配置变更通知 —— 让聚合适配器的降级队列
-    // 与用户刚改的候选顺序归位（内容幂等，重复调用无副作用）。
-    ensureAutoRouteRegistration,
-  )
+  registerAccountHubRpc({
+    ctx,
+    pool,
+    codearts: service,
+    buddyCn,
+    buddy,
+    lobsterai,
+    traeCn,
+    qoder,
+    qoderCn,
+    contextTiers: contextTierRegistry,
+    modelAdapters,
+    // `autoroute.set` 成功后的配置变更通知 —— 让聚合适配器的降级队列与用户刚改的
+    // 候选顺序归位（内容幂等，重复调用无副作用）。
+    onAutoRouteChanged: ensureAutoRouteRegistration,
+  })
   ctx.provide('accountPool', pool)
 
   // ===== 自动签到 · 宿主触发层 =====

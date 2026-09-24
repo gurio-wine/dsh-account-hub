@@ -476,8 +476,10 @@ openpangu-2.0-flash (92B) / openpangu-2.0-pro (505B)，
 ## 开发
 
 - `pnpm test` — 单元测试（快速，无网络）。
-- `pnpm test:e2e` — 针对华为线上端点的真实登录流程；需要在打开的浏览器中由人工
-  点击授权按钮（续期为静默刷新，无需再次点击）。
+- `pnpm test:e2e:*` — 按 provider 分列的真实线上用例（`pnpm test:e2e:login` 走
+  CodeArts 浏览器登录，需要在打开的浏览器中由人工点击授权按钮；续期为静默刷新，
+  无需再次点击）；均有闸门、默认全部跳过，脚本清单与积分消耗情况见
+  `tests/e2e/README.md`。
 - `pnpm typecheck`、`pnpm build:all`。
 
 ### 构建

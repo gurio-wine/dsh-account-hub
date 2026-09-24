@@ -1459,16 +1459,23 @@ function ProviderPanel({ provider, rpcCall }) {
   /**
    * 本 provider 是否支持积分余额查询。
    *
-   * CodeArts 是华为云账号体系，后端**没有**这两条腾讯计费接口
-   * （`credits.balances` 会回 `unsupported provider: codearts`）。
-   * 因此这里必须在**发起请求之前**判掉：既不调用 RPC，也不渲染「积分」行与
-   * 「刷新积分」按钮——否则卡片会永远停在「查询失败」，控制台每次都留报错。
-   *
    * 判定依据是 `./credits-capabilities.js` 的能力矩阵（唯一真相源），
    * 而不是散落在 UI 里的 provider 字面量比较。
+   *
+   * 这里必须在**发起请求之前**判掉：既不调用 RPC，也不渲染「积分」行与
+   * 「刷新积分」按钮——否则卡片会永远停在「查询失败」，控制台每次都留报错。
+   * 矩阵**默认关闭**（未登记者两项全无），故将来新增 provider 忘登记时，
+   * 最坏结果是暂时看不到积分，而不是每次开面板都发一个必然失败的请求。
+   *
+   * ⚠️ 历史缺陷（能力矩阵存在的理由）：早期 CodeArts 两项能力皆无，客户端却在
+   * 面板挂载时对所有 provider 无条件调用 `credits.balances`，于是每打开一次
+   * CodeArts 面板都在控制台留一条必然失败的报错、并把账号卡片渲染成
+   * 「查询失败」。CodeArts 后来已接入真实实现（`src/codearts-credits.ts`，
+   * 两项能力由全假变为全真），**门控机制本身不变**。
    */
   const canLoadCredits = supportsCreditBalance(provider);
-  // 只有支持签到能力的 provider（当前是 Buddy CN / LobsterAI / Trae CN）渲染领取按钮。
+  // 只有支持签到能力的 provider（当前六个面板：Buddy CN / LobsterAI / Trae CN /
+  // CodeArts / Qoder 两区）渲染领取按钮；Buddy 国际版后端无签到接口，不在其中。
   const supportsCredits = supportsDailyCheckin(provider);
   /**
    * 本面板的**显示名**（`PROVIDERS` 条目的 `label`，找不到时回退 `provider` id）。

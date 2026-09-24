@@ -288,10 +288,11 @@ function createHarness(
     logger: { warn: () => {}, info: () => {} },
     credentials,
   }
-  registerAccountHubRpc(
-    ctx as never, pool as never, {} as never, {} as never, {} as never, {} as never,
-    {} as never, qoderAuthStub as never, qoderAuthStub as never,
-  )
+  registerAccountHubRpc({
+    ctx: ctx as never, pool: pool as never,
+    codearts: {} as never, buddyCn: {} as never, buddy: {} as never, lobsterai: {} as never,
+    traeCn: {} as never, qoder: qoderAuthStub as never, qoderCn: qoderAuthStub as never,
+  })
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 
   const call = async <T>(method: string, payload: unknown): Promise<RpcResult<T>> => {

@@ -205,10 +205,13 @@ describe('CodeArtsAdapter', () => {
     expect((await adapter.resolveModel('codearts', 'brand-new-model')).context).toBeUndefined()
   })
 
-  // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用
-  // registration.adapter.prepareCall()，而本仓库链接的副本（0.1.0-rc.6）
-  // 的 LlmAdapter 基类没有该方法——缺少时每轮请求都以
-  // `registration.adapter.prepareCall is not a function` 失败。
+  // 契约回归：`LlmRuntime.prepareCall()` 会直接调用
+  // `registration.adapter.prepareCall()`。本适配器**保留**自己的实现（不是
+  // 旧基类兜底 shim）：基类默认实现只转发 `resolveModel`，而本适配器的
+  // `resolveModel` 不声明模态（只有 `{provider,id,name}` + context）—— 走基类
+  // 会让 `inputModalities` **缺席**（DSH 口径：缺席 = 未知），宿主
+  // `adapterStream` 便不再把图片换成占位符。这里显式声明 `['text']` 是
+  // **明确的否定能力**（两种语义的区别见 `src/qoder-models.ts` 的同名说明）。
   it('prepareCall resolves the model and binds its stream', async () => {
     const adapter = makeAdapter()
     expect(typeof adapter.prepareCall).toBe('function')

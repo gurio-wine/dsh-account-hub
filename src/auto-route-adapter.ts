@@ -276,24 +276,6 @@ export class AutoRouteAdapter extends LlmAdapter {
   }
 
   /**
-   * 兼容旧版 `dsh-llm` 的 `prepareCall` shim（与其余五个适配器同款）。
-   *
-   * 宿主新版基类已提供该方法；旧副本（0.1.0-rc.6）没有，缺了它每轮请求开头会以
-   * `registration.adapter.prepareCall is not a function` 崩。这里把「能力解析」与
-   * 「分发」绑定到同一个适配器实例，语义与基类默认实现一致。
-   */
-  async prepareCall(
-    provider: string,
-    model: string,
-    signal?: AbortSignal,
-  ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
-    return {
-      model: await this.resolveModel(provider, model, signal),
-      stream: (options: GenerateOptions) => this.stream(options),
-    }
-  }
-
-  /**
    * 一次请求：按队首条目转发，失败即降级，满一圈才报「全部条目不可用」。
    *
    * 逐条语义见模块头。三个**不变量**在这里落地：

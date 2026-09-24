@@ -80,7 +80,13 @@ import {
   retestAccount,
   retestAllAccounts,
 } from './account-probe.js'
-import type { CodeArtsCredential } from './types.js'
+// CodeArts 的 provider id 常量（`llm-adapter` 的 `PROVIDER = 'codearts'`）。
+// ⚠️ 只为 {@link TIER_SOURCE_EXEMPT_PROVIDERS} 的**键**导入，别写 `'codearts'`
+// 字面量 —— 产品改名时字面量会静默失配，豁免名单就悄悄失效了。
+// 本导入不构成循环：`llm-adapter` 不 import 本模块（也不 import 任何 import 本模块
+// 的文件），且本文件已经间接依赖它（`account-probe` → `llm-adapter`）。
+import { PROVIDER as CODEARTS_PROVIDER } from './llm-adapter.js'
+import type { CodeArtsCredential, ProviderId } from './types.js'
 import type {
   ProviderAccountEntry,
   RpcListAccountsRequest,
@@ -1557,64 +1563,164 @@ function busyCheckinPerformResponse(provider: string): RpcCheckinPerformResponse
 }
 
 /**
+ * 有模型目录、却**刻意没有档位来源**的 provider 白名单。
+ *
+ * 仅供 {@link warnMissingTierSources} 的运行时一致性告警排除用：这些 provider
+ * 在 `modelAdapters` 里登记（「显示列表」需要完整目录），但**不进**档位注册表，
+ * 且这是设计而非遗漏 —— 白名单就是把这件事实写下来，免得下一个人当成 bug 去「修」。
+ *
+ * - `codearts`：目录没有窗口元数据，档位走静态表 `CONTEXT_WINDOWS` 兜底
+ *   （见 docs/agents/codearts-context-window.md），不参与本档位机制；
+ * - `lobsterai`：目录只公布单个 `contextWindow`，**没有远端档位源** ⇒ 不显示档位
+ *   （「宁缺毋编」，见 `src/context-tiers.ts` 的形态表）。
+ *
+ * ⚠️ **新增有档位数据源的 provider 时不要往这里加** —— 该做的是把它登记进
+ * `src/index.ts` 的档位注册表，否则模型列表会静默不显示档位。
+ */
+const TIER_SOURCE_EXEMPT_PROVIDERS: ReadonlySet<string> = new Set([CODEARTS_PROVIDER, LOBSTERAI.id])
+
+/**
+ * 档位注册表**漏登记**的运行时兜底告警（只 warn，不抛错）。
+ *
+ * ## 为什么需要它：漏登记只会静默退化
+ *
+ * 类型层（{@link AccountHubRpcOptions.modelAdapters} / `createContextTierRegistry`
+ * 的 `Partial<Record<ProviderId, …>>`）只能靠 excess property check 抓**键拼错**；
+ * `Partial` 允许子集，所以「漏登记某个 provider 的档位」**编译期不报错**。漏掉的
+ * 后果是静默的：该 provider 的模型列表不带窗口字段、`model.setContextBudget`
+ * 一律拒绝 —— 用户只看到「档位列没了」，没有任何报错可循。
+ *
+ * 故这里在注册入口做一次**集合差**：有目录适配器、却拿不到档位来源、又不在
+ * {@link TIER_SOURCE_EXEMPT_PROVIDERS} 里的 provider，逐条汇总成一条 warn。
+ *
+ * ⚠️ **刻意只 warn 不抛错**：headless / 测试场景本来就不注入档位注册表（既定降级，
+ * 见 {@link AccountHubRpcOptions.contextTiers}），抛错会把那条合法路径变成启动失败。
+ */
+function warnMissingTierSources(options: AccountHubRpcOptions): void {
+  const { contextTiers, modelAdapters } = options
+  // 未注入适配器映射（headless / 测试）时无从谈起「漏登记」—— 整套档位机制都没接线。
+  if (modelAdapters === undefined) return
+  const missing = Object.keys(modelAdapters)
+    .filter((provider) => !TIER_SOURCE_EXEMPT_PROVIDERS.has(provider))
+    .filter((provider) => contextTiers?.sourceFor(provider) === undefined)
+  if (missing.length === 0) return
+  options.ctx.logger.warn(
+    `[account-hub] 以下 provider 有模型目录但无上下文档位来源（模型列表将不显示档位）：`
+    + `${missing.join(' / ')}；若该 provider 确有档位数据源，请在 src/index.ts 的档位注册表里补登记。`,
+  )
+}
+
+/**
+ * {@link registerAccountHubRpc} 的**单一 options 对象形参**。
+ *
+ * ## 为什么从位置实参改成对象
+ *
+ * 原签名收 **12 个位置实参**（`ctx` + `pool` + 七个 auth 服务 + 三个可选注入），
+ * 每新增一个 provider 都要改签名，并且**全部转发点与调用点必须同步改**。更危险的是
+ * 位置实参的**静默错位**：相邻的 auth 服务类型相同（七个都是 `login/status/refresh/
+ * logout` 形状），互换两个实参 `tsc` 一声不吭，只表现为「登录写进了另一个 provider」。
+ *
+ * 改成单一 options 对象后：**新增 provider 只加字段，不再动签名**；调用点按字段名
+ * 传参、与顺序无关；字段名与原形参名逐一对应（含可选性），故本次重构是纯搬运。
+ *
+ * ## 两套按 provider 分键的映射：类型层保护
+ *
+ * {@link contextTiers} 与 {@link modelAdapters} 都按 provider id 分键，且**漏登记
+ * 只会静默退化**（档位不显示 / 关闭项退回裸 id）。二者的键现由 `ProviderId`
+ * 联合（`src/types.ts` 的唯一真相源）约束，键拼错在调用点的对象字面量处被
+ * excess property check 拦下；「漏登记」编译期不报（`Partial` 允许子集），
+ * 由 {@link warnMissingTierSources} 运行时兜底。
+ */
+export interface AccountHubRpcOptions {
+  /** 宿主上下文。`connection` 只存在于 Web bundle，故由本函数**惰性注入**。 */
+  ctx: Context
+  /** 账号池（持久层与候选优先级）。 */
+  pool: AccountPool
+  /** CodeArts 认证服务。 */
+  codearts: CodeArtsAuth
+  /** Buddy **中国版**认证服务（与 {@link buddy} 同源、不同产品配置）。 */
+  buddyCn: BuddyAuth
+  /** Buddy **国际版**认证服务。 */
+  buddy: BuddyAuth
+  /** LobsterAI 认证服务。 */
+  lobsterai: LobsteraiAuth
+  /** Trae CN 认证服务。 */
+  traeCn: TraeCnAuth
+  /** Qoder **国际版**认证服务。 */
+  qoder: QoderAuth
+  /** Qoder **国内版**认证服务（与 {@link qoder} 同协议、双 region）。 */
+  qoderCn: QoderAuth
+  /**
+   * 可选的窗口档位注册表（见 {@link ContextTierRegistry}）。
+   *
+   * 省略时 `model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝 ——
+   * 这是 headless / 测试场景的既定降级，不是缺陷。
+   *
+   * ⚠️ **构造点的键也受 `ProviderId` 约束**（`createContextTierRegistry` 的形参
+   * 已收窄）：键写错在那里就会报错，而不是等到这里。
+   */
+  contextTiers?: ContextTierRegistry
+  /**
+   * 可选的 provider → 适配器实例映射（见 {@link ModelCatalogSource}）。
+   *
+   * 用于「显示列表」拿到**不套用户黑名单、也不套目录门控**的完整目录，使被关闭的
+   * 模型也显示正确的展示名（含倍率）而不是退化成裸 id。省略时退化为
+   * 「`listModels` 结果 + 黑名单裸 id 回补」的历史行为（同样是 headless / 测试的
+   * 既定降级）。
+   *
+   * ⚠️ **键是 `Partial<Record<ProviderId, …>>`**：拼错键编译期报错；但 `Partial`
+   * 允许子集，「漏登记某 provider」不报错 —— 那由 {@link warnMissingTierSources}
+   * 在注册入口运行时告警。本插件七个 provider **一个都不能少**
+   * （缺一个，那一个的关闭项就退回裸 id）。
+   */
+  modelAdapters?: Partial<Record<ProviderId, ModelCatalogSource>>
+  /**
+   * 可选的**配置变更通知**（`autoroute.set` 成功后调用）。
+   *
+   * 自动路由的运行时（降级队列）由聚合适配器持有，而配置写入发生在池上 ——
+   * 没有这条通知，用户在面板里改了候选顺序后，适配器仍握着**旧队列**：新加的
+   * 候选永远轮不到、删掉的还会被使用，且没有任何报错。由 `src/index.ts` 传
+   * `ensureAutoRouteRegistration`（它内部做内容幂等，重复调用无副作用）。
+   * 省略时（headless / 测试）配置照常写入，只是运行时不在本进程内。
+   */
+  onAutoRouteChanged?: () => void
+}
+
+/**
  * 注册 Account Hub 管理 API 端点。
  *
  * `connection` 服务只存在于 Web bundle；这里用**惰性注入**而非插件级静态
  * `inject`，因此在 headless / CLI profile 下本模块正常加载、只是不注册端点，
  * 而不是把整个插件树卡在 pending（那会让 profile 启动直接失败）。
  *
- * @param contextTiers - 可选的窗口档位注册表（见 {@link ContextTierRegistry}）。
- *        省略时 `model.list` 不带窗口字段、`model.setContextBudget` 一律拒绝 ——
- *        这是 headless / 测试场景的既定降级，不是缺陷。
- * @param modelAdapters - 可选的 provider → 适配器实例映射（见
- *        {@link ModelCatalogSource}）。用于「显示列表」拿到**不套用户黑名单、也不套
- *        目录门控**的完整目录，使被关闭的模型也显示正确的展示名（含倍率）而不是
- *        退化成裸 id。省略时退化为「`listModels` 结果 + 黑名单裸 id 回补」的历史
- *        行为（同样是 headless / 测试的既定降级）。
- * @param onAutoRouteChanged - 可选的**配置变更通知**（`autoroute.set` 成功后调用）。
- *        自动路由的运行时（降级队列）由聚合适配器持有，而配置写入发生在池上 ——
- *        没有这条通知，用户在面板里改了候选顺序后，适配器仍握着**旧队列**：新加的
- *        候选永远轮不到、删掉的还会被使用，且没有任何报错。由 `src/index.ts` 传
- *        `ensureAutoRouteRegistration`（它内部做内容幂等，重复调用无副作用）。
- *        省略时（headless / 测试）配置照常写入，只是运行时不在本进程内。
+ * @param options - 见 {@link AccountHubRpcOptions}。**新增 provider 时只加字段，
+ *        不再改签名**（这正是本函数从 12 个位置实参改成单一对象的原因）。
  */
-export function registerAccountHubRpc(
-  ctx: Context,
-  pool: AccountPool,
-  codearts: CodeArtsAuth,
-  buddyCn: BuddyAuth,
-  buddy: BuddyAuth,
-  lobsterai: LobsteraiAuth,
-  traeCn: TraeCnAuth,
-  qoder: QoderAuth,
-  qoderCn: QoderAuth,
-  contextTiers?: ContextTierRegistry,
-  modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
-  onAutoRouteChanged?: () => void,
-): void {
-  ctx.inject(['connection'], (connectionCtx) => {
-    registerAccountHubEndpoints(
-      connectionCtx as Context, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn,
-      contextTiers, modelAdapters, onAutoRouteChanged,
-    )
+export function registerAccountHubRpc(options: AccountHubRpcOptions): void {
+  warnMissingTierSources(options)
+  options.ctx.inject(['connection'], (connectionCtx) => {
+    // 只替换 `ctx`（端点必须挂在 connection 就绪后的 ctx 上），其余依赖原样转交。
+    registerAccountHubEndpoints({ ...options, ctx: connectionCtx as Context })
   })
 }
 
-/** 注册 Account Hub 管理 API 端点。使用 ctx.connection.fetch.register() 注册 HTTP POST 端点。 */
-function registerAccountHubEndpoints(
-  ctx: Context,
-  pool: AccountPool,
-  codearts: CodeArtsAuth,
-  buddyCn: BuddyAuth,
-  buddy: BuddyAuth,
-  lobsterai: LobsteraiAuth,
-  traeCn: TraeCnAuth,
-  qoder: QoderAuth,
-  qoderCn: QoderAuth,
-  contextTiers: ContextTierRegistry | undefined,
-  modelAdapters: Readonly<Record<string, ModelCatalogSource>> | undefined,
-  onAutoRouteChanged: (() => void) | undefined,
-): void {
+/**
+ * 注册 Account Hub 管理 API 端点。使用 ctx.connection.fetch.register() 注册 HTTP POST 端点。
+ *
+ * 与 {@link registerAccountHubRpc} 同款 **options 对象形参**（见
+ * {@link AccountHubRpcOptions}）：这两个函数此前各自持有一份 12 位置实参的签名，
+ * 转发时还得逐个对齐顺序 —— 那正是最容易被改漏的地方。
+ */
+function registerAccountHubEndpoints(options: AccountHubRpcOptions): void {
+  const {
+    ctx, pool, codearts, buddyCn, buddy, lobsterai, traeCn, qoder, qoderCn,
+    contextTiers, onAutoRouteChanged,
+  } = options
+  // 内部一律按**运行时拿到的 provider id**（`string`）取值 —— RPC 请求里的 provider
+  // 不受 `ProviderId` 约束（DSH 内置 provider 与其它插件也会走到查表处，见
+  // `autoroute.catalog`）。故在这里一次性放宽键类型，而不是给每个消费点各加断言。
+  const modelAdapters: Readonly<Record<string, ModelCatalogSource | undefined>> | undefined
+    = options.modelAdapters
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const connection = (ctx as any).connection ?? ctx.get('connection')
   if (!connection || typeof connection.fetch?.register !== 'function') {

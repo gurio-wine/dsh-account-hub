@@ -109,19 +109,25 @@ function makeHarness(llm: Partial<FakeLlm> | undefined) {
   return { ctx, call, warn }
 }
 
-/** `modelAdapters`（`registerAccountHubRpc` 第 11 实参）的替身形状：只声明 `listAllModels`。 */
+/** `modelAdapters`（`registerAccountHubRpc` 的 `modelAdapters` 字段）的替身形状：只声明 `listAllModels`。 */
 type FakeAdapters = Readonly<Record<string, { listAllModels: () => ReadonlyArray<{ id: string; name: string }> }>>
 
 async function setup(llm: Partial<FakeLlm> | undefined, modelAdapters?: FakeAdapters) {
   const h = makeHarness(llm)
   const pool = new AccountPool(h.ctx as never)
   await pool.openStorage()
-  registerAccountHubRpc(
-    h.ctx as never, pool, {} as never, {} as never, {} as never,
-    {} as never, {} as never, {} as never, {} as never,
-    undefined,
+  registerAccountHubRpc({
+    ctx: h.ctx as never,
+    pool,
+    codearts: {} as never,
+    buddyCn: {} as never,
+    buddy: {} as never,
+    lobsterai: {} as never,
+    traeCn: {} as never,
+    qoder: {} as never,
+    qoderCn: {} as never,
     modelAdapters,
-  )
+  })
   return h
 }
 
@@ -293,7 +299,7 @@ describe('autoroute.catalog：本插件 provider 走适配器目录（不受自�
     expect(catalogWarns[0]).toContain('buddy-cn')
   })
 
-  it('第 11 实参省略（headless / 测试降级）→ 全部回落 ctx.llm.listModels（历史行为）', async () => {
+  it('省略 `modelAdapters` 字段（headless / 测试降级）→ 全部回落 ctx.llm.listModels（历史行为）', async () => {
     const listModels = vi.fn(async (provider: string) => [{ provider, id: 'm-1', name: '模型一' }])
     const h = await setup({ ...gatedLlm(), listModels })
     const result = await h.call('autoroute.catalog', {})

@@ -30,6 +30,7 @@ import {
 } from './buddy.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { BUDDY_CN, resolveUserAgent, type BuddyFallbackModel, type BuddyProduct } from './product.js'
+import type { LlmSettingsAddress } from './types.js'
 import {
   stripCourseLeakFromHistoryContent,
   stripCourseLeakIfEnabled,
@@ -228,6 +229,15 @@ export interface BuddyAdapterOptions {
    * 差异全部由本配置承载。
    */
   product?: BuddyProduct
+  /**
+   * 本 provider 目录项的 settings 地址（namespace + 分槽路径）。
+   *
+   * 两版契约成对不同（0.1.6：`llm-buddy-cn` + `[]`；0.1.7：entry id +
+   * `['providers', 'buddy-cn']`），且**探测只在 `src/index.ts` 的 `apply()` 里
+   * 做一次**（见 `LlmSettingsAddress`）：适配器不做探测、也不认识契约版本。
+   * 省略时回退 **0.1.6 形态**（`llm-<product.id>` + `[]`），与历史行为逐字一致。
+   */
+  settingsAddress?: LlmSettingsAddress
 }
 
 /** 将消息内容载荷展平为纯文本字符串。 */
@@ -939,24 +949,6 @@ export class BuddyAdapter extends LlmAdapter {
     return tiers
   }
 
-  /**
-   * 兼容 0.1.1-rc.2：新版 LlmRuntime.prepareCall() 会调用
-   * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本
-   * （0.1.0-rc.6）的 LlmAdapter 基类尚未提供该方法，缺少时会在每轮请求
-   * 开始时抛 `registration.adapter.prepareCall is not a function`。这里把
-   * 模型解析与分发绑定到同一个适配器实例（与 CodeArtsAdapter 同款 shim）。
-   */
-  async prepareCall(
-    provider: string,
-    model: string,
-    signal?: AbortSignal,
-  ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
-    return {
-      model: await this.resolveModel(provider, model, signal),
-      stream: (options: GenerateOptions) => this.stream(options),
-    }
-  }
-
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     // 1. 获取凭据（过期则先静默续期）
     // 传 options.model：让账号池在**发请求之前**就跳过对该模型已记为
@@ -1586,11 +1578,18 @@ function positiveMaxTokens(value: number | undefined): number | undefined {
 /**
  * 在 ctx.llm 上注册 Buddy 系产品的 provider 路由与适配器。
  *
- * 路由名、配置页展示名与 settingsNs 全部由产品配置驱动：
- * Buddy CN 得到 `buddy-cn` / `llm-buddy-cn`，
- * Buddy 得到 `buddy` / `llm-buddy`。
- * 注意 settingsNs 必须与 `src/index.ts` 的 registerProviderSettings 注册的
- * namespace 保持一致，否则模型设置页会因未注册 namespace 崩溃。
+ * 路由名与配置页展示名由产品配置驱动：Buddy CN 得到 `buddy-cn`，Buddy 得到
+ * `buddy`。
+ *
+ * ## settings 地址由调用方**按契约现算**后传入
+ *
+ * 目录项的 `settingsNs` / `settingsPath` 两版契约成对不同（0.1.6：
+ * `llm-<id>` + `[]`；0.1.7：entry id + `['providers', <id>]`），而**探测只在
+ * `src/index.ts` 的 `apply()` 里做一次**（见 `LlmSettingsAddress`）：适配器自己
+ * 不做探测、也不认识契约版本，只把成对地址原样转交 —— 这样它既能在单测里直接
+ * 注入地址，也不会因为「每个适配器各探一次」而在同一进程里得到两种答案。
+ * 地址必须与 `src/index.ts` 注册/投影出的 namespace 一致，否则模型设置页会因
+ * 未注册 namespace 崩溃。
  *
  * @returns 刚注册的适配器实例 —— `src/index.ts` 把它转交给 `registerAccountHubRpc`，
  *          供 Account Hub 读取逐模型的窗口档位（`contextTiers`）与校验用户选择。
@@ -1599,8 +1598,11 @@ function positiveMaxTokens(value: number | undefined): number | undefined {
  */
 export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): BuddyAdapter {
   const product = options.product ?? BUDDY_CN
+  // 省略 `settingsAddress` 时回退到 **0.1.6 形态**：这是历史行为，也是单测与
+  // 直接调用（不经 `apply()`）时的自然默认 —— 0.1.7 下由 `apply()` 显式传入。
+  const address = options.settingsAddress ?? { settingsNs: `llm-${product.id}`, settingsPath: [] }
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    { provider: product.id, displayName: product.displayName, settingsNs: address.settingsNs, settingsPath: address.settingsPath },
   ])
   const adapter = new BuddyAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

@@ -126,10 +126,10 @@ function makeEndpointHarness(options: {
       resolve: options.resolve ?? (async () => ({ value: JSON.stringify({ access_token: 't' }), source: 'test' as const })),
     },
   }
-  registerAccountHubRpc(
-    ctx as never, pool, {} as never, {} as never, {} as never,
-    {} as never, {} as never, {} as never, {} as never,
-  )
+  registerAccountHubRpc({
+    ctx: ctx as never, pool, codearts: {} as never, buddyCn: {} as never, buddy: {} as never,
+    lobsterai: {} as never, traeCn: {} as never, qoder: {} as never, qoderCn: {} as never,
+  })
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 
   const call = async (method: string, payload: unknown) => {
@@ -563,6 +563,17 @@ describe('轮次标识（options.signal）必须被适配器透传 —— 唯一
     // resolver 与 refresher 都必须把第二参原样透传给 pick。
     expect(source).toMatch(/makeCredentialResolver<T>\([\s\S]*?const available = await pick\(model, turnIdentity\)/)
     expect(source).toMatch(/makeAccountRefresher\([\s\S]*?const available = await pick\(model, turnIdentity\)/)
+  })
+
+  it('宿主侧七个 provider 一律经 makeAccountRefresher 接线（不得手写闭包丢轮次标识）', () => {
+    const source = readSource('../../src/index.ts')
+    // 手写闭包只声明 `(model?: string)`，必然丢掉适配器传来的第二实参
+    // （`options.signal`）—— 这正是本文件所守缺陷的**宿主侧**形态：
+    // resolver 走 makeAccountPicker 并透传 turnIdentity，而续期闭包不透传，
+    // 于是「按轮次」档下两者挑到不同账号。故这里把它变成可执行断言。
+    expect(source).not.toMatch(/refresh: async \(model\?: string\)/)
+    // 七个 provider：codearts / buddy-cn / buddy / lobsterai / trae-cn / qoder / qoder-cn。
+    expect([...source.matchAll(/refresh: makeAccountRefresher\(/g)]).toHaveLength(7)
   })
 
   it('余额缓存刷新挂在 storage 就绪之后，并登记了定时器清理', () => {

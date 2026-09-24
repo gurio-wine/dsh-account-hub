@@ -311,10 +311,11 @@ describe('BuddyAdapter', () => {
     })
   })
 
-  // 回归：dsh-llm 0.1.1-rc.2 的 LlmRuntime.prepareCall() 会直接调用
-  // registration.adapter.prepareCall()，而本仓库链接的副本（0.1.0-rc.6）
-  // 的 LlmAdapter 基类没有该方法——缺少时每轮请求都以
-  // `registration.adapter.prepareCall is not a function` 失败。
+  // 契约回归：`LlmRuntime.prepareCall()` 会直接调用
+  // `registration.adapter.prepareCall()`。本适配器**不再自行声明**该方法 ——
+  // 链接的 dsh-llm 0.1.2-rc.1 基类已提供同语义实现（`lib/index.js:1143`），
+  // 继承即可。下方断言锁住该契约对本适配器仍然成立：模型解析走
+  // `resolveModel`（模态 / 窗口 / 档位同源），`stream` 绑定同一个实例。
   it('exposes prepareCall for the runtime adapter contract', async () => {
     const adapter = makeAdapter()
     expect(typeof adapter.prepareCall).toBe('function')

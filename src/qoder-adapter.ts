@@ -62,6 +62,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { availableContextTiers, effectiveContextWindow, type ContextTier } from './context-tiers.js'
+import type { LlmSettingsAddress } from './types.js'
 import { QODER, QODER_CHAT_PATH, qoderClientType, qoderJobTokenHeaders, resolveQoderChatBase } from './qoder-product.js'
 import type { QoderCredential, QoderProduct } from './qoder-product.js'
 import { QODER_SIGNED_CHAT_PATH } from './qoder-wasm-context.js'
@@ -1370,6 +1371,22 @@ export interface QoderAdapterOptions {
    * debug 级原因），**不像 CN chat 那样直报**：目录是尽力而为的数据。
    */
   directorySigning?: QoderDirectorySigningSource
+  /**
+   * 本 provider 目录项的 settings 地址（`settingsNs` + `settingsPath` 成对）。
+   *
+   * 由 `src/index.ts` 的 `apply()` **按探测到的契约现算**后传入（见
+   * `LlmSettingsAddress`）：0.1.6 得 `llm-qoder` / `llm-qoder-cn` + `[]`，
+   * 0.1.7 得 entry id + `['providers', 'qoder' | 'qoder-cn']`。
+   *
+   * ⚠️ **本适配器被两个 region 共用**（`qoder` / `qoder-cn` 各一个实例，见
+   * `src/qoder-product.ts` 的模块头），故地址必须由调用方**逐实例**传入，
+   * 不能在适配器内按 `product.id` 现算 —— 那样两个实例的地址虽然也对，但
+   * 会把「契约探测」这件事复制到适配器层，与「探测只做一次」的设计冲突。
+   *
+   * 省略时回退到 **0.1.6 形态**（`llm-<product.id>` + `[]`）：那是迁移前的既有
+   * 行为，也让不关心契约的单测保持原样可跑。
+   */
+  settingsAddress?: LlmSettingsAddress
 }
 
 /** Qoder LLM 适配器。使用 `Bearer jt-…` 鉴权，仅支持流式（SSE）。 */
@@ -1715,24 +1732,6 @@ export class QoderAdapter extends LlmAdapter {
     if (classification.code !== 'invalid_model_error') return message
     if (!this.isModelKnownOffCatalog(model)) return message
     return `${message}${QODER_OFF_CATALOG_HINT}`
-  }
-
-  /**
-   * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
-   * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本基类尚未
-   * 提供该方法，缺少时会在每轮请求开始时抛
-   * `registration.adapter.prepareCall is not a function`。
-   * 与 `BuddyAdapter` / `LobsteraiAdapter` / `TraeCnAdapter` 同款 shim。
-   */
-  async prepareCall(
-    provider: string,
-    model: string,
-    signal?: AbortSignal,
-  ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
-    return {
-      model: await this.resolveModel(provider, model, signal),
-      stream: (options: GenerateOptions) => this.stream(options),
-    }
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -2304,8 +2303,10 @@ interface ConsumeCell {
  */
 export function registerQoderLlm(ctx: Context, options: QoderAdapterOptions): QoderAdapter {
   const product = options.product ?? QODER
+  // settings 地址按契约现算后由调用方传入；省略时回退 0.1.6 形态（迁移前的既有行为）。
+  const address = options.settingsAddress ?? { settingsNs: `llm-${product.id}`, settingsPath: [] }
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    { provider: product.id, displayName: product.displayName, settingsNs: address.settingsNs, settingsPath: address.settingsPath },
   ])
   const adapter = new QoderAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

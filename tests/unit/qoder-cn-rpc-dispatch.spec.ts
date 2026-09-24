@@ -223,17 +223,17 @@ function createHarness(responds: (call: CapturedCall) => Response | undefined): 
     get: () => undefined,
   }
 
-  registerAccountHubRpc(
-    rpcCtx as never,
+  registerAccountHubRpc({
+    ctx: rpcCtx as never,
     pool,
-    {} as never,
-    {} as never,
-    {} as never,
-    {} as never,
-    {} as never,
+    codearts: {} as never,
+    buddyCn: {} as never,
+    buddy: {} as never,
+    lobsterai: {} as never,
+    traeCn: {} as never,
     qoder,
     qoderCn,
-  )
+  })
   if (handler === undefined) throw new Error('Account Hub 端点未注册')
 
   const call = async <T>(method: string, payload: unknown): Promise<RpcResult<T>> => {
@@ -953,10 +953,11 @@ describe('model.list / model.setDisabled / retestAll / resetAll 用 qoder-cn 键
         setModelDisabledCalls.push({ provider, modelId, disabled })
       },
     }
-    registerAccountHubRpc(
-      ctx as never, pool as never, {} as never, {} as never, {} as never,
-      {} as never, {} as never, {} as never, {} as never,
-    )
+    registerAccountHubRpc({
+      ctx: ctx as never, pool: pool as never,
+      codearts: {} as never, buddyCn: {} as never, buddy: {} as never,
+      lobsterai: {} as never, traeCn: {} as never, qoder: {} as never, qoderCn: {} as never,
+    })
     if (handler === undefined) throw new Error('endpoint handler was not registered')
     return {
       listModelsCalls,

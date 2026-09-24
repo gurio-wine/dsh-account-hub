@@ -78,19 +78,19 @@ async function callRefresh(
 ): Promise<{ calls: RefreshCall[]; value: { success: boolean; error?: string } }> {
   const calls: RefreshCall[] = []
   const { ctx, getHandler } = makeCtx(accounts)
-  registerAccountHubRpc(
-    ctx as never,
-    makePool(accounts) as never,
-    makeServiceStub('codearts', calls) as never,
-    makeServiceStub('buddy-cn', calls) as never,
-    makeServiceStub('buddy', calls) as never,
-    makeServiceStub('lobsterai', calls) as never,
+  registerAccountHubRpc({
+    ctx: ctx as never,
+    pool: makePool(accounts) as never,
+    codearts: makeServiceStub('codearts', calls) as never,
+    buddyCn: makeServiceStub('buddy-cn', calls) as never,
+    buddy: makeServiceStub('buddy', calls) as never,
+    lobsterai: makeServiceStub('lobsterai', calls) as never,
     // traeCn / qoder / qoderCn：本文件只驱动 `account.refresh`，而它按账号条目
     // 自己的 `provider` 分派；这三种 provider 都不在 fixture 里，故不会被碰到。
-    makeServiceStub('trae-cn', calls) as never,
-    makeServiceStub('qoder', calls) as never,
-    makeServiceStub('qoder-cn', calls) as never,
-  )
+    traeCn: makeServiceStub('trae-cn', calls) as never,
+    qoder: makeServiceStub('qoder', calls) as never,
+    qoderCn: makeServiceStub('qoder-cn', calls) as never,
+  })
   const response = await getHandler()(new Request('http://127.0.0.1/api/account-hub', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

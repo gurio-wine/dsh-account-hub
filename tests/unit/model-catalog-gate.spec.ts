@@ -503,7 +503,7 @@ describe('listAllModels：不套黑名单、也不套门控', () => {
  * Account Hub「显示列表」端点的最小 harness。
  *
  * `llmModels` 复刻 `ctx.llm.listModels` 的返回（门控生效时就是 `[]`）；
- * `allModels` 复刻适配器实例的 `listAllModels()`。第 11 个实参省略即「未接线」，
+ * `allModels` 复刻适配器实例的 `listAllModels()`。`modelAdapters` 字段省略即「未接线」，
  * 此时端点必须退化到历史行为（`listModels` 结果 + 黑名单裸 id 回填）。
  */
 function registerModelList(options: {
@@ -555,12 +555,11 @@ function registerModelList(options: {
     ? { 'buddy-cn': { listAllModels: () => options.allModels! } }
     : undefined
 
-  registerAccountHubRpc(
-    ctx as never, pool, {} as never, {} as never, {} as never,
-    {} as never, {} as never, {} as never, {} as never,
-    undefined,
+  registerAccountHubRpc({
+    ctx: ctx as never, pool, codearts: {} as never, buddyCn: {} as never, buddy: {} as never,
+    lobsterai: {} as never, traeCn: {} as never, qoder: {} as never, qoderCn: {} as never,
     modelAdapters,
-  )
+  })
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 
   const call = async (method: string, payload: unknown) => {

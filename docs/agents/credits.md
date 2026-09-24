@@ -6,7 +6,7 @@
 
 五套**协议完全不同**的实现，各自独立：
 
-五套共同约定：`credits.claimAll` / `credits.status` **处理该 provider 下的全部账号，含已停用**（停用只影响账号池的自动选择与限流切换）；逐账号**顺序执行**（并发易触发风控），单个账号失败不中断整批；返回同一个 `ClaimOutcome` 判别联合，使 `computeClaimSummary` 与前端摘要 UI 五套协议共用；**领取流程自带多步预检的 provider 传 `precheckStatus: false`**（LobsterAI / Trae CN / CodeArts / Qoder CN —— 它们的 `claim` 内部已查过状态）。
+五套共同约定：`credits.claimAll` / `credits.status` **处理该 provider 下的全部账号，含已停用**（停用只影响账号池的自动选择与限流切换）；逐账号**顺序执行**（并发易触发风控），单个账号失败不中断整批；返回同一个 `ClaimOutcome` 判别联合，使 `computeClaimSummary` 与前端摘要 UI 五套协议共用；**领取流程自带多步预检的 provider 传 `precheckStatus: false`**（LobsterAI / Trae CN / CodeArts / Qoder 两区 —— 它们的 `claim` 内部已查过状态）。
 
 **`ClaimOutcome` 的五个 kind 与「要不要重试」**（`src/credits.ts`，判别联合的语义边界）：
 

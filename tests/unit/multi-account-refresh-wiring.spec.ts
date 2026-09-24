@@ -350,6 +350,32 @@ describe('R2：makeAccountRefresher 与 makeCredentialResolver 挑到同一个�
     expect(calls).toEqual(['GLM-5.2', ''])
     expect(targets).toEqual(['CODEARTS_ACCOUNT_A1'])
   })
+
+  it('turnIdentity 原样透传给选号器（续期与解析必须用同一组实参）', async () => {
+    // 缺陷形态：宿主侧手写闭包只声明 `(model?: string)`，把适配器传来的
+    // `options.signal` 丢掉 → 在「按轮次」档下续期与解析挑到**不同**账号，
+    // 刷新的是另一份凭据，而日志里续期全绿、没有任何报错。
+    // 故这里直接断言第二实参到达了选号器（而非只看 model）。
+    const picks: unknown[] = []
+    const targets: string[] = []
+    const pool = {
+      getAvailableAccount: async (
+        _provider: string, _model: string, _signal: unknown, pick: unknown,
+      ) => {
+        picks.push(pick)
+        return { entry: { id: 'a1', credentialRef: 'CODEARTS_ACCOUNT_A1' }, credential: {} }
+      },
+    }
+    const refresh = makeAccountRefresher(pool as never, 'codearts', {
+      refresh: async () => { targets.push('(默认单凭据)') },
+      refreshAccountCredential: async (ref: string) => { targets.push(ref) },
+    })
+
+    await refresh('GLM-5.2', { turn: 1 })
+
+    // 传了 turnIdentity ⇒ 必须带 turnKey；否则等于「按请求」档，不锁轮次。
+    expect(picks).toEqual([{ turnKey: expect.any(String) }])
+  })
 })
 
 // ── R2：经真实 apply() 的接线（防「注册处忘了接线」）─────────────────────────

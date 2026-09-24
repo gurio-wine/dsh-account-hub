@@ -35,6 +35,7 @@ import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
+import type { LlmSettingsAddress } from './types.js'
 import { isTraeCnExpired } from './trae-cn-oauth.js'
 import type { TraeCnCredential } from './trae-cn-oauth.js'
 import {
@@ -298,6 +299,19 @@ export interface TraeCnAdapterOptions {
   accountPool?: AccountPool
   /** 产品配置；默认 `TRAE_CN`。 */
   product?: TraeCnProduct
+  /**
+   * 本 provider 目录项的 settings 地址（`settingsNs` + `settingsPath` 成对）。
+   *
+   * 由 `src/index.ts` 的 `apply()` **按探测到的契约现算**后传入（见
+   * `LlmSettingsAddress`）：0.1.6 得 `llm-trae-cn` + `[]`，0.1.7 得 entry id +
+   * `['providers', 'trae-cn']`。适配器自己不做探测、也不认识契约版本，只把成对
+   * 地址原样转交 `registerConfigurableProviders` —— 这样它既能在单测里直接注入
+   * 地址，也不会因「每个适配器各探一次」而在同一进程里得到两种答案。
+   *
+   * 省略时回退到 **0.1.6 形态**（`llm-trae-cn` + `[]`）：那是本插件迁移前的
+   * 既有行为，也让不关心契约的单测保持原样可跑。
+   */
+  settingsAddress?: LlmSettingsAddress
 }
 
 /** Trae CN 模型适配器。使用 `Cloud-IDE-JWT` 鉴权，仅支持 SSE。 */
@@ -584,24 +598,6 @@ export class TraeCnAdapter extends LlmAdapter {
     const budget = this.options.accountPool?.contextBudget(this.product.id, model)
     if (budget !== max) return undefined
     return { maxContextWindow: max }
-  }
-
-  /**
-   * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
-   * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本基类尚未
-   * 提供该方法，缺少时会在每轮请求开始时抛
-   * `registration.adapter.prepareCall is not a function`。
-   * 与 `BuddyAdapter` / `LobsteraiAdapter` 同款 shim。
-   */
-  async prepareCall(
-    provider: string,
-    model: string,
-    signal?: AbortSignal,
-  ): Promise<{ model: LlmResolvedModelInfo; stream: (options: GenerateOptions) => AsyncIterable<StreamChunk> }> {
-    return {
-      model: await this.resolveModel(provider, model, signal),
-      stream: (options: GenerateOptions) => this.stream(options),
-    }
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
@@ -1177,8 +1173,12 @@ interface ConsumeCell {
  */
 export function registerTraeCnLlm(ctx: Context, options: TraeCnAdapterOptions): TraeCnAdapter {
   const product = options.product ?? TRAE_CN
+  // settings 地址**由调用方按契约现算后传入**（见 `LlmSettingsAddress`）：0.1.6 得
+  // `llm-trae-cn` + `[]`，0.1.7 得 entry id + `['providers', 'trae-cn']`。
+  // 适配器不做探测、不认识契约版本，只把成对地址原样转交；省略时回退 0.1.6 形态。
+  const address = options.settingsAddress ?? { settingsNs: `llm-${product.id}`, settingsPath: [] }
   ctx.llm.registerConfigurableProviders([
-    { provider: product.id, displayName: product.displayName, settingsNs: `llm-${product.id}`, settingsPath: [] },
+    { provider: product.id, displayName: product.displayName, settingsNs: address.settingsNs, settingsPath: address.settingsPath },
   ])
   const adapter = new TraeCnAdapter(options)
   ctx.llm.registerAdapter([product.id], adapter)

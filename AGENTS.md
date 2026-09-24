@@ -61,7 +61,7 @@
 
 ## 积分（签到与余额）（概览）
 
-- 五套**协议完全不同**的实现、各自独立；每日签到由 `buddy-cn` / `lobsterai` / `trae-cn` / `codearts` / `qoder-cn` 五个面板提供；积分余额覆盖全部七个 provider，与签到彼此独立。
+- 五套**协议完全不同**的实现、各自独立；每日签到由 `buddy-cn` / `lobsterai` / `trae-cn` / `codearts` / `qoder` / `qoder-cn` 六个面板提供（Qoder 两区同协议、共用一份实现，故实现仍是五套）；积分余额覆盖全部七个 provider，与签到彼此独立。
 - 能力判定唯一真相源：`plugin-src/client/credits-capabilities.js`（两项能力彼此独立、默认关闭、门控在发请求之前）。
 - 跨 provider 共同约定与能力矩阵见 `docs/agents/credits.md`；各 provider 签到/余额端点与判据见对应 `docs/agents/providers-*.md`。
 
@@ -79,8 +79,10 @@
 - `docs/agents/providers-lobsterai.md` — LobsterAI 协议细节（登录互斥 / 签名 / 签到三步 / 余额端点）
 - `docs/agents/providers-trae-cn.md` — Trae CN 协议细节（SOLO 通道 / 错误码 / 工具调用帧 / 目录五道过滤 / 档位 / 签到与余额）
 - `docs/agents/providers-qoder.md` — Qoder 两区协议细节（设备流 / 字节闸 / wasm 签名链 / CN region / 签到）
+- `docs/agents/qoder-undetermined-investigation.md` — Qoder 系「全部账号无法判定」真机调查（三缺陷叠加 / 缺 `Cosy-ClientType` / `CLAIMED` 误判 / 积分去向）
 - `docs/agents/providers-codearts.md` — CodeArts 协议细节（SDK-HMAC-SHA256 签名 / 签到四步 / 余额）
 - `docs/agents/credits.md` — 积分领域（五套共同约定 / 能力判定矩阵）
+- `docs/agents/auto-checkin-design.md` — 自动签到设计方案（状态存储 / sweep 编排 / RPC 契约 / 触发时机 / 共享互斥）
 - `docs/agents/account-hub-storage.md` — 账号池存储 / 两段式登录 / 模型黑名单 / 档位注册表 / 映射入口
 - `docs/agents/auto-route-runtime.md` — 自动路由运行面（聚合适配器 / 转发与降级 / 注册生命周期 / 隐藏门控 / 重试处置）
 - `docs/agents/codearts-context-window.md` — CodeArts 上下文窗口接线

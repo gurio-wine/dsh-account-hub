@@ -179,19 +179,19 @@ function harness(options: {
     // 冒泡成 handler-failed，把被测的 provider 分派缺陷伪装成替身不完整。
     recordBalances: () => {},
   }
-  registerAccountHubRpc(
-    ctx as never,
-    pool as never,
-    {} as never,
-    {} as never,
-    {} as never,
-    {} as never,
-    {} as never,
+  registerAccountHubRpc({
+    ctx: ctx as never,
+    pool: pool as never,
+    codearts: {} as never,
+    buddyCn: {} as never,
+    buddy: {} as never,
+    lobsterai: {} as never,
+    traeCn: {} as never,
     // qoder / qoderCn：本文件只驱动 trae 系的积分分支（两个 Qoder region 都
     // 走不到），传空对象以暴露任何误落到 Qoder 分支的改动。
-    {} as never,
-    {} as never,
-  )
+    qoder: {} as never,
+    qoderCn: {} as never,
+  })
   if (handler === undefined) throw new Error('endpoint handler was not registered')
 
   return {
