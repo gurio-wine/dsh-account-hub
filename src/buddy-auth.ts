@@ -22,6 +22,7 @@ import {
 import { RefreshScheduler } from './refresh.js'
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { AccountPool } from './account-pool.js'
+import { assertCredentialOwnership } from './credential-ownership.js'
 import { BUDDY_CN, type BuddyProduct } from './product.js'
 
 /**
@@ -176,10 +177,25 @@ export class BuddyAuth extends Service {
   /**
    * 保存凭据并注册到账号池（供后台登录流程使用）。
    * 账号池已预先创建占位条目时，只做凭据写入和更新。
+   *
+   * ## 归属闸门在这里同样必须过（本方法是 buddy 系的**第二条**写凭据入口）
+   *
+   * `runBuddyLoginFlow` 是正常登录链的产出点（闸门已在它返回处），但本方法
+   * 接受**任意** `credentialJson` 直接落盘 —— 它是一条独立入口，不经过那条链。
+   * 不设闸门就等于留了一条「绕过校验写凭据」的路：将来任何调用方（或误用）
+   * 都能把国际版凭据写进 CN 的 ref，正是本次要堵的缺口形态。
+   *
+   * 判定放在 `ctx.credentials.set` **之前** —— 这就是「错配时凭据不落盘」的
+   * 实现方式。与登录链共用同一份判据（`credential-ownership.ts`），不存在
+   * 两处标准不一致的可能。
+   *
+   * @throws {CredentialProductMismatchError} 凭据被确凿判定属于另一个产品。
    */
   async saveCredential(credentialJson: string, refName: string, accountId: string, pool: AccountPool): Promise<void> {
     this.active = true
     const ref = credentialRef(refName)
+    // 判不出归属（无 iss、domain 也不认识）时放行：同登录链的失败开放语义。
+    assertCredentialOwnership(this.product, parseCredential(credentialJson) ?? {})
     await this.ctx.credentials.set(ref, credentialJson)
     this.refreshTokenInvalid = false
     this.lastRefreshError = undefined

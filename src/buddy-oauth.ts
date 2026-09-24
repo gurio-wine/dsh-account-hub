@@ -41,6 +41,7 @@ import {
   parseTokenData,
 } from './buddy.js'
 import type { BuddyAccount, BuddyCredential, BuddyRemoteModel, BuddyToken } from './buddy.js'
+import { assertCredentialOwnership } from './credential-ownership.js'
 import { BUDDY_CN, type BuddyProduct } from './product.js'
 
 /** 在浏览器中打开登录 URL；永不抛出（失败时打印 URL 供手动打开）。 */
@@ -464,6 +465,10 @@ export function decorateLoginUrl(authUrl: string, product: BuddyProduct): string
  *
  * 返回序列化后的凭据 JSON；持久化由调用方（BuddyAuth 服务）负责，
  * 与 CodeArts 的 runOAuthFlow 保持一致的分层。
+ *
+ * @throws {CredentialProductMismatchError} 后端返回的凭据被**确凿判定**属于另一个
+ *         buddy 系产品（如在国际版浏览器会话下登录 CN 面板）。抛出发生在返回之前、
+ *         任何持久化之前 ⇒ 调用方不会拿到可写入的凭据。判不出归属时**不抛**。
  */
 export async function runBuddyLoginFlow(options: BuddyLoginFlowOptions = {}): Promise<BuddyLoginFlowResult> {
   const fetcher = options.fetcher ?? fetch
@@ -498,6 +503,19 @@ export async function runBuddyLoginFlow(options: BuddyLoginFlowOptions = {}): Pr
   const token = await loopGetToken(state, pollOptions)
   const account = await getAccount(state, token, pollOptions)
   const credential = buildCredential(token, account)
+  // ── 归属闸门（本文件的**唯一**凭据产出点，故闸门只此一处）──
+  //
+  // 为什么在这里而不是各调用方写凭据之前：`access` 从这里流向两条路
+  // （`account.create` 的后台第二段、`BuddyAuth.login`），闸门设在这里两条路
+  // 都不可能绕过，判据也不必复制两份（判据本体见 `credential-ownership.ts`）。
+  //
+  // 抛出的位置在任何 `ctx.credentials.set` **之前** —— 这正是「跨产品凭据不许
+  // 落进错误池」的实现方式：错配时凭据根本没被交出去，调用方的既有 catch
+  // 负责移除占位条目并向客户端回报原因（见下方 @throws）。
+  //
+  // ⚠️ 判不出归属（无 iss、domain 也不认识）时**放行**：那是证据缺失而非错配，
+  // 拒写会误伤所有这类正常登录。完整理由见 `assertCredentialOwnership`。
+  assertCredentialOwnership(product, credential)
   return {
     access: JSON.stringify(credential),
     // 对齐 Rust 的 expires_at_ms(...).unwrap_or(0)：无法解析时报告 0。

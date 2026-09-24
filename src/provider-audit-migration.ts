@@ -29,16 +29,19 @@
  * （`AccountHubDocument.providerAuditVersion`，见 `PROVIDER_AUDIT_VERSION`），
  * 与字段集合版本 `schemaVersion` 各司其职。**不要再合并这两个数字。**
  *
- * ## 判据（两级，都不猜）
+ * ## 判据（两级，都不猜）—— **本体在 `src/credential-ownership.ts`**
  *
- * 逐条账号解析其凭据 JSON：
+ * 判据**不再定义在本模块**：登录链（`runBuddyLoginFlow`）写凭据前问的是同一个
+ * 问题，故两级判据与判据表已抽到 `src/credential-ownership.js`，由
+ * {@link judgeCredentialOwnership} 一次定义、两处消费。本模块只把它的结论翻译成
+ * 体检动作（重建 / 保持一致 / 不动手）与日志。**判据一旦分叉，会出现「登录链
+ * 放行的东西体检要重建」这种自相矛盾的状态** —— 那正是抽公共模块要根除的。
+ *
+ * 摘要（细节见该模块）：
  *
  * 1. **JWT 的 `iss` 声明（首选）** —— 签发方写死在令牌里，比 `domain` 可信
  *    （后者是登录时的快照，历史迁移漏改过它）。只做 base64url 解码、不验签
- *    （这里不涉及信任判定，令牌另有服务端校验）。判据表
- *    {@link PROVIDER_ISSUER_PATTERNS} **从产品配置派生**，不在这里另造字面量：
- *    中国版要同时认「登录站 `www.codebuddy.cn`」与「API 端点 `copilot.tencent.com`」
- *    —— 它的登录站与 API 端点**不是同一个域**（见 `src/buddy.ts` 的 `WEBSITE_HOME`）；
+ *    （这里不涉及信任判定，令牌另有服务端校验）；
  * 2. **`domain` 字段（回退）** —— 老令牌没有 `iss` 时按它判，并 `logger.warn`
  *    一条（含 ref 与 domain），便于人工复核；
  * 3. 两级都说不清（凭据缺失 / JSON 损坏 / `iss` 与 `domain` 都不属于已知产品）
@@ -86,9 +89,9 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { WEBSITE_HOME, jwtIssuer } from './buddy.js'
+import { issuerPatternsFor, judgeCredentialOwnership } from './credential-ownership.js'
+import { jwtIssuer } from './buddy.js'
 import { PROVIDER_AUDIT_VERSION, type AccountPool, type ModelDisableMap } from './account-pool.js'
-import { ALL_PRODUCTS, BUDDY_CN, type BuddyProduct } from './product.js'
 import type { ProviderAccountEntry } from './types.js'
 
 /** 一次体检的结局（供日志与测试断言）。 */
@@ -152,138 +155,17 @@ export function resetAuditProcessFlagForTest(): void {
   auditRanInProcess = false
 }
 
-/** 一个产品的凭据归属判据（全部由 {@link BuddyProduct} 配置派生，无字面量）。 */
-export interface ProviderIssuerPatterns {
-  /** 目标产品 id。 */
-  productId: string
-  /** `iss` 声明里出现的品牌域名（小写），命中即判定归属该产品。 */
-  issuerHosts: readonly string[]
-  /** `domain` 字段可接受的取值（小写；同时接受其 `www.` 变体）。 */
-  domains: readonly string[]
-}
-
 /**
- * 从宿主域名里取**品牌域**（末两段；两段式 TLD 如 `com.cn` 取末三段）。
- *
- * `www.workbuddy.ai` → `workbuddy.ai`；`copilot.tencent.com` → `tencent.com`；
- * `www.codebuddy.cn` → `codebuddy.cn`（`com.cn` 规则只命中 `xx.com.cn` 形态）。
+ * 判据**本体**已迁至 `src/credential-ownership.ts`（登录链与本体检共用一份，
+ * 避免两处判据漂移）。这里原样再导出，只为兼容既有导入方与测试 ——
+ * 新增代码请直接从 `credential-ownership.js` 导入。
  */
-function brandDomain(host: string): string {
-  const parts = host.split('.').filter((part) => part.length > 0)
-  if (parts.length <= 2) return parts.join('.')
-  const tail = parts.slice(-2).join('.')
-  // 两级公共后缀（com.cn / net.cn / org.cn …）：品牌域要再往前取一段。
-  return /^(com|net|org|gov|edu)\.cn$/.test(tail) ? parts.slice(-3).join('.') : tail
-}
-
-/** 从 endpoint（URL）与 apiDomain 里抽出候选宿主名。 */
-function hostsOf(product: BuddyProduct): string[] {
-  const hosts = new Set<string>()
-  hosts.add(product.apiDomain.toLowerCase())
-  try {
-    hosts.add(new URL(product.endpoint).hostname.toLowerCase())
-  } catch {
-    // endpoint 不是合法 URL 时忽略（配置是常量，这里只为稳健）
-  }
-  return [...hosts]
-}
-
-/**
- * 该产品的**登录站**宿主名（JWT `iss` 真正指向的域）。
- *
- * ⚠️ 只有中国版是「登录站 ≠ API 端点」的形态（`copilot.tencent.com` ↔
- * `www.codebuddy.cn`，映射关系早就写在 `src/buddy.ts` 的 `WEBSITE_HOME` 上）。
- * 国际版的 `endpoint` 本身就是登录站，故这里返回空数组、由 {@link hostsOf} 覆盖。
- * 别把 `WEBSITE_HOME` 直接套到国际版头上 —— 那是中国版的站点。
- */
-function websiteHostsOf(product: BuddyProduct): string[] {
-  if (product.id !== BUDDY_CN.id) return []
-  try {
-    return [new URL(WEBSITE_HOME).hostname.toLowerCase()]
-  } catch {
-    return []
-  }
-}
-
-/**
- * 全部产品（buddy 系）的判据表 —— **唯一真相源是 `src/product.ts`**（外加
- * `buddy.ts` 那一个「登录站 ≠ API 端点」的既有映射）。
- *
- * 品牌域由产品自己的宿主名派生：
- *
- * | 产品 | API 端点宿主（`endpoint` / `apiDomain`） | 登录站宿主（令牌 `iss`） |
- * |---|---|---|
- * | `buddy` | www.workbuddy.ai | www.workbuddy.ai（`endpoint` 本身就是登录站） |
- * | `buddy-cn` | copilot.tencent.com | www.codebuddy.cn（`buddy.ts` 的 `WEBSITE_HOME`） |
- *
- * ⚠️ **中国版必须两处都取**：它的登录站与 API 端点**不是同一个域**（这正与
- * 产品注释里那句「`copilot.tencent.com` → `www.codebuddy.cn` 映射」同源）。
- * 只按 `endpoint` 派生的话，真实中国版令牌的 `iss=…codebuddy.cn` 会**判不出来**，
- * 体检只好回退到 `domain` 并给每条正常账号都打一条「无 iss」警告 —— 判据的
- * 覆盖范围凭空少一半。
- */
-export const PROVIDER_ISSUER_PATTERNS: readonly ProviderIssuerPatterns[] = ALL_PRODUCTS.map(
-  (product) => {
-    const hosts = hostsOf(product)
-    // 中国版：登录站宿主（`iss` 真正指向的地方）也要算进品牌域。
-    // 用 `WEBSITE_HOME` 而不是再写一份字面量 —— 未配置登录站的产品为空数组。
-    const issuerHosts = [...new Set([
-      ...hosts.map(brandDomain),
-      ...websiteHostsOf(product).map(brandDomain),
-    ])]
-    return { productId: product.id, issuerHosts, domains: hosts }
-  },
-)
-
-/** 取某产品的判据；未知 product id 返回 undefined。 */
-export function issuerPatternsFor(productId: string): ProviderIssuerPatterns | undefined {
-  return PROVIDER_ISSUER_PATTERNS.find((entry) => entry.productId === productId)
-}
-
-/** 宿主是否属于某个品牌域（相等或以 `.品牌域` 结尾）。 */
-function hostMatchesBrand(host: string, brands: readonly string[]): boolean {
-  return brands.some((brand) => host === brand || host.endsWith(`.${brand}`))
-}
-
-/** 从 `iss`（通常是 URL，也可能是裸域名）里取出宿主名；取不到返回空串。 */
-function hostOfIssuer(issuer: string): string {
-  const raw = issuer.trim().toLowerCase()
-  if (raw.length === 0) return ''
-  try {
-    return new URL(raw).hostname.toLowerCase()
-  } catch {
-    // 不是 URL：按裸域名/路径形态尽力取第一段宿主。
-    const host = raw.split('/')[0]
-    return host.includes('.') ? host : ''
-  }
-}
-
-/** `domain` 字段的候选形态（自身 + `www.` 变体），用于与产品域集合比对。 */
-function domainCandidates(domain: string): string[] {
-  const raw = domain.trim().toLowerCase()
-  if (raw.length === 0) return []
-  return raw.startsWith('www.') ? [raw, raw.slice(4)] : [raw, `www.${raw}`]
-}
-
-/**
- * 由 `iss` 判定凭据归属。
- *
- * @returns 命中的产品判据；无法判定时返回 undefined（调用方回退到 domain）。
- */
-function productByIssuer(issuer: string): ProviderIssuerPatterns | undefined {
-  const host = hostOfIssuer(issuer)
-  if (host.length === 0) return undefined
-  return PROVIDER_ISSUER_PATTERNS.find((entry) => hostMatchesBrand(host, entry.issuerHosts))
-}
-
-/** 由 `domain` 字段判定凭据归属；无法判定时返回 undefined。 */
-function productByDomain(domain: string): ProviderIssuerPatterns | undefined {
-  const candidates = domainCandidates(domain)
-  if (candidates.length === 0) return undefined
-  return PROVIDER_ISSUER_PATTERNS.find(
-    (entry) => entry.domains.some((expected) => candidates.includes(expected)),
-  )
-}
+export {
+  PROVIDER_ISSUER_PATTERNS,
+  issuerPatternsFor,
+  judgeCredentialOwnership,
+} from './credential-ownership.js'
+export type { ProviderIssuerPatterns } from './credential-ownership.js'
 
 /** 账号 id 的短 id 部分（与 `account-hub-rpc.ts` 的 `shortId()` 同形）。 */
 function shortId(): string {
@@ -357,23 +239,25 @@ async function auditEntry(
   detail.issuer = issuer
   detail.domain = domain
 
-  // ① 首选判据：JWT 的签发方。issuerHosts 与 domains 同源（都由产品配置派生），
-  //    故这里命中谁就是谁。
-  let judged = productByIssuer(issuer)
-  if (judged !== undefined) {
-    detail.judgedBy = 'iss'
-  } else {
-    // ② 回退判据：凭据的 domain 字段 + 一条 warn（含 ref 与 domain，便于人工核）。
-    judged = productByDomain(domain)
-    if (judged === undefined) {
-      ctx.logger?.warn?.(
-        `[account-hub] provider 体检：账号 ${entry.id}（provider=${entry.provider}）的凭据 `
-        + `${entry.credentialRef} 既无可用 iss（${issuer.length > 0 ? issuer : '未记录'}）、`
-        + `domain 也不属于任何已知产品（${domain.length > 0 ? domain : '未记录'}），已跳过、未改动`,
-      )
-      return { outcome: 'unjudged', detail }
-    }
-    detail.judgedBy = 'domain'
+  // 判定委托给**登录链共用的那一份**判据（`src/credential-ownership.ts`）：
+  // 两级顺序（iss 优先、domain 回退）与「都说不清返回 undefined」的语义都在那里，
+  // 本模块只负责把结论翻译成体检动作 + 日志。
+  //
+  // ⚠️ 别在这里内联判据的副本 —— 判据一旦分叉，就会出现「登录链放行的东西
+  // 体检要重建」这种自相矛盾的状态（那正是本次抽公共模块要根除的）。
+  const judged = judgeCredentialOwnership({ access_token: parsed.access_token as string | undefined, issuer, domain })
+  if (judged === undefined) {
+    ctx.logger?.warn?.(
+      `[account-hub] provider 体检：账号 ${entry.id}（provider=${entry.provider}）的凭据 `
+      + `${entry.credentialRef} 既无可用 iss（${issuer.length > 0 ? issuer : '未记录'}）、`
+      + `domain 也不属于任何已知产品（${domain.length > 0 ? domain : '未记录'}），已跳过、未改动`,
+    )
+    return { outcome: 'unjudged', detail }
+  }
+  detail.judgedBy = judged.judgedBy
+  // 回退到 domain 才判出来时补一条 warn（含 ref 与 domain）：这类条目缺 `iss`，
+  // 判据强度弱一档，值得人工复核一次。
+  if (judged.judgedBy === 'domain') {
     ctx.logger?.warn?.(
       `[account-hub] provider 体检：账号 ${entry.id} 的凭据 ${entry.credentialRef} 无 iss 声明，`
       + `按 domain=${domain} 判定归属 ${judged.productId}（条目标签为 ${entry.provider}），请人工核对`,

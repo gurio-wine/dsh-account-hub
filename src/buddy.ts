@@ -124,8 +124,9 @@ export interface BuddyCredential {
    * `https://www.workbuddy.ai/auth/realms/copilot`）。仅在解析成功时出现。
    *
    * ⚠️ 这是**凭据归属哪个产品**的权威判据（与 `domain` 不同：`domain` 是登录时
-   * 快照、可能被历史迁移漏改，而 `iss` 是签发方写死在令牌里的）。目前只有
-   * provider 体检迁移读它，见 `src/provider-audit-migration.ts`。
+   * 快照、可能被历史迁移漏改，而 `iss` 是签发方写死在令牌里的）。判据本体与
+   * 两个消费者（登录链的归属闸门、provider 体检迁移）见
+   * `src/credential-ownership.ts`。
    */
   issuer?: string
   /** 用户 ID（account.uid）。 */

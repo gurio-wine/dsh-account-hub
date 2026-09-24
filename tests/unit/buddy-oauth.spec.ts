@@ -527,6 +527,10 @@ describe('产品参数化', () => {
 
   it('runBuddyLoginFlow 在 WorkBuddy 下追加 version 与 loginSessionId', async () => {
     let openedUrl = ''
+    // ⚠️ 凭据 domain 必须与 product 的归属一致（这里是国际版）：`accessToken: 'AT'`
+    // 不是 JWT、没有 `iss`，故归属只能按 domain 判 —— 写成 CN 的
+    // `copilot.tencent.com` 会被登录链的归属闸门判成「凭据属于另一个产品」并拒绝。
+    // 本用例测的是 URL 装饰，凭据内容只是流程的过路数据，故按产品写对即可。
     const fetcher = routeFetch([
       {
         when: (url) => url.includes('/auth/state'),
@@ -537,7 +541,7 @@ describe('产品参数化', () => {
       {
         when: (url) => url.includes('/auth/token'),
         respond: () => new Response(JSON.stringify({
-          code: 0, data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: 'copilot.tencent.com' },
+          code: 0, data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: 'www.workbuddy.ai' },
         }), { status: 200 }),
       },
       {
@@ -557,6 +561,8 @@ describe('产品参数化', () => {
   })
 
   it('WorkBuddy 的 loginSessionId 每次登录都不同', async () => {
+    // 同上一用例：`AT` 不是 JWT（无 `iss`），归属只能按 domain 判 ——
+    // 国际版产品必须配国际版 domain，否则会被归属闸门拒绝。
     const mk = () => routeFetch([
       {
         when: (url) => url.includes('/auth/state'),
@@ -567,7 +573,7 @@ describe('产品参数化', () => {
       {
         when: (url) => url.includes('/auth/token'),
         respond: () => new Response(JSON.stringify({
-          code: 0, data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: 'copilot.tencent.com' },
+          code: 0, data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, tokenType: 'Bearer', scope: '', domain: 'www.workbuddy.ai' },
         }), { status: 200 }),
       },
       {

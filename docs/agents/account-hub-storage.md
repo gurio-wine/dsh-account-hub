@@ -35,6 +35,39 @@
 
 配套约束：`login.poll` 按 credentialRef 判断「凭据是否可解析」，与 provider 无关；**占位账号字段是 pending 形态**，时序上必须**先写凭据、再补全账号**（反过来会让轮询在凭据就绪前报成功）；**LobsterAI 登录是 provider 级互斥的**（`prepareLobsteraiLogin`）—— 已有未结算会话时返回 `{ok:false, error:'login-in-progress'}`，不新建也不复用（复用会让一份凭据被多个占位 accountId 共享，静默新建则每次点击堆积一个 loopback 端口直到 10 分钟超时）；`account.delete` 会 cancel 对应会话以释放端口。
 
+## 登录链凭据归属校验（`credential-ownership.ts`）
+
+**堵的缺口**：第二段拿到 `flow.access` 就无条件 `ctx.credentials.set(ref, …)`。当用户在
+**CN 面板**发起登录、而浏览器里仍是**国际版**会话时，服务端返回国际版令牌 —— 它被原样
+写进 `BUDDY_CN_ACCOUNT_*`，池里随即多出一条「标签 buddy-cn、内容 buddy」的账号。
+这正是体检迁移要事后收拾的那种脏数据的**产生源**，本次从源头堵住。
+
+**判据（两级，`iss` 优先）**：首选 JWT 的 `iss`（签发方写死在令牌里）；无 `iss` 时回退
+凭据的 `domain` 字段。期望域由 `src/product.ts` 派生，判据表 `PROVIDER_ISSUER_PATTERNS`
+**与体检迁移共用同一份**（判据分叉会出现「登录链放行的东西体检查要重建」的自相矛盾）。
+⚠️ `iss` 与 `domain` 矛盾时**以 `iss` 为准** —— 「CN 面板 + 国际版会话」场景下服务端可能
+把 `domain` 回成 CN 的样子，信 `domain` 等于本次修复形同虚设。
+
+**闸门位置**：`runBuddyLoginFlow` 的返回处（buddy 系**唯一**凭据产出点，`account.create`
+后台段与 `BuddyAuth.login` 都从这里取 `flow.access`）；另有 `BuddyAuth.saveCredential`
+一条独立写入口同样过闸。抛出发生在任何 `ctx.credentials.set` **之前** ⇒ 错配凭据根本
+没被交出去，调用方既有的 catch 负责移除占位 + 回报原因（两段式的既定处置，无需新增路径）。
+
+**失败开放（刻意）**：两级都判不出时**放行**。判不了是**证据缺失**（老令牌 / 后端改响应 /
+内网代理域），不是「确凿属于别人」；此处拒写会把所有这类正常登录一并打死。闸门只拦
+**能被证明**的错配。
+
+**只覆盖 buddy 系**：其余 provider 无此判据 —— lobsterai / qoder 的 `access_token` 是不透明
+串、trae-cn 的 `iss` 与端点对应关系未实测、codearts 是 AK/SK 三元组。**拿不到确凿判据时
+不猜**（强行校验只会把正常登录判成错配）。
+
+**错误文案**：`CredentialProductMismatchError` 的消息是可直接展示的中文，且点名的面板是
+**凭据真正的归属方**（不是当前面板）—— 用户正站在当前面板上，让他「回当前面板登录」是
+无效指令。`login.poll` 的 `error` 会被客户端原样渲染进面板通知行。
+
+回归护栏：`tests/unit/credential-ownership.spec.ts`（判据单测 + **真流程**端到端：错配 ⇒
+占位移除 + 凭据零写入 + 错误回传；对照 ⇒ 正常登录逐字节不受影响）。
+
 ## X-Domain 必须跟随产品，而非凭据
 
 `checkinHeaders`（`src/credits.ts`）用 `product.apiDomain` 构造 `X-Domain`，**不优先用 `credential.domain`**。凭据里的 domain 是登录时的快照，跨产品迁移后会留下旧值，跟着它走会让请求的 baseURL 与身份标识自相矛盾。
