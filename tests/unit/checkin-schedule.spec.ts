@@ -45,12 +45,21 @@ describe('CHECKIN_RESET_HOURS —— 逐 provider 的重置钟点', () => {
     expect(checkinResetHour('codearts')).toBe(0)
   })
 
-  it('qoder 国际版**单独**一条 0 点，不是复用 qoder-cn 的 10 点', () => {
-    // 两区同协议但「窗口几点翻页」是活动系统的属性，只有 CN 被观测到 10 点。
-    // 这条断言守的是「不要为形态统一把两区并成一条」。
-    expect(checkinResetHour('qoder')).toBe(0)
-    expect(CHECKIN_RESET_HOURS.qoder).toBe(0)
+  it('qoder 两区各一行、值都是 10（各持独立证据：官方公告 + 国际版真机响应 startAt=1790128800）', () => {
+    // 两区同协议但「窗口几点翻页」是活动系统的属性 —— 值相同**不代表**可以合并：
+    // 这条断言守的是「不要为形态统一把两区并成一条」，任一区将来改窗口都必须
+    // 能只改自己那一行。
+    // 国际版的 10 点不是从 CN 推断来的，而是它自己的证据：
+    // ① 官方公告（docs.qoder.com/events/100credits）「每日 10:00 (UTC+8) 刷新」；
+    // ② 国际版真机响应 startAt=1790128800 = 2026-09-23 10:00 (UTC+8)、
+    //    endAt=1790215140 = 次日 09:59 (UTC+8)，见
+    //    `tests/e2e/qoder-minimal-headers-claim-evidence.json`。
+    expect(checkinResetHour('qoder')).toBe(10)
+    expect(CHECKIN_RESET_HOURS.qoder).toBe(10)
     expect(CHECKIN_RESET_HOURS['qoder-cn']).toBe(10)
+    // 两行**各自独立存在**（不是同一行的两个别名）：合并会丢掉「按区改窗口」的能力。
+    expect(Object.keys(CHECKIN_RESET_HOURS)).toContain('qoder')
+    expect(Object.keys(CHECKIN_RESET_HOURS)).toContain('qoder-cn')
   })
 
   it('未登记的 provider 缺省 0 点（新增 provider 忘登记时行为等于旧模型）', () => {
