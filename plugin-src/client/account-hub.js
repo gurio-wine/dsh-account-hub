@@ -25,7 +25,7 @@
 import * as React from 'react';
 
 import {
-  Button, DisclosureRow, IconApiOutline14, IconBranchOutline16, IconChevronDownOutline14, Input,
+  Button, DisclosureRow, IconApiOutlineRegular, IconBranchOutlineRegular, IconChevronDownOutlineRegular, Input,
   Menu, Modal, Pill, RiskConfirmation, StateDot, Switch, Tag, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives';
 
@@ -1262,7 +1262,7 @@ function ConsumptionSelect({ name, label, purpose, options, value, busy, onSelec
         'aria-haspopup': 'menu',
         'aria-expanded': open,
         disabled: busy,
-        icon: React.createElement(IconChevronDownOutline14),
+        icon: React.createElement(IconChevronDownOutlineRegular),
         onClick: () => setOpen(prev => !prev),
       }, current ? current.label : value),
       items,
@@ -2507,7 +2507,7 @@ function AutoRouteSelect({ label, options, value, busy, disabled, fallback, tool
       'aria-haspopup': 'menu',
       'aria-expanded': open,
       disabled: busy || disabled === true,
-      icon: React.createElement(IconChevronDownOutline14),
+      icon: React.createElement(IconChevronDownOutlineRegular),
       onClick: () => setOpen(prev => !prev),
     }, current ? current.label : (value || fallback)),
     items,
@@ -3130,7 +3130,7 @@ export function AccountHubPage({ rpcCall }) {
         // 组标题走 ui-primitives 的 DisclosureRow：`expandOnRowClick` 让整行成为
         // 折叠目标，它同时给出 `aria-expanded`（无障碍要的那一条）。
         React.createElement(DisclosureRow, {
-          icon: React.createElement(IconApiOutline14),
+          icon: React.createElement(IconApiOutlineRegular),
           title: '供应商',
           open: providersOpen,
           expandable: true,
@@ -3167,7 +3167,7 @@ export function AccountHubPage({ rpcCall }) {
         // （--dsw-alias-state-business-primary，语义 = 「本插件自己的功能」而非
         // 某个第三方产品的品牌色）。
         React.createElement('span', { className: 'dim-ah-providerIcon ar' },
-          React.createElement(IconBranchOutline16, { size: 20 })),
+          React.createElement(IconBranchOutlineRegular, { size: 20 })),
         // 与七个 provider 项**逐字同形**（裸 span + strong），不额外加一层标签类
         // （曾经的 `.dim-ah-providerLabel`，已删）：那个类名是单数，多一个类就是八个
         // 导航项里唯一的异类，而两处的文本截断行为应当一致。

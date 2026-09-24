@@ -29,9 +29,75 @@
  * 会静默失配：正则命中、替身却少一个导出，于是那个控件在渲染时是 `undefined`。
  * 这里改为从源码里**读出实际导入的名字**再生成 require，并逐个核对替身是否导出
  * 该名字 —— 名单一变就当场抛错，而不是等到某个 provider 的面板白屏。
+ *
+ * ## 图标名单是**从宿主现算**的，不是手抄的
+ *
+ * 上面那条核对只能保证「源码导入的名字 ⊆ 替身导出的名字」。替身自己的名单若手抄，
+ * 就还剩一个盲区：**手抄的名单可以比宿主旧**。这正是本仓库真实发生过的事故 ——
+ * 宿主 commit `4937343a5e` 把图标 API 整体改名（`IconApiOutline14` →
+ * `IconApiOutlineRegular`、`IconBranchOutline16` → `IconBranchOutlineRegular`、
+ * `IconChevronDownOutline14` → `IconChevronDownOutlineRegular`），而这里手工写的
+ * 三个导出仍是旧名。于是「源码导入 = 替身导出 = 旧名」三方自洽，**全部测试照绿**，
+ * 只有真机上 `React.createElement(undefined)` 让账号中心面板白屏。
+ *
+ * 故图标替身改为从构建机器的宿主 checkout **现算**（复用构建期闸门 A 的读取器
+ * `plugin-src/client/host-ui-primitives.mjs`，与 `build.mjs` 同一份真相源）：
+ * 宿主导出面里每个 `Icon*` 都生成一个不渲染的替身。此后「插件还在用旧名」会让
+ * 上面的核对当场抛错 —— 测试红在提交前，而不是白屏在用户面前。
+ *
+ * 宿主 checkout 不存在时（别人的机器 / CI）回退到 `FALLBACK_ICON_NAMES` 并 warn：
+ * 替身不能因为「没有宿主」而整体加载失败，那会让所有客户端 spec 一起失效。
  */
 
+import { readHostExportNames } from '../../../plugin-src/client/host-ui-primitives.mjs'
+
 const SPECIFIER = '@deepseek-ai/dsh-client-ui-primitives'
+
+/**
+ * 宿主 checkout 读不到时的**最小手工兜底名单**。
+ *
+ * 只列本仓库当前真正导入的三个图标（新名）—— 兜底只需够跑通既有 spec，
+ * 它**不是**真相源：真相源是宿主导出现算，手工名单一旦被当真就会重演旧名事故。
+ */
+const FALLBACK_ICON_NAMES = [
+  'IconApiOutlineRegular',
+  'IconBranchOutlineRegular',
+  'IconChevronDownOutlineRegular',
+]
+
+/**
+ * 现算宿主导出面里的图标名单（`Icon[A-Z]…`；`ICON_REGULAR_STROKE` 这类常量不匹配）。
+ *
+ * @returns 图标导出名数组；宿主不可用时返回 `FALLBACK_ICON_NAMES`。
+ */
+function resolveIconExportNames(): readonly string[] {
+  const host = readHostExportNames()
+  if (host === null) {
+    console.warn(
+      '⚠ ui-primitives 测试替身：未找到宿主 checkout（可用 DSH_UI_PRIMITIVES_DIR 指定），'
+      + `图标替身回退到最小手工名单（${FALLBACK_ICON_NAMES.length} 个）。`
+      + '此模式下「插件引用了宿主已删除的图标名」不再被测试拦截。',
+    )
+    return FALLBACK_ICON_NAMES
+  }
+  const icons = host.names.filter((name) => /^Icon[A-Z]/.test(name))
+  if (icons.length === 0) {
+    console.warn(
+      `⚠ ui-primitives 测试替身：宿主 ${host.origin} 里没解析出任何图标导出（${host.dir}），`
+      + '图标替身回退到最小手工名单。',
+    )
+    return FALLBACK_ICON_NAMES
+  }
+  const absent = FALLBACK_ICON_NAMES.filter((name) => !icons.includes(name))
+  if (absent.length > 0) {
+    // 只 warn 不抛：这里只负责「替身与宿主对齐」，插件侧引用是否合法由核对逻辑判定
+    console.warn(
+      `⚠ ui-primitives 测试替身：宿主 ${host.origin} 里没有 ${absent.join(', ')}`
+      + `（当前源码正在导入它们）—— 宿主可能又改名了，请核对 ${host.dir}。`,
+    )
+  }
+  return icons
+}
 
 /** 替身文件名（写进临时目录后，由改写后的 require 引用）。 */
 export const UI_PRIMITIVES_MODULE = 'ui-primitives-stub.js'
@@ -198,15 +264,6 @@ exports.Tooltip = function Tooltip(props) {
   };
 };
 
-/** Button 的 icon 槽：替身不渲染它（纯装饰），但导出名必须存在。 */
-exports.IconChevronDownOutline14 = function IconChevronDownOutline14() { return null; };
-
-/** 供应商折叠组的组标题图标：同 IconChevronDownOutline14，纯装饰不渲染。 */
-exports.IconApiOutline14 = function IconApiOutline14() { return null; };
-
-/** 「自动路由」导航项图标：同 IconChevronDownOutline14，纯装饰不渲染。 */
-exports.IconBranchOutline16 = function IconBranchOutline16() { return null; };
-
 /**
  * 文本输入框替身：宿主 \`<input>\` 直接暴露 \`value\` / \`onChange\`。
  *
@@ -269,8 +326,25 @@ exports.DisclosureRow = function DisclosureRow(props) {
 };
 `
 
-/** 替身导出的控件名（用于核对源码导入名单）。 */
-const EXPORTED = [...STUB_SOURCE.matchAll(/^exports\.([A-Za-z0-9_]+)\s*=/gm)].map((m) => m[1]!)
+/**
+ * 图标替身源码：**按宿主导出现算**逐个生成，每个 `Icon*` 都是一枚不渲染的占位组件。
+ *
+ * 手工维护这三个名字正是本次白屏事故的成因（见文件头）：宿主改名后，手工名单
+ * 与插件源码**同时**停留在旧名上，两边自洽、测试全绿。改成现算后，只要插件还在
+ * 引用宿主已不存在的名字，`rewriteUiPrimitivesImport` 的核对就当场抛错。
+ *
+ * 替身不渲染图标（纯装饰，spec 断言的是结构与文案，不是图形），但**导出名必须存在**
+ * —— `React.createElement(undefined)` 才是真机上白屏的直接原因。
+ */
+const ICON_STUB_SOURCE = resolveIconExportNames()
+  .map((name) => `exports.${name} = function ${name}() { return null; };`)
+  .join('\n')
+
+/** 写进临时目录的完整替身源码：手工控件替身 + 现算图标替身。 */
+const FULL_STUB_SOURCE = `${STUB_SOURCE}\n${ICON_STUB_SOURCE}\n`
+
+/** 替身导出的全部名字（用于核对源码导入名单）。 */
+const EXPORTED = [...FULL_STUB_SOURCE.matchAll(/^exports\.([A-Za-z0-9_]+)\s*=/gm)].map((m) => m[1]!)
 
 /**
  * 把 `account-hub.js` 里对 ui-primitives 的 import 改写成对替身的 require。
@@ -303,5 +377,5 @@ export function rewriteUiPrimitivesImport(source: string): string {
  * @param write 注入的写文件函数（各 spec 已从 node:fs 导入，避免本文件再引一次）。
  */
 export function writeUiPrimitivesStub(dir: string, write: (path: string, data: string) => void): void {
-  write(`${dir}/${UI_PRIMITIVES_MODULE}`, STUB_SOURCE)
+  write(`${dir}/${UI_PRIMITIVES_MODULE}`, FULL_STUB_SOURCE)
 }

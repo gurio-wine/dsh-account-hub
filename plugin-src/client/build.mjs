@@ -1,13 +1,24 @@
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createContext, runInContext } from 'node:vm';
 import { build } from 'esbuild';
+
+import { readHostExportNames } from './host-ui-primitives.mjs';
 
 const sourceDirectory = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(sourceDirectory, '../..');
 const outputPath = resolve(packageRoot, 'lib/client/account-hub.js');
 const loaderId = 'dsh-account-hub';
+
+/**
+ * 被校验的隐式 baseline 模块。
+ *
+ * 只校验它，不校验 `react`：react 的导出面由上游稳定版本锁定，而 ui-primitives 是
+ * 宿主随 DSH 版本一起演进的**内部包**，其改名/删除是插件侧唯一会静默漂移的接口面。
+ */
+const UI_PRIMITIVES_SPECIFIER = '@deepseek-ai/dsh-client-ui-primitives';
 
 /**
  * 惰性 stub：任意属性访问都返回同款 stub，可读、可写、可调用、可构造。
@@ -24,6 +35,88 @@ const lazyStub = (label) => new Proxy(function smokeStub() {}, {
   apply: () => lazyStub(label),
   construct: () => lazyStub(label),
 });
+
+/**
+ * 成员校验闸门：插件从 ui-primitives 具名导入的每个成员，宿主的导出面里必须真实存在。
+ *
+ * ## 为什么必须有这道闸
+ *
+ * `@deepseek-ai/dsh-client-ui-primitives` 在 esbuild 里是 `external`（理由见下方 build
+ * 调用），而 external 意味着 **esbuild 不解析它的导出**：`import { IconX } from '…'`
+ * 只被改写成 `require('…').IconX`，名字对不对无从得知。三道既有闸门全都不看这个面：
+ *
+ * - esbuild 只打包、不校验语义；
+ * - `tsconfig.json` 的 include 只有 `src/`，看不见 `plugin-src/`；
+ * - 产物冒烟只跑**顶层求值**，而图标是在渲染期才被 `React.createElement` 取用的。
+ *
+ * 于是宿主 commit `4937343a5e`（"unify the client visual language"）把整套图标 API
+ * 改名（`IconApiOutline14` → `IconApiOutlineRegular` 等）后，插件照旧 import 旧名：
+ * 构建全绿、冒烟全绿，用户打开设置页才 `React.createElement(undefined)` 抛
+ * "Element type is invalid" —— 账号中心面板整片白屏。
+ *
+ * ## 名单从哪来
+ *
+ * 从构建机器上的宿主 checkout 现算（`host-ui-primitives.mjs`），**不手工维护**：
+ * 手工名单正是本次事故的成因。宿主 checkout 不存在时（别人的机器 / CI）只 warn
+ * 并跳过 —— 校验闸门绝不能让「没有宿主的环境」构建失败。
+ *
+ * @param inputs esbuild metafile 的 inputs（被打进产物的全部源文件，键为相对路径）。
+ * @returns 无返回值；校验不通过时 `process.exit(1)`。
+ */
+function verifyUiPrimitivesExports(inputs) {
+  const host = readHostExportNames();
+  if (host === null) {
+    console.warn('⚠ 跳过 ui-primitives 成员校验：未找到宿主 checkout（可用 DSH_UI_PRIMITIVES_DIR 指定）。');
+    return;
+  }
+
+  const known = new Set(host.names);
+  const missing = [];
+  const seen = new Set();
+  let checked = 0;
+
+  // 只扫**本插件自己的源码**（plugin-src/ 下），第三方依赖不属校验范围。
+  // metafile 的键用正斜杠、且相对 absWorkingDir；Windows 的 resolve() 给反斜杠，
+  // 故两边都先归一成正斜杠再比较 —— 否则 StartsWith 静默失配、闸门空转仍报绿。
+  const scope = `${resolve(packageRoot, 'plugin-src').replace(/\\/g, '/')}/`;
+  for (const key of Object.keys(inputs)) {
+    const file = isAbsolute(key) ? key : resolve(packageRoot, key);
+    if (!file.replace(/\\/g, '/').startsWith(scope)) continue;
+    if (!existsSync(file) || !/\.[cm]?js$/.test(file)) continue;
+
+    const text = readFileSync(file, 'utf8');
+    // 具名导入：import { A, B as C } from '<specifier>'
+    const pattern = new RegExp(
+      `import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${UI_PRIMITIVES_SPECIFIER.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]`,
+      'g',
+    );
+    for (const match of text.matchAll(pattern)) {
+      for (const raw of match[1].split(',')) {
+        const spec = raw.trim().replace(/^type\s+/, '');
+        if (spec === '') continue;
+        // `A as B` 取**被导入的原始名** A：产物访问的是宿主上的 A
+        const imported = spec.split(/\s+as\s+/)[0].trim();
+        if (!/^[A-Za-z_$][\w$]*$/.test(imported)) continue;
+        if (seen.has(imported)) continue;
+        seen.add(imported);
+        checked += 1;
+        if (!known.has(imported)) missing.push({ name: imported, file: key });
+      }
+    }
+  }
+
+  if (missing.length > 0) {
+    console.error('\n✗ ui-primitives 成员校验失败：以下名字在宿主导出面里不存在。');
+    for (const item of missing) console.error(`  - ${item.name}  （来自 ${item.file}）`);
+    console.error(`\n  宿主：${host.dir}`);
+    console.error(`  名单来源：${host.origin}（共 ${host.names.length} 个导出）`);
+    console.error('  典型成因：宿主重命名了图标/控件 API，而插件源码仍引用旧名。');
+    console.error('  产物未写入 lib/：lib/ 保留上一次构建的可用版本，避免「构建即部署」把页面打崩。');
+    process.exit(1);
+  }
+
+  console.log(`✓ ui-primitives 成员校验通过（${checked} 个具名导入，宿主 ${host.names.length} 个导出，名单来源 ${host.origin}）`);
+}
 
 /**
  * 产物冒烟闸门：像浏览器加载器那样真的把 bundle 跑一遍顶层求值。
@@ -117,12 +210,19 @@ const result = await build({
   // 无法处理的 .module.css 引用（esbuild 不认 CSS Module，直接把 import 留在
   // 产物里，加载器 require 一个 .css 路径必然炸）。
   external: ['react', 'react-dom', '@deepseek-ai/dsh-client-ui-primitives'],
+  // 固定工作目录：metafile 的 inputs 键以它为基准，闸门 A 才能稳定还原源文件路径
+  absWorkingDir: packageRoot,
+  // 闸门 A 靠 inputs 定位「哪些源文件被打进了产物」，再逐文件核对具名导入
+  metafile: true,
   write: false,
   minify: process.env.NODE_ENV === 'production',
   legalComments: 'none',
 });
 const bundled = result.outputFiles?.[0]?.text;
 if (!bundled) throw new Error('esbuild did not produce a client bundle');
+
+// 闸门 A：产物出来即核对成员 —— 名字漂移在构建期炸，不留给用户白屏
+verifyUiPrimitivesExports(result.metafile.inputs);
 
 const wrapped = `window.__ModuleLoader__.load({
   id: ${JSON.stringify(loaderId)},
