@@ -340,7 +340,21 @@ type AccountsMode = 'hold' | 'ok' | 'empty' | 'fail'
  * `credits.checkinStatus` 立即结算（宿主侧是纯内存读、零网络）—— 这正是真机上
  * 「读内存的状态先回、要读池的账号列表后回」的顺序。
  */
-function makeRpc(options: { accountsMode: AccountsMode; checkinBusy?: boolean }) {
+function makeRpc(options: {
+  accountsMode: AccountsMode
+  checkinBusy?: boolean
+  /**
+   * `credits.checkinStatus` 要回的**已签**表（缺省空 = 全部未签）。
+   *
+   * 与 {@link suppressed} 分开两个参数是刻意的：它们在宿主侧就是**正交**的两格
+   * （见 `src/account-hub-rpc.ts` 的 `RpcCheckinStatusResponse`），替身若把它们
+   * 合成一个「是否要跳过」的布尔，本文件就再也测不出「把抑制态误画成已签」——
+   * 而那正是本次改动最需要守住的边界。
+   */
+  checkedIn?: Record<string, boolean>
+  /** `credits.checkinStatus` 要回的**旁路抑制**表（缺省空 = 无账号被抑制）。 */
+  suppressed?: Record<string, boolean>
+}) {
   const calls: Array<{ method: string; payload: Record<string, unknown> }> = []
   const accountListGate = deferred<{ accounts: AccountRow[] }>()
   const checkinPerforms: Array<Record<string, unknown>> = []
@@ -355,7 +369,12 @@ function makeRpc(options: { accountsMode: AccountsMode; checkinBusy?: boolean })
     }
     if (method === 'credits.checkinStatus') {
       // 纯内存读（宿主侧零网络）→ 立即结算；账号此刻尚未就绪。
-      return { provider: payload.provider, nextReset: 0, checkedIn: {} }
+      return {
+        provider: payload.provider,
+        nextReset: 0,
+        checkedIn: options.checkedIn ?? {},
+        suppressed: options.suppressed ?? {},
+      }
     }
     if (method === 'credits.balances') return { accounts: [] }
     if (method === 'consumption.get') return { provider: payload.provider, consumption: { order: 'round-robin', switch: 'per-turn' } }
@@ -452,6 +471,89 @@ describe('进入 Hub 自动补签：挂载期两条 RPC 的结算顺序', () => 
     await driveStable(client.ProviderPanel, { provider: 'trae-cn', rpcCall: rpc.rpcCall }, client.hooks)
 
     expect(performCallsOf(rpc), '空列表被误判为「已全部签过」，自动补签没有发出').toHaveLength(1)
+  })
+})
+
+/**
+ * `undetermined` 的**旁路抑制**必须被自动补签尊重（2026-09-25）。
+ *
+ * ## 守的缺陷
+ *
+ * 宿主给 `undetermined`（Qoder 带头仍空的活动列表）加了窗口内退避
+ * （`src/account-hub-rpc.ts` 的 `undeterminedSuppressUntil`），sweep 与
+ * `checkin.perform` 的**全量**那一支都会跳过被抑制的账号。但面板挂载还会走
+ * 客户端自己的那条自动补签 —— 它若仍照着「有账号未签」判断，就会**替宿主补上
+ * 那一发**，宿主刚堵住的空转循环从客户端这条路原样复活（每进一次 Hub 转一圈，
+ * 每圈以一条「无法判定」通知收尾）。
+ *
+ * ## 为什么抑制态不能并进 `checkedInToday`
+ *
+ * 两者正交，合并任一方向都错：
+ * - 并进 `checkedInToday` ⇒ 被抑制的账号画成「已签」+ 按钮禁用，而它**可能一分
+ *   没领**（「假签到」的界面形态）——下面有用例专门钉死按钮文案**不得**变「已签」；
+ * - 不带这个字段 ⇒ 就是上面那条空转循环。
+ */
+describe('宿主旁路抑制（undetermined 退避）被自动补签尊重', () => {
+  it('全部账号都在抑制期 → 自动补签**不发** `checkin.perform`', async () => {
+    const rpc = makeRpc({
+      accountsMode: 'ok',
+      checkedIn: { [defaultAccount.id]: false },
+      suppressed: { [defaultAccount.id]: true },
+    })
+    client.hooks.__reset()
+
+    await driveStable(client.ProviderPanel, { provider: 'trae-cn', rpcCall: rpc.rpcCall }, client.hooks)
+
+    // ✅ 核心：一发都不发 —— 宿主已判定「窗口内问不出结果」，客户端不该替它补。
+    expect(performCallsOf(rpc), '被抑制的账号仍被自动补签发了请求（空转循环从客户端复活）')
+      .toHaveLength(0)
+  })
+
+  it('抑制态**不**等于「已签」：按钮仍显示「签到」且可点（不得画成已签）', async () => {
+    const rpc = makeRpc({
+      accountsMode: 'ok',
+      checkedIn: { [defaultAccount.id]: false },
+      suppressed: { [defaultAccount.id]: true },
+    })
+    client.hooks.__reset()
+
+    const tree = await driveStable(client.ProviderPanel, { provider: 'trae-cn', rpcCall: rpc.rpcCall }, client.hooks)
+    const expanded = expandTree(tree, client.hooks)
+
+    // ⚠️ 核心断言：被抑制的账号**照旧显示「签到」**、按钮可点。把它画成「已签」
+    // 就是「qoder 假签到」的界面形态 —— 用户看到已签，而它可能一分没领，
+    // 且按钮永久禁用、再也点不动。
+    const checkinButton = findButtonByText(expanded, '签到')
+    expect(checkinButton, '被抑制的账号被画成了「已签」（按钮文案不是「签到」）').toBeDefined()
+    expect(checkinButton!.props.disabled, '被抑制的账号按钮被禁用了（应当仍可手动点）').toBeFalsy()
+    // 反向锚点：不得出现「已签」。
+    expect(textsOf(expanded).join('')).not.toContain('已签')
+  })
+
+  it('未被抑制的账号照旧自动补签（抑制判据不是「一律跳过」）', async () => {
+    // 反向锚点：证明上面那条「零请求」是被 `suppressed` 挡的，而不是本用例搭的
+    // 场景本来就不发请求（少了它，把判据写成「永不自签」也照样绿）。
+    const rpc = makeRpc({
+      accountsMode: 'ok',
+      checkedIn: { [defaultAccount.id]: false },
+      suppressed: { [defaultAccount.id]: false },
+    })
+    client.hooks.__reset()
+
+    await driveStable(client.ProviderPanel, { provider: 'trae-cn', rpcCall: rpc.rpcCall }, client.hooks)
+
+    expect(performCallsOf(rpc), '未被抑制的账号没有自动补签').toHaveLength(1)
+  })
+
+  it('`suppressed` 缺省（旧宿主不返回该字段）→ 行为退回改动前：照发一发', async () => {
+    // 兼容性：旧宿主没有 `suppressed` 字段。此时不得静默跳过（那会让所有账号
+    // 在新客户端 + 旧宿主的组合下再也不自动补签），而应退回改动前的行为。
+    const rpc = makeRpc({ accountsMode: 'ok', checkedIn: { [defaultAccount.id]: false } })
+    client.hooks.__reset()
+
+    await driveStable(client.ProviderPanel, { provider: 'trae-cn', rpcCall: rpc.rpcCall }, client.hooks)
+
+    expect(performCallsOf(rpc), '旧宿主（无 suppressed 字段）下自动补签被静默跳过').toHaveLength(1)
   })
 })
 

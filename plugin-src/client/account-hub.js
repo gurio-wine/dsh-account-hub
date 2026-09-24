@@ -1568,7 +1568,19 @@ function ProviderPanel({ provider, rpcCall }) {
       if (accountsRef.current.length > 0 || res.checkedIn) {
         const next = {};
         for (const account of accountsRef.current) {
-          next[account.id] = { checkedInToday: Boolean(res.checkedIn?.[account.id]) };
+          next[account.id] = {
+            checkedInToday: Boolean(res.checkedIn?.[account.id]),
+            // 宿主侧的**旁路抑制态**（`undetermined` 后的窗口内退避，见
+            // `src/account-hub-rpc.ts` 的 `undeterminedSuppressUntil`）。
+            // ⚠️ 它与 `checkedInToday` 是**正交**的两件事，合并任何一个方向都会
+            // 制造缺陷：并进 `checkedInToday` ⇒ 被抑制的账号显示「已签」+ 按钮
+            // 禁用，而它**可能一分没领**（正是「假签到」的界面形态）；不带上它
+            // ⇒ 下面的自动补签会把「未签」当成「该补一发」并再发一次，宿主刚堵住
+            // 的空转循环从客户端这条路原样复活。
+            // 旧宿主不返回该字段 ⇒ `undefined` ⇒ `Boolean(undefined) === false`
+            // ⇒ 行为退回改动前（多发一发幂等查询），不会读错任何东西。
+            suppressed: Boolean(res.suppressed?.[account.id]),
+          };
         }
         setCheckinsByAccount(next);
       }
@@ -1871,11 +1883,22 @@ function ProviderPanel({ provider, rpcCall }) {
     // 补判一次。判据是「已结算」而不是「引用非空」：空列表 / 读取失败同样是结算，
     // 且本地列表读不到**不影响**这次签到（目标集合由宿主按自己的账号池决定）。
     if (!accountsLoaded) return;
-    // 已全部签过就无需自动补签。
+    // 已全部签过、或全部处于**宿主旁路抑制期**，就无需自动补签 —— 两者都是
+    // 「此刻不该再发这一发」。
+    //
+    // `suppressed` 是 `undetermined` 之后的窗口内退避态（宿主侧
+    // `src/account-hub-rpc.ts` 的 `undeterminedSuppressUntil`）。⚠️ 它**不是**
+    // 「已签」：那些账号照旧显示「签到」、按钮可点（`allCheckedIn` **不读**它，
+    // 见下）。但自动补签必须跳过 —— 否则「进一次面板补一发」会从客户端这条路
+    // 原样复活宿主刚堵住的空转循环，而这一发的结局注定还是 `undetermined`。
+    //
     // ⚠️ `accounts.length > 0` 这一半不可省：`[].every()` **恒为 true**，只留
     // `every` 会把「本地没有可判对象」（列表结算为空）误判成「已全部签过」——
     // 缺陷只是从上面那道守卫换到这个位置，形态一模一样（静默不发）。
-    if (accounts.length > 0 && accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)) return;
+    if (accounts.length > 0 && accounts.every(a => {
+      const state = checkinsByAccount[a.id];
+      return state?.checkedInToday === true || state?.suppressed === true;
+    })) return;
     // 走到这里才算真正发起过判定/补签，标记本面板只做这一次。
     autoCheckinRanRef.current = true;
     // 已有手动签到在跑（claimed 或单片 checkinAccount 都置 claiming），别并发。

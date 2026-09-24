@@ -32,7 +32,12 @@
  */
 
 import { describe, expect, it, vi, afterEach } from 'vitest'
-import { registerAccountHubRpc, CHECKIN_ELIGIBLE_PROVIDERS, __resetCheckinBusy } from '../../src/account-hub-rpc.js'
+import {
+  registerAccountHubRpc,
+  CHECKIN_ELIGIBLE_PROVIDERS,
+  __resetCheckinBusy,
+  __resetUndeterminedSuppression,
+} from '../../src/account-hub-rpc.js'
 import { AccountPool } from '../../src/account-pool.js'
 import { nextEligibleAt } from '../../src/checkin-schedule.js'
 import type { ProviderAccountEntry } from '../../src/types.js'
@@ -358,6 +363,10 @@ function qoderCampaignsOnly(campaigns: () => Response) {
 afterEach(() => {
   vi.unstubAllGlobals()
   __resetCheckinBusy()
+  // ⚠️ 抑制表是**模块级**的（与 checkinBusy 同款）：不在这里清，一个用例写下的
+  // 抑制期会漏进后面的用例 —— 表现为「另一个用例的 sweep 忽然不签了」，
+  // 而失败点与真正的原因（上一个用例）隔着整个文件。
+  __resetUndeterminedSuppression()
 })
 
 // ── CHECKIN_ELIGIBLE_PROVIDERS ──────────────────────────────────────────────
@@ -1056,5 +1065,191 @@ describe('签到互斥：checkin.perform 与 sweep 共享同一把', () => {
     gate.release()
     const done = await perform
     expect((done as { value: { busy?: boolean } }).value.busy).toBeFalsy()
+  })
+})
+
+// ── undetermined 的**旁路抑制**（2026-09-25：堵住「窗口未开时空跑」）──────────
+//
+// 上一组守的是「`undetermined` 不写签到状态」—— 那是对的（写成就伪造一次签到），
+// 但它单独存在时会退化成**空转循环**：服务端窗口未开（活动列表恒空）时，
+// 「不写 ⇒ 下轮可签 ⇒ 再问一次 ⇒ 还是空」每 4 小时转一圈，用户每进一次面板还
+// 额外转一圈，每次都以一条「无法判定」通知收尾。真机上一整天被这个循环骚扰。
+//
+// 修法是把两件事**分开**：`checkins` 继续只表达「签没签」（UI 的唯一依据，一字
+// 不动），另设一张**进程内**的调度抑制表（`undeterminedSuppressUntil`）表达
+// 「这一轮问服务端有没有意义」。本组守的正是这条分界 —— 任何一条断言挂了，
+// 要么空转循环复活，要么「未签」被画成「已签」。
+
+describe('undetermined 旁路抑制：窗口外不再空跑', () => {
+  /** 一个 qoder-cn 账号（`undetermined` 目前唯一的生产者就是 Qoder 系）。 */
+  const qoderEntry = (id: string): ProviderAccountEntry => makeEntry(id, {
+    provider: 'qoder-cn',
+    credentialRef: `QODER_CN_ACCOUNT_${id.toUpperCase()}`,
+  })
+
+  /** **带头仍空**的活动列表 ⇒ claim 判 `undetermined`（见上一组用例）。 */
+  const emptyCampaigns = () => new Response(
+    JSON.stringify({ showCampaign: false, claimable: false, campaigns: [] }), { status: 200 },
+  )
+
+  /** 读 `credits.checkinStatus`，取出「已签」与「被抑制」两张表。 */
+  async function statusOf(h: Harness, provider: string): Promise<{
+    checkedIn: Record<string, boolean>
+    suppressed: Record<string, boolean>
+  }> {
+    const result = await h.call<{
+      checkedIn: Record<string, boolean>
+      suppressed: Record<string, boolean>
+    }>('credits.checkinStatus', { provider })
+    expect(result.ok, JSON.stringify(result)).toBe(true)
+    return (result as {
+      value: { checkedIn: Record<string, boolean>; suppressed: Record<string, boolean> }
+    }).value
+  }
+
+  it('undetermined 之后 sweep 短路：第二轮**一发请求都不发**', async () => {
+    const h = createHarness([qoderEntry('q1')], qoderCampaignsOnly(emptyCampaigns))
+
+    // 第一轮：真的问过服务端（空列表 ⇒ undetermined ⇒ 进抑制表）。
+    await h.call<any>('checkin.sweep', {})
+    const afterFirst = h.fetcher.calls.length
+    expect(afterFirst, '第一轮没有发出任何请求，本用例证明不了「第二轮被短路」').toBeGreaterThan(0)
+
+    // 第二轮（4h 定时器下一次触发）：**零请求** —— 这正是被骚扰一整天的那个循环。
+    await h.call<any>('checkin.sweep', {})
+    expect(h.fetcher.calls.length, 'undetermined 之后 sweep 仍在空跑（抑制没生效）').toBe(afterFirst)
+  })
+
+  it('抑制态与「已签」**正交**：checkins 不写、checkedIn 仍 false、suppressed 为 true', async () => {
+    const h = createHarness([qoderEntry('q1')], qoderCampaignsOnly(emptyCampaigns))
+    await h.call<any>('checkin.sweep', {})
+
+    // ⚠️ 核心：抑制**没有**碰 `checkins`。碰了就等于伪造一次签到 ——
+    // 用户看到「已签」，而它可能一分没领。
+    expect(h.pool.checkinNextEligible('qoder-cn', 'q1')).toBeUndefined()
+    expect(h.pool.isCheckinDue('qoder-cn', 'q1')).toBe(true)
+
+    const v = await statusOf(h, 'qoder-cn')
+    // UI 唯一读的两格：「未签」（照旧）+「被抑制」（宿主这轮为什么不签）。
+    expect(v.checkedIn).toEqual({ q1: false })
+    expect(v.suppressed).toEqual({ q1: true })
+  })
+
+  it('抑制解除时刻按**下一个窗口点**算（qoder-cn = 本地 10:00），不是固定时长', async () => {
+    // ⚠️ 固定时长（如 `now + 2h`）在窗口 10:00 开的 provider 上会当天再空跑三次：
+    // 01:00 抑制两小时 ⇒ 03:00 / 05:00 / 07:00 / 09:00 各撞一次空列表，通知照弹
+    // 四次 —— 那正是本次要堵的循环。故这里用**固定挂钟**把窗口点钉死：
+    // 01:00 起抑制，09:59 仍抑制（固定时长早已失效）、10:00 才解除。
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date(2026, 8, 24, 1, 0, 0))
+      const h = createHarness([qoderEntry('q1')], qoderCampaignsOnly(emptyCampaigns))
+      await h.call<any>('checkin.sweep', {})
+      expect((await statusOf(h, 'qoder-cn')).suppressed.q1, '第一轮空列表后没有进抑制').toBe(true)
+
+      // 窗口前一分钟：仍在抑制期。固定 +2h 的实现会在这里解除 ⇒ 当天再空跑三次。
+      vi.setSystemTime(new Date(2026, 8, 24, 9, 59, 0))
+      expect(
+        (await statusOf(h, 'qoder-cn')).suppressed.q1,
+        '抑制按固定时长解除（而不是按窗口点）⇒ 当天仍会空跑多次',
+      ).toBe(true)
+
+      // 窗口开启：解除抑制，恢复「可签」。
+      vi.setSystemTime(new Date(2026, 8, 24, 10, 0, 0))
+      expect((await statusOf(h, 'qoder-cn')).suppressed.q1, '窗口已开却仍被抑制').toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('抑制期过后 sweep 恢复尝试（不是永久闭嘴）', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date(2026, 8, 24, 1, 0, 0))
+      const h = createHarness([qoderEntry('q1')], qoderCampaignsOnly(emptyCampaigns))
+      await h.call<any>('checkin.sweep', {})
+      const afterFirst = h.fetcher.calls.length
+
+      // 到窗口点：下一轮 sweep 必须**重新发请求** —— 抑制是「等窗口」而不是
+      // 「放弃这个账号」，写成永久抑制会让账号当天彻底不再被尝试。
+      vi.setSystemTime(new Date(2026, 8, 24, 10, 0, 0))
+      await h.call<any>('checkin.sweep', {})
+      expect(h.fetcher.calls.length, '窗口开启后 sweep 没有恢复尝试').toBeGreaterThan(afterFirst)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('显式单账号签到**不被**抑制挡住：用户主动点击必须拿到如实反馈', async () => {
+    // 全量那一支（自动调度）被抑制挡掉是刻意的；显式单账号（卡片上的「签到」
+    // 按钮）**不能**挡：目标被过滤掉 ⇒ 响应空 results ⇒ 客户端 `checkinAccount`
+    // 只在拿到 outcome 时才弹提示 ⇒ 按钮弹回原状、界面什么都不说 —— 那正是本
+    // 仓库反复钉死的「点了没反应」缺陷形态。用户主动点一次只值一发幂等 GET。
+    const h = createHarness([qoderEntry('q1')], qoderCampaignsOnly(emptyCampaigns))
+    await h.call<any>('checkin.sweep', {})
+    expect((await statusOf(h, 'qoder-cn')).suppressed.q1).toBe(true)
+
+    const before = h.fetcher.calls.length
+    const result = await h.call<any>('checkin.perform', { provider: 'qoder-cn', accountId: 'q1' })
+
+    expect(h.fetcher.calls.length, '显式单账号签到被抑制挡掉了（用户会看到「点了没反应」）')
+      .toBeGreaterThan(before)
+    const value = (result as { value: { results: Array<{ outcome: { kind: string } }> } }).value
+    // 如实回报 undetermined（而不是伪装成空结果或已领）。
+    expect(value.results[0]!.outcome.kind).toBe('undetermined')
+  })
+
+  it('provider **全量** `checkin.perform` 同样排除被抑制账号（面板自动入口的堵点）', async () => {
+    // ⚠️ 这是**第二条**自动入口（`checkin.perform` 不带 accountId）：面板挂载的
+    // 自动补签（`autoCheckinOnEntry`）与头部「一键签到」都走它。只在 sweep 里加
+    // 抑制是不够的 —— 用户每进一次面板仍会从这里空跑一发，通知照弹（「一整天被
+    // 骚扰」的另一半），而那一发的结局注定还是 `undetermined`。
+    const h = createHarness([qoderEntry('q1')], qoderCampaignsOnly(emptyCampaigns))
+
+    // 先经 sweep 把账号打进抑制期。
+    await h.call<any>('checkin.sweep', {})
+    expect((await statusOf(h, 'qoder-cn')).suppressed.q1).toBe(true)
+
+    const before = h.fetcher.calls.length
+    const result = await h.call<any>('checkin.perform', { provider: 'qoder-cn' })
+
+    // 全量那一支被抑制挡掉 ⇒ 目标为空 ⇒ 一个请求都不发（连活动列表都不查）。
+    expect(h.fetcher.calls.length, '全量 perform 没被抑制挡住，面板每进一次仍空跑').toBe(before)
+    const value = (result as { value: { results: unknown[]; busy?: boolean } }).value
+    expect(value.results).toEqual([])
+    // 不是被互斥挡下（那需要另一路在跑），故不得带 busy —— 两者对客户端的含义
+    // 完全不同（「稍候」vs「此刻没有该签的账号」）。
+    expect(value.busy).toBeFalsy()
+  })
+
+  it('failed（瞬时故障）**不**进抑制表：下一轮 sweep 照旧重试', async () => {
+    // `failed` 与 `undetermined` 的正确动作**相反**：前者是瞬时故障（服务端/网络
+    // 抖了一下），「下轮重试」就是期望行为；给它加退避等于人为推迟自愈，且与
+    // `unavailable` 的语义重复。判据用 buddy-cn（claimCode 999 ⇒ failed）。
+    const h = createHarness([makeEntry('acc-1')])
+    h.fetcher.claimCode = 999
+
+    await h.call<any>('checkin.sweep', {})
+    expect(h.fetcher.claimRequestCount(), '第一轮必须真的发过 claim').toBe(1)
+
+    // 第二轮照旧重试 —— 与上面 undetermined 的「零请求」形成对照。
+    await h.call<any>('checkin.sweep', {})
+    expect(h.fetcher.claimRequestCount(), 'failed 被加上了退避（推迟了自愈）').toBe(2)
+
+    const v = await statusOf(h, 'buddy-cn')
+    expect(v.suppressed).toEqual({ 'acc-1': false })
+    // 同样不写签到状态（既有规则，与本次改动无关，一并守）。
+    expect(h.pool.isCheckinDue('buddy-cn', 'acc-1')).toBe(true)
+  })
+
+  it('未进抑制表的账号 suppressed 恒为 false（字段不是「一律 true」）', async () => {
+    const h = createHarness([makeEntry('acc-1')])
+    h.fetcher.claimCode = 0
+    await h.call<any>('checkin.sweep', {})
+
+    const v = await statusOf(h, 'buddy-cn')
+    // 签到成功 ⇒ 已签（checkedIn 由 checkins 驱动）；未经历 undetermined ⇒ 不被抑制。
+    expect(v.checkedIn).toEqual({ 'acc-1': true })
+    expect(v.suppressed).toEqual({ 'acc-1': false })
   })
 })

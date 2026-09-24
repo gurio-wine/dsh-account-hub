@@ -591,8 +591,32 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     expect(normalized).toContain('if (!supportsCredits) return;')
     // 用 accountsRef 防并发读到空数组（设计文档点名的坑）。
     expect(normalized).toContain('accountsRef.current.length > 0')
-    // 结果落地为 `accountId → { checkedInToday }`。
-    expect(normalized).toContain('{ checkedInToday: Boolean(res.checkedIn?.[account.id]) }')
+    // 结果落地为 `accountId → { checkedInToday, suppressed }`。
+    expect(normalized).toContain('checkedInToday: Boolean(res.checkedIn?.[account.id])')
+    // `suppressed` 是宿主 `undetermined` 后的旁路抑制态，必须与 `checkedInToday`
+    // **分开**两个字段落进本地状态（合并任一方向都会制造缺陷，见下方专项用例）。
+    expect(normalized).toContain('suppressed: Boolean(res.suppressed?.[account.id])')
+  })
+
+  it('`undetermined` 抑制态：自动补签跳过，但**不**被画成「已签」（两个字段正交）', () => {
+    // 自动补签的跳过判据必须把 `suppressed` 也算作「此刻不该发」——否则宿主刚
+    // 堵住的空转循环会从「进一次面板补一发」这条客户端路径原样复活。
+    expect(normalized).toContain('state?.checkedInToday === true || state?.suppressed === true;')
+    // ⚠️ 反向锚点：`suppressed` **不得**出现在「已签」的显示/禁用链路上。
+    // `allCheckedIn`（头部「全部已签」+ 禁用）与 AccountCard 的 `checkedIn` prop
+    // 都只认 `checkedInToday` —— 一旦把 `suppressed` 并进去，被抑制的账号会显示
+    // 「已签」+ 按钮禁用，而它**可能一分没领**（「假签到」的界面形态）。
+    expect(normalized).toContain('accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)')
+    // ⚠️ 反向锚点在 `allCheckedIn` **那一段**里查，不能对全文查：`suppressed`
+    // 本来就该出现在 `autoCheckinOnEntry` 的跳过判据里（上一行断言的正是它），
+    // 全文 `not.toContain` 会被自己刚加的那句打红 —— 那是**断言写错**，不是缺陷。
+    const allCheckedInStart = normalized.indexOf('const allCheckedIn = supportsCredits')
+    expect(allCheckedInStart).toBeGreaterThan(-1)
+    const allCheckedInBody = normalized.slice(allCheckedInStart, normalized.indexOf(';', allCheckedInStart))
+    expect(allCheckedInBody, '`suppressed` 混进了「全部已签」的判据').not.toContain('suppressed')
+    // 单片按钮的三态文案与禁用条件都不读 `suppressed`。
+    expect(normalized).toContain("checkedIn ? '已签' : checkingThisAccount ? '签到中…' : '签到'")
+    expect(normalized).toContain('disabled: busy || checkedIn || checkingThisAccount')
   })
 
   it('进入 Hub 时自动补签：挂载后只要存在未签账号就自动调一次 `checkin.perform`', () => {
@@ -628,8 +652,14 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     // 已全部签过：不发请求。⚠️ `accounts.length > 0` 这一半是必需的 ——
     // `[].every()` 恒为 true，只留 every 会把「本地没有可判对象」误判成
     // 「已全部签过」，缺陷只换个位置复发（静默不发）。
-    expect(normalized)
-      .toContain('if (accounts.length > 0 && accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)) return;')
+    expect(normalized).toContain('if (accounts.length > 0 && accounts.every(a => {')
+    // 判据是**两个正交态的二选一**：已签（宿主 `checkins` 驱动、决定 UI）或
+    // 处于 `undetermined` 抑制期（纯调度退避，2026-09-25 新增）。
+    // ⚠️ 抑制态**必须**参与这里：不参与就等于宿主少发的那一发由客户端补上，
+    // 空转循环原样复活。而它**不得**参与 `allCheckedIn`（下一条用例钉死）——
+    // 那会把「可能一分没领」的账号画成「全部已签」。
+    expect(normalized).toContain('const state = checkinsByAccount[a.id];')
+    expect(normalized).toContain('return state?.checkedInToday === true || state?.suppressed === true;')
     // 尚未真正发过判定/补签前不置 ran（保证账号就绪后能再进来补判一次）。
     expect(normalized).toContain('autoCheckinRanRef.current = true;')
     // 与手动签到（一键/单片）共用 claimingRef 互斥，避免并发各发一次。

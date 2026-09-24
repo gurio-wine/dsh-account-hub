@@ -181,6 +181,76 @@ export function __resetCheckinBusy(): void {
 }
 
 /**
+ * `undetermined` 的**进程内旁路抑制表**（`provider:accountId` → 抑制解除时刻）。
+ *
+ * ## 它解决的循环（用户被骚扰一整天的那个）
+ *
+ * `undetermined` 的语义是「服务端没给判定依据」（Qoder **带头仍空**的活动列表，
+ * 见 `src/credits.ts`）。按既有规则它**不写 `checkins`** —— 那是刻意的：写成就
+ * 等于伪造一次签到。但「不写」+「下轮重试」在服务端窗口未开（或活动暂未配置、
+ * 接口异常返回空）时会退化成**空转循环**：每 4h sweep 一发、每次进面板
+ * `checkin.perform` 一发，永远空手而归，还把「无法判定」通知反复弹给用户。
+ *
+ * 抑制表把「窗口外不要反复问」与「签到状态」**彻底分开**：
+ *  - `checkins` 仍只由 `claimed` / `already-claimed` 写 ⇒ UI 的「已签」判定
+ *    （`credits.checkinStatus` 的 `checkedIn`）**半个字符都不受影响**：被抑制的
+ *    账号照旧显示「签到」、按钮可点（这正是「不能污染已签判定」的落点）；
+ *  - 本表**只被调度消费**（sweep 的「可签」筛选 + `performCheckin` 的目标筛选），
+ *    除此之外没有任何读点。
+ *
+ * ## 为什么是进程内、不上盘
+ *
+ * 它是**纯调度优化**，不是业务事实：丢了最多多打一发幂等查询（活动列表是 GET，
+ * 领取本身由服务端幂等兜底）。上盘的两条路都更差：复用 `checkins` 就污染了已签
+ * 判定（正是不能做的事）；往九件套加字段则要动 `persist()` 的全部写路径
+ * （「漏带即静默清空」），为一个**可丢的优化**承担那个回归面不值得。
+ *
+ * ## 值是「抑制解除时刻」，且由 `nextEligibleAt` 算
+ *
+ * 与 `checkins` 同源：`nextEligibleAt(now, provider)` 给出的就是**下一个签到窗口
+ * 开启时刻**（qoder 两区 = 本地 10:00）。刻意**不用固定时长**（如 `now + 2h`）：
+ * 窗口 10:00 开时，01:00 写两小时 ⇒ 03:00 / 05:00 / 07:00 / 09:00 各空跑一发，
+ * 当天照样被弹四次通知 —— 那正是本次要堵的循环。
+ *
+ * ## ⚠️ 只覆盖 `undetermined`
+ *
+ * `failed`（瞬时故障，用户可能还要处理）与 `unavailable`（服务端明确拒绝）**都不
+ * 进本表**：它们的期望行为就是「下一轮 sweep 重试」，给它们加退避等于人为推迟
+ * 自愈，且 `unavailable` 本来就带服务端 code、重试是唯一出路。新增 outcome kind
+ * 时**默认不进本表** —— 要进来必须像 `undetermined` 一样先证明「窗口外重试无用」。
+ */
+const undeterminedSuppressUntil = new Map<string, number>()
+
+/** 清空抑制表（仅测试用，与 {@link __resetCheckinBusy} 同款）。 */
+export function __resetUndeterminedSuppression(): void {
+  undeterminedSuppressUntil.clear()
+}
+
+/**
+ * 该账号此刻是否处于 `undetermined` 抑制期内。
+ *
+ * **顺带自清**：读到已过期的条目就删掉。条目数上限是账号数（不会涨），但过期不删
+ * 会让「哪些账号真的被抑制」在调试时看不出来 —— 陈旧的键与生效的键在 Map 里长得
+ * 一模一样。
+ *
+ * @param now - 判定时刻，缺省当前时间（便于测试注入固定时刻）。
+ */
+function isUndeterminedSuppressed(
+  provider: string,
+  accountId: string,
+  now: number = Date.now(),
+): boolean {
+  const key = `${provider}:${accountId}`
+  const until = undeterminedSuppressUntil.get(key)
+  if (until === undefined) return false
+  if (now >= until) {
+    undeterminedSuppressUntil.delete(key)
+    return false
+  }
+  return true
+}
+
+/**
  * 执行一次**单个账号**或**单个 provider 全量**的自动签到（复用 claimAll 分派逻辑）。
  *
  * 内部实现见下方 `runCreditsClaim`：对账号数组逐账号走与 `credits.claimAll` 分支
@@ -251,6 +321,25 @@ export interface RpcCheckinStatusResponse {
   nextReset: number
   /** accountId → 此刻是否**已签**（记录的下一次可签时刻还没到）。无账号时为空对象。 */
   checkedIn: Record<string, boolean>
+  /**
+   * accountId → 此刻是否处于 `undetermined` 的**旁路抑制期**（见
+   * {@link undeterminedSuppressUntil}）。无账号时为空对象。
+   *
+   * ## 为什么必须与 `checkedIn` **分开**两个字段
+   *
+   * 两者是**正交**的两件事，合并任何一个方向都会制造缺陷：
+   *
+   * - 并进 `checkedIn` ⇒ 被抑制的账号显示「已签」+ 按钮禁用，而它**可能一分没领**
+   *   —— 那正是「qoder 假签到」的界面形态，也是本次改动明令不许出现的；
+   * - 并进「未签」而不给字段 ⇒ 客户端**无从知道**宿主这轮为什么没签，于是
+   *   「进页面自动补签」会照着「有账号未签」判断并**再发一发** —— 抑制表刚堵住的
+   *   空转循环会从客户端这条路上原样复活（宿主少发的那一发由客户端补上）。
+   *
+   * 故 `checkedIn` 的语义**一字未动**（仍是「`checkins` 里记的下一次可签时刻还没
+   * 到」），抑制态独立成这一格。旧客户端不读它 ⇒ 行为退回改动前（多发一发幂等
+   * 查询），不会读错任何东西。
+   */
+  suppressed: Record<string, boolean>
 }
 
 /** RPC: `checkin.perform` 请求（accountId 缺省/空串 → 该 provider 全量）。 */
@@ -1508,6 +1597,20 @@ async function performCheckinOnTargets(
       // 账号都成立。一个账号的领取耗时横跨重置点属于极端情形，此处不做特殊处理
       // —— 它最多让该账号多等一个周期，而不会多签一次。
       await deps.pool.writeCheckinNextEligible(provider, r.accountId, nextEligibleAt(Date.now(), provider))
+    } else if (r.outcome.kind === 'undetermined') {
+      // ⚠️ **走的是旁路抑制表，不是 `checkins`** —— 两者绝不能混（见模块头的
+      // {@link undeterminedSuppressUntil}）。这一支刻意写成 `else if`：它表达的是
+      // 「不写签到状态**但**要抑制调度」这第三态，写成独立的 `if` 会让它看起来
+      // 与上一个分支是两件独立的事，而实际上它们是同一个 outcome 的二选一。
+      //
+      // 写「下一个窗口开启时刻」而不是固定时长：窗口 10:00 开的 provider 在
+      // 01:00 被抑制两小时 ⇒ 03:00 又空跑一发，当天最多弹四次 —— 那正是本次
+      // 要堵的循环。`nextEligibleAt` 与写 `checkins` 时**同一个函数**，故钟点
+      // 配置（`CHECKIN_RESET_HOURS`）只有一份。
+      undeterminedSuppressUntil.set(
+        `${provider}:${r.accountId}`,
+        nextEligibleAt(Date.now(), provider),
+      )
     }
     // outcome 保留 runCreditsClaim 产出的完整 ClaimOutcome 对象（不拍扁成字符串），
     // 并带上 nickname —— 与 `credits.claimAll` 同构，客户端通知 UI 直接可用。
@@ -1535,8 +1638,12 @@ export async function performCheckinSweep(deps: CheckinSweepDeps): Promise<RpcCh
     for (const provider of CHECKIN_ELIGIBLE_PROVIDERS) {
       const accounts = await pool.listAccounts(provider)
       if (accounts.length === 0) continue
-      // 只签**此刻可签**的账号：记录的下一次可签时刻还没到 → 直接短路，不发任何请求。
-      const due = accounts.filter((a) => pool.isCheckinDue(provider, a.id))
+      // 只签**此刻可签**的账号，且**不在 `undetermined` 抑制期内**：两个判据缺一不可
+      // —— `isCheckinDue` 答的是「签到状态上是否已签」（由 `checkins` 驱动、决定 UI），
+      // 抑制表答的是「这一轮去问服务端有没有意义」（纯调度）。被抑制的账号在这里
+      // 就被挡掉，**一个请求都不发** —— 这正是「服务端窗口未开时空跑」的堵点。
+      const due = accounts.filter((a) =>
+        pool.isCheckinDue(provider, a.id) && !isUndeterminedSuppressed(provider, a.id))
       const { results, summary } = await performCheckinOnTargets(deps, provider, due)
       providers.push({ provider, results, summary })
     }
@@ -1817,9 +1924,20 @@ function registerAccountHubEndpoints(options: AccountHubRpcOptions): void {
     checkinBusy = true
     try {
       const accounts = await pool.listAccounts(provider)
+      // ⚠️ 抑制筛选**只作用于 provider 全量那一支**（`accountId` 缺省），刻意**不**
+      // 作用于显式单账号 —— 两条路的「谁在做决定」不同：
+      //
+      // - 全量那一支是**自动调度**（面板挂载的自动补签 `autoCheckinOnEntry`、头部
+      //   「一键签到」）：没有人盯着某一行看结果，空跑一发的全部产出就是一条重复
+      //   通知。这正是用户被骚扰一整天的形态，故抑制期一到直接不发。
+      // - 显式单账号（卡片上的「签到」按钮）是**用户刚点的那一下**：把目标过滤掉
+      //   会让响应变成空 results，而客户端 `checkinAccount` 只在拿到 outcome 时才
+      //   弹提示 —— 于是按钮弹回原状、界面什么都不说。那正是本仓库反复钉死的
+      //   「点了没反应」缺陷形态（`CHECKIN_BUSY_NOTICE` 就是为它而设）。用户主动
+      //   点一次只值一发幂等 GET，换来的是**如实反馈**，这笔账划算。
       const targets = accountId !== undefined && accountId.length > 0
         ? accounts.filter((a) => a.id === accountId)
-        : accounts
+        : accounts.filter((a) => !isUndeterminedSuppressed(provider, a.id))
       const { results, summary } = await performCheckinOnTargets(checkinDeps, provider, targets)
       return { provider, nextReset: nextEligibleAt(Date.now(), provider), results, summary }
     } finally {
@@ -2533,9 +2651,17 @@ function registerAccountHubEndpoints(options: AccountHubRpcOptions): void {
         const now = Date.now()
         const accounts = await pool.listAccounts(provider)
         const checkedIn: Record<string, boolean> = {}
+        // 旁路抑制态**独立一格**（理由见 {@link RpcCheckinStatusResponse.suppressed}）：
+        // 它与「已签」正交，合并就会制造缺陷（并进 checkedIn = 假签到；不给字段 =
+        // 客户端照旧补发，抑制表在客户端这条路上失效）。
+        const suppressed: Record<string, boolean> = {}
         for (const entry of accounts) {
           // 「已签」= 记录的下一次可签时刻**还没到**（见 `src/checkin-schedule.ts`）。
           checkedIn[entry.id] = !pool.isCheckinDue(provider, entry.id, now)
+          // 抑制期只对**未签**的账号有意义：已签的账号本来就轮不到调度，
+          // 若是 `claimed` 与抑制同时存在（同一轮里先被抑制、后又签成功），
+          // 报 `false` 才是真相 —— 客户端据此不再补发（checkedIn 已经挡住了）。
+          suppressed[entry.id] = !checkedIn[entry.id] && isUndeterminedSuppressed(provider, entry.id, now)
         }
         return {
           ok: true,
@@ -2543,6 +2669,7 @@ function registerAccountHubEndpoints(options: AccountHubRpcOptions): void {
             provider,
             nextReset: nextEligibleAt(now, provider),
             checkedIn,
+            suppressed,
           } satisfies RpcCheckinStatusResponse,
         }
       }
