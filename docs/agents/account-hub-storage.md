@@ -219,7 +219,11 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
   `description` / `inputModalities`，照抄出去等于把宿主字段名变成客户端的隐性契约。
 - `autoroute.model-info`（请求 `{ provider, model }`）：`resolveModelInfo(provider, model)`
   → 取 `reasoning` → `{ efforts: id[], defaultEffort? }`（`defaultEffort` 缺席即不补键，
-  编造默认档会让编辑器把「没配」显示成「配了某一档」）。**尽力而为、永不报错**：
+  编造默认档会让编辑器把「没配」显示成「配了某一档」）。**这是面板「条目档位下拉」的
+  唯一数据源**，读的是**被转发的那个真实 provider/model**，与聚合模型的能力声明无关 ——
+  聚合模型刻意不声明思考档位（会话侧没有档位下拉，见
+  `docs/agents/auto-route-runtime.md` §7），故**本条不受影响**、也不需要跟着改。
+  **尽力而为、永不报错**：
   无 `reasoning`（CodeArts 全系）、provider 不认该模型、适配器抛错 —— 三种都回 `{}`，
   那是**正常结果**（编辑器显示「该模型无档位可选」）而非「加载失败」；`provider` 传
   `auto-route` 自身直接回 `{}`（该路径的 `resolveModelInfo` 会绕回本插件聚合适配器，

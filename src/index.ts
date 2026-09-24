@@ -13,7 +13,7 @@ import { LobsteraiAuth } from './lobsterai-auth.js'
 import { TraeCnAuth } from './trae-cn-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
-import { createAutoRouteRegistration } from './auto-route-adapter.js'
+import { createAutoRouteRegistration, installAutoRouteEffortGuard } from './auto-route-adapter.js'
 import { TurnKeyTracker } from './account-consumption.js'
 import { createContextTierRegistry } from './context-tiers.js'
 import { migrateProviderNames } from './provider-rename-migration.js'
@@ -959,6 +959,11 @@ export function apply(ctx: Context): void {
   // 下一轮目录刷新就该看到，不存在「忘了重建」的窗口。运行时（降级队列）不能现读
   // （它有状态），故由刷新函数按**内容指纹**决定何时重建。
   const ensureAutoRouteRegistration = createAutoRouteRegistration(ctx, () => pool.autoRouteConfig())
+  // 兜底：剥掉打到聚合模型的会话侧档位（详见 `installAutoRouteEffortGuard` 的说明）。
+  // 挂在这里而不是适配器里，是因为宿主的档位校验发生在**适配器之前**（实测
+  // `adapter.stream()` 根本不会被调用），`agent/request` 是唯一能改变校验前配置的
+  // 可挂点。它**不依赖总开关**：注册一次即可，命中判据自带 provider 过滤。
+  installAutoRouteEffortGuard(ctx)
   // 启动链：`openStorage()` 完成后调用（在那之前读到的是旧 settings 快照或空表，
   // 据此注册会把开关状态判错）。异步注册合法（`ctx.effect` 只要求 fiber 活着）。
   void pool.openStorage().then(() => {

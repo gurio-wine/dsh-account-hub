@@ -7,21 +7,23 @@
  * `auto-route.spec.ts` 守纯逻辑（配置判据 / 轮转引擎），`auto-route-rpc.spec.ts` 守
  * 配置面（落盘 / RPC）。本文件守的是**中间那一段**，也是三处最容易静默失效的地方：
  *
- * 1. **转发语义**：目标 provider / model / effort 怎么取（条目配了用条目的、没配透传
- *    用户实时选择）、历史消息的 `source.provider` 怎么重写（不重写 = 思考模式工具轮
+ * 1. **转发语义**：目标 provider / model / effort 怎么取（条目配了用条目的、没配就不写该键，
+ *    落目标自己的默认档）、历史消息的 `source.provider` 怎么重写（不重写 = 思考模式工具轮
  *    400，见 `rewriteMessagesForTarget` 的说明）、冻结请求能不能改。
- * 2. **降级语义**：内层失败以 **finish chunk** 到达（不是 throw）；没透传过任何 chunk
+ * 2. **能力声明**：聚合模型只合并 context / defaultMaxTokens，**不声明 reasoning**
+ *    （档位唯一归属条目，会话侧没有档位下拉）——见第 9 节。
+ * 3. **降级语义**：内层失败以 **finish chunk** 到达（不是 throw）；没透传过任何 chunk
  *    就静默换下一个（DSH 无感）；透传过就不硬换（外层流语法不允许重复 block-start /
  *    两次 usage）；`aborted` 绝不降级；满一圈只报一次中文错。
- * 3. **注册生命周期**：内容幂等门、开关 → 路由集（`replace([])` 休眠）。
+ * 4. **注册生命周期**：内容幂等门、开关 → 路由集（`replace([])` 休眠）。
  *
  * ## mock 的边界（哪些**刻意不 mock**）
  *
  * `ctx.llm` 用真实 `LlmRuntime`（`@deepseek-ai/dsh-llm` 的默认导出）＋一个记录型
  * 目标适配器：只有这样才能钉住「重入 `ctx.llm.stream()` 真的会重新走适配器选择与
  * 能力解析」这条通路 —— 用替身 mock 掉 `ctx.llm.stream` 等于把被测的那一层也换掉了。
- * 同理，`resolveModelInfo` 的能力合并（`defaultEffort` 必须落在 efforts 里，否则
- * 宿主 `normalizeModelInfo` 抛 `INVALID_MODEL_REASONING`）也由真实运行时校验。
+ * 同理，`resolveCallConfig` 的档位物化行为也由真实运行时校验（聚合模型不声明档位时
+ * 它**不会**补档，这正是「会话侧没有档位」的可观测判据）。
  *
  * 内层失败**以 finish chunk 注入**（`SCRIPT` 里的 `error` 标记），不是 throw：这正是
  * 宿主 `adapterStream` 规范化后的形态（建立/迭代阶段的抛错都变成终止 chunk），照
@@ -37,7 +39,7 @@ import LlmRuntime, {
   createUserMessage,
   createMessage,
 } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, LlmCallConfig, LlmModelInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
   AUTO_ROUTE_ENTRY_UNRESOLVED_CODE,
   AUTO_ROUTE_EXHAUSTED_CODE,
@@ -54,6 +56,7 @@ import {
 import {
   AutoRouteAdapter,
   createAutoRouteRegistration,
+  installAutoRouteEffortGuard,
   registerAutoRouteLlm,
 } from '../../src/auto-route-adapter.js'
 import { AccountPool, providerCatalogVisible } from '../../src/account-pool.js'
@@ -266,29 +269,37 @@ describe('stream：转发改写', () => {
     expect(target.seen.get('p-a')![0]).toMatchObject({ provider: 'p-a', model: 'a', reasoningEffort: 'high' })
   })
 
-  it('条目**没配** effort → 透传用户实时选择的那一档', async () => {
+  it('条目**没配** effort → 不写该键（调用方若已带档位，原样透传；会话侧现已无从选择）', async () => {
     const cfg = () => config(true, [def('m1', '自动一号', [{ provider: 'p-a', model: 'a' }])])
     const { adapter, target } = await harness({ config: cfg })
     target.queue('p-a', { kind: 'chunks', chunks: [{ type: 'finish', reason: { kind: 'stop' } }] })
 
+    // ⚠️ 这是**直接调适配器**的场景（绕过宿主）。真实会话路径下聚合模型不声明档位，
+    // 用户根本没有档位可选、宿主也不会物化，故 `options.reasoningEffort` 恒为
+    // undefined（见下一条用例）。这条用例钉的是**转发函数本身**的语义：条目没配
+    // 档位时它**不写** `reasoningEffort` 键 —— 于是调用方带来的值原样过去，而不是
+    // 被一个 `undefined` 覆盖掉。写成 `reasoningEffort: undefined` 会让上游
+    // 「调用方给的值」被静默清空，这正是这类转发函数最经典的错法。
     await drain(adapter, 'm1', { reasoningEffort: ReasoningEffortId('high') })
 
     expect(target.seen.get('p-a')![0]).toMatchObject({ reasoningEffort: 'high' })
   })
 
-  it('条目没配 effort 且用户也没选 → 落到**目标模型自己的默认档**（不发明档位、也不清空）', async () => {
+  it('条目没配 effort 且用户也没选 → 聚合层不物化档位，目标收到**它自己的默认档**', async () => {
     const cfg = () => config(true, [def('m1', '自动一号', [{ provider: 'p-a', model: 'a' }])])
-    const { adapter, target } = await harness({ config: cfg })
+    const { ctx, adapter, target } = await harness({ config: cfg })
     target.queue('p-a', { kind: 'chunks', chunks: [{ type: 'finish', reason: { kind: 'stop' } }] })
 
     await drain(adapter, 'm1')
 
-    // ⚠️ **不要**在这里断言「`reasoningEffort` 键不存在」：那在目标适配器上不可观测。
-    // 宿主 `resolveCallWithInfo` 会按**自动路由模型**的能力把 `defaultEffort` 物化进
-    // 配置（本自动模型的 defaultEffort 又来自目标模型），随后 `adapterStream` 把
-    // resolvedConfig 合并进 options —— 故转发时那个键必然已经被宿主写上了。
-    // 有意义的断言是：它是**目标自己的默认档**（low），既不是我们发明的值，也不是
-    // 被 `undefined` 清掉后由别处补的另一个值。
+    // 新语义下「不发明档位」的落点分两层：
+    // 1. **外层**（聚合模型）：不再声明 reasoning → 宿主 `resolveCallWithInfo` 无从物化
+    //    → 转发出去的请求**不带档位键**（旧实现这里会带上聚合模型声明的 defaultEffort）。
+    //    这一层在 `resolveCallConfig` 上可观测：
+    const outer = await ctx.llm.resolveCallConfig({ provider: AUTO_ROUTE_PROVIDER_ID, model: 'm1' })
+    expect('reasoningEffort' in outer).toBe(false)
+    // 2. **内层**：转发请求里没有档位 → 宿主按**目标模型自己的声明**补它的默认档
+    //    （p-a/a 声明默认 low）——这是目标自己的事，自动路由这一层不替它决定。
     expect(target.seen.get('p-a')![0].reasoningEffort).toBe('low')
   })
 
@@ -632,23 +643,47 @@ describe('resolveModel：队首目标能力 + 本自动模型身份', () => {
       context: { contextWindow: 200_000 },
       defaultMaxTokens: 8192,
     })
-    expect(resolved.reasoning?.efforts.map((effort) => effort.id)).toEqual(['low', 'high'])
   })
 
-  it('entry.effort 在目标档位表里 → defaultEffort 用条目的', async () => {
+  // ── 档位：聚合模型**一律不声明**（会话侧没有档位下拉）──
+  //
+  // 目标 `p-a/a` 有 low/high 档位表、默认 low，但聚合模型必须把它整个丢掉：档位的
+  // 唯一归属是**条目**，会话侧那条下拉站不住（条目配了会被无视 / 没配时只对队首
+  // 有意义 / 失配会引发链式降级）。这三条设计原因见 `src/auto-route-adapter.ts`。
+
+  it('目标有 reasoning 也不合并：聚合模型**不声明** reasoning（会话侧没有档位下拉）', async () => {
+    const cfg = () => config(true, [def('m1', '自动一号', [{ provider: 'p-a', model: 'a' }])])
+    const { adapter } = await harness({ config: cfg })
+
+    const resolved = await adapter.resolveModel(AUTO_ROUTE_PROVIDER_ID, 'm1')
+
+    // 键本身不该存在（写成 `reasoning: undefined` 会让「不声明」与「声明了空档位表」
+    // 在 `in` 判据下混同，而宿主恰恰按 `info.reasoning` 的存在与否分流）。
+    expect('reasoning' in resolved).toBe(false)
+    expect(resolved.reasoning).toBeUndefined()
+    // 反面判据：目标的档位表一个都不许漏出来（`...target` 展开最容易在这里漏）。
+    expect(JSON.stringify(resolved)).not.toContain('efforts')
+  })
+
+  it('条目**配了**档位（且落在目标表里）也**不**作为 defaultEffort 透出', async () => {
     const cfg = () => config(true, [def('m1', '自动一号', [{ provider: 'p-a', model: 'a', effort: 'high' }])])
     const { adapter } = await harness({ config: cfg })
 
-    expect((await adapter.resolveModel(AUTO_ROUTE_PROVIDER_ID, 'm1')).reasoning?.defaultEffort).toBe('high')
+    // 条目的档位由 `forwardOptions` 在**转发时**注入，不走能力声明这条路 ——
+    // 声明出去就等于把「会话侧可选档位」又装回来了。
+    const resolved = await adapter.resolveModel(AUTO_ROUTE_PROVIDER_ID, 'm1')
+    expect('reasoning' in resolved).toBe(false)
   })
 
-  it('entry.effort **不在**目标档位表里 → 退回目标默认档（塞进去会被宿主判非法）', async () => {
+  it('条目档位**不在**目标表里同样不声明（旧实现会退回目标默认档）', async () => {
     const cfg = () => config(true, [def('m1', '自动一号', [{ provider: 'p-a', model: 'a', effort: 'max' }])])
     const { adapter } = await harness({ config: cfg })
 
-    // 目标只支持 low / high；`max` 不得作为 defaultEffort 透出（否则宿主
-    // normalizeModelInfo 抛 INVALID_MODEL_REASONING，模型点一下就报错）。
-    expect((await adapter.resolveModel(AUTO_ROUTE_PROVIDER_ID, 'm1')).reasoning?.defaultEffort).toBe('low')
+    // 目标只支持 low / high。旧实现把「条目档位非法」退回目标默认档（low）透出，
+    // 那等于替用户声明了一个他没选的档位；新语义下整块 reasoning 都不存在，
+    // 非法档位只会在真正转发到该条目时由内层报错并触发降级。
+    const resolved = await adapter.resolveModel(AUTO_ROUTE_PROVIDER_ID, 'm1')
+    expect('reasoning' in resolved).toBe(false)
   })
 
   it('队首条目变化 → 能力跟着变（能力是**队首**的，不是第一个定义的）', async () => {
@@ -1189,5 +1224,232 @@ describe('运行面与纯逻辑层的判据同源', () => {
 
   it('自动路由 provider id 是纯逻辑层的常量（不写字面量）', () => {
     expect(AUTO_ROUTE_PROVIDER_ID).toBe('auto-route')
+  })
+})
+
+// ──────────────────────────── 15. 会话侧残留档位的兜底 ────────────────────────────
+//
+// 聚合模型不声明 reasoning 后，宿主对「无声明 + 请求带档位」是**硬拒**
+// （`UNSUPPORTED_REASONING_EFFORT`），且发生在**适配器之前** —— 实测那条路径上
+// `adapter.stream()` 根本不会被调用。真实 agent 路径更早：`llm.prepareCall()` 内部
+// 就抛，其 catch 只放行 `NO_ADAPTER`，其余 rethrow ⇒ 整轮直接死。
+//
+// 残留档位来自升级前用过自动路由并显式选过档位的历史会话（持久化在 `model/selection`
+// 或 request header 上，恢复时由 `agent.ts` 还原），而用户此时**没有任何界面手段**
+// 清掉它（档位下拉已不存在）。故兜底挂在 `agent/request` 瀑布流上 —— 它在
+// `prepareRequest` 里**早于 `prepareCall`**，是唯一能改变「校验前配置」的可挂点。
+
+describe('installAutoRouteEffortGuard：剥掉会话侧残留档位（不打死）', () => {
+  /** 建一个带 logger 替身的真实运行时 + 聚合适配器 + 已安装兜底。 */
+  async function guardBench() {
+    const cfg = () => config(true, [def('m1', '自动一号', [{ provider: 'p-a', model: 'a' }])])
+    const { ctx, target, adapter } = await harness({ config: cfg })
+    const warn = vi.fn()
+    ;(ctx as unknown as { logger: unknown }).logger = { warn, info: () => {} }
+    installAutoRouteEffortGuard(ctx)
+    return { ctx, target, adapter, warn }
+  }
+
+  /** 走真实的 `agent/request` 瀑布流跑一遍 seedConfig（模拟 agent.ts 的 prepareRequest）。 */
+  async function throughRequestWaterfall(ctx: Context, seed: LlmCallConfig): Promise<LlmCallConfig> {
+    return ctx.waterfall(
+      ctx,
+      'agent/request',
+      { agent: {} as never, turn: 1, step: 1, signal: new AbortController().signal },
+      () => Promise.resolve(seed),
+    )
+  }
+
+  it('带残留档位 → 剥键 + warn 一次；**用剥键后的配置真能跑通**（这正是修复点）', async () => {
+    const { ctx, target, warn } = await guardBench()
+    target.queue('p-a', { kind: 'chunks', chunks: [{ type: 'finish', reason: { kind: 'stop' } }] })
+
+    const proposed = await throughRequestWaterfall(ctx, {
+      provider: AUTO_ROUTE_PROVIDER_ID,
+      model: 'm1',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+
+    // ① 键被**删掉**（不是置 undefined —— 那仍是一次显式覆盖）。
+    expect('reasoningEffort' in proposed).toBe(false)
+    // ② warn 恰好一次，且点名是哪个模型。
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0]![0])).toContain(`${AUTO_ROUTE_PROVIDER_ID}/m1`)
+
+    // ③ **承重断言**：修复前这里会抛 UNSUPPORTED_REASONING_EFFORT（整轮死）。
+    const prepared = await ctx.llm.prepareCall(proposed)
+    const chunks: StreamChunk[] = []
+    for await (const chunk of prepared.stream({ ...prepared.config, messages: [] })) chunks.push(chunk)
+
+    expect(kinds(chunks)).toEqual(['finish:stop'])
+    // ④ 转发照常走条目档位语义：条目没配 → 落目标自己的默认档 low。
+    expect(target.seen.get('p-a')![0].reasoningEffort).toBe('low')
+  })
+
+  it('warn 按定义去重：同一模型连发两次请求只 warn 一次（不逐步刷屏）', async () => {
+    const { ctx, warn } = await guardBench()
+    const seed: LlmCallConfig = {
+      provider: AUTO_ROUTE_PROVIDER_ID,
+      model: 'm1',
+      reasoningEffort: ReasoningEffortId('high'),
+    }
+
+    await throughRequestWaterfall(ctx, seed)
+    await throughRequestWaterfall(ctx, seed)
+    await throughRequestWaterfall(ctx, seed)
+
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('对偶面：**非** auto-route 的 provider 带档位原样放行、不 warn', async () => {
+    const { ctx, warn } = await guardBench()
+
+    const proposed = await throughRequestWaterfall(ctx, {
+      provider: 'p-a',
+      model: 'a',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+
+    // 兜底只服务聚合模型：别的 provider 的档位是正经能力，动它就是缺陷。
+    expect(proposed.reasoningEffort).toBe('high')
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('对偶面：auto-route 但**没带**档位 → 原样返回、不 warn（不动正常路径）', async () => {
+    const { ctx, warn } = await guardBench()
+
+    const proposed = await throughRequestWaterfall(ctx, { provider: AUTO_ROUTE_PROVIDER_ID, model: 'm1' })
+
+    expect(proposed).toEqual({ provider: AUTO_ROUTE_PROVIDER_ID, model: 'm1' })
+    expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('返回的是**新对象**：不改调用方传进来的那份（seedConfig 可能是冻结的）', async () => {
+    const { ctx } = await guardBench()
+    const seed = Object.freeze({
+      provider: AUTO_ROUTE_PROVIDER_ID,
+      model: 'm1',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+
+    const proposed = await throughRequestWaterfall(ctx, seed)
+
+    expect(proposed).not.toBe(seed)
+    // 原对象仍冻结且档位未被动过（原地 delete 会在这里静默失败或抛错）。
+    expect(Object.isFrozen(seed)).toBe(true)
+    expect(seed.reasoningEffort).toBe('high')
+  })
+
+  it('返回值是注销函数（fiber 释放时能摘掉监听器）', async () => {
+    // ⚠️ 这里刻意**不用** guardBench：它自己会装一个兜底，那样注销掉第二个之后
+    // 第一个仍在生效，用例会变成「注销是假的」的假阳性。
+    const { ctx } = await harness({
+      config: () => config(true, [def('m1', '自动一号', [{ provider: 'p-a', model: 'a' }])]),
+    })
+    const dispose = installAutoRouteEffortGuard(ctx)
+    expect(typeof dispose).toBe('function')
+
+    // 装着的状态：剥键。
+    const before = await throughRequestWaterfall(ctx, {
+      provider: AUTO_ROUTE_PROVIDER_ID,
+      model: 'm1',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+    expect('reasoningEffort' in before).toBe(false)
+
+    dispose()
+
+    // 摘掉后不再剥键（否则「注销」是假的，fiber 释放后会留下一个野监听器）。
+    const after = await throughRequestWaterfall(ctx, {
+      provider: AUTO_ROUTE_PROVIDER_ID,
+      model: 'm1',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+    expect(after.reasoningEffort).toBe('high')
+  })
+
+  it('兜底**真的**救活了 agent 会话路径：prepareCall 不再抛，整轮跑通（承重用例）', async () => {
+    const { ctx, target, warn } = await guardBench()
+    target.queue('p-a', { kind: 'chunks', chunks: [{ type: 'finish', reason: { kind: 'stop' } }] })
+
+    // 照 `agent-loop/agent.ts:502-550 prepareRequest` 的真实序列走一遍：
+    //   seedConfig(带持久化档位) → agent/request 瀑布流 → prepareCall → preparedCall.stream
+    const proposed = await throughRequestWaterfall(ctx, {
+      provider: AUTO_ROUTE_PROVIDER_ID,
+      model: 'm1',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+    // 修复前：这一行就抛 UNSUPPORTED_REASONING_EFFORT（agent.ts 的 catch 只放行
+    // NO_ADAPTER，其余 rethrow ⇒ 整轮直接死）。
+    const prepared = await ctx.llm.prepareCall(proposed)
+    const chunks: StreamChunk[] = []
+    for await (const chunk of prepared.stream({ ...prepared.config, messages: [] })) chunks.push(chunk)
+
+    expect(kinds(chunks)).toEqual(['finish:stop'])
+    // 剥键后照常转发，且落**目标自己的**默认档（条目没配档位）。
+    expect(target.seen.get('p-a')![0].reasoningEffort).toBe('low')
+    expect(warn).toHaveBeenCalledTimes(1)
+  })
+
+  it('**没有**在 `stream()` 入口剥键（否则会破坏「条目没配 → 透传调用方档位」的直调语义）', async () => {
+    // 这条是**反面判据**，钉住一个被实测证伪的设计：任务书曾要求在适配器 `stream()`
+    // 入口加一道防御剥键，声称能兜底 `resolveCallConfig` 直调路径。实测（真实
+    // `LlmRuntime`，三条宿主路径）证伪：
+    //
+    // | 路径 | 结果 | adapter.stream 调用数 |
+    // |---|---|---|
+    // | `resolveCallConfig` 带档位 | 抛 UNSUPPORTED_REASONING_EFFORT | **0** |
+    // | `ctx.llm.stream` 带档位 | 终止 chunk 报错 | **0** |
+    // | `prepareCall` 带档位 | 抛 UNSUPPORTED_REASONING_EFFORT | **0** |
+    //
+    // 校验（`resolveCallWithInfo`，dsh-llm/lib/index.js:1561-1586）**早于**适配器被
+    // 调用 ⇒ 入口剥键**永远执行不到**，是死代码。更糟的是它**有害**：直接调适配器的
+    // 场景（本文件的转发语义用例、未来的外部调用方）依赖「条目没配档位时不写该键、
+    // 调用方带来的值原样透传」，入口剥键会把那个值静默清掉。
+    const cfg = () => config(true, [def('m1', '自动一号', [{ provider: 'p-a', model: 'a' }])])
+    const { adapter, target } = await harness({ config: cfg })
+    target.queue('p-a', { kind: 'chunks', chunks: [{ type: 'finish', reason: { kind: 'stop' } }] })
+
+    await drain(adapter, 'm1', { reasoningEffort: ReasoningEffortId('high') })
+
+    // 调用方显式给的档位**必须原样到达目标**（若入口加了剥键，这里会变成 'low'）。
+    expect(target.seen.get('p-a')![0].reasoningEffort).toBe('high')
+  })
+
+  it('兜底对**非** auto-route provider 是纯直通：连 next() 的返回值都原样透传（引用相等）', async () => {
+    const { ctx } = await guardBench()
+    const seed = { provider: 'p-a', model: 'a', reasoningEffort: ReasoningEffortId('high') } as const
+
+    const proposed = await throughRequestWaterfall(ctx, seed)
+
+    // 对偶面比「值没变」更强：必须是**同一个对象引用**，证明兜底没做任何拷贝/重建。
+    expect(proposed).toBe(seed)
+  })
+
+  it('剥键形态：**删除**键；且「置 undefined」在本链路上等效（记录实测，勿写成正确性要求）', async () => {
+    const { ctx, target } = await guardBench()
+    target.queue('p-a', { kind: 'chunks', chunks: [{ type: 'finish', reason: { kind: 'stop' } }] })
+
+    const proposed = await throughRequestWaterfall(ctx, {
+      provider: AUTO_ROUTE_PROVIDER_ID,
+      model: 'm1',
+      reasoningEffort: ReasoningEffortId('high'),
+    })
+    // 实现选的是「删除」：键不存在（语义是「这一轮压根没有档位这回事」）。
+    expect('reasoningEffort' in proposed).toBe(false)
+
+    // 对照面：宿主各判据都是 `=== void 0`，故「键在但值为 undefined」同样能跑通 ——
+    // 这里断言的是**不抛**且整轮正常（不是断言 config 上有个档位：聚合模型不声明档位，
+    // 故 `prepareCall` 的 config 本来就不带它，目标默认档是在内层才补上的）。
+    // 实测这一条，是为了让「必须 delete、否则会坏」这类**过度断言**无处生根 ——
+    // 选 delete 是偏好（更诚实、且与 agent.ts:66 的 requestProposal 一致），不是正确性要求。
+    const asUndefined = { ...proposed, reasoningEffort: undefined }
+    expect('reasoningEffort' in asUndefined).toBe(true)
+    const prepared = await ctx.llm.prepareCall(asUndefined)
+    const chunks: StreamChunk[] = []
+    for await (const chunk of prepared.stream({ ...prepared.config, messages: [] })) chunks.push(chunk)
+
+    expect(kinds(chunks)).toEqual(['finish:stop'])
+    expect(target.seen.get('p-a')![0].reasoningEffort).toBe('low') // 目标自己的默认档
   })
 })

@@ -41,6 +41,7 @@ import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, ReasoningEffortId, resolveRe
 import type {
   AdapterRegistrationHandle,
   GenerateOptions,
+  LlmCallConfig,
   LlmModelInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
@@ -198,7 +199,8 @@ export class AutoRouteAdapter extends LlmAdapter {
    *   即整个分组消失）。关掉开关却还在下拉里留一组点了必然失败的模型，是最糟的
    *   形态。
    * - 能力（上下文窗口 / 思考档 / 模态）**不在这里声明**：`LlmModelInfo` 本来
-   *   就没有这些字段，它们由 {@link resolveModel} 按队首条目现算。这里刻意只给
+   *   就没有这些字段，它们由 {@link resolveModel} 按队首条目现算（其中思考档
+   *   **刻意不算** —— 见那里的说明）。这里刻意只给
    *   `{provider, id, name}` —— 多塞字段会在宿主 `listModels` 那一层被静默丢掉
    *   （它只重建这四个字段），不如不写。
    */
@@ -213,23 +215,30 @@ export class AutoRouteAdapter extends LlmAdapter {
   }
 
   /**
-   * 精确模型能力 = **队首条目目标能力** + 本自动模型的 id / 名称。
+   * 精确模型能力 = **队首条目的部分目标能力** + 本自动模型的 id / 名称。
    *
    * ## 为什么 `provider` / `id` 必须改写成 `auto-route` / `definition.id`
    *
    * 宿主 `normalizeModelInfo` 会硬校验 `resolved.provider === 路由名` 且
    * `resolved.id === 请求的模型名`，不符即抛 `INVALID_MODEL_INFO` —— 整轮对话起不来。
-   * 故目标能力**原样透传**，身份三元组必须换成本路由的。
+   * 故目标能力**原样透传**（`reasoning` 除外，见下），身份三元组必须换成本路由的。
    *
-   * ## 两处刻意的「不编造」
+   * ## 唯一刻意的「不编造」：**不声明 reasoning**
    *
-   * 1. **目标没有 `reasoning` 就不声明它**。凭空造一个空档位表会让宿主
-   *    `normalizeModelInfo` 抛 `INVALID_MODEL_REASONING`（空 efforts 非法）。
-   * 2. **`entry.effort` 不在目标档位表里时，不把它塞进 `defaultEffort`**。
-   *    宿主的校验会抛 `INVALID_MODEL_REASONING`（未知 defaultEffort），于是整个
-   *    模型变成「目录里点一下就报错」。让它**留空**、由运行时降级兜底才对：请求真的
-   *    打到那个条目时，内层会以 `UNSUPPORTED_REASONING_EFFORT` 失败，本适配器据此
-   *    静默换下一个候选（这正是「档位不匹配」该有的表现）。
+   * 聚合模型**一律不声明思考档位**，即使队首目标有档位表。档位的唯一归属是
+   * **条目**（`entry.effort`）：条目配了就由 {@link forwardOptions} 在转发时注入，
+   * 没配就落目标模型自己的默认档 —— 会话侧那条下拉整个不存在。
+   *
+   * 会话侧下拉站不住的三个理由（用户定案）：
+   * 1. **条目配了档位时它会被无视**：转发以条目为准，下拉选了也不生效；
+   * 2. **没配时它只对队首有意义**：档位表来自队首目标，可队首会随降级漂移，
+   *    用户在 `p-a` 的档位表上选的档，转发给 `p-b` 时未必存在；
+   * 3. **档位失配会引发链式降级**：宿主在**到达本适配器之前**就按聚合模型声明的
+   *    efforts 校验（见 `resolveCallWithInfo`），选的档不在声明里就直接
+   *    `UNSUPPORTED_REASONING_EFFORT`，整轮对话起不来。
+   *
+   * 想给同一个 provider/model 用不同档位，就在面板里建**多个自动模型**（一个条目
+   * 一个档位）—— 这正是「条目是档位唯一归属」的落地形态。
    */
   async resolveModel(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
     const definition = this.definitionOf(model)
@@ -263,7 +272,7 @@ export class AutoRouteAdapter extends LlmAdapter {
         { cause: error },
       )
     }
-    return mergeResolvedModel(target, definition, entry)
+    return mergeResolvedModel(target, definition)
   }
 
   /**
@@ -379,8 +388,14 @@ export class AutoRouteAdapter extends LlmAdapter {
  *
  * - `provider` / `model`：换成队首条目的目标。
  * - `reasoningEffort`：条目**配了**档位就用条目的（自动模型 = provider + model +
- *   effort 的打包语义）；**没配**就原样透传用户实时选择的那一档（`...options` 已经
- *   带着它，故这里连键都不写 —— 写一个 `undefined` 会覆盖掉调用方给的值）。
+ *   effort 的打包语义）；**没配**就什么都不写 —— `...options` 已经带着调用方的值，
+ *   写一个 `undefined` 会**覆盖掉**它。档位的唯一归属就是条目。
+ *
+ *   注意在真实会话路径上「调用方的值」恒为 undefined：聚合模型不声明 reasoning
+ *   （见 {@link AutoRouteAdapter.resolveModel}），DSH 没有档位下拉、宿主也无从物化。
+ *   故这一支的实际效果就是「落目标模型自己的默认档」。保留透传形态而不是写死
+ *   `entry.effort`，是为了让**直接调适配器**的场景（测试、未来的外部调用方）语义
+ *   仍然是「条目优先、调用方兜底」，而不是静默丢弃调用方的显式选择。
  * - `messages`：必须走 {@link rewriteMessagesForTarget}（replayState 归属检查，
  *   见那里的说明）。请求对象与其 `messages` 都是**深冻结**的，故这里 `map` 出新
  *   数组、浅拷贝出新对象，绝不原地改。
@@ -398,47 +413,22 @@ function forwardOptions(options: GenerateOptions, entry: AutoRouteEntry): Genera
 /**
  * 把目标能力合并成「本自动模型」的能力声明。
  *
- * 独立成函数是为了让 `resolveModel` 只读一遍：合并规则（尤其是
- * `defaultEffort` 的两条不编造）集中在一处，加字段时不会漏改某一条分支。
+ * **只合并 `context` / `defaultMaxTokens` 等不随档位争议的能力；`reasoning` 一律
+ * 不合并**（键都不留）—— 聚合模型在会话侧没有档位，档位唯一归属条目。设计原因见
+ * `resolveModel` 的 JSDoc（三条：条目配了会被无视 / 只对队首有意义 / 失配链式降级）。
+ *
+ * 独立成函数是为了让 `resolveModel` 只读一遍：合并规则集中在一处，加字段时不会漏改。
  */
 function mergeResolvedModel(
   target: LlmResolvedModelInfo,
   definition: AutoRouteDefinition,
-  entry: AutoRouteEntry,
 ): LlmResolvedModelInfo {
-  const reasoning = target.reasoning
-  // 目标模型没有思考档 → 不声明 reasoning（凭空造空档位表会被宿主判非法）。
-  const mergedReasoning = reasoning === undefined ? undefined : mergedReasoningInfo(reasoning, entry)
+  const { reasoning: _discardedReasoning, ...targetWithoutReasoning } = target
   return {
-    ...target,
+    ...targetWithoutReasoning,
     provider: AUTO_ROUTE_PROVIDER_ID,
     id: definition.id,
     name: definition.name,
-    ...mergedReasoning === undefined ? {} : { reasoning: mergedReasoning },
-  }
-}
-
-/**
- * 合并思考档位：**档位表原样透传**，默认档按「条目优先、目标兜底」取。
- *
- * 条目档位**只有落在目标档位表里**才作为默认档透出：否则宿主的
- * `normalizeModelInfo` 会以「未知 defaultEffort」抛 `INVALID_MODEL_REASONING`，
- * 模型直接不可用。落不进去时**退回目标自己的默认档**（而不是留空）—— 留空会让
- * 宿主的 `resolveCallWithInfo` 不再补档，deepseek 系「不带档位 = 不思考」的行为
- * 就会因为用户配了一个无效档位而静默改变。
- */
-function mergedReasoningInfo(
-  reasoning: NonNullable<LlmResolvedModelInfo['reasoning']>,
-  entry: AutoRouteEntry,
-): NonNullable<LlmResolvedModelInfo['reasoning']> {
-  const preferred = entry.effort !== undefined
-    && reasoning.efforts.some((effort) => effort.id === entry.effort)
-    ? ReasoningEffortId(entry.effort)
-    : undefined
-  const defaultEffort = preferred ?? reasoning.defaultEffort
-  return {
-    efforts: reasoning.efforts,
-    ...defaultEffort === undefined ? {} : { defaultEffort },
   }
 }
 
@@ -539,4 +529,103 @@ export function createAutoRouteRegistration(
     }
     appliedFacts = facts
   }
+}
+
+/**
+ * 在 `agent/request` 瀑布流上兜底剥掉打到聚合模型的 `reasoningEffort`。
+ *
+ * ## 为什么需要它（宿主在**到达适配器之前**就拒）
+ *
+ * 聚合模型不声明 `reasoning`（见 {@link AutoRouteAdapter.resolveModel}），而宿主的
+ * `resolveCallWithInfo` 对「无声明 + 请求带档位」是**硬拒**：
+ *
+ * ```text
+ * reasoning === undefined && requested !== undefined → UNSUPPORTED_REASONING_EFFORT
+ * ```
+ *
+ * 实测（`dsh-llm@0.1.2-rc.1`，真实 `LlmRuntime`）它发生在适配器 `stream()` **之前**
+ * —— 那条路径上 `adapter.stream()` 的调用数是 0。真实 agent 路径更早：
+ * `agent-loop/agent.ts` 的 `llm.prepareCall()` 内部就抛，而其 catch 只放行
+ * `NO_ADAPTER`，其余 rethrow ⇒ **整轮直接死**。
+ *
+ * ## 谁会带着档位打过来
+ *
+ * 升级前用过自动路由、并在会话侧显式选过档位的历史会话：档位被持久化在
+ * `model/selection` 或 request header 的 `config.reasoningEffort` 上，恢复时由
+ * `agent.ts` 的 `persistedReasoningEffort` 还原。用户此时**没有任何界面手段**把这个
+ * 残留值清掉（档位下拉已经不存在了），故不做兜底就等于让这些会话**永久报错**。
+ *
+ * ## 为什么挂在这里，而不是适配器 `stream()` 入口
+ *
+ * 因为那是**死代码**，而且**有害**（两条都实测过）：
+ *
+ * 1. **执行不到**：档位校验在 `resolveCallWithInfo`（`dsh-llm/lib/index.js:1561-1586`），
+ *    发生在适配器被调用**之前**（`prepareCall` `:1599` 校验、`:1621` 才接上
+ *    `adapterCall.stream`）。三条宿主路径实测 `adapter.stream()` 调用数**全为 0**：
+ *    `resolveCallConfig` 带档位 → 抛；`ctx.llm.stream` 带档位 → 终止 chunk 报错；
+ *    `prepareCall` 带档位 → 抛。
+ * 2. **有害**：直接调适配器的场景（测试、未来的外部调用方）依赖「条目没配档位时
+ *    **不写**该键 ⇒ 调用方带来的值原样透传」。入口剥键会把那个值静默清掉 —— 实测
+ *    加上它会让转发语义用例变红。故刻意不实现，并由一条反面判据用例钉住。
+ *
+ * 而 `agent/request` 在 `prepareRequest` 里**早于 `prepareCall`**（`agent.ts:531`
+ * 派发 vs `:542` 校验），是唯一能改变「校验前配置」的可挂点。
+ *
+ * ## 作用域：根级监听器可达，但仍显式带 `{ global: true }`
+ *
+ * `dsh-scope` 的 `scopeTarget` 让**无 scope 标签的监听器全局放行**（本插件的根级 ctx
+ * 无标签），故不带 `global` 实测也收得到。仍然显式写，是因为 cordis 的派发过滤是
+ * `hook.global || !filter || filter.call(thisArg, hook.ctx)`（`cordis/lib/index.js:263`）——
+ * `global` 是短路项、零成本；而「插件恰好挂在根上」一旦变化（本插件被装进某个 scope），
+ * 不带 `global` 的监听器会被静默过滤掉，兜底无声消失，症状却是「历史会话又整轮报错」。
+ *
+ * ## 覆盖面边界（刻意接受）
+ *
+ * 它只覆盖 agent 会话路径。`llm.resolveCallConfig` 的两条**直调**路径
+ * （面板 `session.selectModel`、子代理 `preflightChildLlmRoute`）是直接方法调用、
+ * 无事件可挂，仍会报 `UNSUPPORTED_REASONING_EFFORT`。这是刻意的：那两条是用户
+ * **显式选了档位**的动作，报错比静默丢弃他的选择更诚实。其他插件对 `ctx.llm.stream()`
+ * 的直调（`session-title-llm` 等）同样绕开这里，但它们目前都不带档位。
+ *
+ * ## 处置：warn 一次 + 剥键，不打死
+ *
+ * 剥掉键之后这一轮照常按**条目档位**转发（没配就是目标自己的默认档），语义与
+ * 「档位唯一归属条目」完全一致。warn **按定义去重**（同一 provider/model 只报一次）：
+ * 残留值会在每一步都出现，每步一条会把日志刷满，反而淹没了真正的信号。
+ *
+ * @param ctx - 宿主上下文（注册 `agent/request` 监听器）。
+ * @returns 注销函数。
+ */
+export function installAutoRouteEffortGuard(ctx: Context): () => void {
+  /** 已告警过的 `provider/model`（按定义去重，避免逐步刷屏）。 */
+  const warned = new Set<string>()
+  // `{ global: true }` 是**显式**的，尽管本插件的根级 ctx 不带 scope 标签、实测不带它
+  // 也照样收到 `agent/request`（`dsh-scope` 的 `scopeTarget` 对无标签监听器全局放行）。
+  // 写成显式的，是为了不把「插件恰好挂在根上」这件事变成一条**静默失效**的隐式前提：
+  // 一旦本插件将来被装进某个 scope，不带 `global` 的监听器会被 cordis 的
+  // `hook.global || !filter || filter.call(...)` 过滤掉 —— 兜底静默消失，而症状是
+  // 「历史会话又整轮报错了」，极难归因。cordis 里 `global` 是短路项，零成本。
+  return ctx.on('agent/request', async (_payload, next): Promise<LlmCallConfig> => {
+    const resolved = await next()
+    if (resolved.provider !== AUTO_ROUTE_PROVIDER_ID) return resolved
+    const effort = resolved.reasoningEffort
+    if (effort === undefined) return resolved
+    const key = `${resolved.provider}/${resolved.model}`
+    if (!warned.has(key)) {
+      warned.add(key)
+      ctx.logger?.warn?.(
+        `[account-hub] 自动路由模型 ${key} 收到会话侧思考档位 "${String(effort)}"，已忽略`
+        + '（聚合模型不声明档位；档位在面板条目上配置，想要不同档位请建多个自动模型）',
+      )
+    }
+    // 剥键用**删除**而不是「置 undefined」。实测两种形态在本链路（`prepareCall` →
+    // `preparedCall.stream`）上**都能跑通**：宿主各处判据都是 `=== void 0`
+    // （`resolveCallWithInfo` 的 `requested !== void 0`、`prepareCall` 的
+    // `config.reasoningEffort === void 0`），故 undefined 与「键不存在」等效。
+    // 选删除是因为它语义更诚实（「这一轮压根没有档位这回事」，而非「有一个空的档位」），
+    // 且与宿主自己的写法一致（`agent-loop/agent.ts:66` 的 `requestProposal` 同样是
+    // `delete`）。这是**偏好，不是正确性要求** —— 别把它写成「置 undefined 会坏」。
+    const { reasoningEffort: _dropped, ...withoutEffort } = resolved
+    return withoutEffort
+  }, { global: true })
 }
