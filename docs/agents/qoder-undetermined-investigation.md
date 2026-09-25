@@ -1,24 +1,25 @@
-# Qoder 系「全部账号无法判定」真机调查（2026-09-24）
+# Qoder 系「全部账号无法判定」真机调查（2026-09-24；设备身份补证 2026-09-25）
 
 ## 结论速览
 
 用户报障「qoder + qoder-cn 全部账号显示无法判定」由**三个独立缺陷叠加**造成，
-其中前两个都在**查活动 / 判已领**链路上，与用户「签到和检查签到的逻辑都有问题」
-的怀疑一致。**积分本身没有丢**（真机验证两个账号各 +100，落在 `addOnQuota` 池）。
+其中第一个缺陷包含按 region 分岔的两层缺头问题；前两个都在**查活动 / 判已领**链路上，
+与用户「签到和检查签到的逻辑都有问题」的怀疑一致。**积分本身没有丢**（真机验证两个账号各 +100，落在 `addOnQuota` 池）。
 
 | # | 根因 | 性质 | 影响面 |
 |---|---|---|---|
-| 1 | 活动列表请求**不发 `Cosy-ClientType`** ⇒ 服务端恒回空列表 | **代码 bug** | 两区全部账号，**必然发生** |
+| 1 | 活动列表请求缺 region 所需请求头：两区缺 `Cosy-ClientType`；**国际版还缺完整设备身份头** ⇒ 服务端回空列表 | **代码 bug** | 两区均受影响；国际版即使补 `Cosy-ClientType` 仍会发生 |
 | 2 | 服务端明说 `CLAIMED` 时被判成 `undetermined` | **代码 bug** | 两区，**签到成功后必然发生** |
 | 3 | 签到成功那一刻恰好落在 `CLAIMED` 分支 ⇒ 不写状态 ⇒ 下轮 sweep 重试又走 #2 | **#1+#2 的复合后果** | 死循环形态 |
 
 ⚠️ **「空活动列表 = 协议无法区分」这一 60f8127 的定案前提被真机推翻**：
-官方桌面端 47 条真实响应中**空列表出现 0 次**；空列表是**缺请求头**的产物，
-不是服务端事实。
+空列表是**请求缺少 region 所需头集的产物**，不是服务端事实。CN 缺 `Cosy-ClientType: 10`
+时回空；国际版除该头外还必须有完整设备身份头，缺任一层都回空。带完整头集时，官方真实响应中
+空列表不再出现。
 
 ---
 
-## 根因 1：缺 `Cosy-ClientType` 请求头（决定性）
+## 根因 1：活动列表请求缺 region 所需请求头（决定性）
 
 ### 证据：官方桌面端源码
 
@@ -35,10 +36,13 @@ Cosy-MachineCode / Cosy-MachineType，UA 固定为 "Qoder"
 
 其中 `Cosy-ClientType` 取自模块级常量
 `yc = Object.freeze({ clientType: 10, businessProduct: "app", sessionType: "app" })`。
+官方客户端还会按条件带 `Cosy-MachineOS` / `Cosy-MachineHostname` / `Cosy-MachineId`；
+本次国际版探针锁定插件必须追加的集合是下表中的裸 `Qoder` UA、`Cosy-Version: 0.3.4`
+与三项 `Cosy-Machine{Token,Type,Code}`，CN 不跟随这组设备头。
 
 ### 证据：官方桌面端自己打印的真实请求头
 
-`~/AppData/Roaming/com.qodercn.app.stable/logs/*/main.log`：
+`~/AppData/Roaming/com.qodercn.app.stable/logs/*/main.log`（CN 官方桌面端）：
 
 ```
 [Campaign] 活动状态请求发出 {"method":"GET","origin":"https://openapi.qoder.com.cn",
@@ -50,22 +54,29 @@ Cosy-MachineCode / Cosy-MachineType，UA 固定为 "Qoder"
 "Cosy-MachineType":"<present>","User-Agent":"Qoder"}}
 ```
 
-### 证据：A/B 对照（同一账号、同一秒交错重放）
+### 证据：A/B 对照（同一账号、交错重放）
 
-`tests/e2e/qoder-minimal-set-probe.mjs`：
+`tests/e2e/qoder-minimal-set-probe.mjs` 的 CN 对照，以及 2026-09-23 探针矩阵和
+2026-09-25 两次国际版重放：
 
 | 请求头 | qoder 国际版 | qoder-cn |
 |---|---|---|
 | 插件现状头（`src/qoder-product.ts` 的 `qoderJobTokenHeaders`：只有 `Authorization`/`Accept`/`Content-Type`/`User-Agent`） | `campaigns: []` | `campaigns: []` |
-| **仅加 `Cosy-ClientType: 10`** | **2 条活动，含 `CLAIM_BENEFIT/CLAIMED`** | **2 条活动，含 `CLAIM_BENEFIT/CLAIMED`** |
-| 再加 `Cosy-MachineToken`/`Type`/`Code`/`Version`/UA=`Qoder` | 同上（无额外增益） | 同上 |
+| **仅加 `Cosy-ClientType: 10`** | **仍为空列表（`claimable: false`）** | **2 条活动，含 `CLAIM_BENEFIT/CLAIMED`** |
+| 再加完整国际版设备身份头（`UA=Qoder` / `Cosy-Version: 0.3.4` / `Cosy-MachineToken`/`Type`/`Code`） | **2 条活动，含 `CLAIM_BENEFIT/CLAIMED`** | 与上一行相同（CN 无额外增益） |
 
-`tests/e2e/qoder-root-cause-crosscheck.mjs` 交错 3 轮，结论稳定：
-插件头 `n=0`，官方头 `n=2` —— **排除时间窗口 / 缓存解释**。
+`tests/e2e/qoder-root-cause-crosscheck.mjs` 的交错重放与后续真机复测结论稳定：
+插件现状头 `n=0`；CN 仅加 `Cosy-ClientType` 时 `n=2`；国际版仅加该头时
+`n=0`，补齐完整设备身份头后 `n=2` —— **排除时间窗口 / 缓存解释**。
 
-### 取值空间扫描（`qoder-clienttype-scan-probe.mjs`）
+这补上了前一轮调查遗漏的第二层根因：国际版**缺设备身份头 → 服务端恒回空列表 →
+三态判读找不到 `CLAIMABLE` / `CLAIMED` → `unknown` → claim/status 落入
+`undetermined`**。只补 `Cosy-ClientType` 只能修 CN，不能替代国际版的
+`runtime-info.exe` 设备身份来源。
 
-`1–7、9、11、12、20、100、0、-1、app、qodercli、空串` 全部回空列表；
+### CN 的取值空间扫描（`qoder-clienttype-scan-probe.mjs`）
+
+CN 活动端点的扫描结果：`1–7、9、11、12、20、100、0、-1、app、qodercli、空串` 全部回空列表；
 **只有 `8` 与 `10` 返回非空**（`8` 只见 `VIEW_DETAILS`，`10` 见完整两条）。
 `10` 正是官方 `yc.clientType`。
 
@@ -77,8 +88,9 @@ Cosy-MachineCode / Cosy-MachineType，UA 固定为 "Qoder"
 `parseQoderCampaigns`（`src/qoder-credits.ts:891-906`）对
 `{"uid":…,"showCampaign":false,"claimable":false,"campaignUrl":"","campaigns":[]}`
 的解析是**正确**的：服务端确实回了空数组，代码如实解析成空数组。
-问题在**请求没被服务端当成活动查询受理**。
-
+问题在**请求没被服务端当成活动查询受理**：CN 缺 `Cosy-ClientType`，国际版还可能缺完整
+设备身份头。于是响应的空列表进入三态判读后只能落在 `unknown` / `undetermined`，而不是
+说明「今天没有活动」。
 ---
 
 ## 根因 2：服务端明说 `CLAIMED` 被判成 `undetermined`
@@ -170,19 +182,17 @@ CLAIM 200 {"grantId":"…","status":"CLAIMED","replayed":false,
 
 ---
 
-## 修复建议清单（未改任何产品代码）
+## 修复建议清单（历史记录；后续已全部落地）
 
 ### 必做
 
-1. **补 `Cosy-ClientType: 10` 到活动列表请求头**（根因 1，一处即可）。
-   建议放在 `qoderJobTokenHeaders`（`src/qoder-product.ts:1138-1149`）
-   或 `sendQoderCheckinRequest` 的 `build` 返回值里，**仅**用于
-   `/sash/` 前缀端点 —— 不要污染 chat / quota 的既有头（出站协议值红线）。
-   - 需确认 `10` 是否应按 region 配置（真机两区**都是 10**；官方两区共用
-     `yc.clientType = 10`），故建议作为 `QoderProduct` 字段或常量单列，
-     不要复用现有 `clientType: '5'`（语义是 chat 请求体，实测对该端点无效）。
-   - `Cosy-MachineToken/Type/Code` 经消融证明**非必需**（最小集合只有
-     `Cosy-ClientType`），但若将来服务端收紧风控，官方那套可作备选。
+1. **按 region 补齐活动列表请求头**（根因 1）。两区都要有
+   `Cosy-ClientType: 10`，且只作用于 `/sash/` 前缀端点 —— 不要污染 chat /
+   quota 的既有头（出站协议值红线）。CN 到此为止；国际版还要追加
+   `User-Agent: Qoder`、`Cosy-Version: 0.3.4` 与 `Cosy-Machine{Token,Type,Code}`。
+   设备三值由官方桌面客户端 `runtime-info.exe` 运行时取得，失败时回到现状头集并走
+   `undetermined` 兜底；不能把该身份猜测、拷贝、分发或落盘。不要复用现有
+   `clientType: '5'`（它是 chat 请求体字段，对活动端点无效）。
 2. **修 `claimQoderDailyCheckin` 的空目标分支**（根因 2）。
    在 `targets.length === 0` 之前，先判「是否存在 `CLAIM_BENEFIT` 且
    `claimStatus === 'CLAIMED'` 的条目」：有 ⇒ `already-claimed`；
@@ -194,30 +204,30 @@ CLAIM 200 {"grantId":"…","status":"CLAIMED","replayed":false,
 
 ### 建议
 
-4. 补一条 e2e 用例，把「缺 `Cosy-ClientType` ⇒ 空列表」钉住
-   （否则将来有人「简化」请求头会静默复发）。
-5. 更新 `docs/agents/providers-qoder.md:85` 与 `src/qoder-credits.ts` 模块头
-   第 4 条：**「空列表 = 协议无法区分」的定案前提已被推翻** ——
-   真机 47 条官方响应中空列表出现 0 次；空列表是缺请求头的产物。
+4. 补 e2e 用例，把「CN 缺 `Cosy-ClientType` ⇒ 空列表」与「国际版仅有
+   `Cosy-ClientType` 仍为空、补齐设备身份头后有活动」都钉住，防止将来有人简化请求头
+   时静默复发。
+5. 更新 `docs/agents/providers-qoder.md` 与 `src/qoder-credits.ts` 模块头：
+   **「空列表 = 协议无法区分」的定案前提已被推翻**，且旧的「设备头全部非必需」
+   只对 CN 成立；国际版必须运行时获取设备身份。
 6. 重新评估 `src/checkin-schedule.ts` 里 qoder 两区的余额比对登记：
    口径正确（三池合计）且**到账无延迟**（已实测），故**保持参与比对**，
    无需登记豁免。仅需注意未来若改为只读 `userQuota` 会立刻失效。
 
-### 需用户拍板的取舍
+### 取舍裁定（已落地）
 
-- **`Cosy-ClientType` 的归属**：作为新常量（`QODER_COSY_CLIENT_TYPE = '10'`）
-  还是 `QoderProduct` 字段？前者改动小、后者更符合「region 差异走产品配置」
-  的既有约定。真机两区同值，故**两者行为一致**，只是可扩展性取舍。
-- 修复 #2 是否同时改 `fetchQoderCheckinStatus` 的 `todayCheckedIn`：
-  改则 UI 立刻正确显示「已签」；不改则该字段仍是死值（恒 false），
-  但 claim 路径已能写状态。
+- `Cosy-ClientType` 归为模块级常量 `QODER_CAMPAIGN_CLIENT_TYPE = 10`，两区同值，
+  不复用 chat 请求体的 `clientType`。
+- 设备身份是否启用归为 `QoderProduct.campaignDeviceIdentity`：仅国际版声明 `true`；
+  CN 不声明，因此即便误传身份也不改变 CN 出站头集，且不会调用 `runtime-info.exe`。
 
 ---
 
-## 修复落地（2026-09-24 实施，探测单之后的实现记录）
+## 修复落地（2026-09-24 至 2026-09-25）
 
-本节记录上述清单**实际落地的形态**，与建议清单的差异只有「取值的归属」一处
-（其余逐条对应）。**探测单正文（含结论与证据）保持原样未改** —— 它是取证记录。
+本节记录上述清单的实际落地形态：2026-09-24 落地 `Cosy-ClientType` 与三态判读修复，
+2026-09-25 补上国际版设备身份头的运行时获取与降级路径。**探测单正文（含结论与证据）
+保持原样未改** —— 它是取证记录；本节只登记实现边界。
 
 ### 取舍裁定：取值做成**模块级常量**，不进 `QoderProduct`
 
@@ -238,10 +248,21 @@ CLAIM 200 {"grantId":"…","status":"CLAIMED","replayed":false,
 两道守卫用例把这条边界钉死：
 
 - `tests/unit/qoder-checkin-credits.spec.ts`：「quota 请求**不带**该头」（纯函数层）；
-- `tests/unit/qoder-cn-rpc-dispatch.spec.ts`：「`Cosy-ClientType: 10` 只出现在
-  `/sash/` 活动请求上（quota / exchange 不带）」（真实 RPC 分派链路）。
+### 国际版设备身份头（2026-09-25）
 
-### 三态判读：`readQoderCampaignDayState`（新导出，**唯一判读处**）
+`QODER.campaignDeviceIdentity = true` 时，`sendQoderCheckinRequest` 在 401 重试循环外
+调用 `getQoderMachineIdentity` 一次；同一次调用得到的身份同时用于活动列表 GET 与 claim POST。
+来源是官方桌面客户端自带的 `runtime-info.exe`：异步 `execFile`，参数
+`--account-stdin`，从 stdin 传入账号 JSON。三值按 `product.id` 只做进程内缓存，失败不缓存，
+也不落盘；与 wasm 提取遵循同一纪律（不拷贝、不分发、不落盘）。取值形态只记诊断，
+不作为拦截条件。
+
+头集为 `Cosy-ClientType: 10`、`User-Agent: Qoder`、`Cosy-Version: 0.3.4`、
+`Cosy-MachineToken`、`Cosy-MachineType`、`Cosy-MachineCode`。CN 不声明
+`campaignDeviceIdentity`，不调用 exe，误传身份也不改变 CN 出站头集。国际版在非 Windows、
+找不到 exe、调用失败、超时或输出畸形时回到现状头集，随后按既有三态逻辑进入
+`undetermined` 抑制兜底。
+
 
 `'claimable' | 'claimed' | 'unknown'`，由 claim 与 status **两路共用**：
 
@@ -265,8 +286,9 @@ CLAIM 200 {"grantId":"…","status":"CLAIMED","replayed":false,
 ### 措辞的连带更正
 
 本模块与文档里所有「空列表 ⇒ undetermined / already-claimed」的措辞一律改为
-「**带头仍空** ⇒ …」—— 缺头时的空列表是**缺头假象**（已修），补头后仍为空才是
-真判不了。这条限定语是本次修复的**语义核心**，简写回去就等于把根因 1 又埋进注释。
+「**补齐该 region 所需头集后仍空** ⇒ …」—— CN 缺 `Cosy-ClientType`、国际版缺设备身份
+时的空列表都是**缺头假象**（已修），补齐对应头集后仍为空才是真判不了。这条限定语是
+本次修复的**语义核心**，简写回去就等于把根因 1 又埋进注释。
 
 ---
 
@@ -292,9 +314,9 @@ CLAIM 200 {"grantId":"…","status":"CLAIMED","replayed":false,
 
 对应 `*-evidence.json` 为原始响应留档（含完整响应头与正文）。
 
-## 约束遵守情况
+## 探针调查阶段的约束记录
 
-- ✅ 未改任何 `src/` 产品代码与单测（`git diff --stat -- src/` 为空）
-- ✅ 未调 chat 端点（不消耗模型积分）
-- ✅ 出站协议值零改动（探针只在请求头层做 A/B，未动源码常量）
-- ✅ 签到为「领积分」操作，用户已明确授权；两个账号各 +100 真实到账
+- ✅ 探针调查阶段未改任何 `src/` 产品代码与单测（后续修复落地见上文）。
+- ✅ 未调 chat 端点（不消耗模型积分）。
+- ✅ 探针阶段只在请求头层做 A/B，未动源码常量。
+- ✅ 签到为「领积分」操作，用户已明确授权；两个账号各 +100 真实到账。

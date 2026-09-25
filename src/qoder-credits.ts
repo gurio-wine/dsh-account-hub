@@ -132,13 +132,15 @@ import {
   qoderCampaignHeaders,
   qoderJobTokenHeaders,
 } from './qoder-product.js'
-import type { QoderCredential, QoderProduct } from './qoder-product.js'
+import type { QoderCredential, QoderMachineIdentity, QoderProduct } from './qoder-product.js'
 import {
   classifyQoderError,
   type QoderErrorClassification,
   type QoderQuotaVerdict,
 } from './qoder-errors.js'
 import { summarizeQoderErrorBody } from './qoder-auth.js'
+import { getQoderMachineIdentity } from './qoder-machine-identity.js'
+import type { QoderMachineIdentityFetcher } from './qoder-machine-identity.js'
 import type { CheckinStatus, ClaimOutcome, CreditBalance, CreditPackage } from './credits.js'
 
 // ── 池 ──
@@ -428,6 +430,17 @@ export interface QoderCreditsOptions {
    * 身份字段缺失只影响昵称显示，不该让一次成功的余额查询变成失败。
    */
   persistIdentity?: (credential: QoderCredential) => void | Promise<void>
+  /**
+   * 设备身份取用出口（**只被 `/sash/` 签到链路消费**）。
+   *
+   * 缺省走 `qoder-machine-identity.ts` 的 {@link getQoderMachineIdentity}（真机可用
+   * 路径）；单测注入替身以避免真的起子进程。
+   *
+   * ⚠️ **CN 不会经这里取任何东西**：`getQoderMachineIdentity` 的第一道闸就是产品字段
+   * `campaignDeviceIdentity`（CN 不声明）⇒ 一个 exe 都不调。故在接线层不必再写
+   * region 判断（两处判据必然漂移）。
+   */
+  machineIdentity?: QoderMachineIdentityFetcher
   /** 脱敏调试出口（只输出原因与状态码，**不输出令牌与凭据**）。 */
   onDebug?: (message: string) => void
 }
@@ -1007,6 +1020,35 @@ async function sendQoderCheckinRequest(
     return { error: `换取 Qoder job token 失败：${error instanceof Error ? error.message : String(error)}` }
   }
 
+  // ── 设备身份（只在国际版生效；2026-09-23 / 09-25 三次真机验证）──
+  //
+  // ⚠️ **必须在重试循环之外取一次**：401 重试是同一发请求的重打，每次重试都去起
+  // 一个 ~1.2 s 的子进程纯属浪费；而且真机已证三值在会话内稳定（跨会话漂移但服务端
+  // 不校验新鲜度），重复取不带来任何正确性收益。
+  //
+  // ⚠️ **判据是产品字段 `campaignDeviceIdentity`**（CN 不声明）—— 与
+  // `qoderCampaignHeaders` 的判据**是同一个字段**，不是第二份 region 判据。
+  //
+  // 它必须在**本层**再判一次，而不能只靠 `getQoderMachineIdentity` 内部那道闸：
+  // 注入面（`options.machineIdentity`）是**绕过那个实现**的，若只在那里把关，
+  // 「CN 一个 exe 都不调」这条保证就会随「谁被接线进来」而变 —— 测试注入替身时
+  // 立刻破功（本文件的单测正是这么抓住它的）。守卫放在调用点才与实现无关。
+  //
+  // ⚠️ **失败即 `undefined`，绝不抛**（契约见 `qoder-machine-identity.ts`）：
+  // 没有身份就退回现状头集，签到自然落入既有的 `undetermined` 抑制兜底。
+  //
+  // ⚠️ **GET 与 POST 都在本函数里出网**（`loadQoderCampaigns` 与 `claimQoderCampaign`
+  // 各自传 build），故这一处取到的身份**天然同时覆盖签到列表与领取** —— 9/23 真机
+  // claim 成功时 POST 用的是同一套全官方头。
+  let machineIdentity: QoderMachineIdentity | undefined
+  if (product.campaignDeviceIdentity === true) {
+    machineIdentity = options.machineIdentity === undefined
+      ? await getQoderMachineIdentity(product, credential.user_id, {
+          ...options.onDebug === undefined ? {} : { onDebug: options.onDebug },
+        })
+      : await options.machineIdentity(product, credential.user_id)
+  }
+
   // 至多两次：第一次 401 TOKEN_EXPIRE 时丢弃缓存重换一次再打。
   for (let attempt = 0; ; attempt += 1) {
     const { url, init } = build(jobToken)
@@ -1014,7 +1056,11 @@ async function sendQoderCheckinRequest(
     const signal = options.signal === undefined ? timeout : AbortSignal.any([timeout, options.signal])
     let response: Response
     try {
-      response = await fetcher(url, { ...init, headers: { ...qoderCampaignHeaders(jobToken, product), ...init.headers }, signal })
+      response = await fetcher(url, {
+        ...init,
+        headers: { ...qoderCampaignHeaders(jobToken, product, undefined, machineIdentity), ...init.headers },
+        signal,
+      })
     } catch (error) {
       return { error: `Qoder 签到请求网络失败：${error instanceof Error ? error.message : String(error)}` }
     }

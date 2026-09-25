@@ -1095,6 +1095,35 @@ export function applyQoderRefresh(
   }
 }
 
+// ── 设备身份 ──
+
+/**
+ * Qoder **设备身份**三值（`Cosy-MachineToken` / `Cosy-MachineType` / `Cosy-MachineCode`）。
+ *
+ * ## 来源：官方桌面客户端的 `runtime-info.exe` 运行时调用
+ *
+ * 由 `src/qoder-machine-identity.ts` 起子进程取出（`execFile(exe, ['--account-stdin'])`，
+ * stdin 传账号、stdout 首行是这几值的 JSON）。**不是**本插件猜的、也不是从磁盘别的
+ * 文件里读的 —— 这一点是本类型存在的全部理由：`QoderProduct.cosyVersion` 那条注释写
+ * 的「不猜机器身份」纪律**仍然成立**，本值是官方 exe 自报的。
+ *
+ * ## 三个实测特性（决定消费侧的用法）
+ *
+ * | 特性 | 后果 |
+ * |---|---|
+ * | 三值是**机器级**的（与账号无关） | 可按 product 缓存，N 个账号只付一次 ~1.2 s |
+ * | **跨会话漂移**，但服务端**不校验新鲜度** | 刻意**不落盘**，进程内缓存足够 |
+ * | 单次调用约 **1.2 s** | 只在**国际版签到**这一条路径上取值 |
+ */
+export interface QoderMachineIdentity {
+  /** `Cosy-MachineToken`：实测 88 字符、`P1g` 开头。 */
+  machineToken: string
+  /** `Cosy-MachineType`：实测 18 位 hex。 */
+  machineType: string
+  /** `Cosy-MachineCode`：实测 18 位 hex。 */
+  machineCode: string
+}
+
 // ── 请求头 ──
 
 /**
@@ -1167,7 +1196,11 @@ export function qoderJobTokenHeaders(
  * |---|---|
  * | 本插件现状头（无任何 `Cosy-*`） | `campaigns: []`（**缺头假象**） |
  * | **仅加** `Cosy-ClientType: 10` | 列表非空，含 `CLAIM_BENEFIT/CLAIMED` |
- * | 再加 `Cosy-MachineToken`/`Type`/`Code`/`Version` | 同上（**无额外增益**） |
+ *
+ * ⚠️ **该表是 CN 的消融结论（2026-09-24）**。国际版**不适用**：2026-09-23 / 09-25
+ * 三次真机验证定案 —— 国际版服务端**只对带完整设备身份头的请求下发活动**
+ * （`claimable: true`），只有 `Cosy-ClientType` 时同样回空列表。故国际版的头集由
+ * {@link qoderCampaignHeaders} 按 region 追加，见那里。
  *
  * 取值空间扫描：`1–7、9、11、12、20、100、0、-1、app、qodercli、空串` 全部回空
  * 列表，**只有 `8` 与 `10` 返回非空**（`8` 只见 `VIEW_DETAILS`）——`10` 是官方值。
@@ -1182,8 +1215,25 @@ export function qoderJobTokenHeaders(
 export const QODER_CAMPAIGN_CLIENT_TYPE = 10
 
 /**
+ * `/sash/` 活动端点（签到）**国际版**所需的 `User-Agent` 取值。
+ *
+ * ⚠️ **它不是产品配置里的 `product.userAgent`**（国际版是 `qoder/1.1.16`、CN 是
+ * `qoder/1.1.58`）：真机成功探针用的是**裸 `Qoder`**，改回产品 UA 就不在验证集合
+ * 里了。故它是活动端点的**独立出站协议值**，不要「统一」到 `product.userAgent`。
+ */
+export const QODER_CAMPAIGN_DEVICE_USER_AGENT = 'Qoder'
+
+/**
+ * `/sash/` 活动端点**国际版**所需的 `Cosy-Version` 取值。
+ *
+ * 与 CN 的 `QoderProduct.cosyVersion`（`1.1.58`，走 chat 签名）**不是同一个值**：
+ * 此处 `0.3.4` 逐字节取自真机成功探针，是设备身份头集的一部分。
+ */
+export const QODER_CAMPAIGN_DEVICE_COSY_VERSION = '0.3.4'
+
+/**
  * 构造 `/sash/` 活动端点（签到）的鉴权头 —— {@link qoderJobTokenHeaders} **加上**
- * `Cosy-ClientType`。
+ * `Cosy-ClientType`，国际版在给定设备身份时**再追加完整设备头集**。
  *
  * ## ⚠️ 作用域**只限** `/sash/` 的 campaigns 请求
  *
@@ -1193,23 +1243,53 @@ export const QODER_CAMPAIGN_CLIENT_TYPE = 10
  * 故签到线走本函数、其余线一律不动（两处各有单测钉死：`qoder-checkin-credits`
  * 的「quota 请求不带该头」与 `qoder-cn-rpc-dispatch` 的「只有 `/sash/` 请求带」）。
  *
- * 消融证明 `Cosy-MachineToken` / `Cosy-MachineType` / `Cosy-MachineCode` /
- * `Cosy-Version` / `User-Agent: Qoder` **全部非必需**，故一律不发 —— 与
- * `QoderProduct.cosyVersion` 注释里「不猜机器身份」同一条纪律（缺头比错头安全）。
+ * ## 设备身份头集按 region 分岔（2026-09-23 / 09-25 三次真机验证）
+ *
+ * | region | 必需头集 | 依据 |
+ * |---|---|---|
+ * | **CN** | 只需 `Cosy-ClientType: 10`（现状即满额） | 消融结论**只对 CN 成立** |
+ * | **国际版** | `Cosy-ClientType` + `Cosy-Version` + `Cosy-Machine{Token,Type,Code}` + `UA: Qoder` | 缺任一即回空列表（`claimable: false`） |
+ *
+ * ⚠️ **旧注释（消融表「设备头全部非必需」）是从 CN 外推的，已被国际版真机推翻**
+ * —— 国际版服务端**只对带完整设备身份头的请求下发每日签到活动**。设备身份由
+ * `src/qoder-machine-identity.ts` 调官方 `runtime-info.exe` 取出（**不是猜的**）。
+ *
+ * ## `identity` 缺省 = 现状头集（降级是**唯一**的失败路径）
+ *
+ * 取不到身份（非 Windows / 无 exe / 调用失败 / 输出畸形）时调用方传 `undefined`，
+ * 本函数**逐字节回到改动前的头集** —— 签到会自然落入既有的 `undetermined` 抑制
+ * 兜底（不写签到状态、下轮 sweep 重试），**不新增错误路径**。
+ *
+ * ⚠️ **本函数不判定 region**：是否取身份由接线层（`qoder-credits.ts`）按 region
+ * 决定，CN 一个 exe 都不调。给 CN 传 identity 属于调用方错误 —— 但那也不该在本
+ * 纯函数里再写一份 region 判据（两处判据必然漂移）。
  *
  * @param jobToken - `jt-…`（由 `getJobToken` 换来）。
- * @param product - 决定 `User-Agent`（其余字段与 region 无关）。
+ * @param product - 决定基线 `User-Agent`（设备身份存在时国际版会被覆盖成 `Qoder`）。
  * @param accept - `Accept` 头取值。
+ * @param identity - 设备身份；缺省即不追加任何设备头（CN 与降级路径）。
  */
 export function qoderCampaignHeaders(
   jobToken: string,
   product: QoderProduct,
   accept = 'application/json',
+  identity?: QoderMachineIdentity,
 ): Record<string, string> {
-  return {
+  const headers: Record<string, string> = {
     ...qoderJobTokenHeaders(jobToken, product, accept),
     'Cosy-ClientType': String(QODER_CAMPAIGN_CLIENT_TYPE),
   }
+  // 是否追加设备头**只有一个判据来源**：产品字段 `campaignDeviceIdentity`。
+  // CN 不声明它 ⇒ 即便调用方误传 identity，CN 的出站头集也**逐字节不变**
+  //（红线在构造点就被守住，不靠调用方自觉）。
+  if (product.campaignDeviceIdentity !== true || identity === undefined) return headers
+  // 逐字节照抄成功探针「4. 全官方头」：一个都不能少、不能改。
+  headers['User-Agent'] = QODER_CAMPAIGN_DEVICE_USER_AGENT
+  headers['Cosy-Version'] = QODER_CAMPAIGN_DEVICE_COSY_VERSION
+  headers['Cosy-MachineToken'] = identity.machineToken
+  headers['Cosy-MachineType'] = identity.machineType
+  headers['Cosy-MachineCode'] = identity.machineCode
+  return headers
 }
 
 // ── 产品配置 ──
@@ -1309,6 +1389,31 @@ export interface QoderProduct {
    * 编造的主机名，不如不发（缺头比错头安全：错头会被后台当真记进设备维度）。
    */
   cosyVersion?: string
+  /**
+   * 该 region 的 `/sash/` 活动端点**是否需要完整设备身份头集**；缺省即不需要。
+   *
+   * ## 只有国际版声明它（2026-09-23 / 09-25 三次真机验证）
+   *
+   * | region | 是否声明 | 真机事实 |
+   * |---|---|---|
+   * | **国际版** {@link QODER} | ✅ 声明 | **只对带完整设备身份头的请求下发活动**；缺任一即空列表 |
+   * | **CN** {@link QODER_CN} | ❌ 不声明 | 只需 `Cosy-ClientType: 10` 即满额（现状已够用） |
+   *
+   * ## 为什么是**产品字段**而不是调用点的 region 判断
+   *
+   * 两个消费点都靠它分岔，且各自若自写判据必然漂移：
+   *
+   * 1. {@link qoderCampaignHeaders} —— 不声明 ⇒ 即便调用方误传身份，出站头集
+   *    **逐字节不变**（CN 的红线在构造点就被守住，不靠调用方自觉）；
+   * 2. `getQoderMachineIdentity` 的调用点 —— 不声明 ⇒ **一个 exe 都不调**
+   *    （省一次 ~1.2 s 子进程，CN 也不必为此依赖官方客户端安装）。
+   *
+   * ⚠️ 这与 `cosyVersion` / `clientType` 是**三件不同的事**：那两个走的是 **chat**
+   * （且 CN 才有值），本字段**只管 `/sash/` 签到**、且**只有国际版**为真。不要把
+   * 「都是 Cosy 头」当成可以复用同一个字段的理由 —— 合并会让「改 chat 身份值」
+   * 静默改掉签到链路。
+   */
+  campaignDeviceIdentity?: boolean
 }
 
 /**
@@ -1333,6 +1438,16 @@ export function qoderClientType(product: QoderProduct): string {
  * ⚠️ **本配置刻意不声明 `clientType`**（缺省即国际版实测值 `'qodercli'`）——
  * 与 `serviceName` 同一判据：只在「缺省不成立」时才填字段。这样国际版的
  * 出站请求体与本 region 落地前**逐字节相同**（有单测钉死）。
+ *
+ * ## ⚠️ 但**必须**声明 `campaignDeviceIdentity`（与上一条判据不冲突）
+ *
+ * 上一条是「缺省即正确」⇒ 不必声明；本字段的**缺省是 `false`**，而国际版的
+ * 正确答案是 `true` ⇒ 必须显式声明。两者的判据是同一条：**只在缺省不成立时填**。
+ *
+ * 真机依据（2026-09-23 / 09-25 三次验证）：国际版 `/sash/` 活动端点**只对带完整
+ * 设备身份头**（`Cosy-Machine{Token,Type,Code}` + `Cosy-Version: 0.3.4` +
+ * `UA: Qoder`）的请求下发每日签到活动；CN 同端点只需 `Cosy-ClientType: 10`。
+ * 故只有本 region 需要调官方 `runtime-info.exe` 取身份（见该字段注释）。
  */
 export const QODER: QoderProduct = {
   id: 'qoder',
@@ -1348,6 +1463,7 @@ export const QODER: QoderProduct = {
   machineIdDir: QODER_MACHINE_ID_DIR,
   defaultCredentialRef: QODER_DEFAULT_CREDENTIAL_REF,
   accountCredentialRefPrefix: QODER_ACCOUNT_REF_PREFIX,
+  campaignDeviceIdentity: true,
 }
 
 /**

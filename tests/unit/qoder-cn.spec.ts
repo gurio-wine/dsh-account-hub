@@ -312,9 +312,16 @@ describe('QODER_CN 配置逐字段', () => {
     // `machineIdDir` 是**两区都必须有**的设备流字段（不是 CN 专属），故三个
     // 键在两侧都出现。这条断言的**原意不变** —— 它守的是「CN 专属的可选字段
     // 不许漏进国际版」，那三个键由下面的可选字段用例继续守。
+    //
+    // ⚠️ 2026-09-25 为 **14 个**：`campaignDeviceIdentity` 是**国际版专属**的
+    // 新字段（签到设备头，见 `docs/agents/providers-qoder.md`）。它是这条断言
+    // 落地以来**第一个「只给国际版加」**的字段，故同时在下一条用例里加了反向
+    // 守卫（CN 不得声明它）—— 单靠本行只能证明「键集合变了」，证明不了
+    // 「没被顺手也给 CN 补上」。
     expect(Object.keys(QODER).sort()).toEqual([
       'accountCredentialRefPrefix',
       'authBaseUrl',
+      'campaignDeviceIdentity',
       'chatBase',
       'clientId',
       'defaultCredentialRef',
@@ -343,6 +350,8 @@ describe('QODER_CN 配置逐字段', () => {
       authBaseUrl: 'https://qoder.com',
       clientId: 'e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb',
       machineIdDir: '.qoder',
+      // 签到设备头：**只有国际版**需要（2026-09-23 / 09-25 三次真机验证）。
+      campaignDeviceIdentity: true,
     })
   })
 
@@ -369,6 +378,18 @@ describe('QODER_CN 配置逐字段', () => {
     expect(QODER_CN.clientType).toBeDefined()
     expect(QODER_CN.cosyVersion).toBeDefined()
     expect(QODER_CN.serviceName).toBeDefined()
+  })
+
+  it('⚠️ 签到设备头**只有国际版**声明（CN 声明了就要白调一次子进程、且改 CN 出站头集）', () => {
+    // 与上一条相反的守卫：`campaignDeviceIdentity` 是**第一个只给国际版加**的字段。
+    // 它同时是两个消费点的判据（`qoderCampaignHeaders` 的追加闸与
+    // `getQoderMachineIdentity` 的 region 闸），故给 CN 也补上会产生两个后果：
+    // ① CN 签到白起一次 ~1.2 s 的 `runtime-info.exe`（真机已证不需要）；
+    // ② CN 出站头集被加上 `Cosy-Version` / `Cosy-Machine*` / `UA: Qoder` ——
+    //    直接破坏「不改 CN 任何出站值」那条红线。
+    expect(QODER.campaignDeviceIdentity).toBe(true)
+    expect(QODER_CN.campaignDeviceIdentity).toBeUndefined()
+    expect('campaignDeviceIdentity' in QODER_CN).toBe(false)
   })
 })
 
