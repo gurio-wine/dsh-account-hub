@@ -57,6 +57,14 @@
 - 请求签名/鉴权方式：`buddy-cn` / `buddy`：Bearer access_token + 额外自定义头（`X-Product-Code` 随产品切换）
 - `buddy-cn` 与 `buddy` 共用 `BuddyAdapter`，行为差异全部由 `src/product.ts` 的 `BuddyProduct` 配置驱动；新增同源产品只需加一份配置并注册实例
 
+## 登录、凭据与模型目录
+
+Buddy CN 与 Buddy 共用 `auth/state` → 浏览器授权 → 轮询 `auth/token` → 轮询 `login/account` 的 external-link-v2 流程，不启动本地回调服务器。先 `POST /v2/plugin/auth/state?platform=<platform>` 获取 `state` 与 `authUrl`；轮询 token 时业务码 `11217` 表示尚未就绪，账户接口 `/v2/plugin/login/account` 的 `12151` 表示账户信息尚未就绪。续期使用 `POST /v2/plugin/auth/token/refresh`，通过 `X-Refresh-Token` 提交刷新令牌。
+
+- Buddy CN 使用 `platform=ide`、`copilot.tencent.com`；Buddy 使用 `platform=workbuddy-ai`、`www.workbuddy.ai`，登录 URL 还带 `version` 与 `loginSessionId`。协议身份头 `X-Product-Code` / `X-Product` 等按产品配置发送，provider id 改名不能改这些值。
+- 单账号凭据 ref 分别为 `BUDDY_CN_ACCESS_TOKEN` / `BUDDY_ACCESS_TOKEN`；账号池 ref 为 `BUDDY_CN_ACCOUNT_<UUID_SHORT>` / `BUDDY_ACCOUNT_<UUID_SHORT>`。凭据 JSON 含 `access_token`、`refresh_token` 与 `expires_at`。
+- 模型目录由 `GET /v3/config` 提供，读取 `data.data.models` / `data.data.agents`；Buddy CN 有内置目录兜底。两个 region 使用各自 endpoint，不能共用模型池。
+
 ## 积分领取（每日签到）
 
 原文照搬 AGENTS.md「积分领取」中 Buddy CN 段。

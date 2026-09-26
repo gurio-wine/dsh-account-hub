@@ -41,7 +41,10 @@ const STYLES = `
 .dim-ah-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--dsw-alias-border-l2); }
 .dim-ah-brand { display: flex; flex-direction: column; }
 .dim-ah-brandTitleRow { display: flex; align-items: center; gap: 8px; }
-.dim-ah-brandName { font-size: var(--dsw-font-base-strong-16-font-size); line-height: var(--dsw-font-base-strong-16-line-height); font-weight: var(--dsw-font-base-strong-16-font-weight); color: var(--dsw-alias-label-primary); }
+/* 品牌名是外链（仓库地址）：不加下划线以保持标题观感，颜色沿用链接
+   语义 token，hover 用宿主的快速过渡 —— 可点性靠 hover 变色传达。 */
+.dim-ah-brandNameLink { font-size: var(--dsw-font-base-strong-16-font-size); line-height: var(--dsw-font-base-strong-16-line-height); font-weight: var(--dsw-font-base-strong-16-font-weight); color: var(--dsw-alias-label-primary); text-decoration: none; }
+.dim-ah-brandNameLink:hover { color: var(--dsw-alias-link); transition: color var(--ds-transition-duration-fast) var(--ds-ease-in-out); }
 .dim-ah-brandDesc { font-size: var(--dsw-font-xs-13-font-size); line-height: var(--dsw-font-xs-13-line-height); color: var(--dsw-alias-label-secondary); margin: 2px 0 0; }
 
 /* 布局：对齐 dsh-im 的两栏。

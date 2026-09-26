@@ -16,7 +16,7 @@
 本项目是 DeepSeek Harness 的插件 `dsh-account-hub`，提供华为云 CodeArts 浏览器登录与凭据管理，附带七个 LLM provider 路由：`codearts` / `buddy-cn`（腾讯 CodeBuddy 中国版）/ `buddy`（WorkBuddy 国际版）/ `lobsterai`（有道）/ `trae-cn`（字节 Trae 国内版）/ `qoder` 与 `qoder-cn`（Qoder 国际版/国内版两 region）。
 
 - **同源关系**：`buddy-cn` 与 `buddy` 同源（差异收敛于 `src/product.ts` 的 `BuddyProduct`）；`lobsterai`、`trae-cn` 完全不同源、各自独立实现；`qoder` 两区同协议双 region、代码只有一份（差异在 `QoderProduct`）。
-- **命名**：显示名与 provider id 一律按产品品牌，旧命名 `buddy`/`workbuddy` 已作废（迁移见 README「provider 改名与数据迁移」）。
+- **命名**：显示名与 provider id 一律按产品品牌，旧命名 `buddy`/`workbuddy` 已作废（迁移见 `docs/agents/account-hub-storage.md`）。
 - **TraeWork**：该路径 provider 已整体移除，`trae-cn` 一条通道即可覆盖。
 - Account Hub 设置页（`plugin-src/client/account-hub.js`）提供多账号管理、限流自动切换与积分入口；七个 provider 都有面板。
 - 各 provider 协议细节见 `docs/agents/providers-*.md`。
@@ -43,7 +43,7 @@
 - 服务名默认由产品 id 派生（`${product.id}Auth`）；带连字符的 id 必须显式声明 `serviceName`（见「LLM Provider 约定」）。
 - `refreshAccountCredential(refName)` 供账号卡片「刷新」按钮；**不要**用 `refresh()` 刷池内账号（它读写该 provider 的默认单凭据 ref，会刷错凭据）。
 - 登录必须两段式：`account.create` 同步返回 `loginUrl`、打开动作归客户端、后台第二段补全或移除占位 —— 细节见 `docs/agents/account-hub-storage.md`；Qoder 设备流的专属差异见 `docs/agents/providers-qoder.md`。
-- 各 provider 登录/续期机制差异见 README.md 与 `docs/agents/providers-*.md`。
+- 各 provider 登录/续期机制差异见 `docs/agents/providers-*.md`。
 
 ## 账号池与模型列表（概览）
 

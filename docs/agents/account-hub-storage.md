@@ -134,6 +134,10 @@ LobsterAI **不适用本条**（它根本不发 `X-Domain`）；其对应约束�
 
 回归护栏：`tests/unit/qoder-hub-blank-screen.spec.ts` 的「控件与样式迁移」一组（原生控件归零、悬停文案一条不丢、样式表无 hex 与死 token）。
 
+## provider id 改名迁移
+
+Buddy 系改名曾将中国版 `buddy` 调整为 `buddy-cn`，国际版 `workbuddy` 调整为 `buddy`。启动时的一次迁移同步更新账号条目的 provider/id/credentialRef、凭据 ref 与 `disabledModels` 的 provider 键；凭据 ref 从 `BUDDY_*` 搬到 `BUDDY_CN_*`，`WORKBUDDY_*` 搬到 `BUDDY_*`。目标凭据 ref 已存在且内容冲突时保留原账号并记错误，避免出现账号指向新 ref、凭据仍在旧 ref 的半迁移状态。该迁移与下节的 provider 体检迁移是不同职责。
+
 ## provider 体检迁移（`provider-audit-migration.ts`）
 
 **修的脏数据**：账号条目的 `provider` 标签与它凭据的**真实归属**不符 —— 现场案例是

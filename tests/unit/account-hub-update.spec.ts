@@ -12,6 +12,7 @@ import {
 const PROFILE_ROOT = 'C:\\fake-profile'
 const CURRENT_SHA = 'a'.repeat(40)
 const LATEST_SHA = 'b'.repeat(40)
+const LATEST_TAG = 'v0.2.0'
 const ACCOUNT_HUB_PIN = 'github:gurio-wine/dsh-account-hub'
 const LOCK_PATH = join(PROFILE_ROOT, 'pnpm-lock.yaml')
 const PACKAGE_PATH = join(PROFILE_ROOT, 'package.json')
@@ -61,7 +62,16 @@ function makePackageJson(pin = ACCOUNT_HUB_PIN): string {
   ].join('\n')
 }
 
-function makeResponse(sha = LATEST_SHA, message = '更新标题\n更多提交说明'): Response {
+function makeReleaseResponse(tag: string, name: string | undefined, status = 200): Response {
+  const body: { tag_name: string; name?: string } = { tag_name: tag }
+  if (name !== undefined) body.name = name
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+function makeCommitResponse(sha: string, message = '提交说明'): Response {
   return new Response(JSON.stringify({ sha, commit: { message } }), {
     status: 200,
     headers: { 'content-type': 'application/json' },
@@ -73,7 +83,10 @@ function makeDeps(options: {
   packageJson?: string
   workspace?: string
   latestSha?: string
-  latestTitle?: string
+  latestTag?: string
+  releaseName?: string
+  omitReleaseName?: boolean
+  releaseStatus?: number
   exec?: AccountHubUpdateExec
 } = {}): {
   deps: AccountHubUpdateDeps
@@ -82,6 +95,8 @@ function makeDeps(options: {
   exec: ReturnType<typeof vi.fn<AccountHubUpdateExec>>
 } {
   const latestSha = options.latestSha ?? LATEST_SHA
+  const latestTag = options.latestTag ?? LATEST_TAG
+  const releaseName = options.omitReleaseName ? undefined : options.releaseName ?? '更新标题'
   const files = new Map<string, string>([
     [LOCK_PATH, options.lockfile ?? makeLockfile(CURRENT_SHA)],
     [PACKAGE_PATH, options.packageJson ?? makePackageJson()],
@@ -95,7 +110,12 @@ function makeDeps(options: {
   const writeFile = vi.fn(async (path: string, content: string) => {
     files.set(path, content)
   })
-  const fetcher = vi.fn<typeof fetch>(async () => makeResponse(latestSha, options.latestTitle ?? '更新标题\n更多提交说明'))
+  const fetcher = vi.fn<typeof fetch>(async (input) => {
+    if (String(input) === 'https://api.github.com/repos/gurio-wine/dsh-account-hub/releases/latest') {
+      return makeReleaseResponse(latestTag, releaseName, options.releaseStatus ?? 200)
+    }
+    return makeCommitResponse(latestSha)
+  })
   const defaultExec: AccountHubUpdateExec = async (_command, args) => {
     if (args[0] === 'add') {
       files.set(LOCK_PATH, makeLockfile(latestSha))
@@ -123,13 +143,38 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     expect(result).toEqual({
       currentSha: CURRENT_SHA,
       latestSha: LATEST_SHA,
+      latestTag: LATEST_TAG,
       hasUpdate: true,
       latestTitle: '更新标题',
     })
-    expect(fetcher).toHaveBeenCalledWith(
-      'https://api.github.com/repos/gurio-wine/dsh-account-hub/commits/master',
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      'https://api.github.com/repos/gurio-wine/dsh-account-hub/releases/latest',
       expect.objectContaining({ headers: { accept: 'application/vnd.github+json' } }),
     )
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      `https://api.github.com/repos/gurio-wine/dsh-account-hub/commits/${LATEST_TAG}`,
+      expect.objectContaining({ headers: { accept: 'application/vnd.github+json' } }),
+    )
+  })
+
+  it('无 GitHub release 时给出清晰提示并停止第二跳', async () => {
+    const { deps, fetcher } = makeDeps({ releaseStatus: 404 })
+
+    await expect(checkAccountHubUpdate(deps)).rejects.toThrow(
+      '尚无 GitHub release，无法检查更新（发首个 release 后可检查）',
+    )
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+
+  it('release 没有 name 时将 latestTitle 回退为 tag 名', async () => {
+    const { deps } = makeDeps({ omitReleaseName: true })
+
+    await expect(checkAccountHubUpdate(deps)).resolves.toMatchObject({
+      latestTag: LATEST_TAG,
+      latestTitle: LATEST_TAG,
+    })
   })
 
   it('lockfile 没有目标依赖时报告半卸载状态并提示有更新', async () => {
@@ -139,6 +184,7 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     await expect(checkAccountHubUpdate(deps)).resolves.toEqual({
       currentSha: '',
       latestSha: LATEST_SHA,
+      latestTag: LATEST_TAG,
       hasUpdate: true,
       latestTitle: '更新标题',
     })
@@ -194,7 +240,7 @@ describe('Account Hub 更新 RPC 逻辑', () => {
       ['add', `${ACCOUNT_HUB_PIN}#${LATEST_SHA}`, '--config.minimum-release-age=0'],
       { cwd: PROFILE_ROOT, timeoutMs: 120_000 },
     )
-    expect(fetcher).toHaveBeenCalledTimes(1)
+    expect(fetcher).toHaveBeenCalledTimes(2)
   })
 
   it('package.json 缺少依赖字段时跳过 remove 直接 add', async () => {

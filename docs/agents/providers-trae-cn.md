@@ -10,6 +10,12 @@
 
 请求签名/鉴权：`trae-cn`：`Cloud-IDE-JWT <access>` + 同值的 `X-Ide-Token` / `X-Cloudide-Token`（无签名、无归属头）。
 
+## 凭据与账号池
+
+- 单账号 ref 为 `TRAE_CN_ACCESS_TOKEN`，账号池 ref 使用 `TRAE_CN_ACCOUNT_*`。
+- 凭据 JSON 保存 `access_token`、`refresh_token`、`user_id`、`client_id`、`device_id`、`checkin_device_id`、`device_id_source` 与 `machine_id` 等字段。`device_id` 是 exchange 返回的绑定 id；签到头使用 `checkin_device_id`，即登录 URL 中生成的 16 位设备号。
+- Access token 使用 `Authorization: Cloud-IDE-JWT <access>`。chat 还带两个同值头 `X-Ide-Token` 与 `X-Cloudide-Token`；签到则需要自己的设备头集，详见下文签到章节，不要把 chat 头集当成完整签到头集。
+
 ## 项目概述（登录 / 通道 / 结构级事实）
 
 原文照搬 AGENTS.md「项目概述」中专属 Trae CN 段。

@@ -3,7 +3,8 @@
 import { join } from 'node:path'
 import type { RpcUpdateApplyResponse, RpcUpdateCheckResponse } from './types.js'
 
-const GITHUB_COMMIT_URL = 'https://api.github.com/repos/gurio-wine/dsh-account-hub/commits/master'
+const RELEASES_LATEST_URL = 'https://api.github.com/repos/gurio-wine/dsh-account-hub/releases/latest'
+const COMMIT_BY_TAG_URL_PREFIX = 'https://api.github.com/repos/gurio-wine/dsh-account-hub/commits/'
 const TARBALL_URL_PREFIX = 'https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/'
 const ACCOUNT_HUB_GITHUB_PIN = 'github:gurio-wine/dsh-account-hub'
 export const ACCOUNT_HUB_UPDATE_TIMEOUT_MS = 120_000
@@ -93,27 +94,51 @@ function findAccountHubSha(lockfile: string): string | null {
   return null
 }
 
-/** 查询 GitHub master 最新提交；检查与安装共用该查询和校验逻辑。 */
-async function fetchLatestCommit(deps: AccountHubUpdateDeps): Promise<{ sha: string; title: string }> {
+/** 查询 GitHub 最新 release，并通过 commits/{tag} 解析其 commit SHA。 */
+async function fetchLatestRelease(
+  deps: AccountHubUpdateDeps,
+): Promise<{ sha: string; tag: string; title: string }> {
   try {
-    const response = await deps.fetcher(GITHUB_COMMIT_URL, {
+    const releaseResponse = await deps.fetcher(RELEASES_LATEST_URL, {
       headers: { accept: 'application/vnd.github+json' },
     })
-    if (!response.ok) throw new Error(`GitHub API 返回 HTTP ${response.status}`)
+    if (!releaseResponse.ok) {
+      if (releaseResponse.status === 404) {
+        throw new Error('尚无 GitHub release，无法检查更新（发首个 release 后可检查）')
+      }
+      throw new Error(`GitHub Releases API 返回 HTTP ${releaseResponse.status}`)
+    }
 
-    const body: unknown = await response.json()
-    if (typeof body !== 'object' || body === null) throw new Error('GitHub API 响应不是对象')
-    const commit = body as { sha?: unknown; commit?: { message?: unknown } }
+    const releaseBody: unknown = await releaseResponse.json()
+    if (typeof releaseBody !== 'object' || releaseBody === null) {
+      throw new Error('GitHub Releases API 响应不是对象')
+    }
+    const release = releaseBody as { tag_name?: unknown; name?: unknown }
+    if (typeof release.tag_name !== 'string' || release.tag_name.trim().length === 0) {
+      throw new Error('GitHub Release 响应缺少有效的 tag_name')
+    }
+    const tag = release.tag_name
+    const title = typeof release.name === 'string' && release.name.length > 0
+      ? release.name
+      : tag
+
+    // 使用 commits/{tag} 直接取得 commit 本体；git/ref/tags/{tag} 对 annotated tag 会返回 tag 对象 SHA。
+    const commitResponse = await deps.fetcher(`${COMMIT_BY_TAG_URL_PREFIX}${encodeURIComponent(tag)}`, {
+      headers: { accept: 'application/vnd.github+json' },
+    })
+    if (!commitResponse.ok) {
+      throw new Error(`GitHub commits API 返回 HTTP ${commitResponse.status}（tag ${tag}）`)
+    }
+
+    const commitBody: unknown = await commitResponse.json()
+    if (typeof commitBody !== 'object' || commitBody === null) {
+      throw new Error('GitHub commits API 响应不是对象')
+    }
+    const commit = commitBody as { sha?: unknown }
     if (typeof commit.sha !== 'string' || !/^[0-9a-f]{40}$/i.test(commit.sha)) {
-      throw new Error('GitHub API 响应缺少有效的 40 位 SHA')
+      throw new Error('GitHub commits API 响应缺少有效的 40 位 SHA')
     }
-    if (typeof commit.commit?.message !== 'string') {
-      throw new Error('GitHub API 响应缺少提交说明')
-    }
-    return {
-      sha: commit.sha.toLowerCase(),
-      title: commit.commit.message.split(/\r?\n/, 1)[0],
-    }
+    return { sha: commit.sha.toLowerCase(), tag, title }
   } catch (error) {
     throw new Error(`无法获取最新版本：${errorMessage(error)}`)
   }
@@ -123,10 +148,11 @@ async function fetchLatestCommit(deps: AccountHubUpdateDeps): Promise<{ sha: str
 export async function checkAccountHubUpdate(deps: AccountHubUpdateDeps): Promise<RpcUpdateCheckResponse> {
   const lockfile = await deps.readFile(join(deps.profileRoot, 'pnpm-lock.yaml'))
   const currentSha = findAccountHubSha(lockfile) ?? ''
-  const latest = await fetchLatestCommit(deps)
+  const latest = await fetchLatestRelease(deps)
   return {
     currentSha,
     latestSha: latest.sha,
+    latestTag: latest.tag,
     hasUpdate: currentSha === '' || currentSha !== latest.sha,
     latestTitle: latest.title,
   }
@@ -195,7 +221,7 @@ export function appendAccountHubAllowBuild(dependenciesFile: string, sha: string
  * 应用最新更新。先取最新 SHA；无需更新时短路，否则执行 pnpm 并验证 lockfile 已切到目标 SHA。
  */
 export async function applyAccountHubUpdate(deps: AccountHubUpdateDeps): Promise<RpcUpdateApplyResponse> {
-  const latest = await fetchLatestCommit(deps)
+  const latest = await fetchLatestRelease(deps)
   const lockPath = join(deps.profileRoot, 'pnpm-lock.yaml')
   const previousSha = findAccountHubSha(await deps.readFile(lockPath)) ?? ''
   if (previousSha !== '' && latest.sha === previousSha) return { previousSha, currentSha: previousSha, log: '' }

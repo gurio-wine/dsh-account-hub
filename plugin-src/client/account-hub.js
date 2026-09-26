@@ -3008,10 +3008,15 @@ function UpdateNotice({ update, logOpen, onApply, onToggleLog }) {
     // 「可更新」与「更新中」共用同一块版面：按钮**原地**从「立即更新」转成禁用的
     // 「更新中…」，位置不跳 —— 用户点下去之后视线不必重新找。
     const applying = update.phase === 'applying';
+    const currentVersion = typeof update.currentSha === 'string' && update.currentSha.length > 0
+      ? `当前 ${shortSha(update.currentSha)}`
+      : '当前未安装';
+    const latestVersion = typeof update.latestTag === 'string' && update.latestTag.length > 0
+      ? `最新 ${update.latestTag}`
+      : `最新 ${shortSha(update.latestSha)}`;
     children = [
       React.createElement('div', { key: 'title' }, `发现新版本：${update.latestTitle}`),
-      React.createElement('div', { key: 'sha' },
-        `当前 ${shortSha(update.currentSha)} → 最新 ${shortSha(update.latestSha)}`),
+      React.createElement('div', { key: 'sha' }, `${currentVersion} → ${latestVersion}`),
       React.createElement(Button, {
         key: 'apply',
         variant: 'primary',
@@ -3022,9 +3027,14 @@ function UpdateNotice({ update, logOpen, onApply, onToggleLog }) {
       }, applying ? '更新中…' : '立即更新'),
     ];
   } else if (update.phase === 'applied') {
+    const installedVersion = typeof update.currentSha === 'string' && update.currentSha.length > 0
+      ? shortSha(update.currentSha)
+      : typeof update.latestTag === 'string' && update.latestTag.length > 0
+        ? update.latestTag
+        : shortSha(update.latestSha);
     children = [
       React.createElement('div', { key: 'done' },
-        `已更新到 ${shortSha(update.currentSha)}，建议重启会话生效`),
+        `已更新到 ${installedVersion}，建议重启会话生效`),
       // 日志折叠：仓库里没有原生 details/summary 范式（控件一律走 ui-primitives），
       // 故用最简的展开/收起 state + 一枚 outline 按钮。日志为空时整块不渲染。
       update.log
@@ -3064,7 +3074,7 @@ export function AccountHubPage({ rpcCall }) {
   const [version, setVersion] = React.useState(0);
   /**
    * 更新状态机：`idle` / `checking` / `available` / `latest` / `applying` /
-   * `applied` / `failed`（字段 `latestTitle` / `latestSha` / `currentSha` /
+   * `applied` / `failed`（字段 `latestTitle` / `latestSha` / `latestTag` / `currentSha` /
    * `log` / `error` 按相位出现）。
    *
    * 落在**页面级**而不是 ProviderPanel：更新检查的是插件自身版本，七个供应商
@@ -3111,6 +3121,7 @@ export function AccountHubPage({ rpcCall }) {
         phase: 'available',
         latestTitle: res.latestTitle,
         latestSha: res.latestSha,
+        latestTag: res?.latestTag,
         currentSha: res.currentSha,
       });
       return;
@@ -3127,7 +3138,8 @@ export function AccountHubPage({ rpcCall }) {
    */
   const applyUpdate = async () => {
     setUpdateLogOpen(false);
-    // 保留 available 相位里的 latestTitle / sha：更新中的提示行要继续显示它在装哪个版本。
+    // applying 与 applied 都保留 available 中的 latestTitle / SHA / tag；成功响应缺 SHA 时
+    // 仍能用 release tag 显示刚安装的版本。
     setUpdate(prev => ({ ...prev, phase: 'applying' }));
     let res;
     try {
@@ -3140,12 +3152,13 @@ export function AccountHubPage({ rpcCall }) {
     }
     if (!updateAliveRef.current) return;
 
-    setUpdate({
+    setUpdate(prev => ({
+      ...prev,
       phase: 'applied',
       previousSha: res?.previousSha,
       currentSha: res?.currentSha,
       log: typeof res?.log === 'string' ? res.log : '',
-    });
+    }));
   };
 
   /**
@@ -3167,7 +3180,16 @@ export function AccountHubPage({ rpcCall }) {
     React.createElement('header', { className: 'dim-ah-header' },
       React.createElement('div', { className: 'dim-ah-brand' },
         React.createElement('div', { className: 'dim-ah-brandTitleRow' },
-          React.createElement('strong', { className: 'dim-ah-brandName' }, '账号中心'),
+          // 品牌名整体点击跳仓库：外包 a 而不是在 strong 上挂 onClick ——
+          // 语义（新开标签页、中键/右键菜单、状态栏地址预览）只有真链接能给。
+          // 颜色沿品牌主色不变，hover 加下划线提示可点，不新造视觉范式。
+          React.createElement('a', {
+            className: 'dim-ah-brandNameLink',
+            href: 'https://github.com/gurio-wine/dsh-account-hub',
+            target: '_blank',
+            rel: 'noopener noreferrer',
+          },
+            React.createElement('strong', { className: 'dim-ah-brandName' }, '账号中心')),
           update.phase === 'latest'
             ? React.createElement(Tag, { tone: 'success' }, '已是最新')
             : null),

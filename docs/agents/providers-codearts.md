@@ -2,6 +2,14 @@
 
 本文件由 AGENTS.md 迁出，供实现/维护 codearts 时查阅。
 
+## OAuth 登录与凭据
+
+默认登录使用 IAM OAuth（PKCE + DPoP）：打开 portal `/authorize`，在本机 loopback 的 `/oauth/callback` 接收授权码，再调用 `https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens` 换取凭据。Account Hub 通过两段式流程先返回 `loginUrl`，授权在后台完成后再补齐账号；命令式 `login()` 保留阻塞式封装。
+
+- 单凭据 ref 为 `CODEARTS_ACCESS_TOKEN`；账号池使用 `CODEARTS_ACCOUNT_*`。凭据为 JSON，含 `access_key_id`、`secret_access_key`、`security_token`、`refresh_token` 与 `expires_at`，可带 `domain_id`、`user_id`、`user_name`。
+- 旧 ticket 流程仍作为显式兼容入口：`login({ flow: 'ticket' })`。ticket 凭据不含 `refresh_token`，续期需要重新登录。
+- Access/refresh token 的具体续期与账号池调度规则见「续期（refresh）与账号池接线」一节。
+
 ## 请求签名/鉴权
 
 `codearts`：华为云 `SDK-HMAC-SHA256` 签名方案

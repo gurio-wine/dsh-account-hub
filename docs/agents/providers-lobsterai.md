@@ -4,11 +4,13 @@
 
 ## 项目概述（不同源说明）
 
-`lobsterai` 与 **Buddy 系完全不同源**（登录方式、请求头、续期载荷、签到流程、版本号来源都不同），实现是独立一套 `src/lobsterai*.ts`。它只**共用架构模式**（产品配置驱动、账号池、限流切换、模型黑名单），**不共用 `BuddyProduct` 类型** —— 其中 `apiDomain` / `productCode` / `attributionName` / `userAgentByModelFamily` / `appendSessionParams` 对 LobsterAI 全部无意义。详见 README「LobsterAI provider」与 `docs/lobsterai-integration-plan.md`。
+`lobsterai` 与 **Buddy 系完全不同源**（登录方式、请求头、续期载荷、签到流程、版本号来源都不同），实现是独立一套 `src/lobsterai*.ts`。它只**共用架构模式**（产品配置驱动、账号池、限流切换、模型黑名单），**不共用 `BuddyProduct` 类型** —— 其中 `apiDomain` / `productCode` / `attributionName` / `userAgentByModelFamily` / `appendSessionParams` 对 LobsterAI 全部无意义。上游接入背景见 `docs/lobsterai-integration-plan.md`。
 
 ## 登录与续期机制
 
-LobsterAI 登录/续期机制与其它 provider 不同（见 README.md），主要通过 `ctx.credentials` 统一管理生命周期。两段式登录（`src/account-hub-rpc.ts`）：第一段 `prepareLogin` 取 `loginUrl`，写占位条目；第二段后台完成登录。**LobsterAI 登录是 provider 级互斥的**（`prepareLobsteraiLogin`）—— 已有未结算会话时返回 `{ok:false, error:'login-in-progress'}`，不新建也不复用（复用会让一份凭据被多个占位 accountId 共享，静默新建则每次点击堆积一个 loopback 端口直到 10 分钟超时）；`account.delete` 会 cancel 对应会话以释放端口。
+Account Hub 登录走两段式：`prepareLogin` 在本地启动回调并先返回 `loginUrl`，浏览器授权完成后后台写入凭据。**LobsterAI 登录是 provider 级互斥的**（`prepareLobsteraiLogin`）—— 已有未结算会话时返回 `{ok:false, error:'login-in-progress'}`，不新建也不复用；`account.delete` 会 cancel 对应会话以释放端口。单账号 ref 为 `LOBSTERAI_ACCESS_TOKEN`，账号池 ref 为 `LOBSTERAI_ACCOUNT_<UUID_SHORT>`；凭据 JSON 除 `access_token` / `refresh_token` / `expires_at` 外，还必须保留续期所需的 `uuid` / `first_keyfrom` / `latest_keyfrom`。
+
+续期请求使用 `POST /api/auth/refresh`，请求体还需上述三个身份字段；客户端版本 `clientVersion` 动态获取并缓存 12 小时，失败回退 `product.fallbackClientVersion`。登录 portal 与 `apiBase` 是两个不同域名，均由产品配置提供。
 
 ## 请求签名/鉴权
 
@@ -16,6 +18,12 @@ LobsterAI 登录/续期机制与其它 provider 不同（见 README.md），主�
 
 - `lobsterai`：Bearer access_token + `X-LobsterAI-Client-*` 头（**无签名**，也**不带**腾讯系归属头）
 - `lobsterai` 用独立的 `LobsteraiAdapter`（协议不同源，见项目概述）；它的产品配置是 `src/lobsterai-product.ts` 的 `LobsteraiProduct`，与 `BuddyProduct` **平行而非继承**
+
+## 模型目录与思考档位
+
+模型目录优先读取远端 `GET /api/models/available`（响应 `data` 直接是数组），失败时回退产品配置中的内置目录。目录请求必须带 `X-LobsterAI-Client-Capabilities`，否则上游会按能力过滤模型。`clientVersion` 运行时拉取并缓存 12 小时，失败回退 `fallbackClientVersion`。
+
+远端 `thinkingConfig.options[].level` 是思考档位的来源，请求字段为 `reasoning_effort`。只透传远端声明值，不补造档位；`off` 在部分模型上会返回 HTTP 500，因此不发送。`lobsterai_options` 能力协商与 reasoning effort 是两套协议字段。
 
 ## 积分领取（每日签到）
 

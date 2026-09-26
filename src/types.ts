@@ -532,7 +532,10 @@ export type RpcUpdateCheckRequest = Record<string, never>
 export interface RpcUpdateCheckResponse {
   currentSha: string
   latestSha: string
+  /** 最新 GitHub Release 的 tag 名（如 v0.2.0），供版本显示使用。 */
+  latestTag: string
   hasUpdate: boolean
+  /** Release 名称；Release 未设置名称时回退为 latestTag。 */
   latestTitle: string
 }
 

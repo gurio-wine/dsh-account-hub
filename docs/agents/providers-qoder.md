@@ -20,7 +20,20 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 ⚠️ **`machine_id` 读写用户真实 home**（`~/.qoder/.auth/machine_id` / `~/.qoder-cn/.auth/machine_id`），**与官方 CLI 同路径是刻意的**（混用时机器身份稳定，wasm 签名链才不失效）。**任何测试都必须注入 `homeDir`**，否则会污染用户环境；生产下 IO 失败退回内存态 UUID，**不抛错**。
 
-⚠️ **设备流与 PAT 写同一种凭据形态**（`access_token` = 令牌或 PAT），故 `refresh` / 额度 / 目录三条下游链路一行未改。⚠️⚠️ **但设备流没有「换令牌」这一步**（真机 400 根因）：`dt-…` 本身就是可用 Bearer，交给 PAT 专用的 `jobToken/exchange` 恒回 400；分派与 poll 判据详见 README。
+⚠️ **设备流与 PAT 写同一种凭据形态**（`access_token` = 令牌或 PAT），故 `refresh` / 额度 / 目录三条下游链路一行未改。⚠️⚠️ **但设备流没有「换令牌」这一步**（真机 400 根因）：`dt-…` 本身就是可用 Bearer，交给 PAT 专用的 `jobToken/exchange` 恒回 400；分派与 poll 判据见本节及下方「Qoder wasm 签名链」。
+
+## 凭据与端点速查
+
+Account Hub 当前只提供浏览器设备流登录；PAT 粘贴界面已移除，库层的 PAT 兼容分支仍保留。国际版账号池 ref 为 `QODER_ACCOUNT_<SHORTID>`，CN 为 `QODER_CN_ACCOUNT_<SHORTID>`；单凭据 ref 为 `QODER_PERSONAL_TOKEN`。两区凭据和账号池相互独立。凭据 JSON 保存 `access_token`、`refresh_token`、`token_expires_at` 与可选身份字段；设备流的 `dt-` 直接作为 Bearer，PAT 的 `pt-` 才需要换取运行时 `jt-`。
+
+| 用途 | 国际版 | Qoder CN |
+|---|---|---|
+| 授权页 | `https://qoder.com/device/selectAccounts` | `https://qoder.cn/device/selectAccounts` |
+| 设备令牌轮询 / 续期 | `openapi.qoder.sh/api/v1/deviceToken/{poll,refresh}` | `openapi.qoder.com.cn/api/v1/deviceToken/{poll,refresh}` |
+| PAT 换 job token | `openapi.qoder.sh/api/v1/jobToken/exchange` | `openapi.qoder.com.cn/api/v1/jobToken/exchange` |
+| 模型目录 | `api.qoder.com/api/v1/cloud/models` | `api.qoder.com.cn/api/v1/cloud/models` |
+| 额度 | `openapi.qoder.sh/api/v2/quota/usage` | `openapi.qoder.com.cn/api/v2/quota/usage` |
+| chat | `api2-v2.qoder.sh/model/v1/chat/completions` | 见下方 wasm 签名链，走 `gateway.qoder.com.cn` |
 
 ## Qoder 国际版（`qoder`）—— chat 250 的三条硬事实
 
@@ -44,11 +57,11 @@ Qoder 两区**两种登录形态并存**（`src/qoder-device-flow.ts`），由 `
 
 ⚠️ **构造要跑两段**：先用五个业务字段（`uid` / `security_oauth_token` / `organization_id` / `organization_tags` / `data_policy_agreed`）调 `generate_runtime_auth_fields` 拿 `{encrypt_user_info, key}`，再并进 `userInfoJson` 才 `qodercontext_new`；缺它 wasm 抛 ``missing field `encrypt_user_info` ``。**PAT 路径同样要跑**。⚠️ **wasm 是内联 base64 而非独立文件**（单条字面量 398 144 字符 → 298 606 字节，内联在 worker runtime）：抠取**按前缀定位、不写死偏移**，前缀用 5 字符 `AGFzb` 而非 `AGFzbQ`（第 6 字符由第 5 字节高位决定，写死它等于假设「wasm 版本恒为 1」）。
 
-**三级提取**（缓存是快路径，细节见 README）：① 本机已装 Qoder（`…/@qoder-ai/<包名>/dist/_worker/qoder-worker-runtime[.obf].mjs`，35 MB 上下）→ ② npm tarball → ③ 官方 CDN `…/qodercli-worker-runtime-win32-x64.tgz`。**每级提取后 SHA-256 校验，不匹配即当该级失败继续降级**（四来源同值 `6419471e…b43d`，298 606 B）。⚠️ 三个坑：国际版 npm `@qoder-ai/qoder-agent-sdk` **不含 worker**（由 ③ 兜住）；CN 包名是 `@qodercn-ai/qoderclicn`（**不是** `@qoder-ai/qoder-cn-agent-sdk`，后者 404）；CDN 平台 token 是 Go 风格 `win32-x64`（写 `windows-x64` 会 404）。**缓存** `~/.dsh/qoder-wasm/qoder_auth_wasm_bg.wasm`（原子替换），两区共用。**许可红线**：只做运行时提取，**不把 wasm 字节提交进仓库、不随插件包分发**。
+**三级提取**（缓存是快路径）：① 本机已装 Qoder（`…/@qoder-ai/<包名>/dist/_worker/qoder-worker-runtime[.obf].mjs`，35 MB 上下）→ ② npm tarball → ③ 官方 CDN `…/qodercli-worker-runtime-win32-x64.tgz`。**每级提取后 SHA-256 校验，不匹配即当该级失败继续降级**（四来源同值 `6419471e…b43d`，298 606 B）。⚠️ 三个坑：国际版 npm `@qoder-ai/qoder-agent-sdk` **不含 worker**（由 ③ 兜住）；CN 包名是 `@qodercn-ai/qoderclicn`（**不是** `@qoder-ai/qoder-cn-agent-sdk`，后者 404）；CDN 平台 token 是 Go 风格 `win32-x64`（写 `windows-x64` 会 404）。**缓存** `~/.dsh/qoder-wasm/qoder_auth_wasm_bg.wasm`（原子替换），两区共用。**许可红线**：只做运行时提取，**不把 wasm 字节提交进仓库、不随插件包分发**。
 
 **glue 是手写复刻的**（`src/qoder-wasm-glue.ts`）：官方那份内联在 35 MB worker 里，本插件不整体加载，故按取证的 31 个 import 语义重写。⚠️ **两个同名不同义的坑必须按完整名分派**：`__wbg_getRandomValues_*` / `__wbg_new_*` 各有变体（`new Uint8Array(len)` vs `new Map()`）。**未知 import 显式抛错**（塞空函数会让 wasm 深处以「签名算错」失败，难查得多）。
 
-**真机验证**（细节见 README）：① CN 签名路径 ✅ 200 + SSE 真内容、无 `101`；② 国际版同路径 ⚠️ 签名通过、业务 400（host `api1.qoder.sh`，`api2-v2` 404 ⇒ 协议可达、**参数待校准**）；③ 国际版大 body 字节墙 ⏸ 未测；④ **CN 接入适配器后三档全通过 —— ④才是「CN chat 可用」的证据**，①②只证明签名算子有效。
+**真机验证**：① CN 签名路径 ✅ 200 + SSE 真内容、无 `101`；② 国际版同路径 ⚠️ 签名通过、业务 400（host `api1.qoder.sh`，`api2-v2` 404 ⇒ 协议可达、**参数待校准**）；③ 国际版大 body 字节墙 ⏸ 未测；④ **CN 接入适配器后三档全通过 —— ④才是「CN chat 可用」的证据**，①②只证明签名算子有效。Qoder 签到调查与原始探针记录见 `docs/agents/qoder-undetermined-investigation.md`。
 
 ⚠️ **签名路径的帧是双层信封，不是裸 OpenAI chunk**：每帧是 `data:{"headers":{…},"body":"<内层 JSON 字符串>","statusCodeValue":200,…}` —— 内层**再 `JSON.parse` 一次**才是标准 chunk；收尾 `"body":"[DONE]"`（**`[DONE]` 也被包着**）。只认裸帧会让每帧都落进「`choices` 不是数组 ⇒ 跳过」，表现为 `Stream ended without [DONE]`，而 HTTP 与签名全是好的。剥离判据 `unwrapQoderFrame`：**`statusCodeValue` 是数字 + `body` 是字符串，两个都在**才当信封（只认 `body` 会误伤国际版裸帧，有反向断言）。夹具 `tests/unit/fixtures/qoder-cn-signed-sse.sse.txt` 是逐字节真机副本。
 
