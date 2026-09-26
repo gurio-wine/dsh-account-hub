@@ -25,8 +25,8 @@
 import * as React from 'react';
 
 import {
-  Button, DisclosureRow, IconApiOutlineRegular, IconBranchOutlineRegular, IconChevronDownOutlineRegular, Input,
-  Menu, Modal, Pill, RiskConfirmation, StateDot, Switch, Tag, Tooltip,
+  Button, DisclosureRow, IconApiOutlineRegular, IconBranchOutlineRegular, IconChevronDownOutlineRegular,
+  IconPlusOutlineRegular, Input, Menu, Modal, Pill, RiskConfirmation, StateDot, Switch, Tag, Tooltip,
 } from '@deepseek-ai/dsh-client-ui-primitives';
 
 import { supportsCreditBalance, supportsDailyCheckin } from './credits-capabilities.js';
@@ -2908,8 +2908,7 @@ function AutoRoutePanel({ rpcCall }) {
 
   return React.createElement('section', { className: 'dim-ah-arPage', 'aria-label': '自动路由配置' },
     React.createElement('div', { className: 'dim-ah-arHead' },
-      React.createElement('h2', { className: 'dim-ah-arTitle' }, '自动路由')),
-    React.createElement('div', { className: 'dim-ah-arSwitchRow' },
+      React.createElement('h2', { className: 'dim-ah-arTitle' }, '自动路由'),
       withHoverTitle(React.createElement(Switch, {
         checked: enabled,
         // 空列表时禁用：打开开关会把七个 provider 从 DSH 模型列表里隐藏，而自动路由
@@ -2919,7 +2918,13 @@ function AutoRoutePanel({ rpcCall }) {
         label: '启用自动路由',
         onChange: (next) => void toggleEnabled(next),
       }), AUTO_ROUTE_SWITCH_HELP),
-      React.createElement('span', { className: 'dim-ah-arSwitchLabel' }, '启用自动路由')),
+      withHoverTitle(React.createElement(Button, {
+        variant: 'outline',
+        size: 'sm',
+        className: 'dim-ah-iconBtn',
+        'aria-label': '添加自动模型',
+        onClick: addDefinition,
+      }, React.createElement(IconPlusOutlineRegular, { size: 16 })), '添加自动模型')),
     loadError !== null
       ? React.createElement('div', { className: 'dim-ah-arError', role: 'alert' },
           React.createElement('span', null, loadError),
@@ -2952,15 +2957,6 @@ function AutoRoutePanel({ rpcCall }) {
             React.createElement('p', null, '尚未配置自动模型'),
             React.createElement('p', null, '自动模型是一个暴露给 DSH 的模型名，背后是一串按顺序降级的候选。'))
         : React.createElement('div', { className: 'dim-ah-arList' }, draft.map(renderDefinition)),
-    // 修改即保存：不再有「保存」按钮与脏标记（与供应商面板的行为对齐），
-    // 保存失败的服务端消息仍在上方红字行提示。
-    React.createElement('div', { className: 'dim-ah-arSaveRow' },
-      React.createElement(Button, {
-        variant: 'outline',
-        size: 'sm',
-        className: 'dim-ah-btn-stable',
-        onClick: addDefinition,
-      }, '添加自动模型')),
     // 删除定义的确认弹窗（单条定义属轻量破坏，二键确认即可，不用勾选闸）。
     pendingDefinition !== null
       ? React.createElement(Modal, {

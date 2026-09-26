@@ -283,18 +283,12 @@ const STYLES = `
 
 /* ── 自动路由面板（左侧「自动路由」tab 的右侧内容） ──
    与 provider 面板**同处 .dim-ah-panel 容器**，故这里只需要面板内部的行排布：
-   头部、总开关行、卡片列表、卡片内的候选行、保存行。 */
+   标题与操作控件、卡片列表、卡片内的候选行。 */
 
-/* 面板头部：标题 + 「未保存」标记同一行。 */
+/* 面板头部：标题、总开关与添加入口同排，开关和加号紧随标题。 */
 .dim-ah-arHead { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
 .dim-ah-arTitle { margin: 0; font-size: var(--dsw-font-m-18-font-size); line-height: var(--dsw-font-m-18-line-height); font-weight: var(--dsw-font-m-18-font-weight); color: var(--dsw-alias-label-primary); }
 .dim-ah-arDirtyTag { font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); }
-
-/* 总开关行：Switch 外观归 ui-primitives，这里只把开关与标签排成一行。
-   开关**不**包在 label 里（点标签也会翻开关），故标签是独立的 span：
-   Switch 的可读名由它自己的 aria-label 提供，不依赖这个可见标签。 */
-.dim-ah-arSwitchRow { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
-.dim-ah-arSwitchLabel { font-size: var(--dsw-font-s-14-font-size); line-height: var(--dsw-font-s-14-line-height); color: var(--dsw-alias-label-primary); }
 
 /* 面板内的错误行（读取失败 / 保存被服务端拒绝）。
    红色走 token：错误不是品牌识别，故不使用任何品牌色豁免。 */
@@ -340,10 +334,6 @@ const STYLES = `
 
 /* 「添加模型」入口所在行。 */
 .dim-ah-arAddEntry { display: flex; align-items: center; gap: 8px; }
-
-/* 面板底部的保存行：添加与保存固定同行，保存右对齐。 */
-.dim-ah-arSaveRow { display: flex; flex-wrap: nowrap; align-items: center; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-l2); }
-.dim-ah-arSaveRow > :last-child { margin-left: auto; }
 
 /* 「自动路由」导航项的图标容器：与 .dim-ah-providerIcon 同形（尺寸 / 圆角 /
    投影都来自那一条），这里只换**背景色**。

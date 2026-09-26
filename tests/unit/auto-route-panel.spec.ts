@@ -38,7 +38,8 @@
  * ```
  *
  * ⚠️ 没有「保存」按钮、也没有脏标记：编辑**就是**保存动作，中间态只留在本地。
- * 面板唯一的底部按钮是「添加自动模型」；提交在途时由 `saving` 置灰卡片内的输入与按钮。
+ * 总开关与「添加自动模型」入口位于标题行；卡片内仍可添加候选，提交在途时由 `saving`
+ * 置灰卡片内的输入与候选按钮。
  */
 
 import { createRequire } from 'node:module'
@@ -322,6 +323,11 @@ const elementsOf = (node: unknown): ElementNode[] => flatten(node).filter(isElem
 /** 按可见文本找**按钮**节点（`type === 'button'`）。 */
 function findButtonByText(node: unknown, text: string): ElementNode | undefined {
   return elementsOf(node).find((el) => el.type === 'button' && textsOf(el).includes(text))
+}
+
+/** 按无障碍名称查找 icon-only 按钮。 */
+function findButtonByLabel(node: unknown, label: string): ElementNode | undefined {
+  return elementsOf(node).find((el) => el.type === 'button' && el.props['aria-label'] === label)
 }
 
 /**
@@ -660,6 +666,44 @@ describe('AutoRoutePanel：挂载与总开关', () => {
     expect(cardsOf(tree)).toHaveLength(2)
   })
 
+  it('标题行含唯一开关与加号入口，且均带可发现说明', async () => {
+    const { rpcCall } = makeRpc()
+    const tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
+    const header = elementsOf(tree).find((el) => el.props.className === 'dim-ah-arHead')
+    expect(header, '自动路由面板缺少标题行').toBeDefined()
+    const headerChildren = header!.children.filter(isElement)
+    expect(headerChildren, '标题、Switch、加号应在同一行').toHaveLength(3)
+    const heading = headerChildren.find((el) => el.type === 'h2')
+    expect(textsOf(heading!).join(''), '标题行 h2 文案错误').toBe('自动路由')
+    expect(textsOf(header!).join(''), 'Switch 不应额外渲染可见标签文字').toBe('自动路由')
+
+    const switchAnchor = headerChildren.find((el) => el.props['data-tooltip'] === AUTO_ROUTE_SWITCH_HELP)
+    expect(switchAnchor, '标题行总开关缺少原有悬停说明').toBeDefined()
+    expect(elementsOf(switchAnchor!).some((el) => el.props.role === 'switch'),
+      '标题行中找不到总开关').toBe(true)
+    expect(switchOf(tree).props['aria-label'], 'Switch label 应提供无障碍名称')
+      .toBe('启用自动路由')
+    expect(elementsOf(tree).filter((el) => el.props.role === 'switch'), '面板应只有一个开关')
+      .toHaveLength(1)
+
+    const addButton = findButtonByLabel(tree, '添加自动模型')
+    expect(addButton, '加号入口必须带「添加自动模型」无障碍名称').toBeDefined()
+    expect(addButton!.props.className, '加号按钮应采用方形图标按钮尺寸').toBe('dim-ah-iconBtn')
+    expect(textsOf(addButton!).join(''), '添加入口应为纯图标按钮').toBe('')
+    const addAnchor = headerChildren.find((el) => el.props['data-tooltip'] === '添加自动模型')
+    expect(addAnchor, '加号按钮缺少悬停说明').toBeDefined()
+    expect(elementsOf(addAnchor!).some((el) => el.props['aria-label'] === '添加自动模型'),
+      '加号按钮不在标题行内').toBe(true)
+
+    expect(elementsOf(tree).some((el) => el.props.className === 'dim-ah-arSwitchRow'),
+      '不应再渲染独立开关行').toBe(false)
+    expect(elementsOf(tree).some((el) => el.props.className === 'dim-ah-arSwitchLabel'),
+      '不应再渲染重复开关文字').toBe(false)
+    expect(elementsOf(tree).some((el) => el.props.className === 'dim-ah-arSaveRow'),
+      '不应再渲染底部添加行').toBe(false)
+    expect(findButtonByText(tree, '添加自动模型'), '底部文字按钮应已移除').toBeUndefined()
+  })
+
   it('关闭状态下面板主体仍可见可编辑（用户可以先配好再开）', async () => {
     const { rpcCall } = makeRpc({ config: { ...CONFIG, enabled: false } })
     const tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
@@ -667,7 +711,7 @@ describe('AutoRoutePanel：挂载与总开关', () => {
     // 关键：关闭**不是**禁用编辑器 —— 两张卡片、名称输入、两个添加按钮全在。
     expect(cardsOf(tree), '关闭状态下编辑器不该消失').toHaveLength(2)
     expect(nameInputOf(cardsOf(tree)[0]!).props.value).toBe('快速')
-    expect(findButtonByText(tree, '添加自动模型'), '关闭状态下仍应能添加自动模型').toBeDefined()
+    expect(findButtonByLabel(tree, '添加自动模型'), '关闭状态下仍应能添加自动模型').toBeDefined()
     expect(findButtonByText(tree, '添加模型'), '关闭状态下仍应能添加候选').toBeDefined()
   })
 
@@ -746,7 +790,7 @@ describe('AutoRoutePanel：草稿编辑（修改即保存）', () => {
   it('添加自动模型：新定义 name 为「自动模型 N」且不与已有定义重名', async () => {
     const { calls, rpcCall } = makeRpc()
     let tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
-    ;(findButtonByText(tree, '添加自动模型')!.props.onClick as () => void)()
+    ;(findButtonByLabel(tree, '添加自动模型')!.props.onClick as () => void)()
     tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
 
     const cards = cardsOf(tree)
@@ -764,7 +808,7 @@ describe('AutoRoutePanel：草稿编辑（修改即保存）', () => {
     const { rpcCall } = makeRpc()
     let tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
     const card = cardsOf(tree)[0]!
-    // 卡片内的「添加模型」按钮（面板底部那个叫「添加自动模型」，判据不同）。
+    // 卡片内的「添加模型」按钮；「添加自动模型」入口现位于标题行。
     ;(findButtonByText(card, '添加模型')!.props.onClick as () => void)()
     tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
 
@@ -1012,7 +1056,7 @@ describe('AutoRoutePanel：自动保存流（修改即保存）', () => {
   it('entries 为空的定义允许存在于草稿且**不触发提交**（中间态跳过，防线在服务端）', async () => {
     const { calls, rpcCall } = makeRpc()
     let tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
-    ;(findButtonByText(tree, '添加自动模型')!.props.onClick as () => void)()
+    ;(findButtonByLabel(tree, '添加自动模型')!.props.onClick as () => void)()
     for (let i = 0; i < 12; i++) await Promise.resolve()
     tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
     // 空 entries 的定义照样渲染出卡片与「添加模型」入口，没有任何前端拦截。
@@ -1306,8 +1350,11 @@ describe('AccountHubPage：左侧「自动路由」选项卡', () => {
     ;(autoRouteTab.props.onClick as () => void)()
     tree = await settle(client.AccountHubPage, panelProps(rpcCall), client.hooks)
 
-    const text = textsOf(tree).join('')
-    expect(text, '点击后应当渲染自动路由面板').toContain('启用自动路由')
+    const autoRoutePanel = elementsOf(tree)
+      .find((el) => el.props.className === 'dim-ah-arPage')
+    expect(autoRoutePanel, '点击后应当渲染自动路由面板').toBeDefined()
+    expect(switchOf(tree).props['aria-label'], '自动路由开关可读名缺失')
+      .toBe('启用自动路由')
     expect(
       elementsOf(tree).some((el) => el.type === 'section' && el.props['aria-label'] === '账号管理'),
       '切走后 provider 面板应卸载（不该留下账号管理 section）',
@@ -1328,15 +1375,8 @@ describe('AccountHubPage：左侧「自动路由」选项卡', () => {
     ;(tabsOf(tree).find((el) => textsOf(el).join('') === 'Buddy CN')!.props.onClick as () => void)()
     tree = await settle(client.AccountHubPage, panelProps(rpcCall), client.hooks)
 
-    const text = textsOf(tree).join('')
-    const buddyPanel = elementsOf(tree)
-      .find((el) => el.type === 'section' && el.props['aria-label'] === '账号管理')
-    expect(buddyPanel, '切回 provider 后 aria-label 应为纯「账号管理」').toBeDefined()
-    const buddyTitle = elementsOf(tree)
-      .find((el) => el.props.className === 'dim-ah-panelTitle')
-    expect(textsOf(buddyTitle!).join(''), '切回 provider 后 h2 应为纯「账号管理」')
-      .toBe('账号管理')
-    expect(text, '切回 provider 后自动路由面板应当卸载').not.toContain('启用自动路由')
+    expect(elementsOf(tree).some((el) => el.props.className === 'dim-ah-arPage'),
+      '切回 provider 后自动路由面板应当卸载').toBe(false)
   })
 
   /**
