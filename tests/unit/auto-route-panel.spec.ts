@@ -1294,7 +1294,13 @@ describe('AccountHubPage：左侧「自动路由」选项卡', () => {
   it('点击切到自动路由面板：provider 面板卸载、tab 变选中态、面板拉自己的配置', async () => {
     const { calls, rpcCall } = makeRpc()
     let tree = await settle(client.AccountHubPage, panelProps(rpcCall), client.hooks, true)
-    expect(textsOf(tree).join(''), '初始应当渲染 Codearts 面板').toContain('Codearts 账号管理')
+    const initialPanel = elementsOf(tree)
+      .find((el) => el.type === 'section' && el.props['aria-label'] === '账号管理')
+    expect(initialPanel, '初始 provider 面板 aria-label 应为纯「账号管理」').toBeDefined()
+    const initialTitle = elementsOf(tree)
+      .find((el) => el.props.className === 'dim-ah-panelTitle')
+    expect(textsOf(initialTitle!).join(''), 'provider 面板 h2 应为纯「账号管理」')
+      .toBe('账号管理')
 
     const autoRouteTab = tabsOf(tree).find((el) => textsOf(el).join('') === '自动路由')!
     ;(autoRouteTab.props.onClick as () => void)()
@@ -1302,7 +1308,10 @@ describe('AccountHubPage：左侧「自动路由」选项卡', () => {
 
     const text = textsOf(tree).join('')
     expect(text, '点击后应当渲染自动路由面板').toContain('启用自动路由')
-    expect(text, '切走后 provider 面板应当卸载（不该两个面板同时挂载）').not.toContain('Codearts 账号管理')
+    expect(
+      elementsOf(tree).some((el) => el.type === 'section' && el.props['aria-label'] === '账号管理'),
+      '切走后 provider 面板应卸载（不该留下账号管理 section）',
+    ).toBe(false)
     expect(
       tabsOf(tree).filter((el) => el.props['aria-selected'] === true).map((el) => textsOf(el).join('')),
       '自动路由 tab 应当变成选中态',
@@ -1320,7 +1329,13 @@ describe('AccountHubPage：左侧「自动路由」选项卡', () => {
     tree = await settle(client.AccountHubPage, panelProps(rpcCall), client.hooks)
 
     const text = textsOf(tree).join('')
-    expect(text).toContain('Buddy CN 账号管理')
+    const buddyPanel = elementsOf(tree)
+      .find((el) => el.type === 'section' && el.props['aria-label'] === '账号管理')
+    expect(buddyPanel, '切回 provider 后 aria-label 应为纯「账号管理」').toBeDefined()
+    const buddyTitle = elementsOf(tree)
+      .find((el) => el.props.className === 'dim-ah-panelTitle')
+    expect(textsOf(buddyTitle!).join(''), '切回 provider 后 h2 应为纯「账号管理」')
+      .toBe('账号管理')
     expect(text, '切回 provider 后自动路由面板应当卸载').not.toContain('启用自动路由')
   })
 

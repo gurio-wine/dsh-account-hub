@@ -50,7 +50,7 @@
  *
  *   - 真的渲染 `ProviderPanel` / `AccountHubPage`、真的派发点击、真的重渲染；
  *   - 八个 provider 逐个冒烟，点击必须**有反应**（浏览器登录 → 开窗）；
- *   - 面板标题必须取显示名而不是裸 id。
+ *   - 每个 provider 面板的 aria-label 与 h2 都统一为「账号管理」。
  *
  * 换句话说：再有人在 render 路径上写一个自由变量、或在某个 provider 分支上
  * 访问了不存在的字段，都会在这里以真机同一个异常炸出来。
@@ -561,7 +561,16 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     // 组标题在（且不是 tab：它是折叠控件，不是导航项）。
     expect(text).toContain('供应商')
     // 未选中的 provider 不该出现面板（`AccountHubPage` 只挂载 selected 那一个）。
-    expect(text).toContain('Codearts 账号管理')
+    const providerPanel = flatten(expanded)
+      .filter(isElement)
+      .find((el) => el.type === 'section' && el.props['aria-label'] === '账号管理')
+    expect(providerPanel, '选中的 provider section aria-label 应为纯「账号管理」').toBeDefined()
+    const providerTitle = flatten(expanded)
+      .filter(isElement)
+      .find((el) => el.props.className === 'dim-ah-panelTitle')
+    expect(textsOf(providerTitle!).join(''), 'provider 面板 h2 应为纯「账号管理」')
+      .toBe('账号管理')
+    expect(text).toContain('账号管理')
   })
 
   /**
@@ -602,7 +611,15 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     expect(tabsOf(collapsed), '折叠后 provider 导航项仍在树里（应为条件渲染，不是 display 隐藏）').toHaveLength(0)
     expect(groupTitleOf(collapsed)!.props['aria-expanded'], '折叠后 aria-expanded 不是 false').toBe(false)
     // 折叠**不是**选择：右栏仍是折叠前那一个（Codearts），没有被切走。
-    expect(textsOf(collapsed).join('')).toContain('Codearts 账号管理')
+    const collapsedPanel = flatten(collapsed)
+      .filter(isElement)
+      .find((el) => el.type === 'section' && el.props['aria-label'] === '账号管理')
+    expect(collapsedPanel, '折叠后右栏 aria-label 应仍为纯「账号管理」').toBeDefined()
+    const collapsedTitle = flatten(collapsed)
+      .filter(isElement)
+      .find((el) => el.props.className === 'dim-ah-panelTitle')
+    expect(textsOf(collapsedTitle!).join(''), '折叠后 provider h2 应仍为纯「账号管理」')
+      .toBe('账号管理')
   })
 
   it('逐个 provider 渲染面板并点击「登录账号」，一律不得抛错', async () => {
@@ -642,23 +659,21 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
     }
   })
 
-  it('每个 provider 的显示名都取自 PROVIDERS（面板标题不是裸 id）', async () => {
-    // 面板标题此前重复了三次 `PROVIDERS.find(...)?.label || provider` 内联表达式，
-    // 现已收敛到 providerLabel 一个绑定。这条断言同时守住收敛本身：
-    // 标题必须真的是**显示名**（Qoder、Buddy CN…），而不是 id。
-    const DISPLAY: Record<string, string> = {
-      codearts: 'Codearts',
-      'buddy-cn': 'Buddy CN',
-      buddy: 'Buddy',
-      lobsterai: 'LobsterAI',
-      'trae-cn': 'Trae CN',
-      qoder: 'Qoder',
-      'qoder-cn': 'Qoder CN',
-    }
+  it('每个 provider 的面板标题统一为「账号管理」，aria-label 与 h2 一致', async () => {
     for (const provider of ALL_PROVIDERS) {
       const { rpcCall } = makeRpc()
       const tree = await renderStable(client.ProviderPanel, { provider, rpcCall }, client.hooks)
-      expect(textsOf(tree).join(''), provider).toContain(`${DISPLAY[provider]} 账号管理`)
+      const section = flatten(tree)
+        .filter(isElement)
+        .find((el) => el.type === 'section' && el.props['aria-label'] === '账号管理')
+      expect(section, `${provider} section aria-label 应为纯「账号管理」`).toBeDefined()
+      const heading = flatten(tree)
+        .filter(isElement)
+        .find((el) => el.props.className === 'dim-ah-panelTitle')
+      expect(heading, `${provider} 缺少 panel title h2`).toBeDefined()
+      expect(heading!.type, `${provider} 标题不是 h2`).toBe('h2')
+      expect(textsOf(heading!).join(''), `${provider} h2 应为纯「账号管理」`)
+        .toBe('账号管理')
     }
   })
 })

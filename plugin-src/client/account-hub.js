@@ -761,7 +761,7 @@ function AccountCard({ account, index, order, onToggle, onDelete, busy, credits,
       React.createElement(Button, {
         variant: 'outline',
         size: 'sm',
-        className: 'dim-ah-btn-danger dim-ah-btn-stable',
+        className: 'dim-ah-btn-danger',
         onClick: () => onDelete(account.id),
       }, '删除')));
 }
@@ -2083,11 +2083,10 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
-  return React.createElement('section', { 'aria-label': `${providerLabel} 账号管理` },
+  return React.createElement('section', { 'aria-label': '账号管理' },
     React.createElement('div', { className: 'dim-ah-panelHead' },
       React.createElement('div', { className: 'dim-ah-panelTitleRow' },
-        React.createElement('h2', { className: 'dim-ah-panelTitle' },
-          `${providerLabel} 账号管理`),
+        React.createElement('h2', { className: 'dim-ah-panelTitle' }, '账号管理'),
         React.createElement('div', { className: 'dim-ah-panelTitleActions' },
           React.createElement(Button, {
             variant: 'outline',
@@ -2477,7 +2476,7 @@ function AutoRouteEntryRow({
     React.createElement(Button, {
       variant: 'outline',
       size: 'sm',
-      className: 'dim-ah-btn-danger dim-ah-btn-stable',
+      className: 'dim-ah-btn-danger',
       disabled: busy,
       onClick: () => onRemove(index),
     }, '删除'));
@@ -2874,7 +2873,7 @@ function AutoRoutePanel({ rpcCall }) {
         React.createElement(Button, {
           variant: 'outline',
           size: 'sm',
-          className: 'dim-ah-btn-danger dim-ah-btn-stable',
+          className: 'dim-ah-btn-danger',
           disabled: saving,
           onClick: () => setPendingDelete(def.id),
         }, '删除')),
@@ -2987,14 +2986,6 @@ function AutoRoutePanel({ rpcCall }) {
       : null);
 }
 
-/**
- * 「已是最新」提示的停留时长（毫秒）。
- *
- * 那是一次性反馈：既没有可操作项，也没有需要用户记住的信息。停留几秒后自动
- * 消失；若不自消失，页面顶部会永久挂着一条无信息量的通知行。
- */
-const UPDATE_LATEST_NOTICE_MS = 4000;
-
 /** commit sha 的展示形态：前 8 位（与 git 自己的短 sha 同款）。 */
 function shortSha(sha) {
   // 服务端契约保证是 40 位十六进制串；这里仍做形状防御 —— 提示行是纯展示，
@@ -3005,9 +2996,9 @@ function shortSha(sha) {
 /**
  * 页面级「检查更新 / 一键更新」提示行。
  *
- * 只有**需要用户看到**的相位才渲染：`idle`（含静默检查失败后的回落）与
- * `checking` 一律返回 null —— 挂载时的自动检查是静默的，用户没主动做任何事，
- * 不能因为一次后台请求失败就在页面顶部弹提示。
+ * 只有需要提示行承载的相位才渲染：`available` / `applying` / `applied` / `failed`。
+ * `idle`（含静默检查失败后的回落）、`checking` 与 `latest` 一律返回 null；
+ * `latest` 的轻量反馈由页面标题旁的 Tag 展示。
  *
  * 外观复用面板级通知行 `.dim-ah-probeNotice`（同一个 `data-tone` 取值域），
  * 不新造视觉；外层 `.dim-ah-updateBar` 只负责与 `.dim-ah-header` 同宽同内边距。
@@ -3018,9 +3009,7 @@ function UpdateNotice({ update, logOpen, onApply, onToggleLog }) {
   let role = 'status';
   let children = null;
 
-  if (update.phase === 'latest') {
-    children = [React.createElement('div', { key: 'latest' }, '已是最新')];
-  } else if (update.phase === 'available' || update.phase === 'applying') {
+  if (update.phase === 'available' || update.phase === 'applying') {
     // 「可更新」与「更新中」共用同一块版面：按钮**原地**从「立即更新」转成禁用的
     // 「更新中…」，位置不跳 —— 用户点下去之后视线不必重新找。
     const applying = update.phase === 'applying';
@@ -3089,8 +3078,6 @@ export function AccountHubPage({ rpcCall }) {
   const [update, setUpdate] = React.useState({ phase: 'idle' });
   /** 「查看完整日志」的展开态（apply 成功后才有意义）。 */
   const [updateLogOpen, setUpdateLogOpen] = React.useState(false);
-  /** 「已是最新」的自动消失定时器句柄；重新检查与卸载都要清掉。 */
-  const updateTimerRef = React.useRef(null);
   /** 卸载后不再 setState（异步检查 / 更新返回时组件可能已经不在了）。 */
   const updateAliveRef = React.useRef(true);
   /**
@@ -3107,21 +3094,12 @@ export function AccountHubPage({ rpcCall }) {
     setVersion(v => v + 1);
   };
 
-  /** 取消「已是最新」的自动消失定时器（重新检查、开始更新、卸载三处都要）。 */
-  const clearUpdateTimer = () => {
-    if (updateTimerRef.current !== null) {
-      clearTimeout(updateTimerRef.current);
-      updateTimerRef.current = null;
-    }
-  };
-
   /**
    * 检查更新。**失败静默**是本方法的性质，不是某一处的选择：挂载时的自动检查
    * 尤其不能打扰用户 —— 他没有主动做任何事，一次后台请求失败不该在页面顶部留提示。
    * 故失败只写一条 console.warn 并回落到 idle（提示行随之消失）。
    */
   const checkUpdate = async () => {
-    clearUpdateTimer();
     setUpdate({ phase: 'checking' });
     let res;
     try {
@@ -3143,12 +3121,8 @@ export function AccountHubPage({ rpcCall }) {
       return;
     }
 
-    // 「已是最新」停留几秒后自动消失：它是一次性反馈，没有可操作项。
+    // 无更新时保留 latest 状态；标题旁的 Tag 直到用户再次检查才切换。
     setUpdate({ phase: 'latest', currentSha: res?.currentSha });
-    updateTimerRef.current = setTimeout(() => {
-      updateTimerRef.current = null;
-      if (updateAliveRef.current) setUpdate({ phase: 'idle' });
-    }, UPDATE_LATEST_NOTICE_MS);
   };
 
   /**
@@ -3157,7 +3131,6 @@ export function AccountHubPage({ rpcCall }) {
    * 不做二次包装或改写。
    */
   const applyUpdate = async () => {
-    clearUpdateTimer();
     setUpdateLogOpen(false);
     // 保留 available 相位里的 latestTitle / sha：更新中的提示行要继续显示它在装哪个版本。
     setUpdate(prev => ({ ...prev, phase: 'applying' }));
@@ -3184,7 +3157,7 @@ export function AccountHubPage({ rpcCall }) {
    * 挂载后自动**静默**检查一次：只在真有更新时才出现提示行。
    *
    * deps 为空 ⇒ 整页生命周期内只跑一次。切 provider 不会重跑：`AccountHubPage`
-   * 自己不重挂载（重挂载的是右侧面板）。cleanup 清掉定时器并置「已卸载」——
+   * 自己不重挂载（重挂载的是右侧面板）。cleanup 标记「已卸载」——
    * 异步结果回来时组件可能已经不在了，那时 setState 是纯浪费。
    */
   React.useEffect(() => {
@@ -3192,14 +3165,17 @@ export function AccountHubPage({ rpcCall }) {
     void checkUpdate();
     return () => {
       updateAliveRef.current = false;
-      clearUpdateTimer();
     };
   }, []);
 
   return React.createElement('section', { className: 'dim-ah-page', 'aria-label': '账号中心' },
     React.createElement('header', { className: 'dim-ah-header' },
       React.createElement('div', { className: 'dim-ah-brand' },
-        React.createElement('strong', { className: 'dim-ah-brandName' }, '账号中心'),
+        React.createElement('div', { className: 'dim-ah-brandTitleRow' },
+          React.createElement('strong', { className: 'dim-ah-brandName' }, '账号中心'),
+          update.phase === 'latest'
+            ? React.createElement(Tag, { tone: 'success' }, '已是最新')
+            : null),
         React.createElement('p', { className: 'dim-ah-brandDesc' }, 'Provider 凭据管理与多账号支持')),
       // 「检查更新」：更新的是**插件自身**，与任何 provider 都无关，故入口在页面
       // 顶部（header 右侧）而不是某个面板的标题行里 —— 七个面板各挂一个只会得到
@@ -3210,7 +3186,7 @@ export function AccountHubPage({ rpcCall }) {
         size: 'sm',
         className: 'dim-ah-iconBtn',
         'aria-label': '检查更新',
-        // 检查中 / 更新中禁止重复触发；结果一律由下面的提示行给出。
+        // 检查中 / 更新中禁止重复触发；latest 用标题旁标签表示，其余结果走下方提示行。
         disabled: update.phase === 'checking' || update.phase === 'applying',
         onClick: () => void checkUpdate(),
       }, React.createElement('span', { 'aria-hidden': 'true' }, '⇩'))),

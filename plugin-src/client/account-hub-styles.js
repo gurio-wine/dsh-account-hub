@@ -40,6 +40,7 @@ const STYLES = `
 .dim-ah-page { display: flex; flex-direction: column; height: 100%; color: var(--dsw-alias-label-primary); }
 .dim-ah-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--dsw-alias-border-l2); }
 .dim-ah-brand { display: flex; flex-direction: column; }
+.dim-ah-brandTitleRow { display: flex; align-items: center; gap: 8px; }
 .dim-ah-brandName { font-size: var(--dsw-font-base-strong-16-font-size); line-height: var(--dsw-font-base-strong-16-line-height); font-weight: var(--dsw-font-base-strong-16-font-weight); color: var(--dsw-alias-label-primary); }
 .dim-ah-brandDesc { font-size: var(--dsw-font-xs-13-font-size); line-height: var(--dsw-font-xs-13-line-height); color: var(--dsw-alias-label-secondary); margin: 2px 0 0; }
 
@@ -181,7 +182,7 @@ const STYLES = `
 .dim-ah-iconGlyph[data-loading="true"] { animation: dim-ah-icon-spin 1s linear infinite; }
 @keyframes dim-ah-icon-spin { to { transform: rotate(360deg); } }
 /* 状态文案变化时固定文本操作按钮的最小宽度。 */
-.dim-ah-btn-stable { min-width: 112px; }
+.dim-ah-btn-stable { min-width: max-content; }
 
 /* 标题行放置全部图标操作（模型列表 / 刷新积分 / 一键签到 / 登录账号）。
    面板上已无任何文字操作按钮，故标题行之下不再有操作区。 */
@@ -316,8 +317,8 @@ const STYLES = `
 .dim-ah-arCard[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -6px; height: 3px; border-radius: 2px; background: var(--dsw-alias-brand-primary); }
 
 /* 卡片头：拖拽柄 + 序号 + 名称输入 + 条目数 + 删除；输入框优先压缩。 */
-.dim-ah-arCardHead { display: grid; grid-template-columns: 16px max-content minmax(0, 1fr) max-content 112px; align-items: center; gap: 8px; }
-.dim-ah-arCardHead[data-drag-enabled="false"] { grid-template-columns: max-content minmax(0, 1fr) max-content 112px; }
+.dim-ah-arCardHead { display: grid; grid-template-columns: 16px max-content minmax(0, 1fr) max-content max-content; align-items: center; gap: 8px; }
+.dim-ah-arCardHead[data-drag-enabled="false"] { grid-template-columns: max-content minmax(0, 1fr) max-content max-content; }
 /* 序号徽标：与账号卡片的 .dim-ah-accountOrder 同义（顺序即降级顺序），
    但这里显示的是**定义**序号，故另起一个类名而不是复用。 */
 .dim-ah-arOrder { min-width: 18px; padding: 0 5px; border-radius: 6px; font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); font-weight: var(--dsw-font-xxxs-strong-11-font-weight); text-align: center; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-module-platform); }
@@ -327,9 +328,9 @@ const STYLES = `
 
 /* 候选列表（卡片内），间距按 12/8/4 节奏收敛。 */
 .dim-ah-arEntries { display: grid; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-l2); }
-/* 一条候选：拖拽柄 + 三个等宽下拉 + 固定宽度删除列。 */
-.dim-ah-arEntryRow { position: relative; display: grid; grid-template-columns: 16px repeat(3, minmax(0, 1fr)) 112px; align-items: center; gap: 8px; padding: 4px; border-radius: 8px; transition: background var(--ds-transition-duration-fast) var(--ds-ease-in-out), opacity var(--ds-transition-duration-fast) var(--ds-ease-in-out); }
-.dim-ah-arEntryRow[data-drag-enabled="false"] { grid-template-columns: repeat(3, minmax(0, 1fr)) 112px; }
+/* 一条候选：拖拽柄 + 三个等宽下拉 + 按删除钮内容自适应的末列。 */
+.dim-ah-arEntryRow { position: relative; display: grid; grid-template-columns: 16px repeat(3, minmax(0, 1fr)) max-content; align-items: center; gap: 8px; padding: 4px; border-radius: 8px; transition: background var(--ds-transition-duration-fast) var(--ds-ease-in-out), opacity var(--ds-transition-duration-fast) var(--ds-ease-in-out); }
+.dim-ah-arEntryRow[data-drag-enabled="false"] { grid-template-columns: repeat(3, minmax(0, 1fr)) max-content; }
 .dim-ah-arEntryRow:hover { background: var(--dsw-alias-bg-layer-2); }
 .dim-ah-arEntryRow[data-dragging="true"] { opacity: 0.4; border-style: dashed; }
 .dim-ah-arEntryRow[data-dropBefore="true"]::before { content: ''; position: absolute; left: 0; right: 0; top: -4px; height: 2px; border-radius: 2px; background: var(--dsw-alias-brand-primary); }

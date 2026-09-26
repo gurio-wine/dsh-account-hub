@@ -14,7 +14,7 @@
  *
  * - 挂载后**自动静默**检查一次；只有真有更新时才出现提示行（含 commit 标题、
  *   新 sha 前 8 位、primary 的「立即更新」）；
- * - 无更新显示「已是最新」短提示，且不再显示「立即更新」；
+ * - 无更新时品牌标题旁显示「已是最新」Tag，不再显示整行提示，且不出现「立即更新」；
  * - 点「立即更新」→ 按钮原地转**禁用**的「更新中…」→ 成功后显示
  *   「已更新到 <sha8>，建议重启会话生效」+ 可展开的完整日志；
  * - apply 失败显示**服务端原始 message**（红字错误档）；
@@ -301,6 +301,19 @@ function updateBarOf(node: unknown): ElementNode | undefined {
       && el.props.className.includes('dim-ah-updateBar'))
 }
 
+/** latest 反馈必须是品牌标题行内的成功 Tag，而不是页面级提示行。 */
+function latestTagOf(node: unknown): ElementNode | undefined {
+  const titleRow = flatten(node)
+    .filter(isElement)
+    .find((el) => el.props.className === 'dim-ah-brandTitleRow')
+  if (titleRow === undefined) return undefined
+  return flatten(titleRow)
+    .filter(isElement)
+    .find((el) => el.type === 'span'
+      && el.props['data-tone'] === 'success'
+      && textsOf(el).join('') === '已是最新')
+}
+
 /**
  * 渲染驱动器：反复「渲染 → 跑 effect → 排空微任务」，直到没有 setState 排队。
  *
@@ -404,6 +417,7 @@ describe('页面级「检查更新 / 一键更新」', () => {
 
     const bar = updateBarOf(tree)
     expect(bar, '有更新时没有渲染更新提示行').toBeDefined()
+    expect(latestTagOf(tree), '发现更新时应由 available 提示行取代 latest Tag').toBeUndefined()
     const text = textsOf(bar!).join('')
     expect(text, '提示行里没有 commit 标题').toContain(LATEST_TITLE)
     expect(text, `提示行里没有新 commit 的前 8 位（${SHA_NEW.slice(0, 8)}）`)
@@ -415,7 +429,7 @@ describe('页面级「检查更新 / 一键更新」', () => {
     expect(apply!.props.disabled, '可更新态的「立即更新」不该被禁用').not.toBe(true)
   })
 
-  it('无更新时显示「已是最新」短提示，且不出现「立即更新」', async () => {
+  it('无更新时标题旁显示「已是最新」Tag，不出现提示行或「立即更新」', async () => {
     const { calls, rpcCall } = makeUpdateRpc({
       check: async () => ({
         hasUpdate: false, currentSha: SHA_OLD, latestSha: SHA_OLD, latestTitle: '',
@@ -425,10 +439,25 @@ describe('页面级「检查更新 / 一键更新」', () => {
     const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
 
     expect(countOf(calls, 'update.check'), '挂载后没有自动检查更新').toBe(1)
-    const bar = updateBarOf(tree)
-    expect(bar, '无更新时应当短暂显示「已是最新」提示').toBeDefined()
-    expect(textsOf(bar!).join(''), '无更新时没有「已是最新」文案').toContain('已是最新')
+    const titleRow = flatten(tree)
+      .filter(isElement)
+      .find((el) => el.props.className === 'dim-ah-brandTitleRow')
+    expect(titleRow, '页面 header 缺少品牌标题行').toBeDefined()
+    expect(textsOf(titleRow!).join(''), 'Tag 未显示在「账号中心」标题旁')
+      .toContain('账号中心已是最新')
+    const tag = latestTagOf(tree)
+    expect(tag, '无更新时标题旁没有「已是最新」Tag').toBeDefined()
+    expect(tag!.props['data-tone'], 'Tag 应使用低调的成功色调').toBe('success')
+    expect(updateBarOf(tree), '无更新时不应渲染整行更新提示').toBeUndefined()
     expect(findButtonByText(tree, '立即更新'), '无更新时不该出现「立即更新」按钮').toBeUndefined()
+
+    // 用户手动点击 ⇩ 走同一检查状态机，latest Tag 应再次显示。
+    ;(findButtonByLabel(tree, '检查更新')!.props.onClick as () => void)()
+    const manuallyCheckedTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    expect(countOf(calls, 'update.check'), '手动检查没有复用 update.check').toBe(2)
+    expect(latestTagOf(manuallyCheckedTree), '手动检查无更新后标题旁没有 Tag').toBeDefined()
+    expect(updateBarOf(manuallyCheckedTree), '手动检查无更新后不应渲染整行提示')
+      .toBeUndefined()
   })
 
   it('点「立即更新」：按钮转禁用的「更新中…」，成功后显示重启提示与可展开日志', async () => {
