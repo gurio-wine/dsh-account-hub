@@ -384,23 +384,11 @@ function textsOf(node: unknown): string[] {
   return node.children.flatMap(textsOf)
 }
 
-/** 按可见文本找一个节点（用于拿按钮的 onClick）。 */
-function findByText(node: unknown, text: string): ElementNode | undefined {
-  return flatten(node).filter(isElement).find((el) => textsOf(el).includes(text))
-}
-
-/**
- * 按可见文本找**按钮**节点。
- *
- * 不能直接用 {@link findByText}：外层 `section` / `div` 的子树里同样含这段
- * 文本，而它们**没有** `onClick` —— 那会拿到一个 `props.onClick === undefined`
- * 的容器，点击断言变成 `TypeError: onClick is not a function`（本文件第一版
- * 就是这么失败的），与要验的自由变量毫无关系。
- */
-function findButtonByText(node: unknown, text: string): ElementNode | undefined {
+/** 按钮入口通过可访问名称查找，图标不依赖可见文字。 */
+function findButtonByLabel(node: unknown, label: string): ElementNode | undefined {
   return flatten(node)
     .filter(isElement)
-    .find((el) => el.type === 'button' && textsOf(el).includes(text))
+    .find((el) => el.type === 'button' && el.props['aria-label'] === label)
 }
 
 /**
@@ -411,11 +399,9 @@ function findButtonByText(node: unknown, text: string): ElementNode | undefined 
  *
  * 每次渲染都经 `hooks.__renderComponent`，让面板拿到属于它自己的 hooks 槽位。
  *
- * ⚠️ 返回值是**展开后**的树（`expandTree`）：面板的按钮现在经 ui-primitives 的
- * `Button` / `Tooltip` 渲染，展开前它们在树上只是 `Tooltip` / `Button` 这些
- * **组件类型**，而 `findButtonByText` 的判据是 `el.type === 'button'` ——
- * 一个都找不到。迁移前按钮是字面量 `'button'`，不展开也能找到，这个保真度
- * 缺口当时不可见。
+ * ⚠️ 返回值是**展开后**的树（`expandTree`）：ui-primitives 的 `Button` / `Tooltip`
+ * 在展开前只是函数组件，展开后才有宿主 `button` 节点；图标按钮再通过
+ * `aria-label` 定位，避免依赖可见文字。
  */
 async function renderStable(
   Component: (props: Record<string, unknown>) => unknown,
@@ -449,7 +435,6 @@ const constValueOf = (name: string): string => {
   expect(match, `account-hub.js 里找不到常量 ${name}`).not.toBeNull()
   return match![1]!
 }
-const MODEL_LIST_HELP = constValueOf('MODEL_LIST_HELP')
 const RETEST_ALL_HELP = constValueOf('RETEST_ALL_HELP')
 const RESET_ALL_HELP = constValueOf('RESET_ALL_HELP')
 
@@ -479,7 +464,7 @@ describe('「登录账号」点击后 Hub 白屏（真机首跑暴露的自由�
         client.hooks,
       )
 
-      const button = findButtonByText(tree, '登录账号')
+      const button = findButtonByLabel(tree, '登录账号')
       expect(button, '面板里找不到「登录账号」按钮').toBeDefined()
 
       const onClick = button!.props.onClick as () => void
@@ -509,7 +494,7 @@ describe('「登录账号」点击后 Hub 白屏（真机首跑暴露的自由�
       for (const provider of ['qoder', 'qoder-cn']) {
         const { rpcCall } = makeRpc()
         const tree = await renderStable(client.ProviderPanel, { provider, rpcCall }, client.hooks)
-        const button = findButtonByText(tree, '登录账号')
+        const button = findButtonByLabel(tree, '登录账号')
         expect(button, `${provider} 缺少「登录账号」按钮`).toBeDefined()
 
         const before = windowStub.opened.length
@@ -648,7 +633,7 @@ describe('整页渲染与逐面板冒烟（Hub 白屏类缺陷的通盘闸门）
         expect(() => expandTree(tree, client.hooks), `${provider} 渲染抛错`).not.toThrow()
 
         // 每个面板都有自己的登录入口，故按钮一律必须存在且能点。
-        const button = findButtonByText(tree, '登录账号')
+        const button = findButtonByLabel(tree, '登录账号')
         expect(button, `${provider} 缺少「登录账号」按钮`).toBeDefined()
         const openedBefore = windowStub.opened.length
         const onClick = button!.props.onClick as () => void
@@ -726,24 +711,20 @@ describe('面板按钮集合（渲染级）', () => {
     return { calls, rpcCall }
   }
 
-  /** 渲染树里全部 button 的可见文案。 */
-  const buttonTexts = (tree: unknown): string[] =>
-    flatten(expandTreeStub(tree))
-      .filter(isElement)
-      .filter((el) => el.type === 'button')
-      .map((el) => textsOf(el).join(''))
-      .filter((t) => t !== '')
-
   /** `expandTree` 需要 hooks 实例，这里包一层省得每处都传。 */
   const expandTreeStub = (tree: unknown): unknown => expandTree(tree, client.hooks)
 
-  it('供应商级按钮是「模型列表 / 重测所有 / 清除限额 / 登录账号」，旧文案一个不留', async () => {
+  it('供应商级操作保留可访问名称，限额操作仍显示文字', async () => {
     const { rpcCall } = makeRpcWithAccount()
     const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    const texts = buttonTexts(tree)
-    // 逐个点名本轮改名后的四个按钮。
-    for (const label of ['模型列表', '重测所有', '清除限额', '登录账号']) {
-      expect(texts, `头部按钮缺少「${label}」`).toContain(label)
+    const buttons = flatten(expandTreeStub(tree)).filter(isElement).filter((el) => el.type === 'button')
+    const labels = buttons.map((el) => el.props['aria-label']).filter((label) => typeof label === 'string')
+    const texts = buttons.map((el) => textsOf(el).join('')).filter((text) => text !== '')
+    for (const label of ['模型列表', '刷新积分', '一键签到', '登录账号']) {
+      expect(labels, `缺少图标按钮可访问名称「${label}」`).toContain(label)
+    }
+    for (const text of ['重测所有', '清除限额']) {
+      expect(texts, `限额操作缺少文字「${text}」`).toContain(text)
     }
     // 旧文案不得出现在任何按钮上。
     for (const stale of ['显示列表', '重置所有', '+ 新建账号']) {
@@ -751,7 +732,7 @@ describe('面板按钮集合（渲染级）', () => {
     }
   })
 
-  it('账号卡片上只剩 签到 / 停用 / 删除，单账号「重测」「重置」已移除', async () => {
+  it('账号卡片签到使用图标，停用与删除仍显示文字', async () => {
     const { rpcCall } = makeRpcWithAccount()
     const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
     const expanded = expandTree(tree, client.hooks)
@@ -763,12 +744,14 @@ describe('面板按钮集合（渲染级）', () => {
     const inCard = flatten(card!)
       .filter(isElement)
       .filter((el) => el.type === 'button')
-      .map((el) => textsOf(el).join(''))
-    // buddy-cn 支持签到 ⇒ 卡片上是这三个。
-    expect(inCard.sort()).toEqual(['停用', '删除', '签到'])
-    // 关键：单账号的清理入口确实没了（它们现在只在头部、且是 all 版本）。
-    expect(inCard).not.toContain('重测')
-    expect(inCard).not.toContain('重置')
+    expect(inCard.map((el) => textsOf(el).join('')).filter((text) => text !== '✉').sort())
+      .toEqual(['停用', '删除'])
+    const checkin = inCard.find((el) => el.props['aria-label'] === '签到')
+    expect(checkin, '未签到账号应显示信封图标入口').toBeDefined()
+    expect(textsOf(checkin!)).toEqual(['✉'])
+    // 关键：单账号的清理入口确实没了（它们现在只在标题下、且是 all 版本）。
+    expect(inCard.map((el) => textsOf(el).join(''))).not.toContain('重测')
+    expect(inCard.map((el) => textsOf(el).join(''))).not.toContain('重置')
   })
 
   it('卡片不再接收 onRetest / onReset（没有死 prop）', async () => {
@@ -786,13 +769,13 @@ describe('面板按钮集合（渲染级）', () => {
 /**
  * 控件与样式迁移的**通盘闸门**（纯展示层迁移，零功能变更）。
  *
- * 迁移把全部交互控件换成 ui-primitives、把全部颜色换成 design token。这里钉死
- * 三件最容易「改一半」的事：
+ * 控件仍由 ui-primitives 提供；样式保留 design token，并支持清单指定的白底黑字图标例外。
+ * 这里钉死三件最容易「改一半」的事：
  *
  * 1. 原生表单控件归零（`<select>` / `<input>` / `confirm()`）—— 少改一处，
  *    深色主题下就会露出一块系统配色的白板或一个浏览器自绘的对话框；
- * 2. 样式表里不再有十六进制颜色（品牌色豁免除外）与死 token；
- * 3. 悬停提示文案**一条都不能丢**（它们承载「这个按钮做什么」与各档含义）。
+ * 2. 样式表不使用十六进制颜色，且不再引用死 token；
+ * 3. 清单指定的图标按钮与拖拽手柄 Tooltip 删除、保留项按精简文案显示。
  *
  * 这些是源码级断言，与上面那些渲染级断言互补：渲染级证明「树长成什么样」，
  * 源码级证明「没有任何遗漏的分支」（渲染只覆盖被渲染到的那几条路径）。
@@ -828,29 +811,29 @@ describe('控件与样式迁移（源码级通盘闸门）', () => {
     }
   })
 
-  it('悬停提示文案一条都没丢（迁移前挂在原生 title 上）', () => {
-    // 迁移前这些字符串是 `title:` 的值；现在挂在 Tooltip 上，**内容必须逐字相同**。
-    for (const text of [
-      '拖动以调整顺序（顺序即自动选号优先级）',
-      '自动选号优先级',
-      '已启用',
-      '已停用',
-      MODEL_LIST_HELP,
-      RETEST_ALL_HELP,
-      RESET_ALL_HELP,
-      '通过浏览器登录一个新的账号并加入账号池。',
-      '重新查询本页全部账号的剩余积分（Credits Balance）。余额由服务端实时计算，点此可刷新。',
-    ]) {
-      expect(clientCode, `悬停提示文案丢失：${text}`).toContain(text)
-    }
-    // 逐档说明（迁移前是 `<option title>`）也仍在：它经 withHoverTitle 挂在菜单项上。
+  it('按钮与拖拽手柄 Tooltip 按清单精简，其余提示保留', () => {
+    expect(RETEST_ALL_HELP).toBe('重测全部账号限流状态（消耗少量额度）')
+    expect(RESET_ALL_HELP).toBe('清除全部账号限流标记')
+    expect(clientCode).toContain("'aria-label': '模型列表'")
+    expect(clientCode).toContain("'aria-label': '刷新积分'")
+    expect(clientCode).toContain("'aria-label': '登录账号'")
+    expect(clientCode).not.toContain('MODEL_LIST_HELP')
+    expect(clientCode).not.toContain('自动选号优先级')
+    expect(clientCode).not.toContain('拖动以调整自动模型顺序')
+    expect(clientCode).not.toContain('拖动以调整候选顺序（顺序即降级顺序）')
+    expect(clientCode).not.toContain('通过浏览器登录一个新的账号并加入账号池。')
+    expect(clientCode).not.toContain('重新查询本页全部账号的剩余积分（Credits Balance）。余额由服务端实时计算，点此可刷新。')
+    // 状态点、自动路由开关与菜单选项自己的简短提示保留。
+    expect(clientCode).toContain("withHoverTitle(React.createElement(StateDot")
+    expect(clientCode).toContain('开启后「自动路由」出现在 DSH 模型列表，其它 provider 从列表隐藏')
     expect(clientCode).toContain('withHoverTitle(React.createElement(\'span\', null, option.label), option.hint)')
   })
 
-  it('样式表不再有硬编码颜色与死 token', () => {
-    // 唯一的例外是七条 providerIcon 的品牌白底（品牌识别，不属主题体系），
-    // 它们用的是 `white` 关键字而不是十六进制 —— 故「非注释行无 #hex」成立。
+  it('样式表无十六进制颜色且不含死 token', () => {
+    // providerIcon 保留品牌白底；清单指定的图标按钮也使用 white / black 关键字，
+    // 两类例外都不使用十六进制色值。
     expect(styleCode).not.toMatch(/#[0-9a-fA-F]{3,8}\b/)
+    expect(styleCode).toContain('background: white; color: black;')
     // 两个曾经存在的死 token：浏览器取 fallback，主题切换时永不跟随。
     expect(styleCode).not.toContain('--dsw-alias-border-default')
     expect(styleCode).not.toContain('--dsw-font-mono')

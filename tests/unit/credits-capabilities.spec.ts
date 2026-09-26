@@ -435,11 +435,12 @@ describe('Hub 面板 UI 调整包（源码级回归）', () => {
     expect(source).not.toContain("'重置所有'")
   })
 
-  it('⑤ 文案改为「模型列表」与「登录账号」', () => {
-    expect(source).toContain("}, '模型列表')")
-    expect(source).toContain("creating ? '正在登录…' : '登录账号'")
-    // 空列表的引导文案与错误前缀同步（否则会指向一个不存在的按钮名）。
-    expect(source).toContain("'点击\"登录账号\"进行浏览器登录。'")
+  it('⑤ 图标入口通过 aria-label 保留「模型列表」与「登录账号」可访问名称', () => {
+    expect(source).toContain("'aria-label': '模型列表'")
+    expect(source).toContain("'aria-label': '登录账号'")
+    expect(source).toContain('disabled: creating')
+    // 空列表的引导文案与错误前缀仍指向可访问名称。
+    expect(source).toContain('点击"登录账号"进行浏览器登录。')
     expect(source).toContain("setError('登录失败：'")
     // 旧文案不得残留在**代码**里。只查非注释行：文件里保留了叙述历史改名的
     // 注释（「旧文案『+ 新建账号』」），注释提及旧名是合理且有益的。
@@ -538,7 +539,7 @@ describe('客户端积分请求门控（源码级回归）', () => {
     // ⚠️ 判据是「按能力门控渲染**一个按钮**」而不是「那个按钮是原生 'button'」：
     // 控件已换成 ui-primitives 的 `Button` 组件，但门控本身没变（仍是
     // `canLoadCredits ? 渲染 : null`）。断言跟门控走，不跟控件实现走。
-    expect(normalized).toMatch(/canLoadCredits\s*\n\s*\? withHoverTitle\(React\.createElement\(Button/)
+    expect(normalized).toMatch(/canLoadCredits\s*\n\s*\? React\.createElement\(Button/)
     expect(normalized).toContain('showCredits: canLoadCredits')
     // AccountCard 必须真的消费 showCredits，否则传了也没用
     const cardStart = normalized.indexOf('function AccountCard(')
@@ -564,12 +565,10 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     // AccountCard 收到 showCheckin / onCheckin 两个新 prop。
     expect(normalized).toContain('showCheckin: supportsCredits')
     expect(normalized).toContain('onCheckin: (id) => void checkinAccount(id)')
-    // 按钮按门控渲染（showCheckin ? 渲染 : null）。控件已换成 ui-primitives 的
-    // `Button`，且外面套了一层 `withHoverTitle`（悬停提示改走 Tooltip 原语）——
-    // 门控本身没变，断言跟门控走。
-    expect(normalized).toMatch(/showCheckin\s*\n?\s*\? withHoverTitle\(React\.createElement\(Button/)
-    // 三态文案机。
-    expect(normalized).toContain('checkedIn ? \'已签\' : checkingThisAccount ? \'签到中…\' : \'签到\'')
+    // 按钮按门控直接渲染为图标 Button，不再包 Tooltip。
+    expect(normalized).toMatch(/showCheckin\s*\n?\s*\? React\.createElement\(Button/)
+    expect(normalized).toContain("checkedIn ? '✓' : checkingThisAccount ? '◐' : '✉'")
+    expect(normalized).toContain("'aria-label': checkedIn ? '已签到' : checkingThisAccount ? '签到中' : '签到'")
     // disabled 三态：busy（面板忙碌）|| 已签 || 正在签到。
     expect(normalized).toContain('disabled: busy || checkedIn || checkingThisAccount')
   })
@@ -615,7 +614,7 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     const allCheckedInBody = normalized.slice(allCheckedInStart, normalized.indexOf(';', allCheckedInStart))
     expect(allCheckedInBody, '`suppressed` 混进了「全部已签」的判据').not.toContain('suppressed')
     // 单片按钮的三态文案与禁用条件都不读 `suppressed`。
-    expect(normalized).toContain("checkedIn ? '已签' : checkingThisAccount ? '签到中…' : '签到'")
+    expect(normalized).toContain("checkedIn ? '✓' : checkingThisAccount ? '◐' : '✉'")
     expect(normalized).toContain('disabled: busy || checkedIn || checkingThisAccount')
   })
 
@@ -688,26 +687,20 @@ describe('自动签到客户端 UI（源码级回归）', () => {
     expect(normalized).toContain('claimingRef.current = true;')
   })
 
-  it('头部按钮文案改为「一键签到」，全签显示「全部已签」并禁用', () => {
-    expect(normalized).not.toContain(": '一键领取积分'")
-    expect(normalized).toContain(": '一键签到')")
-    // 三态文案机。
-    expect(normalized).toContain("'签到中…' : allCheckedIn ? '全部已签' : '一键签到'")
+  it('头部一键签到以信封/进行中/勾选图标显示状态，全签时禁用', () => {
+    expect(normalized).toContain("claiming ? '◐' : allCheckedIn ? '✓' : '✉'")
+    expect(normalized).toContain("'aria-label': claiming ? '一键签到进行中' : allCheckedIn ? '全部已签' : '一键签到'")
     // 全签时禁用。
     expect(normalized).toContain('disabled: claiming || accounts.length === 0 || allCheckedIn')
     // allCheckedIn 派生：列表非空且每账号 checkedInToday 全 true。
     expect(normalized).toContain('accounts.every(a => checkinsByAccount[a.id]?.checkedInToday === true)')
   })
 
-  it('头部「一键签到」用 primary 按钮，成功语义靠文案而非私有绿色变体', () => {
-    // ⚠️ 迁移前这里是 `'data-kind': 'success'` + 样式表里的 `#22c55e` 私有绿色。
-    // ui-primitives 的 Button 只有 primary / ghost / outline / toolbar 四种变体，
-    // **没有** success —— 给它造一个私有变体就等于在插件里重开一套配色，正是本次
-    // 迁移要消除的东西。故成功/进行中/已全签三态由**文案**表达（见上一条），
-    // 按钮取 primary。
+  it('头部签到按钮保持 outline 图标样式，不以状态文案占宽', () => {
     expect(normalized).not.toContain("'data-kind': 'success'")
     expect(normalized).not.toContain("'data-kind': 'primary'")
-    expect(normalized).toContain("variant: 'primary'")
+    expect(normalized).toContain("variant: 'outline'")
+    expect(normalized).toContain('className: `dim-ah-iconBtn${claiming || allCheckedIn ?')
   })
 
   it('样式表不再自绘按钮配色（一律走 ui-primitives 的 Button + design token）', () => {

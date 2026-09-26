@@ -364,15 +364,12 @@ describe('能力矩阵驱动的积分行为在客户端不被 qoder 特判', () 
     // 故面板不会渲染签到按钮 —— 那是矩阵的事，不是面板里再写一条 if。
     expect(normalized).toContain('const canLoadCredits = supportsCreditBalance(provider);')
     expect(normalized).toContain('const supportsCredits = supportsDailyCheckin(provider);')
-    // 签到按钮按矩阵渲染。控件已随 UI 迁移换成 ui-primitives 的 `Button`，且外面
-    // 套了一层 `withHoverTitle`（悬停提示改走 Tooltip 原语）—— 门控本身一个字符
-    // 没变，断言跟门控走：`supportsCredits ? withHoverTitle(<Button …>) : null`。
-    // 末尾那半段钉死它**就是签到按钮**（而不是门控后渲染的任意一个 Button）：
-    // 点击回调必须是 `claimCredits`，文案必须是三态机里的那一个。
+    // 签到按钮按矩阵直接渲染 ui-primitives 的图标 Button，不再包 Tooltip。
+    // 点击回调仍必须是 claimCredits，状态由信封、进行中与勾选图标表达。
     expect(normalized).toMatch(
-      /supportsCredits\s*\n\s*\? withHoverTitle\(React\.createElement\(Button, \{[\s\S]*?onClick: \(\) => void claimCredits\(\)/,
+      /supportsCredits\s*\n\s*\? React\.createElement\(Button, \{[\s\S]*?onClick: \(\) => void claimCredits\(\)/,
     )
-    expect(normalized).toContain("claiming ? '签到中…' : allCheckedIn ? '全部已签' : '一键签到'")
+    expect(normalized).toContain("claiming ? '◐' : allCheckedIn ? '✓' : '✉'")
   })
 
   it('两个 Qoder region 走**同一条**能力矩阵路径（CN 不新增任何客户端分支）', () => {

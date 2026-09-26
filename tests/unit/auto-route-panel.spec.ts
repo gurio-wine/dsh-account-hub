@@ -363,7 +363,6 @@ const constValueOf = (name: string): string => {
   return match![1]!
 }
 const AUTO_ROUTE_SWITCH_HELP = constValueOf('AUTO_ROUTE_SWITCH_HELP')
-const AUTO_ROUTE_SWITCH_EMPTY_HELP = constValueOf('AUTO_ROUTE_SWITCH_EMPTY_HELP')
 const AUTO_ROUTE_EFFORT_NONE_HELP = constValueOf('AUTO_ROUTE_EFFORT_NONE_HELP')
 const AUTO_ROUTE_EFFORT_LOADING_HELP = constValueOf('AUTO_ROUTE_EFFORT_LOADING_HELP')
 
@@ -546,6 +545,8 @@ function dragEvent(clientY: number) {
       setData(type: string, value: string) { this.data[type] = value },
     },
     currentTarget: { getBoundingClientRect: () => rect },
+    propagationStopped: false,
+    stopPropagation() { this.propagationStopped = true },
     preventDefault() { this.prevented++ },
   }
 }
@@ -706,51 +707,29 @@ describe('AutoRoutePanel：挂载与总开关', () => {
     expect(switchOf(tree).props['aria-checked'], '失败后开关不该停在「已关」').toBe(true)
   })
 
-  it('总开关带悬停说明，讲清「隐藏 ≠ 删除」与隐藏范围', async () => {
+  it('总开关保留精简悬停说明', async () => {
     const { rpcCall } = makeRpc()
     const tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
-    // 说明挂在 Switch 外面的 tipWrap 锚点上（Switch 是函数组件，ref 进不去）。
     const anchor = elementsOf(tree).find((el) => el.props['data-tooltip'] === AUTO_ROUTE_SWITCH_HELP)
     expect(anchor, '总开关缺少悬停说明').toBeDefined()
-    // 文案必须点明「本插件其它供应商从列表隐藏但面板仍可编辑」这层语义。
-    expect(AUTO_ROUTE_SWITCH_HELP).toContain('隐藏')
-    expect(AUTO_ROUTE_SWITCH_HELP).toContain('仍可编辑')
-    // 「自动路由」要出现在列表里 —— 这条与「隐藏」是一对：少了它，用户会以为
-    // 打开开关等于把模型列表清空。
-    expect(AUTO_ROUTE_SWITCH_HELP).toContain('自动路由')
-    // ⚠️ 反向锚点：不得再出现「只显示」这种**过强**表述。门控只管本插件自己注册的
-    // 适配器，DSH 内置 provider 与其它插件的供应商照旧显示 —— 旧文案那句承诺永远
-    // 不可能成立，留着它就是一句会让用户以为「内置模型也没了」的谎言。
-    expect(AUTO_ROUTE_SWITCH_HELP).not.toContain('只显示')
-    expect(AUTO_ROUTE_SWITCH_HELP).toContain('DSH 内置')
+    expect(AUTO_ROUTE_SWITCH_HELP).toBe('开启后「自动路由」出现在 DSH 模型列表，其它 provider 从列表隐藏')
   })
 
-  it('空列表时总开关禁用并给出「先添加自动模型」说明（空列表 + 开开关 = 模型列表全空）', async () => {
-    // 空列表 + 打开开关：本插件七个 provider 被门控隐藏，自动路由又没有模型可暴露
-    // ⇒ DSH 模型列表一个分组都不剩。开关必须在源头挡住，并说清原因。
+  it('空列表时总开关禁用，但提示仍为精简说明', async () => {
     const { rpcCall } = makeRpc({ config: { enabled: false, models: [] } })
     const tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
 
     expect(switchOf(tree).props.disabled, '一个自动模型都没有时开关必须禁用').toBe(true)
-    // 说明换成空列表专用的那一句（不是常规的「开启后…」）。
-    const emptyAnchor = elementsOf(tree).find((el) => el.props['data-tooltip'] === AUTO_ROUTE_SWITCH_EMPTY_HELP)
-    expect(emptyAnchor, '空列表时开关缺少「先添加至少一个自动模型」说明').toBeDefined()
-    expect(AUTO_ROUTE_SWITCH_EMPTY_HELP).toBe('先添加至少一个自动模型，再开启开关')
-    const normalAnchor = elementsOf(tree).find((el) => el.props['data-tooltip'] === AUTO_ROUTE_SWITCH_HELP)
-    expect(normalAnchor, '空列表时不该再挂常规说明（两句会互相矛盾）').toBeUndefined()
+    expect(elementsOf(tree).some((el) => el.props['data-tooltip'] === AUTO_ROUTE_SWITCH_HELP)).toBe(true)
     // ⚠️ 刻意**不点**这个开关：真 DOM 里 disabled 的 button 不派发 click，而替身把
     // onClick 原样接上了 —— 点它只能测出替身的行为，测不出「用户点不动」。
-    // 可断言的事实就是 disabled 本身（宿主 Switch 把它落到原生 button 上）。
   })
 
-  it('列表非空时开关可用、说明仍是常规那一句（空列表专用说明不误挂）', async () => {
+  it('列表非空时开关可用且仍挂同一条精简说明', async () => {
     const { rpcCall } = makeRpc()
     const tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
     expect(switchOf(tree).props.disabled, '有自动模型时开关必须可用').toBe(false)
-    const normalAnchor = elementsOf(tree).find((el) => el.props['data-tooltip'] === AUTO_ROUTE_SWITCH_HELP)
-    expect(normalAnchor, '非空列表应当挂常规说明').toBeDefined()
-    const emptyAnchor = elementsOf(tree).find((el) => el.props['data-tooltip'] === AUTO_ROUTE_SWITCH_EMPTY_HELP)
-    expect(emptyAnchor, '非空列表不该挂空列表专用说明').toBeUndefined()
+    expect(elementsOf(tree).some((el) => el.props['data-tooltip'] === AUTO_ROUTE_SWITCH_HELP)).toBe(true)
   })
 })
 
@@ -1125,6 +1104,50 @@ describe('AutoRoutePanel：拖拽排序', () => {
     // 而不是把取值改掉了。
     expect(after[0]!.model, '搬过来的是整条候选（含模型与档位）').toBe('glm-5')
     expect(after[0]!.effort, '档位跟着候选一起搬').toBe('high')
+  })
+
+  it('候选行拖拽会阻止冒泡：父定义卡不得覆盖 entry 的 drag 状态', async () => {
+    const { rpcCall } = makeRpc()
+    const props = panelProps(rpcCall)
+    let tree = await settle(client.AutoRoutePanel, props, client.hooks, true)
+    const card = cardsOf(tree)[1]!
+    const sourceRow = rowsInCard(card)[0]!
+
+    // 原生 DOM 会把事件从候选行冒泡到定义卡；候选行必须在此处截断。
+    const start = dragEvent(150)
+    ;(sourceRow.props.onDragStart as (event: DragEvent) => void)(start)
+    if (!start.propagationStopped) {
+      ;(card.props.onDragStart as (event: DragEvent) => void)(start)
+    }
+    expect(start.propagationStopped, '候选行 dragstart 必须阻止冒泡').toBe(true)
+
+    tree = await settle(client.AutoRoutePanel, props, client.hooks)
+    const afterStartCard = cardsOf(tree)[1]!
+    expect(rowsInCard(afterStartCard)[0]!.props['data-dragging'], '源候选行应进入 dragging 态').toBe('true')
+    expect(afterStartCard.props['data-dragging'], '父定义卡不得接管 entry 拖拽').toBeUndefined()
+
+    const targetRow = rowsInCard(afterStartCard)[1]!
+    const over = dragEvent(160)
+    ;(targetRow.props.onDragOver as (event: DragEvent) => void)(over)
+    if (!over.propagationStopped) {
+      ;(afterStartCard.props.onDragOver as (event: DragEvent) => void)(over)
+    }
+    expect(over.propagationStopped, '候选行 dragover 必须阻止冒泡').toBe(true)
+    expect(over.prevented, '候选行 dragover 必须允许浏览器 drop').toBe(1)
+
+    tree = await settle(client.AutoRoutePanel, props, client.hooks)
+    const afterOverCard = cardsOf(tree)[1]!
+    expect(rowsInCard(afterOverCard)[1]!.props['data-dropAfter']).toBe('true')
+
+    const drop = dragEvent(160)
+    const afterOverTarget = rowsInCard(afterOverCard)[1]!
+    ;(afterOverTarget.props.onDrop as (event: DragEvent) => void)(drop)
+    if (!drop.propagationStopped) {
+      ;(afterOverCard.props.onDrop as (event: DragEvent) => void)(drop)
+    }
+    tree = await settle(client.AutoRoutePanel, props, client.hooks)
+    expect(entryValuesOf(cardsOf(tree)[1]!).map((entry) => entry.provider), '冒泡路径 drop 后候选顺序应翻转')
+      .toEqual(['codearts', 'dsh'])
   })
 
   it('只有一张卡片 / 一行候选时不启用拖拽（拖了也无处可落）', async () => {

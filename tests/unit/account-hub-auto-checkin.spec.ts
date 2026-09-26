@@ -308,13 +308,6 @@ function textsOf(node: unknown): string[] {
   return node.children.flatMap(textsOf)
 }
 
-/** 按可见文本找**按钮**（容器节点也有同一段文本，但它们没有 onClick）。 */
-function findButtonByText(node: unknown, text: string): ElementNode | undefined {
-  return flatten(node)
-    .filter(isElement)
-    .find((el) => el.type === 'button' && textsOf(el).includes(text))
-}
-
 interface AccountRow {
   id: string
   nickname: string
@@ -509,7 +502,7 @@ describe('宿主旁路抑制（undetermined 退避）被自动补签尊重', () 
       .toHaveLength(0)
   })
 
-  it('抑制态**不**等于「已签」：按钮仍显示「签到」且可点（不得画成已签）', async () => {
+  it('抑制态不等于「已签」：按钮仍显示信封图标且可点', async () => {
     const rpc = makeRpc({
       accountsMode: 'ok',
       checkedIn: { [defaultAccount.id]: false },
@@ -523,8 +516,11 @@ describe('宿主旁路抑制（undetermined 退避）被自动补签尊重', () 
     // ⚠️ 核心断言：被抑制的账号**照旧显示「签到」**、按钮可点。把它画成「已签」
     // 就是「qoder 假签到」的界面形态 —— 用户看到已签，而它可能一分没领，
     // 且按钮永久禁用、再也点不动。
-    const checkinButton = findButtonByText(expanded, '签到')
-    expect(checkinButton, '被抑制的账号被画成了「已签」（按钮文案不是「签到」）').toBeDefined()
+    const checkinButton = flatten(expanded)
+      .filter(isElement)
+      .find((el) => el.type === 'button' && el.props['aria-label'] === '签到')
+    expect(checkinButton, '被抑制的账号应保留“签到”入口').toBeDefined()
+    expect(textsOf(checkinButton!), '未签到入口应显示信封图标').toEqual(['✉'])
     expect(checkinButton!.props.disabled, '被抑制的账号按钮被禁用了（应当仍可手动点）').toBeFalsy()
     // 反向锚点：不得出现「已签」。
     expect(textsOf(expanded).join('')).not.toContain('已签')
@@ -597,7 +593,9 @@ describe('「被挡」必须与「没跑」可区分（宿主 busy 语义的客�
       )
       // ⚠️ 必须 expand：账号卡片是函数组件，不展开就只能看到 `<AccountCard/>` 这个
       // 元素本身，按钮（以及它的 onClick）根本不在树上。
-      const button = findButtonByText(expandTree(tree, client.hooks), '签到')
+      const button = flatten(expandTree(tree, client.hooks))
+        .filter(isElement)
+        .find((el) => el.type === 'button' && el.props['aria-label'] === '签到')
       expect(button, '面板里找不到单账号「签到」按钮').toBeDefined()
 
       const before = performCallsOf(rpc).length

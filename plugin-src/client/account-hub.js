@@ -228,20 +228,8 @@ function formatTime(ts) {
 // 两个**供应商级**限流标记操作的 hover 帮助文案。抽成常量以便按钮与说明共用。
 // 单账号的「重测 / 重置」按钮已按用户要求从账号卡片移除（入口只在供应商级），
 // 故 `RETEST_HELP` / `RESET_HELP` 一并删除。
-const RETEST_ALL_HELP = '对本页全部账号（含已停用）执行「重测」：'
-  + '逐个模型真实发送一条最小消息，正常返回才清除标记。停用账号同样会发送。会消耗模型额度。';
-const RESET_ALL_HELP = '直接清除本页全部账号（含已停用）的「限额重置」标记，不发送任何请求。';
-
-/**
- * 「模型列表」按钮的说明。
- *
- * 措辞必须讲清两点，否则用户会以为关掉开关就等于删除模型：
- * - 关闭只是**从对话框的模型选择里隐藏**，模型本身仍然存在、可随时再打开；
- * - 采用黑名单制，没被关掉的模型（含服务端后续新增的）默认都是打开的。
- */
-const MODEL_LIST_HELP = '列出该 Provider 的全部模型。每个模型后面的开关默认打开；'
-  + '关闭后，该模型不再出现在对话框的模型选择列表里（黑名单制：只有被关闭的才隐藏，'
-  + '其余含服务端新增的模型一律默认显示）。此设置持久化保存，可随时重新打开。';
+const RETEST_ALL_HELP = '重测全部账号限流状态（消耗少量额度）';
+const RESET_ALL_HELP = '清除全部账号限流标记';
 
 /** 把一次重测/重置的响应汇总成一行可读文案。 */
 function summarizeProbe(kind, res) {
@@ -709,16 +697,14 @@ function AccountCard({ account, index, order, onToggle, onDelete, busy, credits,
       // 抓取柄 + 序号：序号即自动选号优先级，让「拖到第一位」的含义明确 ——
       // 顺序不是装饰，它直接决定下一个请求用哪个账号（见 account-order.js）。
       dragProps.enabled
-        ? withHoverTitle(React.createElement('span', {
+        ? React.createElement('span', {
             className: 'dim-ah-dragHandle',
             'aria-hidden': 'true',
-          }, '⠿'), '拖动以调整顺序（顺序即自动选号优先级）')
+          }, '⠿')
         : null,
       dragProps.enabled
-        ? withHoverTitle(
-            React.createElement('span', { className: 'dim-ah-accountOrder' },
-              String((order ?? index ?? 0) + 1)),
-            '自动选号优先级')
+        ? React.createElement('span', { className: 'dim-ah-accountOrder' },
+            String((order ?? index ?? 0) + 1))
         : null,
       // 状态点：绿=已启用、灰=已停用（`StateDot` 的 done / idle 两档）。
       // 迁移前是一个自绘的 8px 圆点 + `title`；现在两者都来自设计体系，
@@ -763,9 +749,11 @@ function AccountCard({ account, index, order, onToggle, onDelete, busy, credits,
       : null,
     React.createElement('div', { className: 'dim-ah-accountActions' },
       showCheckin
-        ? withHoverTitle(React.createElement(Button, {
+        ? React.createElement(Button, {
             variant: 'outline',
             size: 'sm',
+            className: `dim-ah-iconBtn${checkedIn || checkingThisAccount ? '' : ' dim-ah-iconBtn-light'}`,
+            'aria-label': checkedIn ? '已签到' : checkingThisAccount ? '签到中' : '签到',
             // `busy` 是面板级忙碌 —— 由调用方传入，`ProviderPanel` 已把它算成
             // `probeBusy || claiming`（重测/清除限额 **或** 签到进行中）。
             // ⚠️ 此前它**不含**签到本身：一键签到或自动补签在跑时，单片按钮看起来
@@ -774,8 +762,7 @@ function AccountCard({ account, index, order, onToggle, onDelete, busy, credits,
             // 与面板级 `claiming` 是两个维度，两个都要判。
             disabled: busy || checkedIn || checkingThisAccount,
             onClick: () => onCheckin(account.id),
-          }, checkedIn ? '已签' : checkingThisAccount ? '签到中…' : '签到'),
-          checkedIn ? '今日已签到' : `为 ${account.nickname || account.id} 执行每日签到`)
+          }, checkedIn ? '✓' : checkingThisAccount ? '◐' : '✉')
         : null,
       React.createElement(Button, {
         variant: 'outline',
@@ -785,7 +772,7 @@ function AccountCard({ account, index, order, onToggle, onDelete, busy, credits,
       React.createElement(Button, {
         variant: 'outline',
         size: 'sm',
-        className: 'dim-ah-btn-danger',
+        className: 'dim-ah-btn-danger dim-ah-btn-stable',
         onClick: () => onDelete(account.id),
       }, '删除')));
 }
@@ -1155,7 +1142,7 @@ function ModelListPanel({ provider, rpcCall, onClose }) {
     phase === 'error'
       ? React.createElement('div', { className: 'dim-ah-empty' },
           React.createElement('p', null, error),
-          React.createElement(Button, { variant: 'outline', size: 'sm', onClick: () => void load() }, '重新读取'))
+          React.createElement(Button, { variant: 'outline', size: 'sm', className: 'dim-ah-btn-stable', onClick: () => void load() }, '重新读取'))
       : phase === 'loading'
         ? React.createElement('div', { className: 'dim-ah-empty' }, '正在读取模型列表…')
         : all.length === 0
@@ -1199,65 +1186,21 @@ const CONSUMPTION_SWITCH_OPTIONS = [
  */
 const CONSUMPTION_DEFAULTS = { order: 'round-robin', switch: 'per-turn' };
 
-/**
- * 一个选择器的悬停提示（原生 `title`，本文件统一做法）。
- *
- * 界面上**没有**可见的设置名与解释文案（用户明确要求只留两个下拉），所以
- * 「这个下拉是干什么的 + 每一档什么意思」必须靠悬停补齐：首行是设置名与用途，
- * 其后每档一行。`title` 里的 `\n` 由浏览器渲染成换行。
- */
-function consumptionTooltip(label, purpose, options) {
-  return [`${label}：${purpose}`]
-    .concat(options.map(option => `· ${option.label}：${option.hint}`))
-    .join('\n');
-}
-
-/**
- * 一个选择器（一个 `Menu` 下拉）。
- *
- * ## 为什么不再用原生 `<select>`
- *
- * 迁移前是原生 `<select>`：收起时省地方、自带键盘与读屏语义，但**展开的列表
- * 由浏览器自绘**，样式完全不受主题控制（`option` 的背景/文字色改不动），
- * 在 DSH 的深色主题下会露出一块系统配色的白板。`Menu` 是 ui-primitives 的
- * 自绘下拉（anchor + open + items 模型），颜色全走 token。
- *
- * ## 无障碍：语义按「选择器」重建，可读名一个不丢
- *
- * 原生 select 的可读名**只能**来自 `aria-label`（界面上刻意没有可见标签，
- * 见下），故这里把它原样移到 Menu 的锚点按钮上；`title` 上那条
- * 「设置名 + 用途 + 每一档含义」的悬停提示改挂 `Tooltip`（文案原样保留，
- * 见 `consumptionTooltip`）。每档自己的说明（`option.hint`）继续挂在
- * 该档的菜单项上 —— 迁移前它是 `<option title>`，展开时逐档可见。
- *
- * ⚠️ `Menu` 的锚点必须是**单个**元素（它经 `cloneElement` 注入 ref 与事件），
- * 故锚点是一个自带 `aria-label` / `aria-haspopup` / `aria-expanded` 的按钮，
- * 外面再套 `Tooltip`。
- *
- * ⚠️ **受控组件**：当前档只由 `value`（宿主权威值）决定，选中动作只回调
- * `onSelect`。这与迁移前的 `<select value=… onChange=…>` 逐字同义 ——
- * 本地先翻会让「宿主拒绝写入」看起来像成功了。
- *
- * ⚠️ `Menu` 的 `open` 状态由本组件自己持有（原语要求 owner 控制）：这是纯
- * 展示层的开合，不参与任何业务状态；`onClose` 也只在原语要求关闭时把
- * 它置回 false。
- */
-function ConsumptionSelect({ name, label, purpose, options, value, busy, onSelect }) {
+function ConsumptionSelect({ name, label, options, value, busy, onSelect }) {
   const [open, setOpen] = React.useState(false);
   const current = options.find(option => option.value === value);
   const items = options.map(option => ({
     id: option.value,
-    // 每档自己也有说明：展开列表时逐档看得到（收起时的整体说明见锚点的悬停提示）。
+    // 每档自己的说明仍挂在菜单项上，展开列表时逐档可见。
     label: withHoverTitle(React.createElement('span', null, option.label), option.hint),
   }));
   return React.createElement('div', { className: 'dim-ah-consumptionGroup', 'data-name': name },
-    withHoverTitle(React.createElement(Menu, {
+    React.createElement(Menu, {
       open,
       anchor: React.createElement(Button, {
         variant: 'outline',
         size: 'sm',
         className: 'dim-ah-consumptionSelect',
-        // 可读名只来自这里（见上）：界面上没有可见标签。
         'aria-label': label,
         'aria-haspopup': 'menu',
         'aria-expanded': open,
@@ -1270,7 +1213,7 @@ function ConsumptionSelect({ name, label, purpose, options, value, busy, onSelec
       onSelect: (id) => { setOpen(false); onSelect(id); },
       onClose: () => setOpen(false),
       align: 'start',
-    }), consumptionTooltip(label, purpose, options)));
+    }));
 }
 
 /**
@@ -1278,13 +1221,12 @@ function ConsumptionSelect({ name, label, purpose, options, value, busy, onSelec
  *
  * ## 版面
  *
- * 与账号卡片同宽、各占一半（`flex: 1 1 0` 见 `account-hub-styles.js`），
- * 由 `ProviderPanel` 放在账号卡片列表**之前** —— 那个位置是一个无 class 的裸
- * `<div>`，宽度天然与卡片一致，故这里不需要任何宽度计算。
+ * 与账号卡片同处一列，两个下拉按最长选项文案固定宽度，保持并排且不随选中项漂移。
+ * 由 `ProviderPanel` 放在账号卡片列表**之前** —— 它与账号区同处一个容器。
  *
  * ⚠️ 界面上**刻意没有**可见的设置名、解释文案与外框：需求是「就两个下拉」。
- * 下拉与账号卡片之间也不再有任何提示段落（原先那条排序提示已删除）。设置名与
- * 各档含义只在悬停提示（select 的 `title`）里，可读名在 `aria-label` 里。
+ * 下拉与账号卡片之间也不再有任何提示段落（原先那条排序提示已删除）。设置名通过
+ * `aria-label` 提供；各档说明仅在展开的菜单选项中显示。
  *
  * ## 为什么是受控组件 + 不做乐观更新
  *
@@ -1307,7 +1249,6 @@ function ConsumptionSelectors({ value, busy, onChange }) {
     React.createElement(ConsumptionSelect, {
       name: 'order',
       label: '消耗顺序',
-      purpose: '在这个顺序上怎么取号',
       options: CONSUMPTION_ORDER_OPTIONS,
       value: order,
       busy,
@@ -1316,7 +1257,6 @@ function ConsumptionSelectors({ value, busy, onChange }) {
     React.createElement(ConsumptionSelect, {
       name: 'switch',
       label: '切换粒度',
-      purpose: '什么时候重新选号',
       options: CONSUMPTION_SWITCH_OPTIONS,
       value: switchMode,
       busy,
@@ -2199,63 +2139,65 @@ function ProviderPanel({ provider, rpcCall }) {
   };
 
   return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
-    // 标题与按钮分开成两块（而不是同一行的 space-between）：操作按钮多达 5 个，
-    // 与面板标题挤在一行时既会被压缩又会溢出。标题独占一行、按钮组另起一行
-    // 并允许换行，窄面板下也能完整显示。
     React.createElement('div', { className: 'dim-ah-panelHead' },
-      React.createElement('h2', { className: 'dim-ah-panelTitle' },
-        `${providerLabel} 账号管理`),
+      React.createElement('div', { className: 'dim-ah-panelTitleRow' },
+        React.createElement('h2', { className: 'dim-ah-panelTitle' },
+          `${providerLabel} 账号管理`),
+        React.createElement('div', { className: 'dim-ah-panelTitleActions' },
+          React.createElement(Button, {
+            variant: 'outline',
+            size: 'sm',
+            className: 'dim-ah-iconBtn',
+            'aria-label': '模型列表',
+            onClick: () => setShowModels(true),
+          }, React.createElement('span', { 'aria-hidden': 'true' }, '☰')),
+          canLoadCredits
+            ? React.createElement(Button, {
+                variant: 'outline',
+                size: 'sm',
+                className: 'dim-ah-iconBtn',
+                'aria-label': '刷新积分',
+                disabled: creditsLoading,
+                onClick: () => void loadCredits(),
+              }, React.createElement('span', {
+                className: 'dim-ah-iconGlyph',
+                'data-loading': creditsLoading ? 'true' : undefined,
+                'aria-hidden': 'true',
+              }, '⟳'))
+            : null,
+          supportsCredits
+            ? React.createElement(Button, {
+                variant: 'outline',
+                size: 'sm',
+                className: `dim-ah-iconBtn${claiming || allCheckedIn ? '' : ' dim-ah-iconBtn-light'}`,
+                'aria-label': claiming ? '一键签到进行中' : allCheckedIn ? '全部已签' : '一键签到',
+                disabled: claiming || accounts.length === 0 || allCheckedIn,
+                onClick: () => void claimCredits(),
+              }, React.createElement('span', { 'aria-hidden': 'true' }, claiming ? '◐' : allCheckedIn ? '✓' : '✉'))
+            : null,
+          React.createElement(Button, {
+            variant: 'outline',
+            size: 'sm',
+            className: 'dim-ah-iconBtn dim-ah-iconBtn-light',
+            'aria-label': '登录账号',
+            onClick: () => void createAccount(),
+            disabled: creating,
+          }, React.createElement('span', { 'aria-hidden': 'true' }, '＋')))),
       React.createElement('div', { className: 'dim-ah-headerActions' },
         withHoverTitle(React.createElement(Button, {
           variant: 'outline',
           size: 'sm',
-          onClick: () => setShowModels(true),
-        }, '模型列表'), MODEL_LIST_HELP),
-        canLoadCredits
-          ? withHoverTitle(React.createElement(Button, {
-              variant: 'outline',
-              size: 'sm',
-              disabled: creditsLoading,
-              onClick: () => void loadCredits(),
-            }, creditsLoading ? '查询中…' : '刷新积分'),
-            '重新查询本页全部账号的剩余积分（Credits Balance）。余额由服务端实时计算，点此可刷新。')
-          : null,
-        // 「一键签到」的进度与结果不再靠按钮底色表达：迁移前它是绿色按钮
-        // （`data-kind="success"`），而 ui-primitives 的 Button 没有 success 变体
-        // —— 给它造一个私有变体就等于在插件里重开一套配色。改为 primary 按钮 +
-        // 进度/结果文字（「签到中…」/「全部已签」/「一键签到」），状态语义交给
-        // 文字与 disabled，颜色仍由设计体系决定。
-        supportsCredits
-          ? withHoverTitle(React.createElement(Button, {
-              variant: 'primary',
-              size: 'sm',
-              disabled: claiming || accounts.length === 0 || allCheckedIn,
-              onClick: () => void claimCredits(),
-            }, claiming ? '签到中…' : allCheckedIn ? '全部已签' : '一键签到'),
-            `为全部 ${providerLabel} 账号（含已停用）执行每日签到`)
-          : null,
-        withHoverTitle(React.createElement(Button, {
-          variant: 'outline',
-          size: 'sm',
+          className: 'dim-ah-btn-stable',
           disabled: probeBusy || accounts.length === 0,
           onClick: () => void runLimitAction('retestAll'),
         }, probeBusy ? '重测中…' : '重测所有'), RETEST_ALL_HELP),
         withHoverTitle(React.createElement(Button, {
           variant: 'outline',
           size: 'sm',
+          className: 'dim-ah-btn-stable',
           disabled: probeBusy || accounts.length === 0,
           onClick: () => void runLimitAction('resetAll'),
-        }, '清除限额'), RESET_ALL_HELP),
-        // 「登录账号」：登录形态**只剩浏览器设备流一种**（PAT 粘贴已于
-        // 2026-09-21 按用户要求移除），故这里直接接 `createAccount()`，
-        // 不再有选择器、也没有「点了做什么」的分支。
-        withHoverTitle(React.createElement(Button, {
-          variant: 'primary',
-          size: 'sm',
-          onClick: () => void createAccount(),
-          disabled: creating,
-        }, creating ? '正在登录…' : '登录账号'),
-        '通过浏览器登录一个新的账号并加入账号池。'))),
+        }, '清除限额'), RESET_ALL_HELP))),
     probeNotice
       ? React.createElement('div', {
           className: 'dim-ah-probeNotice',
@@ -2313,7 +2255,7 @@ function ProviderPanel({ provider, rpcCall }) {
       : phase === 'error'
         ? React.createElement('div', { className: 'dim-ah-empty', role: 'alert' },
             React.createElement('p', null, error),
-            React.createElement(Button, { variant: 'outline', size: 'sm', onClick: loadAccounts }, '重新读取'))
+            React.createElement(Button, { variant: 'outline', size: 'sm', className: 'dim-ah-btn-stable', onClick: loadAccounts }, '重新读取'))
         : accounts.length === 0
           ? React.createElement('div', { className: 'dim-ah-empty' },
               React.createElement('p', null, '尚未配置账号'),
@@ -2321,8 +2263,7 @@ function ProviderPanel({ provider, rpcCall }) {
               // PAT 形态移除后文案只剩这一种，不再按登录形态分支。
               React.createElement('p', null, '点击"登录账号"进行浏览器登录。'))
           : React.createElement('div', null,
-              // 排序提示整段已按用户要求删除（下拉与账号卡片之间不再有文字段落）；
-              // 「顺序即选号优先级」这条信息仍由卡片上的拖拽柄 title 承载。
+              // 排序提示整段已按用户要求删除；排序信息由卡片序号与拖拽手柄的位置表达。
               reorderError
                 ? React.createElement('div', {
                     className: 'dim-ah-probeNotice',
@@ -2417,28 +2358,8 @@ const AUTO_ROUTE_TAB_ID = 'auto-route';
 /** 「自动路由」导航项与面板的显示名。 */
 const AUTO_ROUTE_LABEL = '自动路由';
 
-/**
- * 总开关的悬停说明（一句话说清「开了以后模型列表会怎样」）。
- *
- * 必须讲清**隐藏 ≠ 删除**：关掉后本插件其它 provider 只是从 DSH 的模型列表里消失，
- * 面板本身照旧可编辑 —— 否则用户会以为打开自动路由等于把别的 provider 删了。
- *
- * ⚠️ **不能说「只显示自动路由」**：门控（宿主 `providerCatalogVisible`）只能作用于
- * **本插件自己注册的适配器** —— DSH 内置 provider 与其它插件注册的供应商一行都不经过
- * 这里，它们照旧显示。旧文案那句「只显示」是一句**当时并不成立、且永远不可能成立**
- * 的承诺（现在前半句「本插件其它供应商隐藏」已由宿主判据兑现，但范围仍限本插件）。
- * 同理不能承诺「全部隐藏」：自动路由自己必须留着，否则开启后一个分组都不剩。
- */
-const AUTO_ROUTE_SWITCH_HELP = '开启后「自动路由」出现在 DSH 模型列表里，本插件其它供应商从列表隐藏但面板仍可编辑；DSH 内置及其它插件的供应商不受影响。';
-
-/**
- * 一个自动模型都没有时，总开关的悬停说明（**只在空列表时**挂上去）。
- *
- * 空列表 + 打开开关 = DSH 模型列表一个分组都不剩：本插件的七个 provider 被门控
- * 隐藏，而自动路由自己又没有模型可暴露。开关仍可点（宿主会照常接受），但结果是
- * 用户看不懂的空列表，故在源头禁用并说明原因。
- */
-const AUTO_ROUTE_SWITCH_EMPTY_HELP = '先添加至少一个自动模型，再开启开关';
+/** 自动路由总开关的简短悬停说明。 */
+const AUTO_ROUTE_SWITCH_HELP = '开启后「自动路由」出现在 DSH 模型列表，其它 provider 从列表隐藏';
 
 /** 该模型没有思考档位时，思考程度下拉的悬停说明。 */
 const AUTO_ROUTE_EFFORT_NONE_HELP = '该模型无思考档位';
@@ -2601,6 +2522,7 @@ function AutoRouteEntryRow({
     'data-dragging': drag.isDragging ? 'true' : undefined,
     'data-dropBefore': drag.isDropTarget && drag.dropPosition !== 'after' ? 'true' : undefined,
     'data-dropAfter': drag.isDropTarget && drag.dropPosition === 'after' ? 'true' : undefined,
+    'data-drag-enabled': drag.enabled ? 'true' : 'false',
     draggable: drag.enabled ? 'true' : undefined,
     onDragStart: drag.onDragStart,
     onDragEnd: drag.onDragEnd,
@@ -2608,10 +2530,10 @@ function AutoRouteEntryRow({
     onDrop: drag.onDrop,
   },
     drag.enabled
-      ? withHoverTitle(React.createElement('span', {
+      ? React.createElement('span', {
           className: 'dim-ah-dragHandle',
           'aria-hidden': 'true',
-        }, '⠿'), '拖动以调整候选顺序（顺序即降级顺序）')
+        }, '⠿')
       : null,
     React.createElement(AutoRouteSelect, {
       label: '候选供应商',
@@ -2646,7 +2568,7 @@ function AutoRouteEntryRow({
     React.createElement(Button, {
       variant: 'outline',
       size: 'sm',
-      className: 'dim-ah-btn-danger',
+      className: 'dim-ah-btn-danger dim-ah-btn-stable',
       disabled: busy,
       onClick: () => onRemove(index),
     }, '删除'));
@@ -2928,13 +2850,19 @@ function AutoRoutePanel({ rpcCall }) {
       isDropTarget: active && drag.targetKey === key && drag.sourceKey !== key,
       dropPosition: drag === null ? 'before' : drag.position,
       onDragStart: (event) => {
+        // 候选行嵌在可拖定义卡内：阻止冒泡，避免父卡把 entry 拖拽覆盖成 def 拖拽。
+        if (kind === 'entry') event.stopPropagation?.();
         setDrag({ kind, defId, sourceKey: key, targetKey: null, position: 'before' });
         // 必须设置 dataTransfer，否则 Firefox 根本不启动拖拽。
         try { event.dataTransfer.setData('text/plain', String(key)); } catch { /* 忽略 */ }
         if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
       },
-      onDragEnd: () => setDrag(null),
+      onDragEnd: (event) => {
+        if (kind === 'entry') event.stopPropagation?.();
+        setDrag(null);
+      },
       onDragOver: (event) => {
+        if (kind === 'entry') event.stopPropagation?.();
         if (drag === null || drag.kind !== kind || drag.defId !== defId) return;
         if (drag.sourceKey === key) return;
         // 必须 preventDefault，否则浏览器不把这里当作可放置区域。
@@ -2946,6 +2874,7 @@ function AutoRoutePanel({ rpcCall }) {
         if (position !== drag.position) setDrag({ ...drag, targetKey: key, position });
       },
       onDrop: (event) => {
+        if (kind === 'entry') event.stopPropagation?.();
         event.preventDefault();
         if (drag === null || drag.kind !== kind || drag.defId !== defId) return;
         const sourceKey = drag.sourceKey;
@@ -2980,17 +2909,18 @@ function AutoRoutePanel({ rpcCall }) {
       'data-dropBefore': cardDrag.isDropTarget && cardDrag.dropPosition !== 'after' ? 'true' : undefined,
       'data-dropAfter': cardDrag.isDropTarget && cardDrag.dropPosition === 'after' ? 'true' : undefined,
       draggable: cardDrag.enabled ? 'true' : undefined,
+      'data-drag-enabled': cardDrag.enabled ? 'true' : 'false',
       onDragStart: cardDrag.onDragStart,
       onDragEnd: cardDrag.onDragEnd,
       onDragOver: cardDrag.onDragOver,
       onDrop: cardDrag.onDrop,
     },
-      React.createElement('div', { className: 'dim-ah-arCardHead' },
+      React.createElement('div', { className: 'dim-ah-arCardHead', 'data-drag-enabled': cardDrag.enabled ? 'true' : 'false' },
         cardDrag.enabled
-          ? withHoverTitle(React.createElement('span', {
+          ? React.createElement('span', {
               className: 'dim-ah-dragHandle',
               'aria-hidden': 'true',
-            }, '⠿'), '拖动以调整自动模型顺序')
+            }, '⠿')
           : null,
         React.createElement('span', { className: 'dim-ah-arOrder' }, String(index + 1)),
         React.createElement(Input, {
@@ -3005,7 +2935,7 @@ function AutoRoutePanel({ rpcCall }) {
         React.createElement(Button, {
           variant: 'outline',
           size: 'sm',
-          className: 'dim-ah-btn-danger',
+          className: 'dim-ah-btn-danger dim-ah-btn-stable',
           disabled: saving,
           onClick: () => setPendingDelete(def.id),
         }, '删除')),
@@ -3028,6 +2958,7 @@ function AutoRoutePanel({ rpcCall }) {
           React.createElement(Button, {
             variant: 'outline',
             size: 'sm',
+            className: 'dim-ah-btn-stable',
             disabled: saving,
             onClick: () => addEntry(def.id),
           }, '添加模型'))));
@@ -3050,11 +2981,11 @@ function AutoRoutePanel({ rpcCall }) {
         checked: enabled,
         // 空列表时禁用：打开开关会把七个 provider 从 DSH 模型列表里隐藏，而自动路由
         // 自己又没有模型可暴露 ⇒ 一个分组都不剩。开关仍可点（宿主会照常接受）但结果
-        // 是用户看不懂的空列表，故在源头挡住并说明原因（见下面的悬停说明）。
+        // 是用户看不懂的空列表，故在源头挡住；开关提示统一保留指定的简短说明。
         disabled: switchBusy || draft.length === 0,
         label: '启用自动路由',
         onChange: (next) => void toggleEnabled(next),
-      }), draft.length === 0 ? AUTO_ROUTE_SWITCH_EMPTY_HELP : AUTO_ROUTE_SWITCH_HELP),
+      }), AUTO_ROUTE_SWITCH_HELP),
       React.createElement('span', { className: 'dim-ah-arSwitchLabel' }, '启用自动路由')),
     loadError !== null
       ? React.createElement('div', { className: 'dim-ah-arError', role: 'alert' },
@@ -3062,6 +2993,7 @@ function AutoRoutePanel({ rpcCall }) {
           React.createElement(Button, {
             variant: 'outline',
             size: 'sm',
+            className: 'dim-ah-btn-stable',
             onClick: () => void loadConfig(),
           }, '重新读取'))
       : null,
@@ -3076,6 +3008,7 @@ function AutoRoutePanel({ rpcCall }) {
           React.createElement(Button, {
             variant: 'outline',
             size: 'sm',
+            className: 'dim-ah-btn-stable',
             onClick: () => void loadCatalog(),
           }, '重试'))
       : null,
@@ -3090,6 +3023,7 @@ function AutoRoutePanel({ rpcCall }) {
       React.createElement(Button, {
         variant: 'outline',
         size: 'sm',
+        className: 'dim-ah-btn-stable',
         disabled: saving,
         onClick: addDefinition,
       }, '添加自动模型'),
@@ -3098,6 +3032,7 @@ function AutoRoutePanel({ rpcCall }) {
       React.createElement(Button, {
         variant: dirty ? 'primary' : 'outline',
         size: 'sm',
+        className: 'dim-ah-btn-stable',
         disabled: !dirty || saving,
         onClick: () => void saveModels(),
       }, saving ? '保存中…' : '保存')),
@@ -3118,6 +3053,7 @@ function AutoRoutePanel({ rpcCall }) {
             React.createElement(Button, {
               key: 'confirm',
               variant: 'primary',
+              className: 'dim-ah-btn-stable',
               onClick: () => { setPendingDelete(null); removeDefinition(pendingDefinition.id); },
             }, '删除'),
           ],

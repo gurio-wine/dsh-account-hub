@@ -368,14 +368,12 @@ function openSelectors(props: Record<string, unknown>, index: number): unknown {
   return tree
 }
 
-/** 某个下拉的悬停提示文案（挂在 `Tooltip` 代理投影出的 `data-tooltip` 上）。 */
-function tooltipOfSelect(node: unknown, label: string): string {
-  const anchor = flatten(node)
+/** 展开菜单内各选项自己的 Tooltip 文案。 */
+function optionTooltipsOf(node: unknown): string[] {
+  return flatten(node)
     .filter(isElement)
-    .find((el) => el.props['data-tooltip'] !== undefined
-      && flatten(el).some((inner) => isElement(inner) && inner.props['aria-label'] === label))
-  expect(anchor, `找不到「${label}」下拉的悬停提示`).toBeDefined()
-  return String(anchor!.props['data-tooltip'])
+    .map((el) => el.props['data-tooltip'])
+    .filter((label): label is string => typeof label === 'string')
 }
 
 describe('ConsumptionSelectors：两个并排的下拉（Menu 原语）', () => {
@@ -411,22 +409,19 @@ describe('ConsumptionSelectors：两个并排的下拉（Menu 原语）', () => 
     expect(menuRowsOf(openTree, 1)).toEqual(['按请求', '按轮次'])
 
     const text = textsOf(tree).join('')
-    // ⚠️ 界面上**不得**再出现设置名（用户明确要求删掉两个可见标签与内联解释）。
-    // 这两个名字只能存在于 `aria-label` / 悬停提示这类非可见属性里。
     expect(text).not.toContain('消耗顺序')
     expect(text).not.toContain('切换粒度')
-    // 设置名 + 各档含义必须仍在悬停提示里，否则删了标签就等于删了说明。
-    // ⚠️ 迁移后它**不再挂在原生 `title` 上**，而是经 `Tooltip` 原语渲染
-    // （替身投影为 `data-tooltip`）。文案内容一个字都没改。
-    const orderTip = tooltipOfSelect(tree, '消耗顺序')
-    expect(orderTip).toContain('消耗顺序')
-    expect(orderTip).toContain('顺序')
-    expect(orderTip).toContain('遍历')
-    expect(orderTip).toContain('最高优先')
-    const switchTip = tooltipOfSelect(tree, '切换粒度')
-    expect(switchTip).toContain('切换粒度')
-    expect(switchTip).toContain('按请求')
-    expect(switchTip).toContain('按轮次')
+    // 设置名通过 aria-label 提供；按钮本身不再挂 Tooltip。
+    expect(selects[0]!.props['aria-label']).toBe('消耗顺序')
+    expect(selects[1]!.props['aria-label']).toBe('切换粒度')
+    expect(selects[0]!.props['data-tooltip']).toBeUndefined()
+    expect(selects[1]!.props['data-tooltip']).toBeUndefined()
+    // 展开后仍保留每个选项自己的简短提示。
+    const optionTips = optionTooltipsOf(openTree)
+    expect(optionTips).toContain('总是用排序里的第一个可用账号')
+    expect(optionTips).toContain('每次请求轮转下一个账号，用完一轮再从头开始（默认）')
+    expect(optionTips).toContain('每一次请求都重新选号')
+    expect(optionTips).toContain('一轮对话内固定用同一个账号，下一轮才换（默认，上下文更连贯）')
   })
 
   it('每档的取值与宿主联合类型逐字一致（改名等于让用户配置失效）', () => {
@@ -452,7 +447,7 @@ describe('ConsumptionSelectors：两个并排的下拉（Menu 原语）', () => 
     expect(itemIdsOf(1)).toEqual(['per-request', 'per-turn'])
   })
 
-  it('无外框：分组容器只剩等分布局，边框与内边距已删除', () => {
+  it('无外框：分组容器只保留固定宽度布局，边框与内边距已删除', () => {
     const { rpcCall } = makeRpc()
     client.hooks.__reset()
     const tree = expandTree(
@@ -480,8 +475,8 @@ describe('ConsumptionSelectors：两个并排的下拉（Menu 原语）', () => 
     expect(group).not.toContain('border')
     expect(group).not.toContain('padding')
     expect(group).not.toContain('border-radius')
-    // 布局不能塌：等分两块的 flex 基座仍在。
-    expect(group).toContain('flex: 1 1 0')
+    // 分组本身不扩展，锚点宽度由 order / switch 的具体规则决定。
+    expect(group).toContain('flex: none')
     expect(group).toContain('min-width: 0')
     // 被删掉的三个 class 的规则不得残留（否则是「删了节点、留了样式」）。
     expect(styles).not.toContain('.dim-ah-consumptionHead')
@@ -607,25 +602,23 @@ describe('ConsumptionSelectors：版面（两个下拉同排、各占一半宽�
     return styles.slice(at, styles.indexOf('}', at))
   }
 
-  it('两个下拉同排：容器是 flex 且不换行，两块各占一半', () => {
-    // 不换行是「同一排」的可执行判据：容器一旦 wrap，窄面板下会折成上下两行。
+  it('两个下拉同排：容器不换行，分组按内容固定宽度', () => {
     expect(ruleOf('.dim-ah-consumption')).toContain('display: flex')
     expect(ruleOf('.dim-ah-consumption')).not.toContain('flex-wrap: wrap')
-    // 各占一半：`flex: 1 1 0` 让两块等分容器（减去 gap），即「总宽 = 卡片宽」。
-    const group = ruleOf('.dim-ah-consumptionGroup')
-    expect(group).toContain('flex: 1 1 0')
-    // min-width: 0 不是装饰：默认 min-width:auto 会让长 option 文案把这一块撑宽，
-    // 于是两块不再等宽（「各占一半」失效）。
-    expect(group).toContain('min-width: 0')
+    expect(ruleOf('.dim-ah-consumptionGroup')).toContain('flex: none')
+    expect(ruleOf('.dim-ah-consumptionGroup')).toContain('min-width: 0')
+    expect(ruleOf('.dim-ah-consumptionGroup[data-name="order"] .dim-ah-consumptionSelect'))
+      .toContain('width: 112px')
+    expect(ruleOf('.dim-ah-consumptionGroup[data-name="switch"] .dim-ah-consumptionSelect'))
+      .toContain('width: 96px')
   })
 
-  it('下拉锚点只负责吃满块宽（外观归 ui-primitives 的 Button）', () => {
+  it('下拉锚点按选项文案长度固定宽度（外观归 ui-primitives 的 Button）', () => {
     const select = ruleOf('.dim-ah-consumptionSelect')
-    expect(select).toContain('width: 100%')
+    expect(select).toContain('box-sizing: border-box')
+    expect(select).toContain('white-space: nowrap')
     // 迁移后**不再自绘**边框 / 圆角 / focus 环 / 禁用态：那些都在
-    // ui-primitives 的 Button 里（类名被 hash，本文件也拿不到）。这里只留
-    // 「吃满块宽」这一条布局职责 —— 反过来断言「没有自绘外观」比断言
-    // 「有边框圆角」更能守住这次迁移的目标。
+    // ui-primitives 的 Button 里（类名被 hash，本文件也拿不到）。
     expect(select).not.toContain('border-radius')
     expect(select).not.toContain('border:')
     expect(styles).not.toContain('.dim-ah-consumptionSelect:focus-visible {')
@@ -716,12 +709,11 @@ describe('ProviderPanel：选择器位于账号卡片之前，且读写走 RPC',
       return {}
     }
     const tree = await renderStable(client.ProviderPanel, { provider: 'buddy-cn', rpcCall }, client.hooks)
-    // 面板骨架与选择器都还在（配置读取失败不该让整个面板消失）。
-    // 可见文案已不含设置名，故判据是**下拉数量 + 悬停提示**而不是正文文本。
+    // 面板骨架与选择器都还在；无提示框时仍通过可访问名称识别两个设置。
     const selects = consumptionSelects(tree)
     expect(selects).toHaveLength(2)
-    expect(tooltipOfSelect(tree, '消耗顺序')).toContain('消耗顺序')
-    expect(tooltipOfSelect(tree, '切换粒度')).toContain('切换粒度')
+    expect(selects.map((el) => el.props['aria-label'])).toEqual(['消耗顺序', '切换粒度'])
+    expect(selects.every((el) => el.props['data-tooltip'] === undefined)).toBe(true)
     // 退回默认档：遍历 + 按轮次。
     expect(textsOf(selects[0]!)).toEqual(['遍历'])
     expect(textsOf(selects[1]!)).toEqual(['按轮次'])

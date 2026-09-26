@@ -22,11 +22,14 @@
  * 本次把所有 `var(..., #xxx)` 形式的 fallback 一并去掉：token 不存在就该
  * 露出空值（可被立刻发现），而不是悄悄退回一个写死的颜色。
  *
- * ## 品牌色豁免（唯一的非 token 颜色）
+ * ## 两类颜色豁免
  *
- * 七条 `.dim-ah-providerIcon.*` 的白底与 Qoder CN 的内描边**保持原样**，理由：
- * 那是**品牌识别**（每个 provider 的图标要在白底上显示清晰），不属于主题体系，
- * 也不该随亮/暗主题变化。这是本文件里唯一允许出现字面色值的地方。
+ * - 七条 `.dim-ah-providerIcon.*` 的白底与 Qoder CN 的内描边**保持原样**，理由：
+ *   那是**品牌识别**（每个 provider 的图标要在白底上显示清晰），不属于主题体系，
+ *   也不该随亮/暗主题变化。
+ * - `.dim-ah-iconBtn-light` 使用白底黑字，是清单明确要求的未签到与登录图标外观。
+ *
+ * 其余颜色 / 字体一律走 DSH design token，不使用十六进制字面量。
  *
  * ⚠️ 本文件整体是一个 JS 模板字符串：注释里绝不能出现反引号（会提前闭合模板）。
  */
@@ -168,14 +171,23 @@ const STYLES = `
 /* 限额重置徽章：Tag 负责胶囊与配色，这里只调字号行高与强调字重。 */
 .dim-ah-ttlBadge { font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); }
 
-/* 面板标题区：标题独占一行，操作按钮另起一行。
-   此前用单行 space-between 把标题与 5 个按钮挤在一起，面板一窄就溢出被裁掉。 */
-.dim-ah-panelHead { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
-.dim-ah-panelTitle { margin: 0; font-size: var(--dsw-font-m-18-font-size); line-height: var(--dsw-font-m-18-line-height); font-weight: var(--dsw-font-m-18-font-weight); color: var(--dsw-alias-label-primary); }
+/* 图标按钮统一为 32px 方形；按钮本体仍由 ui-primitives 提供。 */
+.dim-ah-iconBtn { box-sizing: border-box; flex: none; width: 32px; min-width: 32px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+/* 未签到与登录入口采用白底黑字的 outline 外观。 */
+.dim-ah-iconBtn-light { background: white; color: black; }
+.dim-ah-iconGlyph { display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
+.dim-ah-iconGlyph[data-loading="true"] { animation: dim-ah-icon-spin 1s linear infinite; }
+@keyframes dim-ah-icon-spin { to { transform: rotate(360deg); } }
+/* 状态文案变化时固定文本操作按钮的最小宽度。 */
+.dim-ah-btn-stable { min-width: 112px; }
 
-/* 面板标题下方的操作按钮组（模型列表 / 刷新积分 / 一键签到 / 重测所有 / 清除限额 / 登录账号）。
-   允许换行：按钮数量随 provider 变化（Buddy CN 有「一键签到」，其他没有），
-   固定单行在窄面板下必然放不下。 */
+/* 标题行放置四个图标操作；重测与清除限额留在下方文字操作区。 */
+.dim-ah-panelHead { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 16px; }
+.dim-ah-panelTitleRow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; width: 100%; }
+.dim-ah-panelTitle { margin: 0; font-size: var(--dsw-font-m-18-font-size); line-height: var(--dsw-font-m-18-line-height); font-weight: var(--dsw-font-m-18-font-weight); color: var(--dsw-alias-label-primary); }
+.dim-ah-panelTitleActions { display: flex; flex: none; align-items: center; gap: 8px; }
+
+/* 面板标题下方只保留重测与清除限额；按钮数量恒定且允许窄宽换行。 */
 .dim-ah-headerActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
 
 /* 上一次「重测 / 清除限额」的结果提示 */
@@ -239,24 +251,13 @@ const STYLES = `
 .dim-ah-modelTier { flex: none; display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
 .dim-ah-tierOption { font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-line-height); white-space: nowrap; }
 
-/* 消耗顺序 / 切换粒度：两个下拉**同一排**、各占一半宽。
-   与账号卡片同宽：它与账号卡片列表同处一个容器，故宽度天然一致，
-   这里不需要任何宽度计算。
-
-   ⚠️ 容器**刻意不换行**（没有 flex-wrap）：需求是「同一排」。窄面板下两块会一起
-   变窄，而下拉收起时只显示当前档、内容自带省略，比折成上下两行更贴近需求。
-   ⚠️ 两块各占一半靠「flex: 1 1 0」+「min-width: 0」两条共同成立：
-   flex-basis 为 0 才是**等分**（写成 1 1 45% 时两块会留出 10% 空档、
-   不再等于卡片宽）；而 min-width 默认 auto 会让长档位文案把这一块撑宽，
-   于是两块不等宽 —— 那正是「各占一半」的反面。 */
-.dim-ah-consumption { display: flex; gap: 12px; margin-bottom: 12px; }
-/* 块：只承担「两个下拉等分一排」这一件事。设置名与各档含义都在锚点的悬停提示里，
-   可见文案只剩当前档位名。 */
-.dim-ah-consumptionGroup { flex: 1 1 0; min-width: 0; }
-.dim-ah-consumptionGroup > .dim-ah-tipWrap { display: flex; }
-/* 下拉锚点：外观归 ui-primitives 的 Button（outline/sm），这里只让它吃满块宽。
-   迁移前这里是原生 select，箭头由浏览器绘制；现在箭头是 Button 的 icon。 */
-.dim-ah-consumptionSelect { width: 100%; min-width: 0; justify-content: space-between; }
+/* 消耗顺序 / 切换粒度：两个下拉按各自最长选项文案固定宽度，保持同一排。 */
+.dim-ah-consumption { display: flex; gap: 8px; margin-bottom: 12px; }
+.dim-ah-consumptionGroup { flex: none; min-width: 0; }
+/* 下拉锚点宽度含选项文本、chevron 与按钮内边距，不跟随当前选中项变化。 */
+.dim-ah-consumptionSelect { box-sizing: border-box; justify-content: space-between; white-space: nowrap; }
+.dim-ah-consumptionGroup[data-name="order"] .dim-ah-consumptionSelect { width: 112px; min-width: 112px; }
+.dim-ah-consumptionGroup[data-name="switch"] .dim-ah-consumptionSelect { width: 96px; min-width: 96px; }
 
 /* 悬停提示的宿主锚点：包住非 forwardRef 的组件，使 Tooltip 能拿到真实 DOM 节点。
    inline-flex 不改变父级 flex/grid 的参与关系，也不给行内元素引入额外行高。 */
@@ -287,8 +288,8 @@ const STYLES = `
 .dim-ah-arEmpty p { margin: 6px 0; font-size: var(--dsw-font-s-14-font-size); line-height: var(--dsw-font-s-14-line-height); }
 
 /* 定义卡片列表。position: relative 是拖拽插入线的定位基准。 */
-.dim-ah-arList { display: grid; gap: 10px; }
-.dim-ah-arCard { position: relative; border: 1px solid var(--dsw-alias-border-l2); border-radius: 14px; padding: 12px 14px; background: var(--dsw-alias-bg-layer-3); box-shadow: var(--dsw-shadow-lv1); transition: border-color var(--ds-transition-duration-fast) var(--ds-ease-in-out), box-shadow var(--ds-transition-duration-fast) var(--ds-ease-in-out), opacity var(--ds-transition-duration-fast) var(--ds-ease-in-out); }
+.dim-ah-arList { display: grid; gap: 12px; }
+.dim-ah-arCard { position: relative; border: 1px solid var(--dsw-alias-border-l2); border-radius: 14px; padding: 12px; background: var(--dsw-alias-bg-layer-3); box-shadow: var(--dsw-shadow-lv1); transition: border-color var(--ds-transition-duration-fast) var(--ds-ease-in-out), box-shadow var(--ds-transition-duration-fast) var(--ds-ease-in-out), opacity var(--ds-transition-duration-fast) var(--ds-ease-in-out); }
 .dim-ah-arCard:hover { border-color: var(--dsw-alias-border-l3); box-shadow: var(--dsw-shadow-lv2); }
 /* 正在被拖动的卡片：淡出以表明它已被「拿起」（与账号卡片同款反馈）。 */
 .dim-ah-arCard[data-dragging="true"] { opacity: 0.4; border-style: dashed; }
@@ -297,36 +298,33 @@ const STYLES = `
 .dim-ah-arCard[data-dropBefore="true"]::before { content: ''; position: absolute; left: 0; right: 0; top: -6px; height: 3px; border-radius: 2px; background: var(--dsw-alias-brand-primary); }
 .dim-ah-arCard[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -6px; height: 3px; border-radius: 2px; background: var(--dsw-alias-brand-primary); }
 
-/* 卡片头：拖拽柄 + 序号 + 名称输入 + 条目数 + 删除。 */
-.dim-ah-arCardHead { display: flex; align-items: center; gap: 8px; }
+/* 卡片头：拖拽柄 + 序号 + 名称输入 + 条目数 + 删除；输入框优先压缩。 */
+.dim-ah-arCardHead { display: grid; grid-template-columns: 16px max-content minmax(0, 1fr) max-content 112px; align-items: center; gap: 8px; }
+.dim-ah-arCardHead[data-drag-enabled="false"] { grid-template-columns: max-content minmax(0, 1fr) max-content 112px; }
 /* 序号徽标：与账号卡片的 .dim-ah-accountOrder 同义（顺序即降级顺序），
    但这里显示的是**定义**序号，故另起一个类名而不是复用。 */
-.dim-ah-arOrder { flex: none; min-width: 18px; padding: 0 5px; border-radius: 6px; font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); font-weight: var(--dsw-font-xxxs-strong-11-font-weight); text-align: center; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-module-platform); }
-/* 名称输入：外观归 ui-primitives 的 Input（边框 / 圆角 / focus 环都在那个包里），
-   这里只让它吃掉卡片头的剩余宽度 —— 固定宽度会让长名字被裁掉。 */
-.dim-ah-arNameInput { flex: 1 1 auto; min-width: 0; }
-.dim-ah-arEntryCount { flex: none; font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-line-height); color: var(--dsw-alias-label-tertiary); }
+.dim-ah-arOrder { min-width: 18px; padding: 0 5px; border-radius: 6px; font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); font-weight: var(--dsw-font-xxxs-strong-11-font-weight); text-align: center; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-module-platform); }
+/* 名称输入优先占用剩余空间；条目数与删除按钮维持自身宽度。 */
+.dim-ah-arNameInput { width: 100%; min-width: 0; }
+.dim-ah-arEntryCount { white-space: nowrap; font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-line-height); color: var(--dsw-alias-label-tertiary); }
 
-/* 候选列表（卡片内）。 */
-.dim-ah-arEntries { display: grid; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--dsw-alias-border-l2); }
-/* 一条候选：三个下拉 + 删除，允许换行（窄面板下三个下拉必然放不下）。 */
-.dim-ah-arEntryRow { position: relative; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 4px; border-radius: 8px; transition: background var(--ds-transition-duration-fast) var(--ds-ease-in-out), opacity var(--ds-transition-duration-fast) var(--ds-ease-in-out); }
+/* 候选列表（卡片内），间距按 12/8/4 节奏收敛。 */
+.dim-ah-arEntries { display: grid; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-l2); }
+/* 一条候选：拖拽柄 + 三个等宽下拉 + 固定宽度删除列。 */
+.dim-ah-arEntryRow { position: relative; display: grid; grid-template-columns: 16px repeat(3, minmax(0, 1fr)) 112px; align-items: center; gap: 8px; padding: 4px; border-radius: 8px; transition: background var(--ds-transition-duration-fast) var(--ds-ease-in-out), opacity var(--ds-transition-duration-fast) var(--ds-ease-in-out); }
+.dim-ah-arEntryRow[data-drag-enabled="false"] { grid-template-columns: repeat(3, minmax(0, 1fr)) 112px; }
 .dim-ah-arEntryRow:hover { background: var(--dsw-alias-bg-layer-2); }
 .dim-ah-arEntryRow[data-dragging="true"] { opacity: 0.4; border-style: dashed; }
 .dim-ah-arEntryRow[data-dropBefore="true"]::before { content: ''; position: absolute; left: 0; right: 0; top: -4px; height: 2px; border-radius: 2px; background: var(--dsw-alias-brand-primary); }
 .dim-ah-arEntryRow[data-dropAfter="true"]::after { content: ''; position: absolute; left: 0; right: 0; bottom: -4px; height: 2px; border-radius: 2px; background: var(--dsw-alias-brand-primary); }
-/* 三档下拉的锚点：外观归 ui-primitives 的 Button（outline/sm），这里只给一个
-   最小宽度 —— 全靠内容撑宽会让「未选」态的锚点窄得点不中，而三档的宽度
-   在同一个卡片里应当对齐（视觉上才像一组联动选择器）。 */
-.dim-ah-arEntryMenu { min-width: 96px; justify-content: space-between; }
+/* 每格填满固定 grid 列，选项文字变化不会改变列宽。 */
+.dim-ah-arEntryMenu { box-sizing: border-box; width: 100%; min-width: 0; max-width: 100%; justify-content: space-between; overflow: hidden; white-space: nowrap; }
 
-/* 「添加模型」按钮所在行（卡片级入口）。 */
+/* 「添加模型」入口所在行。 */
 .dim-ah-arAddEntry { display: flex; align-items: center; gap: 8px; }
 
-/* 面板底部的保存行：左侧「添加自动模型」、右侧「保存」。
-   两者都是操作按钮，靠 margin-left: auto 把保存推到右侧 —— 主操作在右下角
-   是这套界面里「提交」的固定位置。 */
-.dim-ah-arSaveRow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-l2); }
+/* 面板底部的保存行：添加与保存固定同行，保存右对齐。 */
+.dim-ah-arSaveRow { display: flex; flex-wrap: nowrap; align-items: center; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-l2); }
 .dim-ah-arSaveRow > :last-child { margin-left: auto; }
 
 /* 「自动路由」导航项的图标容器：与 .dim-ah-providerIcon 同形（尺寸 / 圆角 /
