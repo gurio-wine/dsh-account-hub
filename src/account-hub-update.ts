@@ -225,26 +225,40 @@ export async function applyAccountHubUpdate(deps: AccountHubUpdateDeps): Promise
   if (latest.sha === previousSha) return { previousSha, currentSha: previousSha, log: '' }
 
   const packagePath = join(deps.profileRoot, 'package.json')
+  const workspacePath = join(deps.profileRoot, 'pnpm-workspace.yaml')
+  const execOptions = {
+    cwd: deps.profileRoot,
+    timeoutMs: ACCOUNT_HUB_UPDATE_TIMEOUT_MS,
+  }
+
+  let removeOutput: AccountHubUpdateProcessOutput
+  try {
+    removeOutput = await deps.exec('pnpm', ['remove', 'dsh-account-hub'], execOptions)
+  } catch (error) {
+    throwWithLog(error, formatInstallLog(processOutputFromError(error)))
+  }
+  const removeLog = formatInstallLog(removeOutput)
+
   const packageJson = await deps.readFile(packagePath)
   const updatedPackageJson = writeAccountHubPin(packageJson, latest.sha)
   if (updatedPackageJson !== packageJson) await deps.writeFile(packagePath, updatedPackageJson)
 
-  const workspacePath = join(deps.profileRoot, 'pnpm-workspace.yaml')
   const workspace = await deps.readFile(workspacePath)
   const updatedWorkspace = appendAccountHubAllowBuild(workspace, latest.sha)
   if (updatedWorkspace !== workspace) await deps.writeFile(workspacePath, updatedWorkspace)
 
-  let output: AccountHubUpdateProcessOutput
+  let addOutput: AccountHubUpdateProcessOutput
   try {
-    output = await deps.exec('pnpm', ['install', '--config.minimum-release-age=0'], {
-      cwd: deps.profileRoot,
-      timeoutMs: ACCOUNT_HUB_UPDATE_TIMEOUT_MS,
-    })
+    addOutput = await deps.exec(
+      'pnpm',
+      ['add', `${ACCOUNT_HUB_GITHUB_PIN}#${latest.sha}`, '--config.minimum-release-age=0'],
+      execOptions,
+    )
   } catch (error) {
-    throwWithLog(error, formatInstallLog(processOutputFromError(error)))
+    throwWithLog(error, joinInstallLogs(removeLog, formatInstallLog(processOutputFromError(error))))
   }
+  const log = joinInstallLogs(removeLog, formatInstallLog(addOutput))
 
-  const log = formatInstallLog(output)
   let currentSha: string
   try {
     currentSha = extractAccountHubSha(await deps.readFile(lockPath))
@@ -266,6 +280,10 @@ function leadingWhitespaceLength(line: string): number {
 
 function joinLines(lines: string[], newline: string, endsWithNewline: boolean): string {
   return `${lines.join(newline)}${endsWithNewline ? newline : ''}`
+}
+
+function joinInstallLogs(...logs: string[]): string {
+  return logs.filter((log) => log.length > 0).join('\n')
 }
 
 function formatInstallLog(output: AccountHubUpdateProcessOutput): string {

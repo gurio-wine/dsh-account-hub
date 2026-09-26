@@ -83,9 +83,11 @@ function makeDeps(options: {
     files.set(path, content)
   })
   const fetcher = vi.fn<typeof fetch>(async () => makeResponse(latestSha, options.latestTitle ?? '更新标题\n更多提交说明'))
-  const defaultExec: AccountHubUpdateExec = async () => {
-    files.set(LOCK_PATH, makeLockfile(latestSha))
-    return { stdout: '安装完成\n', stderr: '' }
+  const defaultExec: AccountHubUpdateExec = async (_command, args) => {
+    if (args[0] === 'add') files.set(LOCK_PATH, makeLockfile(latestSha))
+    return args[0] === 'remove'
+      ? { stdout: '卸载完成\n', stderr: '' }
+      : { stdout: '安装完成\n', stderr: '' }
   }
   const exec = vi.fn<AccountHubUpdateExec>(options.exec ?? defaultExec)
   return {
@@ -180,7 +182,7 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     expect(result).toEqual({
       previousSha: CURRENT_SHA,
       currentSha: LATEST_SHA,
-      log: 'stdout:\n安装完成\n',
+      log: 'stdout:\n卸载完成\n\nstdout:\n安装完成\n',
     })
     expect(files.get(WORKSPACE_PATH)).toContain(`dsh-account-hub@https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/${LATEST_SHA}: true`)
     expect(files.get(PACKAGE_PATH)).toContain(`"dsh-account-hub": "${ACCOUNT_HUB_PIN}#${LATEST_SHA}"`)
@@ -194,10 +196,18 @@ describe('Account Hub 更新 RPC 逻辑', () => {
       WORKSPACE_PATH,
       expect.stringContaining(`dsh-account-hub@https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/${LATEST_SHA}: true`),
     )
-    expect(exec).toHaveBeenCalledWith('pnpm', ['install', '--config.minimum-release-age=0'], {
-      cwd: PROFILE_ROOT,
-      timeoutMs: 120_000,
-    })
+    expect(exec).toHaveBeenNthCalledWith(
+      1,
+      'pnpm',
+      ['remove', 'dsh-account-hub'],
+      { cwd: PROFILE_ROOT, timeoutMs: 120_000 },
+    )
+    expect(exec).toHaveBeenNthCalledWith(
+      2,
+      'pnpm',
+      ['add', `${ACCOUNT_HUB_PIN}#${LATEST_SHA}`, '--config.minimum-release-age=0'],
+      { cwd: PROFILE_ROOT, timeoutMs: 120_000 },
+    )
     expect(fetcher).toHaveBeenCalledTimes(1)
   })
 
@@ -214,7 +224,7 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     expect(exec).not.toHaveBeenCalled()
   })
 
-  it('写 package.json pin 失败时不启动 pnpm 并返回原始错误', async () => {
+  it('remove 成功但写 package.json pin 失败时不启动 add 并返回原始错误', async () => {
     const failure = new Error('package.json write failed')
     const { deps, exec } = makeDeps()
     deps.writeFile = vi.fn(async (path: string) => {
@@ -222,7 +232,51 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     })
 
     await expect(applyAccountHubUpdate(deps)).rejects.toBe(failure)
-    expect(exec).not.toHaveBeenCalled()
+    expect(exec).toHaveBeenCalledTimes(1)
+    expect(exec).toHaveBeenNthCalledWith(
+      1,
+      'pnpm',
+      ['remove', 'dsh-account-hub'],
+      { cwd: PROFILE_ROOT, timeoutMs: 120_000 },
+    )
+  })
+
+  it('remove 失败时不写 pin、不写 allowBuilds 且不启动 add', async () => {
+    const failure = Object.assign(new Error('pnpm remove failed'), {
+      code: 1,
+      stdout: 'remove stdout',
+      stderr: 'remove stderr',
+    })
+    const { deps, files, exec } = makeDeps({ exec: async () => { throw failure } })
+    const packageBefore = files.get(PACKAGE_PATH)
+    const workspaceBefore = files.get(WORKSPACE_PATH)
+
+    await expect(applyAccountHubUpdate(deps)).rejects.toThrow(
+      'pnpm remove failed (code 1)\n\nstdout:\nremove stdout\nstderr:\nremove stderr',
+    )
+    expect(files.get(PACKAGE_PATH)).toBe(packageBefore)
+    expect(files.get(WORKSPACE_PATH)).toBe(workspaceBefore)
+    expect(deps.writeFile).not.toHaveBeenCalled()
+    expect(exec).toHaveBeenCalledTimes(1)
+  })
+
+  it('add 失败时保留原始错误并附 remove 与 add 日志', async () => {
+    const failure = Object.assign(new Error('pnpm add failed'), {
+      code: 1,
+      stdout: 'add stdout',
+      stderr: 'add stderr',
+    })
+    const { deps, exec } = makeDeps({
+      exec: async (_command, args) => {
+        if (args[0] === 'remove') return { stdout: 'remove stdout', stderr: 'remove stderr' }
+        throw failure
+      },
+    })
+
+    await expect(applyAccountHubUpdate(deps)).rejects.toThrow(
+      'pnpm add failed (code 1)\n\nstdout:\nremove stdout\nstderr:\nremove stderr\nstdout:\nadd stdout\nstderr:\nadd stderr',
+    )
+    expect(exec).toHaveBeenCalledTimes(2)
   })
 
   it('pnpm 失败时保留原错误、stdout 与 stderr', async () => {
@@ -245,7 +299,7 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     })
 
     await expect(applyAccountHubUpdate(deps)).rejects.toThrow(
-      `更新后 lockfile 未切换到最新版本（期望 ${LATEST_SHA}，实际 ${CURRENT_SHA}）\n\nstdout:\npnpm stdout\nstderr:\npnpm stderr`,
+      `更新后 lockfile 未切换到最新版本（期望 ${LATEST_SHA}，实际 ${CURRENT_SHA}）\n\nstdout:\npnpm stdout\nstderr:\npnpm stderr\nstdout:\npnpm stdout\nstderr:\npnpm stderr`,
     )
   })
 

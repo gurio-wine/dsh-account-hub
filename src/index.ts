@@ -1,4 +1,4 @@
-import { execFile as nodeExecFile } from 'node:child_process'
+import { execFile as nodeExecFile, spawn as nodeSpawn, type ChildProcess } from 'node:child_process'
 import { readFile as nodeReadFile, writeFile as nodeWriteFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -105,36 +105,89 @@ function createAccountHubUpdateDeps(moduleUrl: string): AccountHubUpdateDeps {
   }
 }
 
-/** pnpm 安装使用异步 execFile，超时与输出都由宿主执行器统一处理。 */
+/**
+ * pnpm 更新使用 spawn 自行管理超时，不能依赖 execFile(shell:true) 只杀壳进程。
+ * 真机曾出现 0:34 postcss 在 85 包处理到 84 时挂起，超时只杀 shell 会留下 pnpm 本体和临时目录锁。
+ */
 const runAccountHubUpdate: AccountHubUpdateExec = (command, args, options) =>
   new Promise<AccountHubUpdateProcessOutput>((resolvePromise, rejectPromise) => {
-    nodeExecFile(
-      command,
-      [...args],
-      {
-        cwd: options.cwd,
-        encoding: 'utf8',
-        timeout: Math.min(options.timeoutMs, ACCOUNT_HUB_UPDATE_TIMEOUT_MS),
-        // 更新耗时最多 120 秒，完整保留 stdout/stderr，供错误响应和成功日志使用。
-        maxBuffer: Infinity,
-        windowsHide: true,
-        // Windows 的 pnpm 通常通过 pnpm.cmd 暴露；execFile 需经系统 shell 启动脚本。
-        shell: process.platform === 'win32',
-      },
-      (error, stdout, stderr) => {
-        const output = {
-          stdout: typeof stdout === 'string' ? stdout : String(stdout ?? ''),
-          stderr: typeof stderr === 'string' ? stderr : String(stderr ?? ''),
-        }
-        if (error !== null) {
-          Object.assign(error, output)
-          rejectPromise(error)
-          return
-        }
-        resolvePromise(output)
-      },
-    )
+    const timeoutMs = Math.min(options.timeoutMs, ACCOUNT_HUB_UPDATE_TIMEOUT_MS)
+    const child = nodeSpawn(command, [...args], {
+      cwd: options.cwd,
+      shell: process.platform === 'win32',
+      windowsHide: true,
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined
+
+    const complete = (error?: Error): void => {
+      if (settled) return
+      settled = true
+      if (timeoutTimer !== undefined) clearTimeout(timeoutTimer)
+      const output = { stdout, stderr }
+      if (error !== undefined) {
+        Object.assign(error, output)
+        rejectPromise(error)
+        return
+      }
+      resolvePromise(output)
+    }
+
+    child.stdout?.setEncoding('utf8')
+    child.stdout?.on('data', (chunk: string | Buffer) => {
+      stdout += String(chunk)
+    })
+    child.stderr?.setEncoding('utf8')
+    child.stderr?.on('data', (chunk: string | Buffer) => {
+      stderr += String(chunk)
+    })
+    child.once('error', (error) => complete(error))
+    child.once('close', (code, signal) => {
+      if (code === 0) {
+        complete()
+        return
+      }
+      const message = code === null
+        ? `Command terminated by signal ${signal ?? 'unknown'}`
+        : `Command failed with exit code ${code}`
+      complete(Object.assign(new Error(message), { code: code ?? signal ?? 'UNKNOWN', signal }))
+    })
+    timeoutTimer = setTimeout(() => {
+      killAccountHubProcessTree(child)
+      complete(Object.assign(new Error(`Command timed out after ${timeoutMs}ms`), {
+        code: 'ETIMEDOUT',
+        killed: true,
+      }))
+    }, timeoutMs)
   })
+
+function killAccountHubProcessTree(child: ChildProcess): void {
+  const pid = child.pid
+  if (pid === undefined) return
+  if (process.platform === 'win32') {
+    nodeExecFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => {
+      try {
+        child.kill()
+      } catch {
+        // taskkill 已负责结束进程树时，child 可能已经退出。
+      }
+    })
+    return
+  }
+  try {
+    process.kill(-pid, 'SIGKILL')
+  } catch {
+    try {
+      child.kill('SIGKILL')
+    } catch {
+      // 子进程已经退出时无需再次处理。
+    }
+  }
+}
 
 /**
  * 把 schema 节点标记为 volatile（宿主 settings 的「进 describe() + 可热改」判据）。
