@@ -709,6 +709,25 @@ Account Hub（设置页）的账号面板按 provider 分组展示，Buddy 是�
 - 对应 LLM provider 的设置命名空间为 `llm-buddy`（Buddy CN 是 `llm-buddy-cn`，
   两者由 `llm-${product.id}` 派生）。
 
+### 检查更新与一键更新
+
+打开 Account Hub 设置页时会自动静默检查一次 GitHub `master`；也可点击
+页面右上角的 ⇩ 按钮（「检查更新」）手动检查。检查失败不打扰当前使用。
+
+- 发现新版本时，页面顶部显示「发现新版本：`<最新 commit 标题>`」，并提供
+  「立即更新」按钮；同时显示当前与最新 commit SHA 的前 8 位。「已是最新」
+  提示会在几秒后自动消失。
+- 点击「立即更新」后，插件会自动更新 profile 中的版本 pin 与 `allowBuilds`
+  白名单、安装依赖，并校验安装后的 lockfile SHA。安装命令会设置
+  `--config.minimum-release-age=0`，以绕过 pnpm 默认 24 小时发布等待；
+  完整 pnpm 日志可展开查看。失败时会显示服务端原始错误和日志。
+- 当前版本取自 profile `pnpm-lock.yaml` 中插件 tarball URL 的 40 位 SHA；
+  最新版本通过无需鉴权的 GitHub API 查询 `gurio-wine/dsh-account-hub` 的
+  `master` commit。检查与下载需能访问 `api.github.com` 和
+  `codeload.github.com`。
+- 更新成功后会显示「已更新到 `<sha8>`，建议重启会话生效」。插件运行时代码
+  在会话启动时加载，重启当前会话后新版本才会生效。
+
 ### 模型列表开关（黑名单）
 
 Account Hub 面板标题栏的「**模型列表**」按钮展开该 provider 的**全部模型**，每个模型
