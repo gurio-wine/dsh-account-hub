@@ -1111,7 +1111,7 @@ describe('AutoRoutePanel：拖拽排序', () => {
   })
 
   it('同一卡片内的候选行可拖：只在该卡片内落点，不影响别的定义', async () => {
-    const { rpcCall } = makeRpc()
+    const { calls, rpcCall } = makeRpc()
     const props = panelProps(rpcCall)
     let tree = await settle(client.AutoRoutePanel, props, client.hooks, true)
     const card = cardsOf(tree)[1]!
@@ -1134,6 +1134,19 @@ describe('AutoRoutePanel：拖拽排序', () => {
     // 而不是把取值改掉了。
     expect(after[0]!.model, '搬过来的是整条候选（含模型与档位）').toBe('glm-5')
     expect(after[0]!.effort, '档位跟着候选一起搬').toBe('high')
+
+    // 修改即保存：候选行落定同样是合法编辑，drop 后立即**整组**提交目标列表。
+    // 「另一张卡片一行不动」在界面上成立还不够 —— 载荷是整个 `models`，一旦提交时
+    // 漏带或错带另一张卡片，服务端的 `models` 整组替换语义会把线上配置改坏。
+    const set = calls.filter((c) => c.method === 'autoroute.set')
+    expect(set, '候选行拖拽应当立即触发 autoroute.set').toHaveLength(1)
+    const payload = set[0]!.payload as { models: typeof CONFIG.models }
+    expect(payload.models.map((d) => d.name), '载荷仍是完整的目标列表').toEqual(['快速', '强力'])
+    expect(payload.models[0]!.entries, '未被拖的定义原样带上').toEqual([{ provider: 'dsh', model: 'deepseek-v4' }])
+    expect(payload.models[1]!.entries, '载荷里的候选顺序与界面一致').toEqual([
+      { provider: 'codearts', model: 'glm-5', effort: 'high' },
+      { provider: 'dsh', model: 'deepseek-v4' },
+    ])
   })
 
   it('候选行拖拽会阻止冒泡：父定义卡不得覆盖 entry 的 drag 状态', async () => {

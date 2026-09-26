@@ -198,6 +198,14 @@ const STYLES = `
 .dim-ah-probeDetails { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 2px; }
 .dim-ah-probeDetails li { font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-line-height); }
 
+/* 页面级更新提示行（检查更新 / 一键更新）：提示行本体沿用 .dim-ah-probeNotice，
+   这一层只补它与 .dim-ah-header 对齐的内边距 —— 它挂在 header 与两栏布局之间，
+   横跨整页（更新的是插件自身，不属于任何 provider）。 */
+.dim-ah-updateBar { padding: 12px 24px 0; }
+/* 更新日志：等宽 + 限高滚动。服务端给的是 pnpm 安装输出汇总，可能上百行，
+   不设上限会把下面的两栏布局顶出视口（与 .dim-ah-modal 的 max-height 同一考虑）。 */
+.dim-ah-updateLog { max-height: 180px; margin: 6px 0 0; padding: 8px 10px; overflow: auto; border-radius: 8px; background: var(--dsw-alias-bg-layer-2); font-family: var(--ds-font-family-code); font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); white-space: pre-wrap; word-break: break-all; }
+
 /* 弹窗被拦截时的手动登录链接。
    这里**不是**装饰性链接，而是唯一的登录入口，因此必须一眼可见、可点、
    并且在窄面板里也能换行（登录 URL 很长）。 */

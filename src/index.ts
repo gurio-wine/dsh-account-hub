@@ -1,3 +1,7 @@
+import { execFile as nodeExecFile } from 'node:child_process'
+import { readFile as nodeReadFile, writeFile as nodeWriteFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
@@ -25,6 +29,12 @@ import {
   type ModelCatalogSource,
   type ProviderBalancesDeps,
 } from './account-hub-rpc.js'
+import {
+  ACCOUNT_HUB_UPDATE_TIMEOUT_MS,
+  type AccountHubUpdateDeps,
+  type AccountHubUpdateExec,
+  type AccountHubUpdateProcessOutput,
+} from './account-hub-update.js'
 import { BUDDY_CN, BUDDY } from './product.js'
 import { LOBSTERAI } from './lobsterai-product.js'
 import { TRAE_CN } from './trae-cn-product.js'
@@ -80,6 +90,51 @@ export const name = 'codearts-auth'
 // 会因此全部 exit 1。Account Hub 的 RPC 端点在 Web 下通过 apply 内的可选注入挂载，
 // 其余 profile 只是不注册该端点。
 export const inject = ['credentials', 'commands', 'llm']
+
+/** 根据已编译入口的位置创建 profile 更新依赖。 */
+function createAccountHubUpdateDeps(moduleUrl: string): AccountHubUpdateDeps {
+  const profileRoot = resolve(dirname(fileURLToPath(moduleUrl)), '..', '..', '..')
+  return {
+    profileRoot,
+    readFile: (path) => nodeReadFile(path, 'utf8'),
+    writeFile: async (path, content) => {
+      await nodeWriteFile(path, content, 'utf8')
+    },
+    fetcher: (input, init) => globalThis.fetch(input, init),
+    exec: runAccountHubUpdate,
+  }
+}
+
+/** pnpm 安装使用异步 execFile，超时与输出都由宿主执行器统一处理。 */
+const runAccountHubUpdate: AccountHubUpdateExec = (command, args, options) =>
+  new Promise<AccountHubUpdateProcessOutput>((resolvePromise, rejectPromise) => {
+    nodeExecFile(
+      command,
+      [...args],
+      {
+        cwd: options.cwd,
+        encoding: 'utf8',
+        timeout: Math.min(options.timeoutMs, ACCOUNT_HUB_UPDATE_TIMEOUT_MS),
+        // 更新耗时最多 120 秒，完整保留 stdout/stderr，供错误响应和成功日志使用。
+        maxBuffer: Infinity,
+        windowsHide: true,
+        // Windows 的 pnpm 通常通过 pnpm.cmd 暴露；execFile 需经系统 shell 启动脚本。
+        shell: process.platform === 'win32',
+      },
+      (error, stdout, stderr) => {
+        const output = {
+          stdout: typeof stdout === 'string' ? stdout : String(stdout ?? ''),
+          stderr: typeof stderr === 'string' ? stderr : String(stderr ?? ''),
+        }
+        if (error !== null) {
+          Object.assign(error, output)
+          rejectPromise(error)
+          return
+        }
+        resolvePromise(output)
+      },
+    )
+  })
 
 /**
  * 把 schema 节点标记为 volatile（宿主 settings 的「进 describe() + 可热改」判据）。
@@ -1374,6 +1429,7 @@ export function apply(ctx: Context, config?: Config): void {
     // `autoroute.set` 成功后的配置变更通知 —— 让聚合适配器的降级队列与用户刚改的
     // 候选顺序归位（内容幂等，重复调用无副作用）。
     onAutoRouteChanged: ensureAutoRouteRegistration,
+    updateDeps: createAccountHubUpdateDeps(import.meta.url),
   })
   ctx.provide('accountPool', pool)
 

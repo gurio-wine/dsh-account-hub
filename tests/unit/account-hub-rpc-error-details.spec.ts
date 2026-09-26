@@ -140,7 +140,7 @@ describe('account-hub-rpc.ts —— 失败信封的唯一构造点', () => {
     // 那条断言的提示同步即可。
     // 两处**同增同减**才是「纯位移」的特征：若只有一处变，说明构造点被搬到了
     // 别处，那正是本断言要逼人显式确认的情形，别顺手照抄新数字。
-    expect(outside.map((site) => site.line)).toEqual([1866, 1878])
+    expect(outside.map((site) => site.line)).toEqual([1877, 1889])
     for (const site of outside) {
       // 从该构造点往前找最近的 `return`，那一段必须已经打开了 `reply(rpcId, `。
       const returnAt = SOURCE.lastIndexOf('return ', site.index)

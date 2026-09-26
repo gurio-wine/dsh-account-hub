@@ -126,8 +126,17 @@ import type {
   RpcAutoRouteCatalogResponse,
   RpcAutoRouteModelInfoRequest,
   RpcAutoRouteModelInfoResponse,
+  RpcUpdateCheckRequest,
+  RpcUpdateCheckResponse,
+  RpcUpdateApplyRequest,
+  RpcUpdateApplyResponse,
 } from './types.js'
 import { AUTO_ROUTE_PROVIDER_ID, type AutoRouteDefinition } from './auto-route.js'
+import {
+  applyAccountHubUpdate,
+  checkAccountHubUpdate,
+  type AccountHubUpdateDeps,
+} from './account-hub-update.js'
 
 /** Account Hub RPC API 路径 */
 export const ACCOUNT_HUB_API_PATH = '/api/account-hub'
@@ -1791,6 +1800,8 @@ export interface AccountHubRpcOptions {
    * 省略时（headless / 测试）配置照常写入，只是运行时不在本进程内。
    */
   onAutoRouteChanged?: () => void
+  /** 可选更新依赖；headless 测试可省略，更新端点调用时会返回规范错误。 */
+  updateDeps?: AccountHubUpdateDeps
 }
 
 /**
@@ -1948,6 +1959,20 @@ function registerAccountHubEndpoints(options: AccountHubRpcOptions): void {
   /** 分发端点方法到对应的处理器 */
   async function handleMethod(method: string, payload: unknown, _signal: AbortSignal): Promise<unknown> {
     switch (method) {
+      case 'update.check': {
+        void (payload as RpcUpdateCheckRequest)
+        if (options.updateDeps === undefined) throw new Error('Account Hub 更新功能未初始化')
+        const value: RpcUpdateCheckResponse = await checkAccountHubUpdate(options.updateDeps)
+        return { ok: true, value }
+      }
+
+      case 'update.apply': {
+        void (payload as RpcUpdateApplyRequest)
+        if (options.updateDeps === undefined) throw new Error('Account Hub 更新功能未初始化')
+        const value: RpcUpdateApplyResponse = await applyAccountHubUpdate(options.updateDeps)
+        return { ok: true, value }
+      }
+
       case 'account.list': {
         const req = payload as RpcListAccountsRequest
         // provider → 池键（见 {@link poolProviderFor}）。

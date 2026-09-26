@@ -525,6 +525,27 @@ export interface RpcAutoRouteGetResponse {
   models: import('./auto-route.js').AutoRouteDefinition[]
 }
 
+/** RPC: `update.check` 请求（无参数）。 */
+export type RpcUpdateCheckRequest = Record<string, never>
+
+/** RPC: `update.check` 响应。 */
+export interface RpcUpdateCheckResponse {
+  currentSha: string
+  latestSha: string
+  hasUpdate: boolean
+  latestTitle: string
+}
+
+/** RPC: `update.apply` 请求（无参数）。 */
+export type RpcUpdateApplyRequest = Record<string, never>
+
+/** RPC: `update.apply` 响应。 */
+export interface RpcUpdateApplyResponse {
+  previousSha: string
+  currentSha: string
+  log: string
+}
+
 /**
  * RPC: `autoroute.set` 请求（**部分更新**）。
  *

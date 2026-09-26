@@ -2987,10 +2987,112 @@ function AutoRoutePanel({ rpcCall }) {
       : null);
 }
 
+/**
+ * 「已是最新」提示的停留时长（毫秒）。
+ *
+ * 那是一次性反馈：既没有可操作项，也没有需要用户记住的信息。停留几秒后自动
+ * 消失；若不自消失，页面顶部会永久挂着一条无信息量的通知行。
+ */
+const UPDATE_LATEST_NOTICE_MS = 4000;
+
+/** commit sha 的展示形态：前 8 位（与 git 自己的短 sha 同款）。 */
+function shortSha(sha) {
+  // 服务端契约保证是 40 位十六进制串；这里仍做形状防御 —— 提示行是纯展示，
+  // 不该因为一个字段缺失就把整页渲染打崩（白屏的代价远大于显示一个「未知」）。
+  return typeof sha === 'string' && sha.length > 0 ? sha.slice(0, 8) : '未知';
+}
+
+/**
+ * 页面级「检查更新 / 一键更新」提示行。
+ *
+ * 只有**需要用户看到**的相位才渲染：`idle`（含静默检查失败后的回落）与
+ * `checking` 一律返回 null —— 挂载时的自动检查是静默的，用户没主动做任何事，
+ * 不能因为一次后台请求失败就在页面顶部弹提示。
+ *
+ * 外观复用面板级通知行 `.dim-ah-probeNotice`（同一个 `data-tone` 取值域），
+ * 不新造视觉；外层 `.dim-ah-updateBar` 只负责与 `.dim-ah-header` 同宽同内边距。
+ */
+function UpdateNotice({ update, logOpen, onApply, onToggleLog }) {
+  /** 与 `.dim-ah-probeNotice` 的 tone 域一致；失败才换成错误档。 */
+  let tone = 'ok';
+  let role = 'status';
+  let children = null;
+
+  if (update.phase === 'latest') {
+    children = [React.createElement('div', { key: 'latest' }, '已是最新')];
+  } else if (update.phase === 'available' || update.phase === 'applying') {
+    // 「可更新」与「更新中」共用同一块版面：按钮**原地**从「立即更新」转成禁用的
+    // 「更新中…」，位置不跳 —— 用户点下去之后视线不必重新找。
+    const applying = update.phase === 'applying';
+    children = [
+      React.createElement('div', { key: 'title' }, `发现新版本：${update.latestTitle}`),
+      React.createElement('div', { key: 'sha' },
+        `当前 ${shortSha(update.currentSha)} → 最新 ${shortSha(update.latestSha)}`),
+      React.createElement(Button, {
+        key: 'apply',
+        variant: 'primary',
+        size: 'sm',
+        className: 'dim-ah-btn-stable',
+        disabled: applying,
+        onClick: onApply,
+      }, applying ? '更新中…' : '立即更新'),
+    ];
+  } else if (update.phase === 'applied') {
+    children = [
+      React.createElement('div', { key: 'done' },
+        `已更新到 ${shortSha(update.currentSha)}，建议重启会话生效`),
+      // 日志折叠：仓库里没有原生 details/summary 范式（控件一律走 ui-primitives），
+      // 故用最简的展开/收起 state + 一枚 outline 按钮。日志为空时整块不渲染。
+      update.log
+        ? React.createElement('div', { key: 'log' },
+            React.createElement(Button, {
+              variant: 'outline',
+              size: 'sm',
+              className: 'dim-ah-btn-stable',
+              onClick: onToggleLog,
+            }, logOpen ? '收起日志' : '查看完整日志'),
+            logOpen
+              ? React.createElement('pre', { className: 'dim-ah-updateLog' }, update.log)
+              : null)
+        : null,
+    ];
+  } else if (update.phase === 'failed') {
+    // 失败显示**服务端原文**：提示行只加「更新失败：」前缀说明是哪个操作失败了，
+    // message 本身一字不改 —— 改写会把唯一可诊断的线索洗掉。
+    tone = 'error';
+    role = 'alert';
+    children = [React.createElement('div', { key: 'error' }, `更新失败：${update.error}`)];
+  }
+
+  if (children === null) return null;
+
+  return React.createElement('div', { className: 'dim-ah-updateBar' },
+    React.createElement('div', {
+      className: 'dim-ah-probeNotice',
+      'data-tone': tone,
+      role,
+    }, children));
+}
+
 export function AccountHubPage({ rpcCall }) {
   const [selected, setSelected] = React.useState(PROVIDERS[0].id);
   // 每次切换 provider 时递增版号，强制重新挂载 ProviderPanel 触发 loadAccounts
   const [version, setVersion] = React.useState(0);
+  /**
+   * 更新状态机：`idle` / `checking` / `available` / `latest` / `applying` /
+   * `applied` / `failed`（字段 `latestTitle` / `latestSha` / `currentSha` /
+   * `log` / `error` 按相位出现）。
+   *
+   * 落在**页面级**而不是 ProviderPanel：更新检查的是插件自身版本，七个供应商
+   * 面板与自动路由共用同一个事实 —— 逐个面板各挂一份只会得到八份互相矛盾的提示。
+   */
+  const [update, setUpdate] = React.useState({ phase: 'idle' });
+  /** 「查看完整日志」的展开态（apply 成功后才有意义）。 */
+  const [updateLogOpen, setUpdateLogOpen] = React.useState(false);
+  /** 「已是最新」的自动消失定时器句柄；重新检查与卸载都要清掉。 */
+  const updateTimerRef = React.useRef(null);
+  /** 卸载后不再 setState（异步检查 / 更新返回时组件可能已经不在了）。 */
+  const updateAliveRef = React.useRef(true);
   /**
    * 供应商折叠组：**默认展开**（用户拍板「默认不折叠」），且**不持久化** ——
    * 刷新页面回到展开态，不引入任何存储面。
@@ -3005,11 +3107,121 @@ export function AccountHubPage({ rpcCall }) {
     setVersion(v => v + 1);
   };
 
+  /** 取消「已是最新」的自动消失定时器（重新检查、开始更新、卸载三处都要）。 */
+  const clearUpdateTimer = () => {
+    if (updateTimerRef.current !== null) {
+      clearTimeout(updateTimerRef.current);
+      updateTimerRef.current = null;
+    }
+  };
+
+  /**
+   * 检查更新。**失败静默**是本方法的性质，不是某一处的选择：挂载时的自动检查
+   * 尤其不能打扰用户 —— 他没有主动做任何事，一次后台请求失败不该在页面顶部留提示。
+   * 故失败只写一条 console.warn 并回落到 idle（提示行随之消失）。
+   */
+  const checkUpdate = async () => {
+    clearUpdateTimer();
+    setUpdate({ phase: 'checking' });
+    let res;
+    try {
+      res = await rpcCall('update.check', {});
+    } catch (caught) {
+      console.warn('[account-hub] update check failed:', caught);
+      if (updateAliveRef.current) setUpdate({ phase: 'idle' });
+      return;
+    }
+    if (!updateAliveRef.current) return;
+
+    if (res?.hasUpdate === true) {
+      setUpdate({
+        phase: 'available',
+        latestTitle: res.latestTitle,
+        latestSha: res.latestSha,
+        currentSha: res.currentSha,
+      });
+      return;
+    }
+
+    // 「已是最新」停留几秒后自动消失：它是一次性反馈，没有可操作项。
+    setUpdate({ phase: 'latest', currentSha: res?.currentSha });
+    updateTimerRef.current = setTimeout(() => {
+      updateTimerRef.current = null;
+      if (updateAliveRef.current) setUpdate({ phase: 'idle' });
+    }, UPDATE_LATEST_NOTICE_MS);
+  };
+
+  /**
+   * 一键更新。与检查相反：这是用户**主动**发起的动作，失败必须可见 ——
+   * 提示行显示服务端原始 message（`unwrapRpcResult` 抛出的 `caught.message`），
+   * 不做二次包装或改写。
+   */
+  const applyUpdate = async () => {
+    clearUpdateTimer();
+    setUpdateLogOpen(false);
+    // 保留 available 相位里的 latestTitle / sha：更新中的提示行要继续显示它在装哪个版本。
+    setUpdate(prev => ({ ...prev, phase: 'applying' }));
+    let res;
+    try {
+      res = await rpcCall('update.apply', {});
+    } catch (caught) {
+      if (updateAliveRef.current) {
+        setUpdate({ phase: 'failed', error: caught?.message || '更新失败' });
+      }
+      return;
+    }
+    if (!updateAliveRef.current) return;
+
+    setUpdate({
+      phase: 'applied',
+      previousSha: res?.previousSha,
+      currentSha: res?.currentSha,
+      log: typeof res?.log === 'string' ? res.log : '',
+    });
+  };
+
+  /**
+   * 挂载后自动**静默**检查一次：只在真有更新时才出现提示行。
+   *
+   * deps 为空 ⇒ 整页生命周期内只跑一次。切 provider 不会重跑：`AccountHubPage`
+   * 自己不重挂载（重挂载的是右侧面板）。cleanup 清掉定时器并置「已卸载」——
+   * 异步结果回来时组件可能已经不在了，那时 setState 是纯浪费。
+   */
+  React.useEffect(() => {
+    updateAliveRef.current = true;
+    void checkUpdate();
+    return () => {
+      updateAliveRef.current = false;
+      clearUpdateTimer();
+    };
+  }, []);
+
   return React.createElement('section', { className: 'dim-ah-page', 'aria-label': '账号中心' },
     React.createElement('header', { className: 'dim-ah-header' },
       React.createElement('div', { className: 'dim-ah-brand' },
         React.createElement('strong', { className: 'dim-ah-brandName' }, '账号中心'),
-        React.createElement('p', { className: 'dim-ah-brandDesc' }, 'Provider 凭据管理与多账号支持'))),
+        React.createElement('p', { className: 'dim-ah-brandDesc' }, 'Provider 凭据管理与多账号支持')),
+      // 「检查更新」：更新的是**插件自身**，与任何 provider 都无关，故入口在页面
+      // 顶部（header 右侧）而不是某个面板的标题行里 —— 七个面板各挂一个只会得到
+      // 八份互相矛盾的提示。图标按钮**不带悬停提示**：本插件的按钮提示已按用户
+      // 要求整体删除，可读名由 aria-label 提供。
+      React.createElement(Button, {
+        variant: 'outline',
+        size: 'sm',
+        className: 'dim-ah-iconBtn',
+        'aria-label': '检查更新',
+        // 检查中 / 更新中禁止重复触发；结果一律由下面的提示行给出。
+        disabled: update.phase === 'checking' || update.phase === 'applying',
+        onClick: () => void checkUpdate(),
+      }, React.createElement('span', { 'aria-hidden': 'true' }, '⇩'))),
+    // 页面级更新提示行：header 之下、两栏之上。它不属于任何 provider，故放在
+    // `.dim-ah-layout` **之外**（切 provider 时既不重挂载、也不会消失）。
+    React.createElement(UpdateNotice, {
+      update,
+      logOpen: updateLogOpen,
+      onApply: () => void applyUpdate(),
+      onToggleLog: () => setUpdateLogOpen(prev => !prev),
+    }),
     React.createElement('div', { className: 'dim-ah-layout' },
       React.createElement('nav', { className: 'dim-ah-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
         // 组标题走 ui-primitives 的 DisclosureRow：`expandOnRowClick` 让整行成为
