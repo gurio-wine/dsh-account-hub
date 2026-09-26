@@ -5,6 +5,7 @@ import {
   applyAccountHubUpdate,
   checkAccountHubUpdate,
   extractAccountHubSha,
+  writeAccountHubPin,
   type AccountHubUpdateDeps,
   type AccountHubUpdateExec,
 } from '../../src/account-hub-update.js'
@@ -12,7 +13,9 @@ import {
 const PROFILE_ROOT = 'C:\\fake-profile'
 const CURRENT_SHA = 'a'.repeat(40)
 const LATEST_SHA = 'b'.repeat(40)
+const ACCOUNT_HUB_PIN = 'github:gurio-wine/dsh-account-hub'
 const LOCK_PATH = join(PROFILE_ROOT, 'pnpm-lock.yaml')
+const PACKAGE_PATH = join(PROFILE_ROOT, 'package.json')
 const WORKSPACE_PATH = join(PROFILE_ROOT, 'pnpm-workspace.yaml')
 
 function makeLockfile(sha: string): string {
@@ -29,6 +32,22 @@ function makeLockfile(sha: string): string {
   ].join('\n')
 }
 
+function makePackageJson(pin = ACCOUNT_HUB_PIN): string {
+  return [
+    '{',
+    '  "name": "fake-profile",',
+    '  "dependencies": {',
+    `    "dsh-account-hub": "${pin}",`,
+    '    "other-package": "1.0.0"',
+    '  },',
+    '  "scripts": {',
+    '    "start": "dsh"',
+    '  }',
+    '}',
+    '',
+  ].join('\n')
+}
+
 function makeResponse(sha = LATEST_SHA, message = '更新标题\n更多提交说明'): Response {
   return new Response(JSON.stringify({ sha, commit: { message } }), {
     status: 200,
@@ -38,6 +57,7 @@ function makeResponse(sha = LATEST_SHA, message = '更新标题\n更多提交说
 
 function makeDeps(options: {
   lockfile?: string
+  packageJson?: string
   workspace?: string
   latestSha?: string
   latestTitle?: string
@@ -51,6 +71,7 @@ function makeDeps(options: {
   const latestSha = options.latestSha ?? LATEST_SHA
   const files = new Map<string, string>([
     [LOCK_PATH, options.lockfile ?? makeLockfile(CURRENT_SHA)],
+    [PACKAGE_PATH, options.packageJson ?? makePackageJson()],
     [WORKSPACE_PATH, options.workspace ?? 'allowBuilds:\n  esbuild: true\n'],
   ])
   const readFile = vi.fn(async (path: string) => {
@@ -118,6 +139,29 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     expect(fetcher).not.toHaveBeenCalled()
   })
 
+  it('package.json pin 改写只替换目标值并保持其余格式', () => {
+    const packageJson = makePackageJson()
+    const updated = writeAccountHubPin(packageJson, LATEST_SHA)
+
+    expect(updated).toBe(makePackageJson(`${ACCOUNT_HUB_PIN}#${LATEST_SHA}`))
+    expect(updated).toContain(`"dsh-account-hub": "${ACCOUNT_HUB_PIN}#${LATEST_SHA}"`)
+  })
+
+  it('package.json pin 已是目标 SHA 时保持幂等', () => {
+    const packageJson = makePackageJson(`${ACCOUNT_HUB_PIN}#${LATEST_SHA}`)
+
+    expect(writeAccountHubPin(packageJson, LATEST_SHA)).toBe(packageJson)
+  })
+
+  it('package.json 缺少 pin 字段或 pin 形态异常时拒绝改写', () => {
+    expect(() => writeAccountHubPin('{\n  "dependencies": {}\n}\n', LATEST_SHA)).toThrow(
+      '找不到 dsh-account-hub pin 字段',
+    )
+    expect(() => writeAccountHubPin(makePackageJson('npm:dsh-account-hub@1.0.0'), LATEST_SHA)).toThrow(
+      'pin 格式无效',
+    )
+  })
+
   it('allowBuilds 追加 tarball 条目且重复调用幂等', () => {
     const workspace = 'allowBuilds:\n  esbuild: true\n'
     const once = appendAccountHubAllowBuild(workspace, LATEST_SHA)
@@ -139,6 +183,17 @@ describe('Account Hub 更新 RPC 逻辑', () => {
       log: 'stdout:\n安装完成\n',
     })
     expect(files.get(WORKSPACE_PATH)).toContain(`dsh-account-hub@https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/${LATEST_SHA}: true`)
+    expect(files.get(PACKAGE_PATH)).toContain(`"dsh-account-hub": "${ACCOUNT_HUB_PIN}#${LATEST_SHA}"`)
+    expect(deps.writeFile).toHaveBeenNthCalledWith(
+      1,
+      PACKAGE_PATH,
+      expect.stringContaining(`"dsh-account-hub": "${ACCOUNT_HUB_PIN}#${LATEST_SHA}"`),
+    )
+    expect(deps.writeFile).toHaveBeenNthCalledWith(
+      2,
+      WORKSPACE_PATH,
+      expect.stringContaining(`dsh-account-hub@https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/${LATEST_SHA}: true`),
+    )
     expect(exec).toHaveBeenCalledWith('pnpm', ['install', '--config.minimum-release-age=0'], {
       cwd: PROFILE_ROOT,
       timeoutMs: 120_000,
@@ -156,6 +211,17 @@ describe('Account Hub 更新 RPC 逻辑', () => {
       log: '',
     })
     expect(files.get(WORKSPACE_PATH)).toBe(workspaceBefore)
+    expect(exec).not.toHaveBeenCalled()
+  })
+
+  it('写 package.json pin 失败时不启动 pnpm 并返回原始错误', async () => {
+    const failure = new Error('package.json write failed')
+    const { deps, exec } = makeDeps()
+    deps.writeFile = vi.fn(async (path: string) => {
+      if (path === PACKAGE_PATH) throw failure
+    })
+
+    await expect(applyAccountHubUpdate(deps)).rejects.toBe(failure)
     expect(exec).not.toHaveBeenCalled()
   })
 

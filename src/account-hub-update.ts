@@ -5,6 +5,7 @@ import type { RpcUpdateApplyResponse, RpcUpdateCheckResponse } from './types.js'
 
 const GITHUB_COMMIT_URL = 'https://api.github.com/repos/gurio-wine/dsh-account-hub/commits/master'
 const TARBALL_URL_PREFIX = 'https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/'
+const ACCOUNT_HUB_GITHUB_PIN = 'github:gurio-wine/dsh-account-hub'
 export const ACCOUNT_HUB_UPDATE_TIMEOUT_MS = 120_000
 
 export interface AccountHubUpdateProcessOutput {
@@ -191,6 +192,30 @@ export function appendAccountHubAllowBuild(dependenciesFile: string, sha: string
 }
 
 /**
+ * 把 profile package.json 中的 dsh-account-hub GitHub pin 改成目标 SHA。
+ * 只替换字段值，保留其余字节、键顺序、缩进和换行，避免破坏 profile 启动文件；目标值相同则原样返回。
+ */
+export function writeAccountHubPin(packageJsonContent: string, sha: string): string {
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('待写入版本不是有效的 40 位 SHA')
+  const normalizedSha = sha.toLowerCase()
+  const targetPin = `${ACCOUNT_HUB_GITHUB_PIN}#${normalizedSha}`
+  const pinMatch = packageJsonContent.match(/("dsh-account-hub"\s*:\s*")([^"]*)"/)
+  if (pinMatch === null || pinMatch.index === undefined) {
+    throw new Error('package.json 中找不到 dsh-account-hub pin 字段')
+  }
+
+  const currentPin = pinMatch[2]
+  if (currentPin === targetPin) return packageJsonContent
+  if (!new RegExp(`^${ACCOUNT_HUB_GITHUB_PIN}(?:#[0-9a-f]{40})?$`, 'i').test(currentPin)) {
+    throw new Error(`package.json 中 dsh-account-hub pin 格式无效：${currentPin}`)
+  }
+
+  const valueStart = pinMatch.index + pinMatch[1].length
+  const valueEnd = valueStart + currentPin.length
+  return `${packageJsonContent.slice(0, valueStart)}${targetPin}${packageJsonContent.slice(valueEnd)}`
+}
+
+/**
  * 应用最新更新。先取最新 SHA；无需更新时短路，否则执行 pnpm 并验证 lockfile 已切到目标 SHA。
  */
 export async function applyAccountHubUpdate(deps: AccountHubUpdateDeps): Promise<RpcUpdateApplyResponse> {
@@ -198,6 +223,11 @@ export async function applyAccountHubUpdate(deps: AccountHubUpdateDeps): Promise
   const lockPath = join(deps.profileRoot, 'pnpm-lock.yaml')
   const previousSha = extractAccountHubSha(await deps.readFile(lockPath))
   if (latest.sha === previousSha) return { previousSha, currentSha: previousSha, log: '' }
+
+  const packagePath = join(deps.profileRoot, 'package.json')
+  const packageJson = await deps.readFile(packagePath)
+  const updatedPackageJson = writeAccountHubPin(packageJson, latest.sha)
+  if (updatedPackageJson !== packageJson) await deps.writeFile(packagePath, updatedPackageJson)
 
   const workspacePath = join(deps.profileRoot, 'pnpm-workspace.yaml')
   const workspace = await deps.readFile(workspacePath)
