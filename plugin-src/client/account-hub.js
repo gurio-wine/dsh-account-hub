@@ -2981,91 +2981,95 @@ function AutoRoutePanel({ rpcCall }) {
       : null);
 }
 
-/** commit sha 的展示形态：前 8 位（与 git 自己的短 sha 同款）。 */
-function shortSha(sha) {
-  // 服务端契约保证是 40 位十六进制串；这里仍做形状防御 —— 提示行是纯展示，
-  // 不该因为一个字段缺失就把整页渲染打崩（白屏的代价远大于显示一个「未知」）。
-  return typeof sha === 'string' && sha.length > 0 ? sha.slice(0, 8) : '未知';
+/**
+ * 更新通道下拉：正式（GitHub release）/ Beta（master 提交）。
+ *
+ * 形态复用 `ConsumptionSelect` 的 Menu + Button 锚点范式 —— 宿主 ui-primitives
+ * 没有 Select 导出，Menu 是本仓库唯一在测试替身里验证过的下拉范式；锚点文案
+ * 即当前通道名，切换立即触发一次检查（用户拍板的行为）。
+ *
+ * `busy`（检查中 / 更新中）时锚点禁用：切换通道会立刻发起一次新检查，
+ * 与在途的旧检查并发交错，后返回的旧结果会覆盖新通道的状态（乱序竞态）。
+ */
+function ChannelSelect({ channel, busy, onSelect }) {
+  const [open, setOpen] = React.useState(false);
+  const current = channel === 'beta' ? 'Beta' : '正式';
+  return React.createElement(Menu, {
+    open,
+    anchor: React.createElement(Button, {
+      variant: 'outline',
+      size: 'sm',
+      className: 'dim-ah-iconBtn',
+      'aria-label': '更新通道',
+      'aria-haspopup': 'menu',
+      'aria-expanded': open,
+      disabled: busy,
+      icon: React.createElement(IconChevronDownOutlineRegular),
+      onClick: () => setOpen(prev => !prev),
+    }, current),
+    items: [
+      { id: 'stable', label: '正式' },
+      { id: 'beta', label: 'Beta' },
+    ],
+    selectedId: channel,
+    onSelect: (id) => { setOpen(false); onSelect(id); },
+    onClose: () => setOpen(false),
+    align: 'end',
+  });
 }
 
 /**
- * 页面级「检查更新 / 一键更新」提示行。
- *
- * 只有需要提示行承载的相位才渲染：`available` / `applying` / `applied` / `failed`。
- * `idle`（含静默检查失败后的回落）、`checking` 与 `latest` 一律返回 null；
- * `latest` 的轻量反馈由页面标题旁的 Tag 展示。
- *
- * 外观复用面板级通知行 `.dim-ah-probeNotice`（同一个 `data-tone` 取值域），
- * 不新造视觉；外层 `.dim-ah-updateBar` 只负责与 `.dim-ah-header` 同宽同内边距。
+ * 版本文本当前应展示的 changelog：available/applied 展示**新版本**日志，
+ * latest 展示**当前版本**日志（都由 check 响应直传）；其余相位无日志可看。
  */
-function UpdateNotice({ update, logOpen, onApply, onToggleLog }) {
-  /** 与 `.dim-ah-probeNotice` 的 tone 域一致；失败才换成错误档。 */
-  let tone = 'ok';
-  let role = 'status';
-  let children = null;
+function versionLogOf(update) {
+  if (update.phase === 'available' || update.phase === 'applied') return update.changelog || '';
+  if (update.phase === 'latest') return update.currentChangelog || '';
+  return '';
+}
 
-  if (update.phase === 'available' || update.phase === 'applying') {
-    // 「可更新」与「更新中」共用同一块版面：按钮**原地**从「立即更新」转成禁用的
-    // 「更新中…」，位置不跳 —— 用户点下去之后视线不必重新找。
-    const applying = update.phase === 'applying';
-    const currentVersion = typeof update.currentSha === 'string' && update.currentSha.length > 0
-      ? `当前 ${shortSha(update.currentSha)}`
-      : '当前未安装';
-    const latestVersion = typeof update.latestTag === 'string' && update.latestTag.length > 0
-      ? `最新 ${update.latestTag}`
-      : `最新 ${shortSha(update.latestSha)}`;
-    children = [
-      React.createElement('div', { key: 'title' }, `发现新版本：${update.latestTitle}`),
-      React.createElement('div', { key: 'sha' }, `${currentVersion} → ${latestVersion}`),
-      React.createElement(Button, {
-        key: 'apply',
-        variant: 'primary',
-        size: 'sm',
-        className: 'dim-ah-btn-stable',
-        disabled: applying,
-        onClick: onApply,
-      }, applying ? '更新中…' : '立即更新'),
-    ];
+/**
+ * header 品牌行的版本号文本（替换旧的「已是最新」Tag 与整行更新提示）。
+ *
+ * 一个文本位承载全部更新状态：
+ * - `latest`：当前版本号（stable 为 release tag，beta 为 tag+短 sha；未安装灰字）
+ * - `available`：黄色「有更新 <版本>」—— 警示色与常态明确区分（用户拍板）
+ * - `applying`：过程信息「更新中…」（更新过程就显示在这个文本位上）
+ * - `applied`：绿色「已更新到 <版本>，建议重启」
+ * - `failed`：红色「更新失败：<服务端原文>」（原文一字不改，改写会洗掉线索）
+ *
+ * 点击展开对应日志：available/applied 展示**新版本** changelog，latest 展示
+ * **当前版本** changelog；两者都由服务端算好直传（task-26 契约），客户端只管显示。
+ */
+function UpdateStatusText({ update, onToggle }) {
+  let text = null;
+  let tone = 'idle';
+  if (update.phase === 'available') {
+    text = `有更新 ${update.latestVersion}`;
+    tone = 'warn';
+  } else if (update.phase === 'applying') {
+    text = '更新中…';
+    tone = 'muted';
   } else if (update.phase === 'applied') {
-    const installedVersion = typeof update.currentSha === 'string' && update.currentSha.length > 0
-      ? shortSha(update.currentSha)
-      : typeof update.latestTag === 'string' && update.latestTag.length > 0
-        ? update.latestTag
-        : shortSha(update.latestSha);
-    children = [
-      React.createElement('div', { key: 'done' },
-        `已更新到 ${installedVersion}，建议重启会话生效`),
-      // 日志折叠：仓库里没有原生 details/summary 范式（控件一律走 ui-primitives），
-      // 故用最简的展开/收起 state + 一枚 outline 按钮。日志为空时整块不渲染。
-      update.log
-        ? React.createElement('div', { key: 'log' },
-            React.createElement(Button, {
-              variant: 'outline',
-              size: 'sm',
-              className: 'dim-ah-btn-stable',
-              onClick: onToggleLog,
-            }, logOpen ? '收起日志' : '查看完整日志'),
-            logOpen
-              ? React.createElement('pre', { className: 'dim-ah-updateLog' }, update.log)
-              : null)
-        : null,
-    ];
+    text = `已更新到 ${update.currentVersion || update.latestVersion}，建议重启`;
+    tone = 'ok';
   } else if (update.phase === 'failed') {
-    // 失败显示**服务端原文**：提示行只加「更新失败：」前缀说明是哪个操作失败了，
-    // message 本身一字不改 —— 改写会把唯一可诊断的线索洗掉。
+    text = `更新失败：${update.error}`;
     tone = 'error';
-    role = 'alert';
-    children = [React.createElement('div', { key: 'error' }, `更新失败：${update.error}`)];
+  } else if (update.phase === 'latest') {
+    text = update.currentVersion || '未安装';
+    tone = update.currentVersion ? 'idle' : 'muted';
+  } else if (update.phase === 'checking') {
+    text = '检查中…';
+    tone = 'muted';
   }
-
-  if (children === null) return null;
-
-  return React.createElement('div', { className: 'dim-ah-updateBar' },
-    React.createElement('div', {
-      className: 'dim-ah-probeNotice',
-      'data-tone': tone,
-      role,
-    }, children));
+  if (text === null) return null;
+  return React.createElement('button', {
+    type: 'button',
+    className: 'dim-ah-versionText',
+    'data-tone': tone,
+    onClick: onToggle,
+  }, text);
 }
 
 export function AccountHubPage({ rpcCall }) {
@@ -3074,15 +3078,21 @@ export function AccountHubPage({ rpcCall }) {
   const [version, setVersion] = React.useState(0);
   /**
    * 更新状态机：`idle` / `checking` / `available` / `latest` / `applying` /
-   * `applied` / `failed`（字段 `latestTitle` / `latestSha` / `latestTag` / `currentSha` /
-   * `log` / `error` 按相位出现）。
+   * `applied` / `failed`。服务端（task-26 契约）已把显示用的版本字符串算好：
+   * `currentVersion` / `latestVersion`（beta 形如 `v0.2.0+b2ae129`）、`changelog`
+   * （新版本日志）、`currentChangelog`（当前版本日志）按相位出现，客户端直显。
    *
    * 落在**页面级**而不是 ProviderPanel：更新检查的是插件自身版本，七个供应商
    * 面板与自动路由共用同一个事实 —— 逐个面板各挂一份只会得到八份互相矛盾的提示。
    */
   const [update, setUpdate] = React.useState({ phase: 'idle' });
-  /** 「查看完整日志」的展开态（apply 成功后才有意义）。 */
-  const [updateLogOpen, setUpdateLogOpen] = React.useState(false);
+  /** 更新通道：`stable`（GitHub release）/ `beta`（master 提交），默认正式。 */
+  const [channel, setChannel] = React.useState('stable');
+  /**
+   * 版本文本的 changelog 展开态：available/applied 展示新版本日志，
+   * latest 展示当前版本日志（都由 check 响应直传，见 UpdateStatusText）。
+   */
+  const [logOpen, setLogOpen] = React.useState(false);
   /** 卸载后不再 setState（异步检查 / 更新返回时组件可能已经不在了）。 */
   const updateAliveRef = React.useRef(true);
   /**
@@ -3100,18 +3110,21 @@ export function AccountHubPage({ rpcCall }) {
   };
 
   /**
-   * 检查更新。**失败静默**是本方法的性质，不是某一处的选择：挂载时的自动检查
-   * 尤其不能打扰用户 —— 他没有主动做任何事，一次后台请求失败不该在页面顶部留提示。
-   * 故失败只写一条 console.warn 并回落到 idle（提示行随之消失）。
+   * 检查更新（按通道）。**失败静默**是本方法的性质，不是某一处的选择：挂载时与
+   * 切换通道触发的自动检查尤其不能打扰用户 —— 他没有主动做任何事，一次后台请求
+   * 失败不该在 header 上留红色报错。故失败只写一条 console.warn 并回落到 idle
+   * （版本文本随之回到「未安装」之外的既有内容或消失，不新增提示面）。
    */
-  const checkUpdate = async () => {
-    setUpdate({ phase: 'checking' });
+  const checkUpdate = async (chArg) => {
+    // 手动点击 ⇩ 与挂载时无参调用：用当前选中通道；通道切换时显式传入新值。
+    const ch = chArg === 'beta' || chArg === 'stable' ? chArg : channel;
+    setUpdate({ phase: 'checking', channel: ch });
     let res;
     try {
-      res = await rpcCall('update.check', {});
+      res = await rpcCall('update.check', { channel: ch });
     } catch (caught) {
       console.warn('[account-hub] update check failed:', caught);
-      if (updateAliveRef.current) setUpdate({ phase: 'idle' });
+      if (updateAliveRef.current) setUpdate({ phase: 'idle', channel: ch });
       return;
     }
     if (!updateAliveRef.current) return;
@@ -3119,34 +3132,46 @@ export function AccountHubPage({ rpcCall }) {
     if (res?.hasUpdate === true) {
       setUpdate({
         phase: 'available',
+        channel: ch,
         latestTitle: res.latestTitle,
         latestSha: res.latestSha,
         latestTag: res?.latestTag,
+        latestVersion: res?.latestVersion,
         currentSha: res.currentSha,
+        currentVersion: res?.currentVersion,
+        changelog: typeof res?.changelog === 'string' ? res.changelog : '',
       });
       return;
     }
 
-    // 无更新时保留 latest 状态；标题旁的 Tag 直到用户再次检查才切换。
-    setUpdate({ phase: 'latest', currentSha: res?.currentSha });
+    // 无更新：版本文本直接显示服务端解析好的当前版本号。
+    setUpdate({
+      phase: 'latest',
+      channel: ch,
+      currentSha: res?.currentSha,
+      currentVersion: res?.currentVersion,
+      currentChangelog: typeof res?.currentChangelog === 'string' ? res.currentChangelog : '',
+    });
   };
 
   /**
-   * 一键更新。与检查相反：这是用户**主动**发起的动作，失败必须可见 ——
-   * 提示行显示服务端原始 message（`unwrapRpcResult` 抛出的 `caught.message`），
+   * 一键更新（按通道）。与检查相反：这是用户**主动**发起的动作，失败必须可见 ——
+   * 版本文本位显示服务端原始 message（`unwrapRpcResult` 抛出的 `caught.message`），
    * 不做二次包装或改写。
    */
   const applyUpdate = async () => {
-    setUpdateLogOpen(false);
-    // applying 与 applied 都保留 available 中的 latestTitle / SHA / tag；成功响应缺 SHA 时
-    // 仍能用 release tag 显示刚安装的版本。
+    // applying 保留 available 的 latestVersion / changelog：更新中显示哪个版本、
+    // 成功后展示哪份日志，都来自检查阶段缓存的这份事实。
     setUpdate(prev => ({ ...prev, phase: 'applying' }));
     let res;
     try {
-      res = await rpcCall('update.apply', {});
+      res = await rpcCall('update.apply', { channel: update.channel });
     } catch (caught) {
       if (updateAliveRef.current) {
-        setUpdate({ phase: 'failed', error: caught?.message || '更新失败' });
+        // failed 保留 channel：失败后用户再点 ⇩ 重新检查时仍按原通道走，
+        // 不悄悄回落到默认 stable（beta 用户在失败后突然看到 stable 的结果
+        // 是一种「通道被重置」的错觉）。
+        setUpdate(prev => ({ ...prev, phase: 'failed', error: caught?.message || '更新失败' }));
       }
       return;
     }
@@ -3157,7 +3182,7 @@ export function AccountHubPage({ rpcCall }) {
       phase: 'applied',
       previousSha: res?.previousSha,
       currentSha: res?.currentSha,
-      log: typeof res?.log === 'string' ? res.log : '',
+      currentVersion: res?.currentVersion || prev.latestVersion,
     }));
   };
 
@@ -3170,7 +3195,8 @@ export function AccountHubPage({ rpcCall }) {
    */
   React.useEffect(() => {
     updateAliveRef.current = true;
-    void checkUpdate();
+    // 挂载检查按当前通道（默认 stable）——channel 是 state，但挂载时恒为初值。
+    void checkUpdate(channel);
     return () => {
       updateAliveRef.current = false;
     };
@@ -3190,31 +3216,51 @@ export function AccountHubPage({ rpcCall }) {
             rel: 'noopener noreferrer',
           },
             React.createElement('strong', { className: 'dim-ah-brandName' }, '账号中心')),
-          update.phase === 'latest'
-            ? React.createElement(Tag, { tone: 'success' }, '已是最新')
+          // 版本号文本（用户拍板替换原「已是最新」Tag）：常态显示当前版本号，
+          // 有更新变黄「有更新 vX」，更新过程（更新中/已更新到/更新失败）也在这。
+          React.createElement(UpdateStatusText, {
+            update,
+            onToggle: () => setLogOpen(prev => !prev),
+          }),
+          logOpen && versionLogOf(update) !== ''
+            ? React.createElement('pre', { className: 'dim-ah-updateLog' }, versionLogOf(update))
             : null),
         React.createElement('p', { className: 'dim-ah-brandDesc' }, 'Provider 凭据管理与多账号支持')),
-      // 「检查更新」：更新的是**插件自身**，与任何 provider 都无关，故入口在页面
-      // 顶部（header 右侧）而不是某个面板的标题行里 —— 七个面板各挂一个只会得到
-      // 八份互相矛盾的提示。图标按钮**不带悬停提示**：本插件的按钮提示已按用户
-      // 要求整体删除，可读名由 aria-label 提供。
-      React.createElement(Button, {
-        variant: 'outline',
-        size: 'sm',
-        className: 'dim-ah-iconBtn',
-        'aria-label': '检查更新',
-        // 检查中 / 更新中禁止重复触发；latest 用标题旁标签表示，其余结果走下方提示行。
-        disabled: update.phase === 'checking' || update.phase === 'applying',
-        onClick: () => void checkUpdate(),
-      }, React.createElement('span', { 'aria-hidden': 'true' }, '⇩'))),
-    // 页面级更新提示行：header 之下、两栏之上。它不属于任何 provider，故放在
-    // `.dim-ah-layout` **之外**（切 provider 时既不重挂载、也不会消失）。
-    React.createElement(UpdateNotice, {
-      update,
-      logOpen: updateLogOpen,
-      onApply: () => void applyUpdate(),
-      onToggleLog: () => setUpdateLogOpen(prev => !prev),
-    }),
+      // 「检查更新 / 更新」按钮（用户拍板的双态）：常态是 outline 图标按钮 ⇩
+      // （aria-label「检查更新」）；有更新时原地变为白底黑字的 primary 文字按钮
+      // 「更新」（aria-label 同步换），点击即安装 —— 入口不挪位，视线不用重新找。
+      // 更新中 / 检查中两态都禁用：更新中防重复触发，检查中防检查与安装并发交错。
+      update.phase === 'available' || update.phase === 'applying'
+        ? React.createElement(Button, {
+            variant: 'primary',
+            size: 'sm',
+            className: 'dim-ah-updateBtn',
+            'aria-label': '更新',
+            disabled: update.phase === 'applying',
+            onClick: () => void applyUpdate(),
+          }, update.phase === 'applying' ? '更新中…' : '更新')
+        : React.createElement(Button, {
+            variant: 'outline',
+            size: 'sm',
+            className: 'dim-ah-iconBtn',
+            'aria-label': '检查更新',
+            disabled: update.phase === 'checking',
+            onClick: () => void checkUpdate(),
+          }, React.createElement('span', { 'aria-hidden': 'true' }, '⇩')),
+      // 更新通道下拉（用户拍板）：正式 = GitHub release，Beta = master 提交；
+      // 切换即立刻按新通道检查一次 —— 通道是「下一跳查什么」的谓词，选完就看效果。
+      // checking/applying 期间禁切：通道切换即触发新检查，与进行中的动作并发会
+      // 让两次响应交错回灌同一状态机（版本文本闪跳、apply 装错通道的版本）。
+      React.createElement(ChannelSelect, {
+        channel,
+        busy: update.phase === 'checking' || update.phase === 'applying',
+        onSelect: (id) => {
+          if (id === channel) return;
+          setChannel(id);
+          setLogOpen(false);
+          void checkUpdate(id);
+        },
+      })),
     React.createElement('div', { className: 'dim-ah-layout' },
       React.createElement('nav', { className: 'dim-ah-rail', role: 'tablist', 'aria-label': 'Provider 导航' },
         // 组标题走 ui-primitives 的 DisclosureRow：`expandOnRowClick` 让整行成为

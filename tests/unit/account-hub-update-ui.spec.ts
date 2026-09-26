@@ -1,23 +1,27 @@
 /**
- * 页面级「检查更新 / 一键更新」UI 的**渲染级**回归。
+ * 页面级「检查更新 / 一键更新」UI 的**渲染级**回归（v0.3.0 版本文本形态）。
  *
  * ## 为什么必须是渲染级
  *
  * 该功能的状态机（`idle → checking → available / latest → applying → applied /
- * failed`）整个活在 `AccountHubPage` 的 render 路径上：相位判断写错会把提示行渲染成
- * 空白、把「更新中…」渲染成可重复点击的入口、把失败原文吞掉 —— 这些缺陷在源码正则
- * 里都看不出来（正则只能证明「某个字符串还在」）。故本文件照抄
+ * failed`）整个活在 `AccountHubPage` 的 render 路径上：相位判断写错会把版本文本
+ * 渲染成空白、把「更新」按钮渲染成可重复点的入口、把失败原文吞掉 —— 这些缺陷
+ * 在源码正则里都看不出来（正则只能证明「某个字符串还在」）。故本文件照抄
  * `qoder-hub-blank-screen.spec.ts` 的渲染基建（带 hooks 的 react 占位模块 +
  * renderStable 驱动器）：真的渲染整页、真的点按钮、真的重渲染。
  *
- * ## 覆盖的契约（服务端由 `update.check` / `update.apply` 两个 RPC 提供）
+ * ## 覆盖的契约（服务端由 `update.check` / `update.apply` 两个 RPC 提供，
+ * ## task-26 双通道契约：请求带 `channel`，响应带 `currentVersion` / `latestVersion` /
+ * ## `changelog` / `currentChangelog`，显示串服务端算好直传）
  *
- * - 挂载后**自动静默**检查一次；只有真有更新时才出现提示行（含 release 名、tag 优先显示版本、primary 的「立即更新」）；
- * - 无更新时品牌标题旁显示「已是最新」Tag，不再显示整行提示，且不出现「立即更新」；
- * - 点「立即更新」→ 按钮原地转**禁用**的「更新中…」→ 成功后显示
- *   release tag 或 commit SHA 回退值、建议重启提示与可展开的完整日志；
- * - apply 失败显示**服务端原始 message**（红字错误档）；
- * - 检查失败静默：只 `console.warn`，页面顶部不留提示、也不抛。
+ * - 挂载后**自动静默**按 stable 通道检查一次；有更新时 header 版本文本变黄
+ *   「有更新 vX」，⇩ 按钮原地变 primary「更新」按钮；
+ * - 无更新时版本文本显示当前版本号（currentVersion），点击展开当前版本日志；
+ * - 点「更新」→ 按钮转禁用「更新中…」，版本文本位显示「更新中…」→ 成功后
+ *   「已更新到 <版本>，建议重启」+ 可展开的新版本 changelog；
+ * - 切换通道下拉为 Beta：立即按 beta 通道重新检查（update.check 带 channel: 'beta'）；
+ * - apply 失败：版本文本位显示**服务端原始 message**（error 色）；
+ * - 检查失败静默：只 `console.warn`，版本文本不留报错。
  *
  * ⚠️ `account-hub.js` 新增 import 时必须**同时**改 `IMPORT_REWRITES` 与临时目录里的
  * 替身文件：只改前者的话改写规则命中、而 `require` 在临时目录里找不到文件，本文件会以
@@ -41,7 +45,7 @@ const here = dirname(fileURLToPath(import.meta.url))
  *
  * 三条与真实 react 对齐的语义缺一不可：
  * 1. hooks 槽位按组件实例隔离 —— 本页里 `AccountHubPage` 与它渲染的
- *    `UpdateNotice` / `ProviderPanel` 各自的 `useState` 不能共用一份槽位；
+ *    `ChannelSelect` / `ProviderPanel` 各自的 `useState` 不能共用一份槽位；
  * 2. 依赖数组真的比对 —— 挂载检查的 effect deps 是 `[]`，若每轮渲染都重跑，
  *    它会无限重发 `update.check`，驱动器永远等不到稳定（而放宽收敛条件是错的：
  *    那会让「真的死循环」也冒充通过）；
@@ -279,7 +283,7 @@ function findButtonByLabel(node: unknown, label: string): ElementNode | undefine
     .find((el) => el.type === 'button' && el.props['aria-label'] === label)
 }
 
-/** 文字按钮通过可见文案查找（「立即更新」/「查看完整日志」）。 */
+/** 文字按钮通过可见文案查找。 */
 function findButtonByText(node: unknown, text: string): ElementNode | undefined {
   return flatten(node)
     .filter(isElement)
@@ -287,30 +291,17 @@ function findButtonByText(node: unknown, text: string): ElementNode | undefined 
 }
 
 /**
- * 页面级更新提示行的容器。
+ * header 品牌行的版本号文本（v0.3.0 起唯一承载更新状态的文本位）。
  *
- * ⚠️ 判据是 `.dim-ah-updateBar`（**页面级**那一层），不是 `.dim-ah-probeNotice`：
- * 后者是所有面板通知行共用的类名，用它会在「某个 provider 面板也弹了通知」时
- * 把面板的东西误当成更新提示（反之亦然）。
+ * 判据是 `className` 含 `dim-ah-versionText` 的 button —— 旧「已是最新」Tag
+ * 与整行 UpdateNotice 已删，这里就是「一个文本位承载全部状态」的那个位。
  */
-function updateBarOf(node: unknown): ElementNode | undefined {
+function versionTextOf(node: unknown): ElementNode | undefined {
   return flatten(node)
     .filter(isElement)
-    .find((el) => typeof el.props.className === 'string'
-      && el.props.className.includes('dim-ah-updateBar'))
-}
-
-/** latest 反馈必须是品牌标题行内的成功 Tag，而不是页面级提示行。 */
-function latestTagOf(node: unknown): ElementNode | undefined {
-  const titleRow = flatten(node)
-    .filter(isElement)
-    .find((el) => el.props.className === 'dim-ah-brandTitleRow')
-  if (titleRow === undefined) return undefined
-  return flatten(titleRow)
-    .filter(isElement)
-    .find((el) => el.type === 'span'
-      && el.props['data-tone'] === 'success'
-      && textsOf(el).join('') === '已是最新')
+    .find((el) => el.type === 'button'
+      && typeof el.props.className === 'string'
+      && el.props.className.includes('dim-ah-versionText'))
 }
 
 /**
@@ -349,9 +340,12 @@ beforeEach(() => { client.hooks.__resetStores() })
 /** 服务端契约里的两个 sha：前 8 位刻意不同，避免「拿 currentSha 冒充 latestSha」假绿。 */
 const SHA_OLD = '1111111111111111111111111111111111111111'
 const SHA_NEW = '2222222222222222222222222222222222222222'
-const LATEST_TITLE = 'dsh-account-hub v0.2.0'
-const LATEST_TAG = 'v0.2.0'
-const APPLY_LOG = 'Progress: resolved 12, reused 12, downloaded 0\nDone in 1.4s'
+const LATEST_TITLE = 'dsh-account-hub v0.3.0'
+const LATEST_TAG = 'v0.3.0'
+const CURRENT_VERSION = 'v0.2.0'
+const LATEST_VERSION_BETA = 'v0.2.0+3333333'
+const CHANGELOG = '## v0.3.0\n- 检查更新切换 release 轨道\n- 版本号文本三态'
+const CURRENT_CHANGELOG = '## v0.2.0\n- 首个正式 release'
 
 /** 可控的 promise：用于把 `update.apply` 卡在「更新中」那一相位上断言按钮态。 */
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
@@ -361,14 +355,14 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 }
 
 interface UpdateRpcOptions {
-  /** `update.check` 的响应（省略即「无更新」）；抛错即模拟网络失败。 */
-  check?: () => Promise<unknown>
+  /** `update.check` 的响应（省略即「无更新」）；抛错即模拟网络失败。可按 channel 区分。 */
+  check?: (channel: string) => Promise<unknown>
   /** `update.apply` 的响应（省略即一次成功安装）。 */
   apply?: () => Promise<unknown>
 }
 
 /**
- * rpc 替身：记录调用，并按方法给响应。
+ * rpc 替身：记录调用（含 payload），并按方法给响应。
  *
  * `account.list` / `credits.balances` 返回空集 —— 整页渲染会挂载 Codearts 面板，
  * 它挂载后立刻拉账号列表；不接住这两个方法的话渲染会在面板里炸，污染本文件的断言。
@@ -380,14 +374,22 @@ function makeUpdateRpc(options: UpdateRpcOptions = {}) {
     if (method === 'account.list') return { accounts: [] }
     if (method === 'credits.balances') return { accounts: [] }
     if (method === 'update.check') {
+      const channel = typeof payload?.channel === 'string' ? payload.channel : 'stable'
       return options.check
-        ? await options.check()
-        : { hasUpdate: false, currentSha: SHA_OLD, latestSha: SHA_OLD, latestTitle: '' }
+        ? await options.check(channel)
+        : {
+            hasUpdate: false,
+            currentSha: SHA_OLD,
+            latestSha: SHA_OLD,
+            latestTitle: '',
+            currentVersion: CURRENT_VERSION,
+            currentChangelog: CURRENT_CHANGELOG,
+          }
     }
     if (method === 'update.apply') {
       return options.apply
         ? await options.apply()
-        : { previousSha: SHA_OLD, currentSha: SHA_NEW, log: '' }
+        : { previousSha: SHA_OLD, currentSha: SHA_NEW, currentVersion: LATEST_TAG }
     }
     return {}
   }
@@ -398,8 +400,14 @@ function makeUpdateRpc(options: UpdateRpcOptions = {}) {
 const countOf = (calls: Array<{ method: string }>, method: string): number =>
   calls.filter((call) => call.method === method).length
 
-describe('页面级「检查更新 / 一键更新」', () => {
-  it('挂载后自动静默检查：提示行显示 release 名与 tag 版本、「立即更新」', async () => {
+/** `update.check` 调用里最后一条 payload 的 channel（缺省记 stable）。 */
+const lastCheckChannel = (calls: Array<{ method: string; payload: Record<string, unknown> }>): string => {
+  const found = calls.filter((call) => call.method === 'update.check').pop()
+  return typeof found?.payload?.channel === 'string' ? (found.payload.channel as string) : '(missing)'
+}
+
+describe('页面级「检查更新 / 一键更新」（版本文本三态 + 通道下拉）', () => {
+  it('挂载后自动按 stable 检查：版本文本变黄「有更新 vX」，⇩ 变「更新」按钮', async () => {
     const { calls, rpcCall } = makeUpdateRpc({
       check: async () => ({
         hasUpdate: true,
@@ -407,132 +415,149 @@ describe('页面级「检查更新 / 一键更新」', () => {
         latestSha: SHA_NEW,
         latestTag: LATEST_TAG,
         latestTitle: LATEST_TITLE,
+        latestVersion: LATEST_TAG,
+        currentVersion: CURRENT_VERSION,
+        changelog: CHANGELOG,
       }),
     })
 
     const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
 
-    // 入口：页面顶部的图标按钮，可读名由 aria-label 提供（本插件不留悬停提示）。
-    const entry = findButtonByLabel(tree, '检查更新')
-    expect(entry, '页面顶部找不到「检查更新」按钮').toBeDefined()
-
-    // 用户没点任何东西，挂载后必须**自动**检查过一次。
+    // 用户没点任何东西，挂载后必须**自动**检查过一次，且默认 stable 通道。
     expect(countOf(calls, 'update.check'), '挂载后没有自动检查更新').toBe(1)
+    expect(lastCheckChannel(calls), '默认通道必须是 stable').toBe('stable')
 
-    const bar = updateBarOf(tree)
-    expect(bar, '有更新时没有渲染更新提示行').toBeDefined()
-    expect(latestTagOf(tree), '发现更新时应由 available 提示行取代 latest Tag').toBeUndefined()
-    const text = textsOf(bar!).join('')
-    expect(text, '提示行里没有 release 名').toContain(LATEST_TITLE)
-    expect(text, '最新版本应显示 release tag').toContain(`最新 ${LATEST_TAG}`)
-    expect(text, '有 tag 时最新侧不应回退显示 commit 短 SHA')
-      .not.toContain(`最新 ${SHA_NEW.slice(0, 8)}`)
+    // 版本文本：有更新态 —— 黄色警示「有更新 <最新版本>」。
+    const versionText = versionTextOf(tree)
+    expect(versionText, 'header 里没有版本号文本').toBeDefined()
+    expect(textsOf(versionText!).join(''), '有更新时版本文本没有显示「有更新」+ 版本号')
+      .toContain(`有更新 ${LATEST_TAG}`)
+    expect(versionText!.props['data-tone'], '有更新态必须是警示色（黄）').toBe('warn')
 
-    const apply = findButtonByText(tree, '立即更新')
-    expect(apply, '提示行里没有「立即更新」按钮').toBeDefined()
-    expect(apply!.props['data-variant'], '「立即更新」不是 primary 按钮').toBe('primary')
-    expect(apply!.props.disabled, '可更新态的「立即更新」不该被禁用').not.toBe(true)
+    // ⇩ 按钮原地变为白底黑字 primary「更新」按钮（aria-label 同步换）。
+    const update = findButtonByLabel(tree, '更新')
+    expect(update, '有更新时没有「更新」按钮').toBeDefined()
+    expect(update!.props['data-variant'], '「更新」按钮必须是 primary（白底黑字）').toBe('primary')
+    expect(update!.props.disabled, '可更新态的「更新」按钮不该被禁用').not.toBe(true)
+    expect(findButtonByLabel(tree, '检查更新'), '有更新时不应再显示 ⇩ 检查按钮').toBeUndefined()
   })
 
-  it('available 的 currentSha 为空时显示「当前未安装」，latestTag 缺失时回退到短 SHA', async () => {
+  it('无更新：版本文本显示当前版本号，点击展开当前版本日志', async () => {
+    const { rpcCall } = makeUpdateRpc({
+      check: async () => ({
+        hasUpdate: false,
+        currentSha: SHA_OLD,
+        latestSha: SHA_OLD,
+        latestTitle: '',
+        currentVersion: CURRENT_VERSION,
+        currentChangelog: CURRENT_CHANGELOG,
+      }),
+    })
+
+    const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+
+    const versionText = versionTextOf(tree)
+    expect(versionText, 'header 里没有版本号文本').toBeDefined()
+    expect(textsOf(versionText!).join(''), '无更新时应显示当前版本号而非「已是最新」')
+      .toContain(CURRENT_VERSION)
+    expect(textsOf(versionText!).join(''), '无更新时不应再显示「已是最新」')
+      .not.toContain('已是最新')
+    expect(versionText!.props['data-tone'], '常态版本文本应是低调色').toBe('idle')
+
+    // 点击版本文本 → 展开当前版本的 changelog（task-26 契约里的 currentChangelog）。
+    ;(versionText!.props.onClick as () => void)()
+    const openTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    const texts = textsOf(openTree).join('')
+    expect(texts, '点击版本文本后没有展开当前版本日志').toContain('首个正式 release')
+    // 再点一次收起（toggle 语义）。
+    ;(versionTextOf(openTree)!.props.onClick as () => void)()
+    const closedTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    expect(textsOf(closedTree).join(''), '再次点击没有收起日志').not.toContain('首个正式 release')
+  })
+
+  it('有更新时点版本文本展开新版本 changelog，点「更新」走 apply', async () => {
+    const { calls, rpcCall } = makeUpdateRpc({
+      check: async () => ({
+        hasUpdate: true,
+        currentSha: SHA_OLD,
+        latestSha: SHA_NEW,
+        latestTag: LATEST_TAG,
+        latestTitle: LATEST_TITLE,
+        latestVersion: LATEST_TAG,
+        currentVersion: CURRENT_VERSION,
+        changelog: CHANGELOG,
+      }),
+    })
+
+    const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+
+    // 有更新态点版本文本 → 展开的是**新版本**日志（不是当前版本的）。
+    ;(versionTextOf(tree)!.props.onClick as () => void)()
+    const openTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    const texts = textsOf(openTree).join('')
+    expect(texts, '有更新态点击版本文本应展开新版本日志').toContain('检查更新切换 release 轨道')
+
+    // 点「更新」→ update.apply 带 stable 通道。apply 返回挂起的 gate，
+    // 把相位钉在 applying 上断言「更新过程显示在版本文本位」。
+    // ⚠️ 点击必须发生在用 gatedRpc 渲染的树上：openTree 里按钮的 onClick 闭包
+    // 捕获的是旧 rpcCall（apply 立即 resolve，相位一闪而过断言不到）。
+    const gate = deferred<{ previousSha: string; currentSha: string; currentVersion: string }>()
+    const { calls: gatedCalls, rpcCall: gatedRpc } = makeUpdateRpc({ apply: () => gate.promise })
+    const gatedTree = await renderStable(client.AccountHubPage, { rpcCall: gatedRpc }, client.hooks)
+    ;(findButtonByLabel(gatedTree, '更新')!.props.onClick as () => void)()
+    const applyingTree = await renderStable(client.AccountHubPage, { rpcCall: gatedRpc }, client.hooks)
+    expect(countOf(gatedCalls, 'update.apply'), '点击「更新」没有调用 update.apply').toBe(1)
+    const applyCall = gatedCalls.find((call) => call.method === 'update.apply')!
+    expect(applyCall.payload.channel, 'apply 应带当前通道 stable').toBe('stable')
+    expect(textsOf(applyingTree).join(''), '更新过程应显示在版本文本位').toContain('更新中')
+    gate.resolve({ previousSha: SHA_OLD, currentSha: SHA_NEW, currentVersion: LATEST_TAG })
+  })
+
+  it('点「更新」：按钮转禁用「更新中…」，成功后显示「已更新到 <版本>，建议重启」', async () => {
+    const gate = deferred<{ previousSha: string; currentSha: string; currentVersion: string }>()
     const { rpcCall } = makeUpdateRpc({
       check: async () => ({
         hasUpdate: true,
-        currentSha: '',
-        latestSha: SHA_NEW,
-        latestTitle: LATEST_TITLE,
-      }),
-    })
-
-    const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    const text = textsOf(updateBarOf(tree)!).join('')
-    expect(text, '空 currentSha 应显示为「当前未安装」')
-      .toContain(`当前未安装 → 最新 ${SHA_NEW.slice(0, 8)}`)
-    expect(text, '空 currentSha 不应再被 shortSha 格式化为「未知」')
-      .not.toContain('未知')
-  })
-
-  it('无更新时标题旁显示「已是最新」Tag，不出现提示行或「立即更新」', async () => {
-    const { calls, rpcCall } = makeUpdateRpc({
-      check: async () => ({
-        hasUpdate: false, currentSha: SHA_OLD, latestSha: SHA_OLD, latestTitle: '',
-      }),
-    })
-
-    const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-
-    expect(countOf(calls, 'update.check'), '挂载后没有自动检查更新').toBe(1)
-    const titleRow = flatten(tree)
-      .filter(isElement)
-      .find((el) => el.props.className === 'dim-ah-brandTitleRow')
-    expect(titleRow, '页面 header 缺少品牌标题行').toBeDefined()
-    expect(textsOf(titleRow!).join(''), 'Tag 未显示在「账号中心」标题旁')
-      .toContain('账号中心已是最新')
-    const tag = latestTagOf(tree)
-    expect(tag, '无更新时标题旁没有「已是最新」Tag').toBeDefined()
-    expect(tag!.props['data-tone'], 'Tag 应使用低调的成功色调').toBe('success')
-    expect(updateBarOf(tree), '无更新时不应渲染整行更新提示').toBeUndefined()
-    expect(findButtonByText(tree, '立即更新'), '无更新时不该出现「立即更新」按钮').toBeUndefined()
-
-    // 用户手动点击 ⇩ 走同一检查状态机，latest Tag 应再次显示。
-    ;(findButtonByLabel(tree, '检查更新')!.props.onClick as () => void)()
-    const manuallyCheckedTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    expect(countOf(calls, 'update.check'), '手动检查没有复用 update.check').toBe(2)
-    expect(latestTagOf(manuallyCheckedTree), '手动检查无更新后标题旁没有 Tag').toBeDefined()
-    expect(updateBarOf(manuallyCheckedTree), '手动检查无更新后不应渲染整行提示')
-      .toBeUndefined()
-  })
-
-  it('点「立即更新」：按钮转禁用的「更新中…」，成功后显示重启提示与可展开日志', async () => {
-    const gate = deferred<{ previousSha: string; currentSha: string; log: string }>()
-    const { calls, rpcCall } = makeUpdateRpc({
-      check: async () => ({
-        hasUpdate: true,
         currentSha: SHA_OLD,
         latestSha: SHA_NEW,
         latestTag: LATEST_TAG,
         latestTitle: LATEST_TITLE,
+        latestVersion: LATEST_TAG,
+        currentVersion: CURRENT_VERSION,
+        changelog: CHANGELOG,
       }),
       // 卡住 apply：先断言「更新中」那一相位，再放行看成功态。
       apply: () => gate.promise,
     })
 
     const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    const apply = findButtonByText(tree, '立即更新')
-    expect(apply, '提示行里没有「立即更新」按钮').toBeDefined()
-
-    const onClick = apply!.props.onClick as () => void
-    expect(typeof onClick).toBe('function')
-    expect(() => onClick()).not.toThrow()
+    ;(findButtonByLabel(tree, '更新')!.props.onClick as () => void)()
 
     // 「更新中」相位：请求还挂着，按钮必须原地转禁用态（不能是可重复点的入口）。
     const busyTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    const busy = findButtonByText(busyTree, '更新中…')
-    expect(busy, '点击后按钮没有转成「更新中…」').toBeDefined()
+    const busy = findButtonByLabel(busyTree, '更新')
+    expect(busy, '点击后没有「更新中…」按钮').toBeDefined()
     expect(busy!.props.disabled, '「更新中…」必须是禁用态').toBe(true)
-    expect(countOf(calls, 'update.apply'), '点击没有调用 update.apply').toBe(1)
+    expect(textsOf(busy!).join(''), '更新中按钮文案不对').toContain('更新中…')
+    expect(textsOf(versionTextOf(busyTree)!).join(''), '版本文本位应同步显示「更新中…」')
+      .toContain('更新中…')
 
-    // 放行：成功态 + 日志折叠。
-    gate.resolve({ previousSha: SHA_OLD, currentSha: SHA_NEW, log: APPLY_LOG })
+    // 放行：成功态 —— 版本文本位变绿「已更新到 <版本>，建议重启」。
+    gate.resolve({ previousSha: SHA_OLD, currentSha: SHA_NEW, currentVersion: LATEST_TAG })
     const doneTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    const doneText = textsOf(versionTextOf(doneTree)!).join('')
+    expect(doneText, '成功后没有显示「已更新到 <版本>，建议重启」')
+      .toContain(`已更新到 ${LATEST_TAG}，建议重启`)
+    expect(versionTextOf(doneTree)!.props['data-tone'], '成功态应是成功色').toBe('ok')
 
-    const doneText = textsOf(updateBarOf(doneTree)!).join('')
-    expect(doneText, '成功后没有显示新 sha 与「建议重启会话生效」')
-      .toContain(`已更新到 ${SHA_NEW.slice(0, 8)}，建议重启会话生效`)
-    // 日志默认**收起**：完整输出不该白占版面。
-    expect(doneText, '日志默认就是展开的（应当收起）').not.toContain('Done in 1.4s')
-
-    const toggle = findButtonByText(doneTree, '查看完整日志')
-    expect(toggle, '成功后没有「查看完整日志」入口').toBeDefined()
-    ;(toggle!.props.onClick as () => void)()
-
+    // 成功后点击版本文本 → 展开新版本 changelog。
+    ;(versionTextOf(doneTree)!.props.onClick as () => void)()
     const openTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    const openText = textsOf(updateBarOf(openTree)!).join('')
-    expect(openText, '展开后没有显示服务端返回的日志').toContain('Done in 1.4s')
-    expect(findButtonByText(openTree, '收起日志'), '展开后没有「收起日志」入口').toBeDefined()
+    expect(textsOf(openTree).join(''), '成功态点击应能展开新版本日志')
+      .toContain('检查更新切换 release 轨道')
   })
 
-  it('apply 成功未返回 currentSha 时回退到保留的 release tag', async () => {
+  it('apply 响应缺 currentVersion 时回退到检查阶段缓存的 latestVersion', async () => {
     const { rpcCall } = makeUpdateRpc({
       check: async () => ({
         hasUpdate: true,
@@ -540,68 +565,95 @@ describe('页面级「检查更新 / 一键更新」', () => {
         latestSha: SHA_NEW,
         latestTag: LATEST_TAG,
         latestTitle: LATEST_TITLE,
+        latestVersion: LATEST_TAG,
+        currentVersion: CURRENT_VERSION,
+        changelog: CHANGELOG,
       }),
-      apply: async () => ({ previousSha: SHA_OLD, log: '' }),
+      apply: async () => ({ previousSha: SHA_OLD, currentSha: SHA_NEW }),
     })
 
     const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    ;(findButtonByText(tree, '立即更新')!.props.onClick as () => void)()
+    ;(findButtonByLabel(tree, '更新')!.props.onClick as () => void)()
     const doneTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    const text = textsOf(updateBarOf(doneTree)!).join('')
-    expect(text, 'apply 响应缺 currentSha 时应显示继承的 release tag')
-      .toContain(`已更新到 ${LATEST_TAG}，建议重启会话生效`)
-    expect(text, 'apply 响应缺 currentSha 时不应显示「未知」').not.toContain('未知')
+    expect(textsOf(versionTextOf(doneTree)!).join(''), 'apply 缺 currentVersion 应回退 latestVersion')
+      .toContain(`已更新到 ${LATEST_TAG}，建议重启`)
+    expect(textsOf(doneTree).join(''), '任何回退场景都不该出现「未知」').not.toContain('未知')
   })
 
-  it('apply 成功且 currentSha、latestTag 均缺失时回退到 latestSha', async () => {
+  it('apply 失败：版本文本位显示服务端原始错误（error 色）', async () => {
+    const SERVER_MESSAGE = 'pnpm add 失败：ERR_PNPM_NO_MATCHING_VERSION 版本不存在'
     const { rpcCall } = makeUpdateRpc({
       check: async () => ({
         hasUpdate: true,
         currentSha: SHA_OLD,
         latestSha: SHA_NEW,
+        latestTag: LATEST_TAG,
         latestTitle: LATEST_TITLE,
-      }),
-      apply: async () => ({ previousSha: SHA_OLD, log: '' }),
-    })
-
-    const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    ;(findButtonByText(tree, '立即更新')!.props.onClick as () => void)()
-    const doneTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    const text = textsOf(updateBarOf(doneTree)!).join('')
-    expect(text, '缺少 currentSha 和 latestTag 时应回退到 latestSha')
-      .toContain(`已更新到 ${SHA_NEW.slice(0, 8)}，建议重启会话生效`)
-    expect(text, 'SHA 回退场景也不应显示「未知」').not.toContain('未知')
-  })
-
-  it('apply 失败时显示服务端原始错误 message', async () => {
-    const SERVER_MESSAGE = 'pnpm install 失败：ERR_PNPM_NO_MATCHING_VERSION 版本不存在'
-    const { rpcCall } = makeUpdateRpc({
-      check: async () => ({
-        hasUpdate: true, currentSha: SHA_OLD, latestSha: SHA_NEW, latestTitle: LATEST_TITLE,
+        latestVersion: LATEST_TAG,
+        currentVersion: CURRENT_VERSION,
+        changelog: CHANGELOG,
       }),
       apply: async () => { throw new Error(SERVER_MESSAGE) },
     })
 
     const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    ;(findButtonByText(tree, '立即更新')!.props.onClick as () => void)()
+    ;(findButtonByLabel(tree, '更新')!.props.onClick as () => void)()
 
     const failedTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
-    const bar = updateBarOf(failedTree)
-    expect(bar, 'apply 失败后没有渲染错误提示行').toBeDefined()
+    const failedText = versionTextOf(failedTree)
+    expect(failedText, 'apply 失败后版本文本位没有渲染').toBeDefined()
     // 原文一字不改：改写会把唯一可诊断的线索洗掉。
-    expect(textsOf(bar!).join(''), '错误提示行里没有服务端原始 message').toContain(SERVER_MESSAGE)
-    // ⚠️ 色调与语义在**通知行本体**（`.dim-ah-probeNotice`）上，不在包裹它的
-    // `.dim-ah-updateBar` 容器上 —— 判据写错层级会让这条断言永远拿到 undefined。
-    const notice = flatten(bar!)
-      .filter(isElement)
-      .find((el) => typeof el.props.className === 'string'
-        && el.props.className.includes('dim-ah-probeNotice'))
-    expect(notice, '失败提示行里没有通知行本体').toBeDefined()
-    expect(notice!.props['data-tone'], '失败提示行不是错误档').toBe('error')
-    expect(notice!.props.role, '失败提示行不是 alert 语义').toBe('alert')
+    expect(textsOf(failedText!).join(''), '版本文本里没有服务端原始 message').toContain(SERVER_MESSAGE)
+    expect(failedText!.props['data-tone'], '失败态必须是 error 色').toBe('error')
   })
 
-  it('挂载时的检查网络失败：不弹提示、不抛，只留一条 console.warn', async () => {
+  it('切换通道到 Beta：立即按 beta 重新检查（channel: beta 透传到 update.check）', async () => {
+    const { calls, rpcCall } = makeUpdateRpc({
+      check: async (channel) => channel === 'beta'
+        ? {
+            hasUpdate: true,
+            currentSha: SHA_OLD,
+            latestSha: '3333333333333333333333333333333333333333',
+            latestTag: LATEST_TAG,
+            latestTitle: LATEST_TITLE,
+            latestVersion: LATEST_VERSION_BETA,
+            currentVersion: CURRENT_VERSION,
+            changelog: CHANGELOG,
+          }
+        : {
+            hasUpdate: false,
+            currentSha: SHA_OLD,
+            latestSha: SHA_OLD,
+            latestTitle: '',
+            currentVersion: CURRENT_VERSION,
+            currentChangelog: CURRENT_CHANGELOG,
+          },
+    })
+
+    const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    expect(lastCheckChannel(calls), '挂载默认检查应为 stable').toBe('stable')
+    expect(textsOf(versionTextOf(tree)!).join(''), 'stable 无更新时应显示当前版本号')
+      .toContain(CURRENT_VERSION)
+
+    // 打开通道菜单 → 选 Beta。菜单行是 role="menuitem" 的 button（Menu 替身）。
+    ;(findButtonByLabel(tree, '更新通道')!.props.onClick as () => void)()
+    const menuTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    const betaItem = flatten(menuTree)
+      .filter(isElement)
+      .find((el) => el.props.role === 'menuitem' && textsOf(el).join('') === 'Beta')
+    expect(betaItem, '通道菜单里没有「Beta」选项').toBeDefined()
+    ;(betaItem!.props.onClick as () => void)()
+
+    // 切换即检查：update.check 立即带 channel: 'beta' 重发。
+    const betaTree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
+    expect(countOf(calls, 'update.check'), '切换通道后没有立即重新检查').toBe(2)
+    expect(lastCheckChannel(calls), '重新检查没有带 beta 通道').toBe('beta')
+    // beta 有更新：版本文本显示「有更新 v0.2.0+3333333」（tag+短 sha 形态直显）。
+    expect(textsOf(versionTextOf(betaTree)!).join(''), 'beta 有更新应显示 tag+短 sha 版本号')
+      .toContain(`有更新 ${LATEST_VERSION_BETA}`)
+  })
+
+  it('挂载时的检查网络失败：版本文本不留报错、不抛，只留一条 console.warn', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     try {
       const { calls, rpcCall } = makeUpdateRpc({
@@ -611,8 +663,12 @@ describe('页面级「检查更新 / 一键更新」', () => {
       const tree = await renderStable(client.AccountHubPage, { rpcCall }, client.hooks)
 
       expect(countOf(calls, 'update.check'), '挂载后没有自动检查更新').toBe(1)
-      // 用户没主动做任何事：一次后台请求失败不该在页面顶部留提示。
-      expect(updateBarOf(tree), '静默检查失败后不该出现任何更新提示行').toBeUndefined()
+      // 用户没主动做任何事：一次后台请求失败不该在 header 上留报错（静默回落 idle）。
+      const versionText = versionTextOf(tree)
+      if (versionText !== undefined) {
+        expect(textsOf(versionText).join(''), '静默失败后版本文本不该显示报错')
+          .not.toContain('network down')
+      }
       expect(warn, '检查失败应当留一条 console.warn 供排查').toHaveBeenCalled()
     } finally {
       warn.mockRestore()

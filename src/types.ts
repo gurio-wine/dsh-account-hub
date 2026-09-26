@@ -525,22 +525,37 @@ export interface RpcAutoRouteGetResponse {
   models: import('./auto-route.js').AutoRouteDefinition[]
 }
 
-/** RPC: `update.check` 请求（无参数）。 */
-export type RpcUpdateCheckRequest = Record<string, never>
+/** 更新轨道；stable 跟随 GitHub Release，beta 跟随 master 提交。 */
+export type RpcUpdateChannel = 'stable' | 'beta'
+
+/** RPC: `update.check` 请求；channel 缺省为 stable。 */
+export interface RpcUpdateCheckRequest {
+  channel?: RpcUpdateChannel
+}
 
 /** RPC: `update.check` 响应。 */
 export interface RpcUpdateCheckResponse {
   currentSha: string
   latestSha: string
-  /** 最新 GitHub Release 的 tag 名（如 v0.2.0），供版本显示使用。 */
+  /** 当前版本所关联的 Release tag；beta 无 Release 时为 beta。 */
   latestTag: string
   hasUpdate: boolean
-  /** Release 名称；Release 未设置名称时回退为 latestTag。 */
+  /** stable 为 Release 名称，beta 为 HEAD 提交标题。 */
   latestTitle: string
+  /** 服务端计算好的当前版本显示串；beta 为 tag+短 SHA。 */
+  currentVersion: string
+  /** 服务端计算好的目标版本显示串；beta 为 tag+短 SHA。 */
+  latestVersion: string
+  /** 所选更新轨道的目标版本更新日志。 */
+  changelog: string
+  /** 当前版本日志：stable 为当前 Release，beta 为自最新 Release 以来的提交。 */
+  currentChangelog: string
 }
 
-/** RPC: `update.apply` 请求（无参数）。 */
-export type RpcUpdateApplyRequest = Record<string, never>
+/** RPC: `update.apply` 请求；channel 缺省为 stable。 */
+export interface RpcUpdateApplyRequest {
+  channel?: RpcUpdateChannel
+}
 
 /** RPC: `update.apply` 响应。 */
 export interface RpcUpdateApplyResponse {

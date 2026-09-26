@@ -202,10 +202,17 @@ const STYLES = `
 .dim-ah-probeDetails { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 2px; }
 .dim-ah-probeDetails li { font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-line-height); }
 
-/* 页面级更新提示行（检查更新 / 一键更新）：提示行本体沿用 .dim-ah-probeNotice，
-   这一层只补它与 .dim-ah-header 对齐的内边距 —— 它挂在 header 与两栏布局之间，
-   横跨整页（更新的是插件自身，不属于任何 provider）。 */
-.dim-ah-updateBar { padding: 12px 24px 0; }
+/* 版本号文本（header 品牌行内，替换原「已是最新」Tag）：一个文本位承载全部
+   更新状态，色档与 .dim-ah-probeNotice 的 data-tone 域同源 —— warn = 有更新，
+   ok = 更新完成，error = 失败原文，idle/muted = 常态版本号 / 过程态。 */
+.dim-ah-versionText { flex: none; max-width: 240px; overflow: hidden; padding: 2px 6px; border: none; border-radius: 6px; background: transparent; font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-font-height, var(--dsw-font-xxs-12-font-size)); font-weight: var(--dsw-font-xxs-strong-12-font-weight); color: var(--dsw-alias-label-secondary); text-overflow: ellipsis; white-space: nowrap; cursor: pointer; transition: color var(--ds-transition-duration-fast) var(--ds-ease-in-out); }
+.dim-ah-versionText:hover { color: var(--dsw-alias-link); }
+.dim-ah-versionText[data-tone="warn"] { color: var(--dsw-alias-state-warn-primary); }
+.dim-ah-versionText[data-tone="ok"] { color: var(--dsw-alias-state-success-primary); }
+.dim-ah-versionText[data-tone="error"] { color: var(--dsw-alias-state-error-primary); }
+.dim-ah-versionText[data-tone="muted"] { color: var(--dsw-alias-label-tertiary); }
+/* 有更新态的白底黑字「更新」按钮（用户拍板，替换原 ⇩ 图标按钮形态）。 */
+.dim-ah-updateBtn { min-width: max-content; }
 /* 更新日志：等宽 + 限高滚动。服务端给的是 pnpm 安装输出汇总，可能上百行，
    不设上限会把下面的两栏布局顶出视口（与 .dim-ah-modal 的 max-height 同一考虑）。 */
 .dim-ah-updateLog { max-height: 180px; margin: 6px 0 0; padding: 8px 10px; overflow: auto; border-radius: 8px; background: var(--dsw-alias-bg-layer-2); font-family: var(--ds-font-family-code); font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); white-space: pre-wrap; word-break: break-all; }

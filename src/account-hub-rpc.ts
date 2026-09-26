@@ -126,10 +126,9 @@ import type {
   RpcAutoRouteCatalogResponse,
   RpcAutoRouteModelInfoRequest,
   RpcAutoRouteModelInfoResponse,
-  RpcUpdateCheckRequest,
   RpcUpdateCheckResponse,
-  RpcUpdateApplyRequest,
   RpcUpdateApplyResponse,
+  RpcUpdateChannel,
 } from './types.js'
 import { AUTO_ROUTE_PROVIDER_ID, type AutoRouteDefinition } from './auto-route.js'
 import {
@@ -1822,6 +1821,11 @@ export function registerAccountHubRpc(options: AccountHubRpcOptions): void {
   })
 }
 
+function normalizeUpdateChannel(payload: unknown): RpcUpdateChannel {
+  if (typeof payload !== 'object' || payload === null) return 'stable'
+  return (payload as { channel?: unknown }).channel === 'beta' ? 'beta' : 'stable'
+}
+
 /**
  * 注册 Account Hub 管理 API 端点。使用 ctx.connection.fetch.register() 注册 HTTP POST 端点。
  *
@@ -1960,16 +1964,16 @@ function registerAccountHubEndpoints(options: AccountHubRpcOptions): void {
   async function handleMethod(method: string, payload: unknown, _signal: AbortSignal): Promise<unknown> {
     switch (method) {
       case 'update.check': {
-        void (payload as RpcUpdateCheckRequest)
+        const channel = normalizeUpdateChannel(payload)
         if (options.updateDeps === undefined) throw new Error('Account Hub 更新功能未初始化')
-        const value: RpcUpdateCheckResponse = await checkAccountHubUpdate(options.updateDeps)
+        const value: RpcUpdateCheckResponse = await checkAccountHubUpdate(options.updateDeps, channel)
         return { ok: true, value }
       }
 
       case 'update.apply': {
-        void (payload as RpcUpdateApplyRequest)
+        const channel = normalizeUpdateChannel(payload)
         if (options.updateDeps === undefined) throw new Error('Account Hub 更新功能未初始化')
-        const value: RpcUpdateApplyResponse = await applyAccountHubUpdate(options.updateDeps)
+        const value: RpcUpdateApplyResponse = await applyAccountHubUpdate(options.updateDeps, channel)
         return { ok: true, value }
       }
 
