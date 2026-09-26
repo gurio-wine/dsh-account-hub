@@ -1062,7 +1062,7 @@ describe('AutoRoutePanel：自动保存流（修改即保存）', () => {
     // 空 entries 的定义照样渲染出卡片与「添加模型」入口，没有任何前端拦截。
     const card = cardsOf(tree)[2]!
     expect(rowsInCard(card)).toHaveLength(0)
-    expect(textsOf(card), '卡片头应当显示条目数').toContain('0 个模型条目')
+    expect(textsOf(card).join('\n'), '卡片头不再显示条目数').not.toContain('个模型条目')
     expect(findButtonByText(card, '添加模型'), '空定义仍要能加候选').toBeDefined()
     // 修改即保存的合法性闸：中间态不提交（提交必被服务端拒，白报错）。
     expect(calls.filter((c) => c.method === 'autoroute.set'), '空定义中间态不该触发提交').toHaveLength(0)

@@ -2869,7 +2869,6 @@ function AutoRoutePanel({ rpcCall }) {
           placeholder: '自动模型名称',
           onChange: (event) => renameDefinition(def.id, event?.target?.value ?? ''),
         }),
-        React.createElement('span', { className: 'dim-ah-arEntryCount' }, `${def.entries.length} 个模型条目`),
         React.createElement(Button, {
           variant: 'outline',
           size: 'sm',

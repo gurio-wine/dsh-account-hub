@@ -318,7 +318,6 @@ const STYLES = `
 .dim-ah-arOrder { min-width: 18px; padding: 0 5px; border-radius: 6px; font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); font-weight: var(--dsw-font-xxxs-strong-11-font-weight); text-align: center; color: var(--dsw-alias-label-secondary); background: var(--dsw-alias-bg-module-platform); }
 /* 名称输入优先占用剩余空间；条目数与删除按钮维持自身宽度。 */
 .dim-ah-arNameInput { width: 100%; min-width: 0; }
-.dim-ah-arEntryCount { white-space: nowrap; font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-line-height); color: var(--dsw-alias-label-tertiary); }
 
 /* 候选列表（卡片内），间距按 12/8/4 节奏收敛。 */
 .dim-ah-arEntries { display: grid; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--dsw-alias-border-l2); }
