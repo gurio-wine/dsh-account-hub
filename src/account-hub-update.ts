@@ -35,17 +35,24 @@ export interface AccountHubUpdateDeps {
 
 /**
  * 从 pnpm-lock.yaml 的 dependencies 下定位 dsh-account-hub tarball，并提取完整 commit SHA。
- * 使用行级缩进配合正则读取目标依赖块，避免误取其它包或其它 YAML 区段中的 SHA。
+ * 对外保持既有严格行为；半卸载状态的检查与应用使用内部 nullable 查找器。
  */
 export function extractAccountHubSha(lockfile: string): string {
+  const sha = findAccountHubSha(lockfile)
+  if (sha !== null) return sha
+  if (!/^[ \t]*dependencies:\s*(?:#.*)?$/m.test(lockfile)) {
+    throw new Error('pnpm-lock.yaml 格式无效：找不到 dependencies 段')
+  }
+  throw new Error('pnpm-lock.yaml dependencies 段中找不到 dsh-account-hub')
+}
+
+/** 找不到目标依赖时返回 null；目标条目存在但格式错误仍抛出原有错误。 */
+function findAccountHubSha(lockfile: string): string | null {
   const lines = lockfile.split(/\r?\n/)
-  let sawDependencies = false
-  let sawPackage = false
 
   for (let sectionIndex = 0; sectionIndex < lines.length; sectionIndex += 1) {
     const sectionMatch = lines[sectionIndex].match(/^([ \t]*)dependencies:\s*(?:#.*)?$/)
     if (sectionMatch === null) continue
-    sawDependencies = true
 
     const sectionIndent = sectionMatch[1].length
     let sectionEnd = sectionIndex + 1
@@ -62,7 +69,6 @@ export function extractAccountHubSha(lockfile: string): string {
     for (let packageIndex = sectionIndex + 1; packageIndex < sectionEnd; packageIndex += 1) {
       const packageMatch = lines[packageIndex].match(/^([ \t]*)dsh-account-hub:\s*(.*)$/)
       if (packageMatch === null || packageMatch[1].length <= sectionIndent) continue
-      sawPackage = true
 
       const packageIndent = packageMatch[1].length
       let packageEnd = packageIndex + 1
@@ -84,13 +90,7 @@ export function extractAccountHubSha(lockfile: string): string {
     sectionIndex = sectionEnd - 1
   }
 
-  if (!sawDependencies) {
-    throw new Error('pnpm-lock.yaml 格式无效：找不到 dependencies 段')
-  }
-  if (!sawPackage) {
-    throw new Error('pnpm-lock.yaml dependencies 段中找不到 dsh-account-hub')
-  }
-  throw new Error('pnpm-lock.yaml 中 dsh-account-hub 的 tarball URL 格式无效，无法提取 40 位 SHA')
+  return null
 }
 
 /** 查询 GitHub master 最新提交；检查与安装共用该查询和校验逻辑。 */
@@ -122,12 +122,12 @@ async function fetchLatestCommit(deps: AccountHubUpdateDeps): Promise<{ sha: str
 /** 查询当前安装 SHA 与 GitHub master，并返回客户端面板使用的字段。 */
 export async function checkAccountHubUpdate(deps: AccountHubUpdateDeps): Promise<RpcUpdateCheckResponse> {
   const lockfile = await deps.readFile(join(deps.profileRoot, 'pnpm-lock.yaml'))
-  const currentSha = extractAccountHubSha(lockfile)
+  const currentSha = findAccountHubSha(lockfile) ?? ''
   const latest = await fetchLatestCommit(deps)
   return {
     currentSha,
     latestSha: latest.sha,
-    hasUpdate: currentSha !== latest.sha,
+    hasUpdate: currentSha === '' || currentSha !== latest.sha,
     latestTitle: latest.title,
   }
 }
@@ -192,57 +192,36 @@ export function appendAccountHubAllowBuild(dependenciesFile: string, sha: string
 }
 
 /**
- * 把 profile package.json 中的 dsh-account-hub GitHub pin 改成目标 SHA。
- * 只替换字段值，保留其余字节、键顺序、缩进和换行，避免破坏 profile 启动文件；目标值相同则原样返回。
- */
-export function writeAccountHubPin(packageJsonContent: string, sha: string): string {
-  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('待写入版本不是有效的 40 位 SHA')
-  const normalizedSha = sha.toLowerCase()
-  const targetPin = `${ACCOUNT_HUB_GITHUB_PIN}#${normalizedSha}`
-  const pinMatch = packageJsonContent.match(/("dsh-account-hub"\s*:\s*")([^"]*)"/)
-  if (pinMatch === null || pinMatch.index === undefined) {
-    throw new Error('package.json 中找不到 dsh-account-hub pin 字段')
-  }
-
-  const currentPin = pinMatch[2]
-  if (currentPin === targetPin) return packageJsonContent
-  if (!new RegExp(`^${ACCOUNT_HUB_GITHUB_PIN}(?:#[0-9a-f]{40})?$`, 'i').test(currentPin)) {
-    throw new Error(`package.json 中 dsh-account-hub pin 格式无效：${currentPin}`)
-  }
-
-  const valueStart = pinMatch.index + pinMatch[1].length
-  const valueEnd = valueStart + currentPin.length
-  return `${packageJsonContent.slice(0, valueStart)}${targetPin}${packageJsonContent.slice(valueEnd)}`
-}
-
-/**
  * 应用最新更新。先取最新 SHA；无需更新时短路，否则执行 pnpm 并验证 lockfile 已切到目标 SHA。
  */
 export async function applyAccountHubUpdate(deps: AccountHubUpdateDeps): Promise<RpcUpdateApplyResponse> {
   const latest = await fetchLatestCommit(deps)
   const lockPath = join(deps.profileRoot, 'pnpm-lock.yaml')
-  const previousSha = extractAccountHubSha(await deps.readFile(lockPath))
-  if (latest.sha === previousSha) return { previousSha, currentSha: previousSha, log: '' }
+  const previousSha = findAccountHubSha(await deps.readFile(lockPath)) ?? ''
+  if (previousSha !== '' && latest.sha === previousSha) return { previousSha, currentSha: previousSha, log: '' }
 
   const packagePath = join(deps.profileRoot, 'package.json')
   const workspacePath = join(deps.profileRoot, 'pnpm-workspace.yaml')
+  const packageJson = await deps.readFile(packagePath)
+  const hasAccountHubDependency = /"dsh-account-hub"\s*:/.test(packageJson)
   const execOptions = {
     cwd: deps.profileRoot,
     timeoutMs: ACCOUNT_HUB_UPDATE_TIMEOUT_MS,
   }
 
-  let removeOutput: AccountHubUpdateProcessOutput
-  try {
-    removeOutput = await deps.exec('pnpm', ['remove', 'dsh-account-hub'], execOptions)
-  } catch (error) {
-    throwWithLog(error, formatInstallLog(processOutputFromError(error)))
+  let removeLog = ''
+  if (hasAccountHubDependency) {
+    let removeOutput: AccountHubUpdateProcessOutput
+    try {
+      removeOutput = await deps.exec('pnpm', ['remove', 'dsh-account-hub'], execOptions)
+    } catch (error) {
+      throwWithLog(error, formatInstallLog(processOutputFromError(error)))
+    }
+    removeLog = formatInstallLog(removeOutput)
   }
-  const removeLog = formatInstallLog(removeOutput)
 
-  const packageJson = await deps.readFile(packagePath)
-  const updatedPackageJson = writeAccountHubPin(packageJson, latest.sha)
-  if (updatedPackageJson !== packageJson) await deps.writeFile(packagePath, updatedPackageJson)
-
+  // pnpm remove 会删除 package.json 中的依赖字段，pnpm add 本身会写入带 SHA 的 pin；
+  // 手工再写 pin 不仅冗余，还会在 remove 之后因字段不存在而必然失败。
   const workspace = await deps.readFile(workspacePath)
   const updatedWorkspace = appendAccountHubAllowBuild(workspace, latest.sha)
   if (updatedWorkspace !== workspace) await deps.writeFile(workspacePath, updatedWorkspace)

@@ -5,7 +5,6 @@ import {
   applyAccountHubUpdate,
   checkAccountHubUpdate,
   extractAccountHubSha,
-  writeAccountHubPin,
   type AccountHubUpdateDeps,
   type AccountHubUpdateExec,
 } from '../../src/account-hub-update.js'
@@ -27,6 +26,20 @@ function makeLockfile(sha: string): string {
     '      dsh-account-hub:',
     '        specifier: https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/' + sha,
     '        version: https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/' + sha,
+    'packages:',
+    '',
+  ].join('\n')
+}
+
+function makeLockfileWithoutAccountHub(): string {
+  return [
+    "lockfileVersion: '9.0'",
+    'importers:',
+    '  .:',
+    '    dependencies:',
+    '      other-package:',
+    '        specifier: 1.0.0',
+    '        version: 1.0.0',
     'packages:',
     '',
   ].join('\n')
@@ -84,7 +97,10 @@ function makeDeps(options: {
   })
   const fetcher = vi.fn<typeof fetch>(async () => makeResponse(latestSha, options.latestTitle ?? '更新标题\n更多提交说明'))
   const defaultExec: AccountHubUpdateExec = async (_command, args) => {
-    if (args[0] === 'add') files.set(LOCK_PATH, makeLockfile(latestSha))
+    if (args[0] === 'add') {
+      files.set(LOCK_PATH, makeLockfile(latestSha))
+      files.set(PACKAGE_PATH, makePackageJson(`${ACCOUNT_HUB_PIN}#${latestSha}`))
+    }
     return args[0] === 'remove'
       ? { stdout: '卸载完成\n', stderr: '' }
       : { stdout: '安装完成\n', stderr: '' }
@@ -116,20 +132,19 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     )
   })
 
-  it('lockfile dependencies 中没有目标包时拒绝检查且不请求 GitHub', async () => {
-    const { deps, fetcher } = makeDeps({
-      lockfile: [
-        'importers:',
-        '  .:',
-        '    dependencies:',
-        '      other-package:',
-        '        version: 1.0.0',
-        'packages:',
-      ].join('\n'),
-    })
+  it('lockfile 没有目标依赖时报告半卸载状态并提示有更新', async () => {
+    const lockfile = makeLockfileWithoutAccountHub()
+    const { deps } = makeDeps({ lockfile })
 
-    await expect(checkAccountHubUpdate(deps)).rejects.toThrow('找不到 dsh-account-hub')
-    expect(fetcher).not.toHaveBeenCalled()
+    await expect(checkAccountHubUpdate(deps)).resolves.toEqual({
+      currentSha: '',
+      latestSha: LATEST_SHA,
+      hasUpdate: true,
+      latestTitle: '更新标题',
+    })
+    expect(() => extractAccountHubSha(lockfile)).toThrow(
+      'pnpm-lock.yaml dependencies 段中找不到 dsh-account-hub',
+    )
   })
 
   it('lockfile 中目标依赖的 tarball SHA 畸形时拒绝检查', async () => {
@@ -139,29 +154,6 @@ describe('Account Hub 更新 RPC 逻辑', () => {
 
     await expect(checkAccountHubUpdate(deps)).rejects.toThrow('无法提取 40 位 SHA')
     expect(fetcher).not.toHaveBeenCalled()
-  })
-
-  it('package.json pin 改写只替换目标值并保持其余格式', () => {
-    const packageJson = makePackageJson()
-    const updated = writeAccountHubPin(packageJson, LATEST_SHA)
-
-    expect(updated).toBe(makePackageJson(`${ACCOUNT_HUB_PIN}#${LATEST_SHA}`))
-    expect(updated).toContain(`"dsh-account-hub": "${ACCOUNT_HUB_PIN}#${LATEST_SHA}"`)
-  })
-
-  it('package.json pin 已是目标 SHA 时保持幂等', () => {
-    const packageJson = makePackageJson(`${ACCOUNT_HUB_PIN}#${LATEST_SHA}`)
-
-    expect(writeAccountHubPin(packageJson, LATEST_SHA)).toBe(packageJson)
-  })
-
-  it('package.json 缺少 pin 字段或 pin 形态异常时拒绝改写', () => {
-    expect(() => writeAccountHubPin('{\n  "dependencies": {}\n}\n', LATEST_SHA)).toThrow(
-      '找不到 dsh-account-hub pin 字段',
-    )
-    expect(() => writeAccountHubPin(makePackageJson('npm:dsh-account-hub@1.0.0'), LATEST_SHA)).toThrow(
-      'pin 格式无效',
-    )
   })
 
   it('allowBuilds 追加 tarball 条目且重复调用幂等', () => {
@@ -185,14 +177,8 @@ describe('Account Hub 更新 RPC 逻辑', () => {
       log: 'stdout:\n卸载完成\n\nstdout:\n安装完成\n',
     })
     expect(files.get(WORKSPACE_PATH)).toContain(`dsh-account-hub@https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/${LATEST_SHA}: true`)
-    expect(files.get(PACKAGE_PATH)).toContain(`"dsh-account-hub": "${ACCOUNT_HUB_PIN}#${LATEST_SHA}"`)
-    expect(deps.writeFile).toHaveBeenNthCalledWith(
-      1,
-      PACKAGE_PATH,
-      expect.stringContaining(`"dsh-account-hub": "${ACCOUNT_HUB_PIN}#${LATEST_SHA}"`),
-    )
-    expect(deps.writeFile).toHaveBeenNthCalledWith(
-      2,
+    expect(deps.writeFile).toHaveBeenCalledTimes(1)
+    expect(deps.writeFile).toHaveBeenCalledWith(
       WORKSPACE_PATH,
       expect.stringContaining(`dsh-account-hub@https://codeload.github.com/gurio-wine/dsh-account-hub/tar.gz/${LATEST_SHA}: true`),
     )
@@ -211,6 +197,43 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     expect(fetcher).toHaveBeenCalledTimes(1)
   })
 
+  it('package.json 缺少依赖字段时跳过 remove 直接 add', async () => {
+    const { deps, exec } = makeDeps({ packageJson: '{\n  "name": "fake-profile",\n  "private": true\n}\n' })
+
+    await expect(applyAccountHubUpdate(deps)).resolves.toMatchObject({
+      previousSha: CURRENT_SHA,
+      currentSha: LATEST_SHA,
+    })
+    expect(exec).toHaveBeenCalledTimes(1)
+    expect(exec).toHaveBeenCalledWith(
+      'pnpm',
+      ['add', `${ACCOUNT_HUB_PIN}#${LATEST_SHA}`, '--config.minimum-release-age=0'],
+      { cwd: PROFILE_ROOT, timeoutMs: 120_000 },
+    )
+  })
+
+  it('lockfile 没有依赖条目时 previousSha 为空并仍完成安装', async () => {
+    const { deps, exec } = makeDeps({ lockfile: makeLockfileWithoutAccountHub() })
+
+    await expect(applyAccountHubUpdate(deps)).resolves.toMatchObject({
+      previousSha: '',
+      currentSha: LATEST_SHA,
+    })
+    expect(exec).toHaveBeenCalledTimes(2)
+    expect(exec).toHaveBeenNthCalledWith(
+      1,
+      'pnpm',
+      ['remove', 'dsh-account-hub'],
+      { cwd: PROFILE_ROOT, timeoutMs: 120_000 },
+    )
+    expect(exec).toHaveBeenNthCalledWith(
+      2,
+      'pnpm',
+      ['add', `${ACCOUNT_HUB_PIN}#${LATEST_SHA}`, '--config.minimum-release-age=0'],
+      { cwd: PROFILE_ROOT, timeoutMs: 120_000 },
+    )
+  })
+
   it('apply 已是最新版本时不改 workspace、不启动 pnpm', async () => {
     const { deps, files, exec } = makeDeps({ latestSha: CURRENT_SHA })
     const workspaceBefore = files.get(WORKSPACE_PATH)
@@ -224,24 +247,7 @@ describe('Account Hub 更新 RPC 逻辑', () => {
     expect(exec).not.toHaveBeenCalled()
   })
 
-  it('remove 成功但写 package.json pin 失败时不启动 add 并返回原始错误', async () => {
-    const failure = new Error('package.json write failed')
-    const { deps, exec } = makeDeps()
-    deps.writeFile = vi.fn(async (path: string) => {
-      if (path === PACKAGE_PATH) throw failure
-    })
-
-    await expect(applyAccountHubUpdate(deps)).rejects.toBe(failure)
-    expect(exec).toHaveBeenCalledTimes(1)
-    expect(exec).toHaveBeenNthCalledWith(
-      1,
-      'pnpm',
-      ['remove', 'dsh-account-hub'],
-      { cwd: PROFILE_ROOT, timeoutMs: 120_000 },
-    )
-  })
-
-  it('remove 失败时不写 pin、不写 allowBuilds 且不启动 add', async () => {
+  it('remove 失败时不改 workspace 且不启动 add', async () => {
     const failure = Object.assign(new Error('pnpm remove failed'), {
       code: 1,
       stdout: 'remove stdout',
@@ -277,20 +283,6 @@ describe('Account Hub 更新 RPC 逻辑', () => {
       'pnpm add failed (code 1)\n\nstdout:\nremove stdout\nstderr:\nremove stderr\nstdout:\nadd stdout\nstderr:\nadd stderr',
     )
     expect(exec).toHaveBeenCalledTimes(2)
-  })
-
-  it('pnpm 失败时保留原错误、stdout 与 stderr', async () => {
-    const failure = Object.assign(new Error('pnpm install failed'), {
-      code: 1,
-      stdout: 'pnpm stdout',
-      stderr: 'pnpm stderr',
-    })
-    const { deps, exec } = makeDeps({ exec: async () => { throw failure } })
-
-    await expect(applyAccountHubUpdate(deps)).rejects.toThrow(
-      'pnpm install failed (code 1)\n\nstdout:\npnpm stdout\nstderr:\npnpm stderr',
-    )
-    expect(exec).toHaveBeenCalledTimes(1)
   })
 
   it('pnpm 成功但 lockfile SHA 未变化时失败并附完整日志', async () => {
