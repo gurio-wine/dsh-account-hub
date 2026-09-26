@@ -447,7 +447,7 @@ describe('ConsumptionSelectors：两个并排的下拉（Menu 原语）', () => 
     expect(itemIdsOf(1)).toEqual(['per-request', 'per-turn'])
   })
 
-  it('无外框：分组容器只保留固定宽度布局，边框与内边距已删除', () => {
+  it('无外框：分组容器只保留等分布局，边框与内边距已删除', () => {
     const { rpcCall } = makeRpc()
     client.hooks.__reset()
     const tree = expandTree(
@@ -475,8 +475,9 @@ describe('ConsumptionSelectors：两个并排的下拉（Menu 原语）', () => 
     expect(group).not.toContain('border')
     expect(group).not.toContain('padding')
     expect(group).not.toContain('border-radius')
-    // 分组本身不扩展，锚点宽度由 order / switch 的具体规则决定。
-    expect(group).toContain('flex: none')
+    // 分组按 flex: 1 1 0 严格平分这一排（basis 取 0 才等宽；留 auto 会被文案拉偏），
+    // min-width: 0 让窄面板下继续压缩而不是撑破右栏 —— 两者都不是「框」的构成要素。
+    expect(group).toContain('flex: 1 1 0')
     expect(group).toContain('min-width: 0')
     // 被删掉的三个 class 的规则不得残留（否则是「删了节点、留了样式」）。
     expect(styles).not.toContain('.dim-ah-consumptionHead')
@@ -602,18 +603,19 @@ describe('ConsumptionSelectors：版面（两个下拉同排、各占一半宽�
     return styles.slice(at, styles.indexOf('}', at))
   }
 
-  it('两个下拉同排：容器不换行，分组按内容固定宽度', () => {
+  it('两个下拉同排且各占一半宽：分组等分剩余宽度，锚点填满分组', () => {
     expect(ruleOf('.dim-ah-consumption')).toContain('display: flex')
     expect(ruleOf('.dim-ah-consumption')).not.toContain('flex-wrap: wrap')
-    expect(ruleOf('.dim-ah-consumptionGroup')).toContain('flex: none')
+    // 等分：flex-basis 为 0 才能忽略两个文案的长短差，否则长文案那侧更宽。
+    expect(ruleOf('.dim-ah-consumptionGroup')).toContain('flex: 1 1 0')
     expect(ruleOf('.dim-ah-consumptionGroup')).toContain('min-width: 0')
-    expect(ruleOf('.dim-ah-consumptionGroup[data-name="order"] .dim-ah-consumptionSelect'))
-      .toContain('width: 112px')
-    expect(ruleOf('.dim-ah-consumptionGroup[data-name="switch"] .dim-ah-consumptionSelect'))
-      .toContain('width: 96px')
+    expect(ruleOf('.dim-ah-consumptionSelect')).toContain('width: 100%')
+    // 按文案长度写死的固定宽度已随「等分」一并删除：那两个选择器不该再出现。
+    expect(styles).not.toContain('.dim-ah-consumptionGroup[data-name="order"] .dim-ah-consumptionSelect')
+    expect(styles).not.toContain('.dim-ah-consumptionGroup[data-name="switch"] .dim-ah-consumptionSelect')
   })
 
-  it('下拉锚点按选项文案长度固定宽度（外观归 ui-primitives 的 Button）', () => {
+  it('下拉锚点不自绘外框（边框/圆角/焦点环/禁用态全归 ui-primitives 的 Button）', () => {
     const select = ruleOf('.dim-ah-consumptionSelect')
     expect(select).toContain('box-sizing: border-box')
     expect(select).toContain('white-space: nowrap')

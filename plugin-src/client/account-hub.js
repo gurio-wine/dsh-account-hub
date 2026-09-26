@@ -225,27 +225,14 @@ function formatTime(ts) {
   return d.toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-// 两个**供应商级**限流标记操作的 hover 帮助文案。抽成常量以便按钮与说明共用。
-// 单账号的「重测 / 重置」按钮已按用户要求从账号卡片移除（入口只在供应商级），
-// 故 `RETEST_HELP` / `RESET_HELP` 一并删除。
-const RETEST_ALL_HELP = '重测全部账号限流状态（消耗少量额度）';
-const RESET_ALL_HELP = '清除全部账号限流标记';
-
-/** 把一次重测/重置的响应汇总成一行可读文案。 */
-function summarizeProbe(kind, res) {
-  if (kind === 'reset' || kind === 'resetAll') {
-    const n = res?.clearedCount ?? 0;
-    return n > 0 ? `已清除 ${n} 条限流标记` : '没有可清除的限流标记';
-  }
-  const accounts = res?.accounts ?? [];
-  const cleared = res?.clearedCount ?? 0;
-  const still = accounts.reduce((sum, a) => sum + (a.stillLimited?.length ?? 0), 0);
-  const parts = [];
-  if (cleared > 0) parts.push(`已清除 ${cleared} 条`);
-  if (still > 0) parts.push(`${still} 条仍受限`);
-  if (parts.length === 0) parts.push('没有可重测的限流标记');
-  return parts.join('，');
-}
+// 限流标记操作的提示文案与响应汇总函数（`RETEST_ALL_HELP` / `RESET_ALL_HELP` /
+// `summarizeProbe`）已随面板上那对**供应商级**按钮一并删除；更早一轮已从账号卡片
+// 删掉单账号的「重测 / 重置」及其 `RETEST_HELP` / `RESET_HELP`。至此界面上不再有任何
+// 限流标记操作入口。
+//
+// ⚠️ 删的**只是 UI 入口**：宿主侧 `account.retest` / `account.reset` /
+// `account.retestAll` / `account.resetAll` 四个 RPC 一行未动（库层能力，
+// 服务 headless / 测试等其它调用方），见 `src/account-hub-rpc.ts`。
 
 /**
  * 把积分余额格式化成一行文案。
@@ -552,7 +539,7 @@ function buildClaimNotice(res) {
 /**
  * 领取结果的提示块：摘要行（`text`）+ 失败账号明细列表（`details`）。
  *
- * 形状与上方「重测 / 重置」的 `probeNotice` 完全一致（同 `.dim-ah-probeNotice`
+ * 形状与面板级通知行 `probeNotice` 完全一致（同 `.dim-ah-probeNotice`
  * + `.dim-ah-probeDetails`，同一个 `tone` 取值域），两处提示在界面上是同一种
  * 东西，不该长成两个样。
  *
@@ -659,10 +646,11 @@ function CreditBalanceRow({ balance, error, loading }) {
 /**
  * 账号卡片。
  *
- * ⚠️ 卡片上**只有**签到 / 启用停用 / 删除三类按钮：单账号的「重测」「重置」
- * 已按用户要求移除，限流标记的清理入口只保留面板标题栏的供应商级那两个。
- * 宿主侧的 `account.retest` / `account.reset` 两个 RPC **一行未动**（它们是
- * 库层能力，服务 headless / 测试等其它调用方），删的只是 UI 入口。
+ * ⚠️ 卡片上**只有**签到 / 启用停用 / 删除三类按钮：单账号的「重测」「重置」已按
+ * 用户要求移除，面板标题栏的供应商级「重测所有 / 清除限额」后来也一并删除 ——
+ * 界面上已不存在任何限流标记操作入口。宿主侧的 `account.retest` / `account.reset` /
+ * `account.retestAll` / `account.resetAll` 四个 RPC **一行未动**（它们是库层能力，
+ * 服务 headless / 测试等其它调用方），删的只是 UI 入口。
  *
  * `drag` 是本卡片的拖拽接线（由 `ProviderPanel` 的 `dragPropsFor` 构造）：
  * 传入 `undefined` 或 `{ enabled: false }` 时卡片**完全不渲染**拖拽属性与
@@ -755,7 +743,8 @@ function AccountCard({ account, index, order, onToggle, onDelete, busy, credits,
             className: `dim-ah-iconBtn${checkedIn || checkingThisAccount ? '' : ' dim-ah-iconBtn-light'}`,
             'aria-label': checkedIn ? '已签到' : checkingThisAccount ? '签到中' : '签到',
             // `busy` 是面板级忙碌 —— 由调用方传入，`ProviderPanel` 已把它算成
-            // `probeBusy || claiming`（重测/清除限额 **或** 签到进行中）。
+            // `claiming`（签到进行中）。限流标记那对供应商级按钮删除后，面板级忙碌
+            // 只剩签到这一个来源，`probeBusy` 随之消失。
             // ⚠️ 此前它**不含**签到本身：一键签到或自动补签在跑时，单片按钮看起来
             // 可点、点下去却被 `claimingRef` 静默挡掉 —— 「点了没反应」的缺陷形态。
             // `checkingThisAccount` 是本账号自己的签到中态（本卡片局部），
@@ -1209,6 +1198,9 @@ function ConsumptionSelect({ name, label, options, value, busy, onSelect }) {
         onClick: () => setOpen(prev => !prev),
       }, current ? current.label : value),
       items,
+      // 「弹层宽度 = 按钮宽度」：宿主 Menu 的列表默认是内容宽（min-width: 144px），
+      // 与锚点无关，故必须给列表一个类名把它钉到 100%（见样式表）。
+      listClassName: 'dim-ah-consumptionMenu',
       selectedId: value,
       onSelect: (id) => { setOpen(false); onSelect(id); },
       onClose: () => setOpen(false),
@@ -1221,8 +1213,9 @@ function ConsumptionSelect({ name, label, options, value, busy, onSelect }) {
  *
  * ## 版面
  *
- * 与账号卡片同处一列，两个下拉按最长选项文案固定宽度，保持并排且不随选中项漂移。
- * 由 `ProviderPanel` 放在账号卡片列表**之前** —— 它与账号区同处一个容器。
+ * 与账号卡片同处一列，两个下拉**各占容器一半**：宽度之和恒等于账号卡片那一排的
+ * 宽度，且不随选中项文案长短漂移。由 `ProviderPanel` 放在账号卡片列表**之前** ——
+ * 它与账号区同处一个容器。
  *
  * ⚠️ 界面上**刻意没有**可见的设置名、解释文案与外框：需求是「就两个下拉」。
  * 下拉与账号卡片之间也不再有任何提示段落（原先那条排序提示已删除）。设置名通过
@@ -1269,10 +1262,9 @@ function ProviderPanel({ provider, rpcCall }) {
   const [phase, setPhase] = React.useState('loading');
   const [error, setError] = React.useState(null);
   const [creating, setCreating] = React.useState(false);
-  // 正在进行的限流操作。账号卡片上的单账号「重测 / 重置」已移除，故只剩
-  // 「有一个供应商级操作在跑」这一个布尔维度（原先还要区分 one / all）。
-  const [probeBusy, setProbeBusy] = React.useState(false);
-  // 上一次重测/清除限额的结果文案（成功或失败）。
+  // 面板级通知行（成功或失败）。历史上它是「重测 / 清除限额」的结果位，
+  // 那两对按钮（卡片上的单账号、标题栏的供应商级）都已移除，如今只剩**登录失败**
+  // 这一条写入口，但组件形状与样式保持不变（ClaimNotice 与它同形）。
   const [probeNotice, setProbeNotice] = React.useState(null);
   // 积分余额：accountId → { balance, error }。与账号列表分开加载——余额要逐
   // 账号发网络请求，不能拖慢账号列表本身的渲染。
@@ -1354,17 +1346,16 @@ function ProviderPanel({ provider, rpcCall }) {
   // 顺序提交失败的提示（如宿主回「列表已变化，请刷新」）。
   const [reorderError, setReorderError] = React.useState(null);
   /**
-   * 待确认的两个操作（各对应一个弹窗）。
+   * 待确认的删除操作（对应一个弹窗）。
    *
-   * 迁移前它们是两个原生 `confirm()`：同步阻塞、由浏览器自绘、样式不进主题体系。
-   * 改为原语后「确认」这件事必须先变成一个**状态**（弹窗要渲染在树里），
-   * 故这里多两个 state。它们是纯展示层状态，不参与任何业务判定：
-   * - `pendingDelete`：待删除的账号 id（`RiskConfirmation` 勾选后才执行）；
-   * - `pendingRetest`：是否正在等「重测所有」的确认（`Modal` 点确认才执行）。
+   * 迁移前它是原生 `confirm()`：同步阻塞、由浏览器自绘、样式不进主题体系。
+   * 改为 `RiskConfirmation` 后「确认」这件事必须先变成一个**状态**（弹窗要渲染在
+   * 树里），故这里多两个 state。它们是纯展示层状态，不参与任何业务判定：
+   * - `pendingDelete`：待删除的账号 id（勾选 acknowledge 后才执行）；
+   * - `deleteAcknowledged`：上面那枚勾选闸的当前值。
    */
   const [pendingDelete, setPendingDelete] = React.useState(null);
   const [deleteAcknowledged, setDeleteAcknowledged] = React.useState(false);
-  const [pendingRetest, setPendingRetest] = React.useState(false);
 
   const loadAccounts = React.useCallback(async () => {
     setPhase('loading');
@@ -2092,53 +2083,7 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
-  /**
-   * 重测 / 清除限额的统一入口（**只剩供应商级两条**）。
-   *
-   * kind 决定调用哪个 RPC：
-   * - 'retestAll' account.retestAll 对本页全部账号（含停用）发真实请求
-   * - 'resetAll'  account.resetAll  本页全部账号（含停用）直接清除标记
-   *
-   * 单账号的 'retest' / 'reset' 两条分支已随账号卡片上的按钮一并移除。
-   * 重测会真实消耗模型额度，因此「重测所有」在执行前要求确认 —— 迁移前是原生
-   * `confirm()`，现在是一枚 `Modal`（非破坏性，故不用 RiskConfirmation 的勾选闸，
-   * 但同样把「会消耗额度」这句话摆在正文里）。确认文案与迁移前逐字一致。
-   */
-  const runLimitAction = async (kind) => {
-    if (kind === 'retestAll') {
-      setPendingRetest(true);
-      return;
-    }
-    await executeLimitAction(kind);
-  };
-
-  /** 确认（或无需确认）后真正执行限额操作。 */
-  const executeLimitAction = async (kind) => {
-    setPendingRetest(false);
-    setProbeBusy(true);
-    setProbeNotice(null);
-    try {
-      const res = kind === 'retestAll'
-        ? await rpcCall('account.retestAll', { provider })
-        : await rpcCall('account.resetAll', { provider });
-
-      if (!mounted.current) return;
-      // 仍受限的模型要如实列出原因，否则用户只看到"没清除"会以为按钮失灵。
-      const details = (res?.accounts || [])
-        .flatMap(a => (a.stillLimited || []).map(m => `${a.nickname || a.accountId} · ${m.modelId}：${m.message || '仍受限'}`));
-      const summary = summarizeProbe(kind, res);
-      setProbeNotice({ tone: details.length > 0 ? 'warn' : 'ok', text: summary, details });
-      await loadAccounts();
-    } catch (caught) {
-      console.error('[account-hub] limit action failed:', caught);
-      if (!mounted.current) return;
-      setProbeNotice({ tone: 'error', text: `操作失败：${caught?.message || '未知错误'}`, details: [] });
-    } finally {
-      if (mounted.current) setProbeBusy(false);
-    }
-  };
-
-  return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
+  return React.createElement('section', { 'aria-label': `${providerLabel} 账号管理` },
     React.createElement('div', { className: 'dim-ah-panelHead' },
       React.createElement('div', { className: 'dim-ah-panelTitleRow' },
         React.createElement('h2', { className: 'dim-ah-panelTitle' },
@@ -2182,22 +2127,7 @@ function ProviderPanel({ provider, rpcCall }) {
             'aria-label': '登录账号',
             onClick: () => void createAccount(),
             disabled: creating,
-          }, React.createElement('span', { 'aria-hidden': 'true' }, '＋')))),
-      React.createElement('div', { className: 'dim-ah-headerActions' },
-        withHoverTitle(React.createElement(Button, {
-          variant: 'outline',
-          size: 'sm',
-          className: 'dim-ah-btn-stable',
-          disabled: probeBusy || accounts.length === 0,
-          onClick: () => void runLimitAction('retestAll'),
-        }, probeBusy ? '重测中…' : '重测所有'), RETEST_ALL_HELP),
-        withHoverTitle(React.createElement(Button, {
-          variant: 'outline',
-          size: 'sm',
-          className: 'dim-ah-btn-stable',
-          disabled: probeBusy || accounts.length === 0,
-          onClick: () => void runLimitAction('resetAll'),
-        }, '清除限额'), RESET_ALL_HELP))),
+          }, React.createElement('span', { 'aria-hidden': 'true' }, '＋'))))),
     probeNotice
       ? React.createElement('div', {
           className: 'dim-ah-probeNotice',
@@ -2279,7 +2209,7 @@ function ProviderPanel({ provider, rpcCall }) {
                 // 单片按钮必须 disabled，否则用户点下去只会被 `claimingRef` 挡掉
                 // —— 那正是「点了没反应」的缺陷形态。`claiming` 是 state（可渲染），
                 // `claimingRef` 是它的实时镜像（给闭包里的自动补签读）。
-                busy: probeBusy || claiming,
+                busy: claiming,
                 credits: credits[account.id],
                 creditsLoading: creditsLoading && credits[account.id] === undefined,
                 showCredits: canLoadCredits,
@@ -2301,32 +2231,11 @@ function ProviderPanel({ provider, rpcCall }) {
           onClose: () => setShowModels(false),
         })
       : null,
-    // 两个确认弹窗（取代原生 `confirm()`）。它们同样由 `Modal` / `RiskConfirmation`
+    // 删除账号的确认弹窗（取代原生 `confirm()`）。它同样由 `RiskConfirmation`
     // portal 到 body，故渲染位置只影响组件树的书写顺序。
     //
-    // ⚠️ 弹窗**不阻塞**下面那段「待确认操作」的调用：`runLimitAction` / `deleteAccount`
-    // 现在只把待确认状态置位就返回，真正的 RPC 由弹窗的确认回调触发。
-    pendingRetest
-      ? React.createElement(Modal, {
-          open: true,
-          onClose: () => setPendingRetest(false),
-          title: '重测所有账号',
-          closeLabel: '取消重测',
-          description: '将对本页全部账号（含已停用）各发送一条真实消息来验证限流状态，会消耗模型额度。继续？',
-          footer: [
-            React.createElement(Button, {
-              key: 'cancel',
-              variant: 'outline',
-              onClick: () => setPendingRetest(false),
-            }, '取消'),
-            React.createElement(Button, {
-              key: 'confirm',
-              variant: 'primary',
-              onClick: () => void executeLimitAction('retestAll'),
-            }, '继续'),
-          ],
-        })
-      : null,
+    // ⚠️ 弹窗**不阻塞** `deleteAccount` 的调用：它现在只把待确认状态置位就返回，
+    // 真正的 RPC 由弹窗的确认回调触发。
     pendingDelete !== null
       ? React.createElement(RiskConfirmation, {
           open: true,
@@ -2608,8 +2517,7 @@ function AutoRoutePanel({ rpcCall }) {
   const [switchBusy, setSwitchBusy] = React.useState(false);
   // 自动模型草稿。
   const [draft, setDraft] = React.useState([]);
-  // 脏标记：草稿与「宿主已知的配置」不一致。保存成功、或重新拉取后置回 false。
-  const [dirty, setDirty] = React.useState(false);
+  // 脏标记已随「修改即保存」改造移除：编辑操作自动提交（合法态才提交，见 editDraft）。
   const [saving, setSaving] = React.useState(false);
   // 保存失败的服务端中文消息（红色提示行）。
   const [saveError, setSaveError] = React.useState(null);
@@ -2631,6 +2539,13 @@ function AutoRoutePanel({ rpcCall }) {
   const [drag, setDrag] = React.useState(null);
   const mounted = React.useRef(true);
   /**
+   * 本地草稿的**同步镜像**（与 `draft` state 同值）。
+   *
+   * `saveModels` 的竞态判据要读「此刻」的草稿（请求在途时用户又改了一笔就不覆盖），
+   * 而 `draft` state 在异步回调里读到的是**闭包快照**（发起时的值），必须靠 ref。
+   */
+  const draftRef = React.useRef([]);
+  /**
    * 档位缓存的**权威副本**。
    *
    * 必须先于 await 写进 ref 再发请求：`setState` 是异步的，同一轮渲染里两行引用
@@ -2648,8 +2563,6 @@ function AutoRoutePanel({ rpcCall }) {
       if (!mounted.current) return;
       setEnabled(res?.enabled === true);
       setDraft(Array.isArray(res?.models) ? res.models : []);
-      // 刚拉到的就是宿主权威值，此刻没有未保存改动。
-      setDirty(false);
       setPhase('ready');
     } catch (caught) {
       if (!mounted.current) return;
@@ -2739,15 +2652,32 @@ function AutoRoutePanel({ rpcCall }) {
     }
   };
 
-  /** 保存草稿：成功后用**宿主返回的**列表覆盖草稿并清脏标记；失败保留草稿与错误。 */
-  const saveModels = async () => {
+  /**
+   * 提交自动模型列表到宿主（修改即保存模式，取代旧的「显式保存」按钮）。
+   *
+   * 成功后用**宿主返回的**列表覆盖草稿（服务端可能补全/规整字段）；失败保留
+   * 草稿与错误行 —— 用户继续编辑，下一次合法修改会再次触发提交。
+   */
+  const saveModels = async (nextDraft) => {
+    // 中间态不提交：空 entries 卡片 / 空 provider-model 候选是编辑过程的合法
+    // 暂态，但服务端会拒。此时只留本地，等下一条合法编辑一起提交。
+    const submittable = Array.isArray(nextDraft) && nextDraft.length >= 0
+      && nextDraft.every(def => def && typeof def.name === 'string' && Array.isArray(def.entries)
+        && def.entries.length > 0
+        && def.entries.every(entry => entry && typeof entry.provider === 'string' && entry.provider !== ''
+          && typeof entry.model === 'string' && entry.model !== ''));
+    if (!submittable) return;
     setSaving(true);
     setSaveError(null);
     try {
-      const res = await rpcCall('autoroute.set', { models: draft });
+      const res = await rpcCall('autoroute.set', { models: nextDraft });
       if (!mounted.current) return;
-      setDraft(Array.isArray(res?.models) ? res.models : []);
-      setDirty(false);
+      // 只有「宿主权威值与本地草稿不一致」才覆盖：用户在请求在途时又改了一笔，
+      // 覆盖会把那一笔丢掉（改判为等下一次提交带上）。
+      const current = draftRef.current;
+      if (JSON.stringify(current) === JSON.stringify(nextDraft)) {
+        setDraft(Array.isArray(res?.models) ? res.models : nextDraft);
+      }
     } catch (caught) {
       console.error('[account-hub] save auto-route models failed:', caught);
       if (!mounted.current) return;
@@ -2758,11 +2688,20 @@ function AutoRoutePanel({ rpcCall }) {
     }
   };
 
-  /** 编辑草稿的统一入口（顺带清掉上一次的保存错误：错误行不该跟着新编辑继续挂着）。 */
+  /**
+   * 编辑草稿的统一入口（修改即保存）：本地立即更新 + 异步提交宿主。
+   *
+   * 提交走 `saveModels(next)` 的合法性闸：中间态（空卡片/半选候选）只改本地。
+   * 顺带清掉上一次的保存错误：错误行不该跟着新编辑继续挂着。
+   */
   const editDraft = (updater) => {
-    setDraft(updater);
-    setDirty(true);
+    // 副作用不得进 state updater（React 要求纯函数：StrictMode 双跑会发两份
+    // autoroute.set，并发渲染下 updater 也可能被丢弃重算）。先算 next 再提交。
+    const next = typeof updater === 'function' ? updater(draft) : updater;
+    draftRef.current = next;
+    setDraft(next);
     setSaveError(null);
+    void saveModels(next);
   };
 
   const addDefinition = () => {
@@ -2970,12 +2909,7 @@ function AutoRoutePanel({ rpcCall }) {
 
   return React.createElement('section', { className: 'dim-ah-arPage', 'aria-label': '自动路由配置' },
     React.createElement('div', { className: 'dim-ah-arHead' },
-      React.createElement('h2', { className: 'dim-ah-arTitle' }, '自动路由'),
-      // 未保存标记：脏标记是**状态**（不是按钮文案），因为「保存」按钮本身在
-      // 干净时是禁用的 —— 只靠按钮态，用户看不出「有改动待保存」与「没有改动」的差别。
-      dirty
-        ? React.createElement(Tag, { tone: 'warning', className: 'dim-ah-arDirtyTag' }, '未保存')
-        : null),
+      React.createElement('h2', { className: 'dim-ah-arTitle' }, '自动路由')),
     React.createElement('div', { className: 'dim-ah-arSwitchRow' },
       withHoverTitle(React.createElement(Switch, {
         checked: enabled,
@@ -3019,23 +2953,15 @@ function AutoRoutePanel({ rpcCall }) {
             React.createElement('p', null, '尚未配置自动模型'),
             React.createElement('p', null, '自动模型是一个暴露给 DSH 的模型名，背后是一串按顺序降级的候选。'))
         : React.createElement('div', { className: 'dim-ah-arList' }, draft.map(renderDefinition)),
+    // 修改即保存：不再有「保存」按钮与脏标记（与供应商面板的行为对齐），
+    // 保存失败的服务端消息仍在上方红字行提示。
     React.createElement('div', { className: 'dim-ah-arSaveRow' },
       React.createElement(Button, {
         variant: 'outline',
         size: 'sm',
         className: 'dim-ah-btn-stable',
-        disabled: saving,
         onClick: addDefinition,
-      }, '添加自动模型'),
-      // 保存：有未保存改动时才是 primary（脏标记的**第二处**可见表达），
-      // 干净时禁用 —— 没有改动可存，按钮可点只会让人以为点了会有什么发生。
-      React.createElement(Button, {
-        variant: dirty ? 'primary' : 'outline',
-        size: 'sm',
-        className: 'dim-ah-btn-stable',
-        disabled: !dirty || saving,
-        onClick: () => void saveModels(),
-      }, saving ? '保存中…' : '保存')),
+      }, '添加自动模型')),
     // 删除定义的确认弹窗（单条定义属轻量破坏，二键确认即可，不用勾选闸）。
     pendingDefinition !== null
       ? React.createElement(Modal, {

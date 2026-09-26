@@ -171,8 +171,10 @@ const STYLES = `
 /* 限额重置徽章：Tag 负责胶囊与配色，这里只调字号行高与强调字重。 */
 .dim-ah-ttlBadge { font-size: var(--dsw-font-xxxs-11-font-size); line-height: var(--dsw-font-xxxs-11-line-height); }
 
-/* 图标按钮统一为 32px 方形；按钮本体仍由 ui-primitives 提供。 */
-.dim-ah-iconBtn { box-sizing: border-box; flex: none; width: 32px; min-width: 32px; height: 32px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+/* 图标按钮统一为 28px 方形，**高度对齐宿主 size="sm" 文本按钮**（28px）：
+   标题行里图标按钮与文字按钮同排，若两者高度不同就会一行两种基线。宽度取同值
+   以保持正方形。按钮本体仍由 ui-primitives 提供。 */
+.dim-ah-iconBtn { box-sizing: border-box; flex: none; width: 28px; min-width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
 /* 未签到与登录入口采用白底黑字的 outline 外观。 */
 .dim-ah-iconBtn-light { background: white; color: black; }
 .dim-ah-iconGlyph { display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
@@ -181,16 +183,14 @@ const STYLES = `
 /* 状态文案变化时固定文本操作按钮的最小宽度。 */
 .dim-ah-btn-stable { min-width: 112px; }
 
-/* 标题行放置四个图标操作；重测与清除限额留在下方文字操作区。 */
+/* 标题行放置全部图标操作（模型列表 / 刷新积分 / 一键签到 / 登录账号）。
+   面板上已无任何文字操作按钮，故标题行之下不再有操作区。 */
 .dim-ah-panelHead { display: flex; flex-direction: column; align-items: stretch; gap: 10px; margin-bottom: 16px; }
 .dim-ah-panelTitleRow { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; width: 100%; }
 .dim-ah-panelTitle { margin: 0; font-size: var(--dsw-font-m-18-font-size); line-height: var(--dsw-font-m-18-line-height); font-weight: var(--dsw-font-m-18-font-weight); color: var(--dsw-alias-label-primary); }
 .dim-ah-panelTitleActions { display: flex; flex: none; align-items: center; gap: 8px; }
 
-/* 面板标题下方只保留重测与清除限额；按钮数量恒定且允许窄宽换行。 */
-.dim-ah-headerActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; max-width: 100%; }
-
-/* 上一次「重测 / 清除限额」的结果提示 */
+/* 面板级通知行：登录失败、顺序保存失败、领取结果共用同一种外观。 */
 .dim-ah-probeNotice { margin-bottom: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-line-height); color: var(--dsw-alias-label-secondary); }
 .dim-ah-probeNotice[data-tone="ok"] { border-color: var(--dsw-alias-state-success-primary); background: color-mix(in srgb, var(--dsw-alias-state-success-primary) 8%, transparent); color: var(--dsw-alias-state-success-primary); }
 .dim-ah-probeNotice[data-tone="warn"] { border-color: var(--dsw-alias-state-warn-primary); background: color-mix(in srgb, var(--dsw-alias-state-warn-primary) 8%, transparent); color: var(--dsw-alias-state-warn-primary); }
@@ -251,13 +251,22 @@ const STYLES = `
 .dim-ah-modelTier { flex: none; display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
 .dim-ah-tierOption { font-size: var(--dsw-font-xxs-12-font-size); line-height: var(--dsw-font-xxs-12-line-height); white-space: nowrap; }
 
-/* 消耗顺序 / 切换粒度：两个下拉按各自最长选项文案固定宽度，保持同一排。 */
+/* 消耗顺序 / 切换粒度：两个下拉**各占容器一半**，两者宽度之和恒等于这一排的宽度。
+   分组用 flex: 1 1 0 平分（basis 取 0 才是严格等宽：若留 auto，较长的那份文案
+   会把两份拉成不同宽度）；min-width: 0 让窄面板下继续压缩而不是撑破右栏。 */
 .dim-ah-consumption { display: flex; gap: 8px; margin-bottom: 12px; }
-.dim-ah-consumptionGroup { flex: none; min-width: 0; }
-/* 下拉锚点宽度含选项文本、chevron 与按钮内边距，不跟随当前选中项变化。 */
-.dim-ah-consumptionSelect { box-sizing: border-box; justify-content: space-between; white-space: nowrap; }
-.dim-ah-consumptionGroup[data-name="order"] .dim-ah-consumptionSelect { width: 112px; min-width: 112px; }
-.dim-ah-consumptionGroup[data-name="switch"] .dim-ah-consumptionSelect { width: 96px; min-width: 96px; }
+/* 分组本身是 grid 容器：唯一的子节点（Menu 的 .root 是 inline-flex）会被拉伸到
+   整列宽，故锚点宽度 = 分组宽度，不需要给 .root 再加类名。 */
+.dim-ah-consumptionGroup { flex: 1 1 0; min-width: 0; display: grid; }
+/* 锚点填满分组；文字与 chevron 分列两端。宽度由分组决定，不跟随选中项文案变化。 */
+.dim-ah-consumptionSelect { box-sizing: border-box; width: 100%; min-width: 0; justify-content: space-between; white-space: nowrap; }
+/* 展开的选项列表与锚点同宽（「弹层宽度 = 按钮宽度」）：Menu 的列表是 .root 内的
+   绝对定位子节点，而 .root 已被拉到分组宽度，故 100% 即按钮宽度。
+   面板没有用 portal（portal 会把列表挂到 body 上、失去这个包含块），
+   这一条必须在场，否则列表退回宿主 .list 的 min-width: 144px 内容宽。
+   宿主 .list 的 min-width 同为单类选择器，靠注入顺序（运行期 append 到 head
+   末尾）在同特异性下胜出 —— 与 .dim-ah-modal 覆盖宿主 dialog 宽度同一机制。 */
+.dim-ah-consumptionMenu { width: 100%; min-width: 0; }
 
 /* 悬停提示的宿主锚点：包住非 forwardRef 的组件，使 Tooltip 能拿到真实 DOM 节点。
    inline-flex 不改变父级 flex/grid 的参与关系，也不给行内元素引入额外行高。 */

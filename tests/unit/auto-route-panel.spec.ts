@@ -18,7 +18,7 @@
  * | `qoder-hub-blank-screen.spec.ts` | 渲染不抛错（白屏类缺陷的通盘闸门）+ 导航计数 |
  * | `account-consumption-panel.spec.ts` | 消耗顺序 / 切换粒度两个下拉 |
  * | `account-order-panel.spec.ts` | 账号拖拽排序的事件接线 |
- * | **本文件** | 自动路由：总开关、草稿编辑器、三级联动、档位缓存、保存流 |
+ * | **本文件** | 自动路由：总开关、草稿编辑器、三级联动、档位缓存、自动保存流 |
  *
  * 各自维护一份 import 改写表：一方改了 import 形态，几边都会立刻红，
  * 不会静默加载出半成品。
@@ -26,15 +26,19 @@
  * ## 状态机（本文件断言的就是它）
  *
  * ```
- * 挂载 ──autoroute.get──▶ phase=ready，draft=宿主权威列表，dirty=false
+ * 挂载 ──autoroute.get──▶ phase=ready，draft=宿主权威列表
  *                          │
  *   总开关 click ──autoroute.set {enabled}──▶ 以返回值覆盖 enabled（不做乐观更新）
  *                          │
- *   任何编辑 ──▶ draft 变、dirty=true（**不发任何请求**）
- *                          │
- *   「保存」──autoroute.set {models: draft}──┬─ 成功 ─▶ draft=返回值、dirty=false
- *                                            └─ 失败 ─▶ 面板内红字显示服务端消息，draft 原样保留
+ *   任何编辑 ──▶ draft 变 ──┬─ 草稿合法（每卡片有条目、每条 provider+model 非空）
+ *                          │     └─▶ autoroute.set {models: draft}  ─┬─ 成功 ─▶ draft=返回值
+ *                          │                                        └─ 失败 ─▶ 面板内红字显示
+ *                          │                                                   服务端消息，draft 原样保留
+ *                          └─ 仍是中间态（空卡片 / 半选候选）──▶ **不发任何请求**
  * ```
+ *
+ * ⚠️ 没有「保存」按钮、也没有脏标记：编辑**就是**保存动作，中间态只留在本地。
+ * 面板唯一的底部按钮是「添加自动模型」；提交在途时由 `saving` 置灰卡片内的输入与按钮。
  */
 
 import { createRequire } from 'node:module'
@@ -607,19 +611,6 @@ async function drag(
   return current
 }
 
-/** 保存按钮（干净时 disabled、脏时 primary）。 */
-function saveButton(tree: unknown): ElementNode {
-  const button = findButtonByText(tree, '保存') ?? findButtonByText(tree, '保存中…')
-  if (button === undefined) throw new Error('面板里找不到「保存」按钮')
-  return button
-}
-
-/** 「未保存」标记（Tag 替身投影为 data-tone）。 */
-const dirtyTagsOf = (tree: unknown): ElementNode[] =>
-  elementsOf(tree).filter((el) => el.type === 'span'
-    && typeof el.props.className === 'string'
-    && el.props.className.includes('dim-ah-arDirtyTag'))
-
 /** 面板内红色错误行（保存失败 / 读取失败）。 */
 const errorLinesOf = (tree: unknown): string[] =>
   elementsOf(tree)
@@ -673,7 +664,7 @@ describe('AutoRoutePanel：挂载与总开关', () => {
     const { rpcCall } = makeRpc({ config: { ...CONFIG, enabled: false } })
     const tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
     expect(switchOf(tree).props['aria-checked']).toBe(false)
-    // 关键：关闭**不是**禁用编辑器 —— 两张卡片、名称输入、添加按钮、保存按钮全在。
+    // 关键：关闭**不是**禁用编辑器 —— 两张卡片、名称输入、两个添加按钮全在。
     expect(cardsOf(tree), '关闭状态下编辑器不该消失').toHaveLength(2)
     expect(nameInputOf(cardsOf(tree)[0]!).props.value).toBe('快速')
     expect(findButtonByText(tree, '添加自动模型'), '关闭状态下仍应能添加自动模型').toBeDefined()
@@ -733,26 +724,23 @@ describe('AutoRoutePanel：挂载与总开关', () => {
   })
 })
 
-describe('AutoRoutePanel：草稿编辑（只改本地，不发请求）', () => {
-  it('改名只改草稿：脏标记翻起、保存按钮转 primary、不发出任何 autoroute.set', async () => {
+describe('AutoRoutePanel：草稿编辑（修改即保存）', () => {
+  it('改名立即提交：autoroute.set 载荷携带新名，成功后草稿取宿主返回值', async () => {
     const { calls, rpcCall } = makeRpc()
     let tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
-    // 干净态：没有「未保存」标记，保存按钮禁用。
-    expect(dirtyTagsOf(tree), '刚拉完配置不该有未保存标记').toHaveLength(0)
-    expect(saveButton(tree).props.disabled, '没有改动时保存按钮应当禁用').toBe(true)
 
     typeInto(nameInputOf(cardsOf(tree)[0]!), '极速')
+    for (let i = 0; i < 12; i++) await Promise.resolve()
     tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
 
     expect(nameInputOf(cardsOf(tree)[0]!).props.value, '改名应当反映在草稿上').toBe('极速')
-    expect(dirtyTagsOf(tree), '有未保存改动时应当显示「未保存」标记').toHaveLength(1)
-    expect(textsOf(dirtyTagsOf(tree)[0]!).join('')).toBe('未保存')
-    expect(dirtyTagsOf(tree)[0]!.props['data-tone'], '未保存是警示档而不是错误档').toBe('warning')
-    // 脏时保存按钮可点且是 primary（主操作）。
-    expect(saveButton(tree).props.disabled).toBe(false)
-    expect(saveButton(tree).props['data-variant']).toBe('primary')
-    // 关键：编辑**不发请求** —— 服务端 assertValid 会拒掉一切中间态。
-    expect(calls.filter((c) => c.method === 'autoroute.set'), '编辑草稿不该写服务端').toHaveLength(0)
+    // 修改即保存：编辑**立即**写服务端（合法配置才提交，改名始终合法）。
+    const set = calls.filter((c) => c.method === 'autoroute.set')
+    expect(set, '改名应当立即触发 autoroute.set').toHaveLength(1)
+    const payload = set[0]!.payload as { models: Array<{ name: string }> }
+    expect(payload.models.map((d) => d.name), '载荷应携带新名').toEqual(['极速', '强力'])
+    // 成功后无错误行。
+    expect(errorLinesOf(tree), '成功提交后不该有错误行').toHaveLength(0)
   })
 
   it('添加自动模型：新定义 name 为「自动模型 N」且不与已有定义重名', async () => {
@@ -789,6 +777,50 @@ describe('AutoRoutePanel：草稿编辑（只改本地，不发请求）', () =>
     // 锚点显示引导文案而不是空白（空锚点看起来像坏掉的控件）。
     expect(textsOf(rows[1]!)).toContain('选择供应商')
     expect(textsOf(rows[1]!)).toContain('选择模型')
+  })
+
+  it('中间态逐级填：加空候选、只选供应商都不提交，填全的那一刻才提交一次', async () => {
+    // 「修改即保存」的闸门判据是**整份草稿合法**（每张卡片有条目、每条候选
+    // provider+model 都是非空串）。加一行空候选、或只选了供应商，提交上去必被
+    // 服务端 `assertValidAutoRouteConfig` 点名拒绝 —— 那等于用户每点一下都收一条
+    // 红字。故这条断言链是「零请求 → 零请求 → 恰好一次」，缺任何一环都测不出闸门：
+    // 只测首尾两步的话，「每次编辑都提交、失败就报错」的实现照样能绿。
+    const { calls, rpcCall } = makeRpc()
+    let tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
+    const sets = () => calls.filter((c) => c.method === 'autoroute.set')
+
+    // 第一步：加一行空候选（provider / model 都是空串占位）。
+    ;(findButtonByText(cardsOf(tree)[0]!, '添加模型')!.props.onClick as () => void)()
+    for (let i = 0; i < 12; i++) await Promise.resolve()
+    tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
+    expect(rowsInCard(cardsOf(tree)[0]!), '新候选应当已经进了本地草稿（不是被前端拦下）').toHaveLength(2)
+    expect(sets(), 'provider 与 model 都空：一次都不该提交').toHaveLength(0)
+
+    // 第二步：只选供应商 —— 草稿合法了吗？没有，model 还是空串。
+    let menus = menusIn(rowsInCard(cardsOf(tree)[0]!)[1]!)
+    selectInMenu(menus[0]!, 'dsh')
+    for (let i = 0; i < 12; i++) await Promise.resolve()
+    tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
+    expect(entryValuesOf(cardsOf(tree)[0]!)[1]!.provider, '本地草稿要认下这一笔').toBe('dsh')
+    expect(sets(), 'model 还空着：仍不该提交').toHaveLength(0)
+    expect(errorLinesOf(tree), '中间态不该冒出任何错误行').toHaveLength(0)
+
+    // 第三步：补上 model ⇒ 整份草稿第一次变合法，提交恰好一次。
+    menus = menusIn(rowsInCard(cardsOf(tree)[0]!)[1]!)
+    selectInMenu(menus[1]!, 'deepseek-v4')
+    for (let i = 0; i < 12; i++) await Promise.resolve()
+    tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
+
+    const submitted = sets()
+    expect(submitted, '填全的那一刻应当提交，且只提交一次').toHaveLength(1)
+    const payload = submitted[0]!.payload as { models: typeof CONFIG.models }
+    // 载荷里的新候选已经是填全的形态 —— 证明提交的是**填全之后**的草稿，
+    // 而不是把中间态先塞出去。
+    expect(payload.models[0]!.entries).toEqual([
+      { provider: 'dsh', model: 'deepseek-v4' },
+      { provider: 'dsh', model: 'deepseek-v4' },
+    ])
+    expect(errorLinesOf(tree), '合法提交成功后不该有错误行').toHaveLength(0)
   })
 
   it('三级联动：选供应商后模型 options 来自 catalog 对应组，且清掉下游取值', async () => {
@@ -847,7 +879,11 @@ describe('AutoRoutePanel：草稿编辑（只改本地，不发请求）', () =>
     expect(modalRoot(tree), '取消后弹窗应当关闭').toBeUndefined()
     expect(cardsOf(tree), '取消不该删掉卡片').toHaveLength(2)
 
-    // 确认：卡片真的少一张，且仍是**草稿**改动（不发请求）。
+    // 确认：卡片真的少一张，且本地草稿同步收下这一笔。
+    //
+    // ⚠️ 删除**会**触发提交（`removeDefinition` 走 `editDraft`）：删掉一张卡片后
+    // 剩下的那份草稿仍合法，故与改名/拖拽同属「修改即保存」。这条用例只钉本地
+    // 结果，提交载荷由「自动保存流」那组用例负责。
     ;(findButtonByText(cardsOf(tree)[0]!, '删除')!.props.onClick as () => void)()
     tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
     const confirm = findButtonByText(modalRoot(tree)!, '删除')!
@@ -935,65 +971,57 @@ describe('AutoRoutePanel：思考档位（按需拉取 + 缓存）', () => {
   })
 })
 
-describe('AutoRoutePanel：保存流', () => {
-  it('保存发出完整 models 草稿，成功后以返回值覆盖草稿并清脏标记', async () => {
+describe('AutoRoutePanel：自动保存流（修改即保存）', () => {
+  it('合法修改立即提交整组 models，成功后无错误行、草稿保留', async () => {
     const { calls, rpcCall } = makeRpc()
     let tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
     typeInto(nameInputOf(cardsOf(tree)[0]!), '极速')
-    tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
-    expect(dirtyTagsOf(tree)).toHaveLength(1)
-
-    ;(saveButton(tree).props.onClick as () => void)()
     for (let i = 0; i < 12; i++) await Promise.resolve()
     tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
 
     const set = calls.find((c) => c.method === 'autoroute.set')
-    expect(set, '保存应当写回 models').toBeDefined()
+    expect(set, '合法修改应当立即写回 models').toBeDefined()
     // 载荷是**整组替换**（models 有序，逐条合并表达不了「删除」与「挪到队首」）。
     const payload = set!.payload as { models: typeof CONFIG.models }
-    expect(Object.keys(payload), '保存只带 models，不重发 enabled').toEqual(['models'])
+    expect(Object.keys(payload), '提交只带 models，不重发 enabled').toEqual(['models'])
     expect(payload.models.map((d) => d.name)).toEqual(['极速', '强力'])
     expect(payload.models[0]!.entries).toEqual([{ provider: 'dsh', model: 'deepseek-v4' }])
 
-    // 成功后：脏标记清掉、保存按钮回到禁用、草稿取自宿主返回值。
-    expect(dirtyTagsOf(tree), '保存成功后不该再有「未保存」').toHaveLength(0)
-    expect(saveButton(tree).props.disabled).toBe(true)
+    // 成功后：无错误行、草稿保留（本地值即提交值，宿主返回值一致时不覆盖）。
+    expect(errorLinesOf(tree), '提交成功不该有错误行').toHaveLength(0)
     expect(nameInputOf(cardsOf(tree)[0]!).props.value).toBe('极速')
   })
 
-  it('保存失败：显示服务端中文错误、草稿原样保留、脏标记不消失', async () => {
+  it('提交被拒：显示服务端中文错误、草稿原样保留，下一次合法修改再次提交', async () => {
     // 服务端 `assertValidAutoRouteConfig` 对「entries 为空」的定义会点名到定义名。
     const serverMessage = '自动模型『快速』缺少模型条目（至少一条 provider + model）'
     const { calls, rpcCall } = makeRpc({ setFails: serverMessage })
     let tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
     typeInto(nameInputOf(cardsOf(tree)[0]!), '极速')
-    tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
-
-    ;(saveButton(tree).props.onClick as () => void)()
     for (let i = 0; i < 12; i++) await Promise.resolve()
     tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
 
     expect(calls.some((c) => c.method === 'autoroute.set')).toBe(true)
     // 服务端原文（点名到具体定义）必须出现在面板内的红字行上。
     const errors = errorLinesOf(tree)
-    expect(errors.join('\n'), '保存失败必须显示服务端的中文错误原文').toContain(serverMessage)
+    expect(errors.join('\n'), '提交被拒必须显示服务端的中文错误原文').toContain(serverMessage)
     // 草稿**保留**：用户改了一堆东西，失败不该把它清掉。
-    expect(nameInputOf(cardsOf(tree)[0]!).props.value, '保存失败后草稿必须保留').toBe('极速')
-    expect(dirtyTagsOf(tree), '保存失败后仍应是未保存状态').toHaveLength(1)
-    expect(saveButton(tree).props.disabled, '保存失败后应当能再点一次').toBe(false)
+    expect(nameInputOf(cardsOf(tree)[0]!).props.value, '提交失败后草稿必须保留').toBe('极速')
   })
 
-  it('entries 为空的定义允许存在于草稿（防线在服务端，前端刻意不拦）', async () => {
-    const { rpcCall } = makeRpc()
+  it('entries 为空的定义允许存在于草稿且**不触发提交**（中间态跳过，防线在服务端）', async () => {
+    const { calls, rpcCall } = makeRpc()
     let tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks, true)
     ;(findButtonByText(tree, '添加自动模型')!.props.onClick as () => void)()
+    for (let i = 0; i < 12; i++) await Promise.resolve()
     tree = await settle(client.AutoRoutePanel, panelProps(rpcCall), client.hooks)
     // 空 entries 的定义照样渲染出卡片与「添加模型」入口，没有任何前端拦截。
     const card = cardsOf(tree)[2]!
     expect(rowsInCard(card)).toHaveLength(0)
     expect(textsOf(card), '卡片头应当显示条目数').toContain('0 个模型条目')
     expect(findButtonByText(card, '添加模型'), '空定义仍要能加候选').toBeDefined()
-    expect(saveButton(tree).props.disabled, '空定义在草稿里是可保存的（由服务端判定）').toBe(false)
+    // 修改即保存的合法性闸：中间态不提交（提交必被服务端拒，白报错）。
+    expect(calls.filter((c) => c.method === 'autoroute.set'), '空定义中间态不该触发提交').toHaveLength(0)
   })
 
   it('目录拉取失败：面板显示错误行 + 「重试」，重试成功后错误消失', async () => {
@@ -1053,8 +1081,10 @@ describe('AutoRoutePanel：拖拽排序', () => {
     ])
 
     expect(cardsOf(tree).map((c) => nameInputOf(c).props.value), '拖拽后顺序应当翻转').toEqual(['强力', '快速'])
-    // 排序只改草稿（与编辑一致），保存时才写服务端。
-    expect(calls.filter((c) => c.method === 'autoroute.set'), '拖拽排序不该立即写服务端').toHaveLength(0)
+    // 修改即保存：拖拽落定是合法编辑，drop 后立即写服务端。
+    const set = calls.filter((c) => c.method === 'autoroute.set')
+    expect(set, '拖拽排序应当立即触发 autoroute.set').toHaveLength(1)
+    expect((set[0]!.payload as { models: Array<{ name: string }> }).models.map((d) => d.name), '载荷顺序与界面一致').toEqual(['强力', '快速'])
   })
 
   it('拖拽过程中给出插入线反馈，dragend 后临时状态清干净', async () => {

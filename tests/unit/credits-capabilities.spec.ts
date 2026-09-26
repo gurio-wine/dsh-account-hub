@@ -394,7 +394,7 @@ describe('Hub 面板 UI 调整包（源码级回归）', () => {
     expect(ruleOf('.dim-ah-provider')).toContain('box-sizing: border-box')
   })
 
-  it('③ 单账号「重测 / 重置」按钮已从账号卡片移除，且不留死 handler', () => {
+  it('③ 全部限流标记操作入口（单账号 + 供应商级）已从 UI 移除，且不留死 handler', () => {
     const cardStart = source.indexOf('function AccountCard(')
     expect(cardStart).toBeGreaterThan(-1)
     const card = source.slice(cardStart, cardStart + 4000)
@@ -406,17 +406,33 @@ describe('Hub 面板 UI 调整包（源码级回归）', () => {
     // 面板侧不再传这两个 prop（传了就是死代码，没人消费）。
     expect(source).not.toContain('onRetest:')
     expect(source).not.toContain('onReset:')
-    // 单账号 help 常量随之删除，两个 all 版本的保留。
-    expect(source).not.toMatch(/^const RETEST_HELP/m)
-    expect(source).not.toMatch(/^const RESET_HELP/m)
-    expect(source).toContain('RETEST_ALL_HELP')
-    expect(source).toContain('RESET_ALL_HELP')
+    // 供应商级那对按钮后来也删了，故四组 help 常量、响应汇总函数、待确认状态与
+    // 忙碌标志全部随按钮删除。
+    //
+    // 只查**非注释行**：源码注释里叙述「这四个常量已随按钮删除」是合理且有益的
+    // （与下方 ⑤ 同款处理），注释提及不等于代码残留。
+    const codeLines = source
+      .split('\n')
+      .filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line))
+      .join('\n')
+    expect(codeLines).not.toMatch(/^const RETEST_HELP/m)
+    expect(codeLines).not.toMatch(/^const RESET_HELP/m)
+    expect(codeLines).not.toContain('RETEST_ALL_HELP')
+    expect(codeLines).not.toContain('RESET_ALL_HELP')
+    expect(codeLines).not.toContain('function summarizeProbe(')
+    // 供应商级那对按钮的文字、执行函数与确认弹窗一并消失。
+    expect(codeLines).not.toContain("'重测所有'")
+    expect(codeLines).not.toContain("'清除限额'")
+    expect(codeLines).not.toContain('pendingRetest')
+    expect(codeLines).not.toContain('probeBusy')
+    expect(codeLines).not.toContain('runLimitAction')
+    expect(codeLines).not.toContain('executeLimitAction')
   })
 
-  it('③（反面）宿主侧的单账号 RPC 与供应商级「清除限额」能力一律保留', () => {
-    // ⚠️ 删的是 **UI 入口**，不是能力：`account.retest` / `account.reset` 两个
-    // 端点是库层能力（headless / 测试 / 将来形态都可用），宿主一行未动。
-    // 本用例读宿主源码，防止将来有人「顺手把没人用的端点删掉」。
+  it('③（反面）宿主侧四条限流 RPC 能力一律保留（删的只是 UI 入口）', () => {
+    // ⚠️ 删的是 **UI 入口**，不是能力：四个端点都是库层能力（headless / 测试 /
+    // 将来形态都可用），宿主一行未动。本用例读宿主源码，防止将来有人
+    // 「顺手把没人用的端点删掉」。
     const host = readFileSync(
       resolve(dirname(fileURLToPath(import.meta.url)), '../../src/account-hub-rpc.ts'),
       'utf8',
@@ -424,15 +440,6 @@ describe('Hub 面板 UI 调整包（源码级回归）', () => {
     for (const endpoint of ["case 'account.retest'", "case 'account.reset'", "case 'account.retestAll'", "case 'account.resetAll'"]) {
       expect(host, `宿主缺少端点 ${endpoint}`).toContain(endpoint)
     }
-    // 供应商级「清除限额」仍走 resetAll。
-    expect(source).toContain("rpcCall('account.resetAll', { provider })")
-    expect(source).toContain("rpcCall('account.retestAll', { provider })")
-  })
-
-  it('④ 供应商级按钮文案为「清除限额」（功能仍走 account.resetAll）', () => {
-    expect(source).toContain("}, '清除限额')")
-    // 旧文案不得残留（它现在既不对应功能，也会让用户以为在重置整个面板）。
-    expect(source).not.toContain("'重置所有'")
   })
 
   it('⑤ 图标入口通过 aria-label 保留「模型列表」与「登录账号」可访问名称', () => {
@@ -788,8 +795,8 @@ describe('单账号签到反馈与 unavailable 接线（源码级回归）', () 
   })
 
   it('④ 单片按钮的 disabled 含面板级签到忙碌（claiming 折进 busy 传入）', () => {
-    // 账号卡片渲染处：`busy` 不再只是 probeBusy。
-    expect(normalized).toContain('busy: probeBusy || claiming')
+    // 账号卡片渲染处：`busy` 的唯一来源就是签到本身（限流操作已整条移除）。
+    expect(normalized).toContain('busy: claiming')
     // AccountCard 自身仍按 busy || 已签 || 本账号签到中 三态禁用。
     expect(normalized).toContain('disabled: busy || checkedIn || checkingThisAccount')
   })

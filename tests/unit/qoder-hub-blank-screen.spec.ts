@@ -422,22 +422,6 @@ async function renderStable(
 
 const client = loadClientModule()
 
-/**
- * 两条源码级常量：从被测源码里**读出来**（而不是在测试里复制一份）。
- *
- * 悬停提示那组断言要逐字比对文案，写死一份副本就等于「测试自己跟自己比」——
- * 源码里的文案被改短了，副本不会跟着变，断言照样绿。故这里从源码里正则取出
- * 常量定义的值，再断言这些值出现在**使用处**（`withHoverTitle(..., CONST)`）。
- */
-const constValueOf = (name: string): string => {
-  const source = readFileSync(resolve(here, '../../plugin-src/client/account-hub.js'), 'utf8')
-  const match = new RegExp(`^const ${name} = '([^']*)'`, 'm').exec(source)
-  expect(match, `account-hub.js 里找不到常量 ${name}`).not.toBeNull()
-  return match![1]!
-}
-const RETEST_ALL_HELP = constValueOf('RETEST_ALL_HELP')
-const RESET_ALL_HELP = constValueOf('RESET_ALL_HELP')
-
 /** 一个记录调用的 rpcCall 替身。 */
 function makeRpc() {
   const calls: Array<{ method: string; payload: Record<string, unknown> }> = []
@@ -723,11 +707,9 @@ describe('面板按钮集合（渲染级）', () => {
     for (const label of ['模型列表', '刷新积分', '一键签到', '登录账号']) {
       expect(labels, `缺少图标按钮可访问名称「${label}」`).toContain(label)
     }
-    for (const text of ['重测所有', '清除限额']) {
-      expect(texts, `限额操作缺少文字「${text}」`).toContain(text)
-    }
-    // 旧文案不得出现在任何按钮上。
-    for (const stale of ['显示列表', '重置所有', '+ 新建账号']) {
+    // 「重测所有 / 清除限额」按钮已按用户要求移除（2026-09-26），
+    // 面板不再渲染它们 —— 旧文案进 stale 清单守卫，防止回流。
+    for (const stale of ['显示列表', '重置所有', '+ 新建账号', '重测所有', '清除限额']) {
       expect(texts, `按钮里仍有旧文案「${stale}」`).not.toContain(stale)
     }
   })
@@ -812,8 +794,6 @@ describe('控件与样式迁移（源码级通盘闸门）', () => {
   })
 
   it('按钮与拖拽手柄 Tooltip 按清单精简，其余提示保留', () => {
-    expect(RETEST_ALL_HELP).toBe('重测全部账号限流状态（消耗少量额度）')
-    expect(RESET_ALL_HELP).toBe('清除全部账号限流标记')
     expect(clientCode).toContain("'aria-label': '模型列表'")
     expect(clientCode).toContain("'aria-label': '刷新积分'")
     expect(clientCode).toContain("'aria-label': '登录账号'")
