@@ -1,0 +1,917 @@
+import { Context } from '@deepseek-ai/cordis';
+import { type ConsumptionCursorMap, type ConsumptionMap, type ConsumptionSetting } from './account-consumption.js';
+import { type AutoRouteConfig, type AutoRouteDefinition } from './auto-route.js';
+import { type BuddyCredential } from './buddy.js';
+import type { BuddyProduct } from './product.js';
+import type { CodeArtsCredential, ProviderAccountEntry, ProviderAccountStatus } from './types.js';
+declare module '@deepseek-ai/cordis' {
+    interface Context {
+        accountPool: AccountPool;
+        /** 宿主解析的 `$DSH_HOME`（`@deepseek-ai/dsh-home-paths` 的 `dshHomePath`）。 */
+        dshHomePath?: (...segments: string[]) => string;
+    }
+}
+/**
+ * Account Hub 旧 settings namespace。
+ *
+ * ⚠️ **历史兼容读取，勿改** —— 这个字面量是 0.1.6 的 settings namespace，
+ * 也是老用户数据真正所在的键。新写入一律走 storage 域（见
+ * `src/account-hub-storage.ts` 的 `ACCOUNT_HUB_DOMAIN`），这里只在**回退路径**
+ * （storage 不可用）下继续读写它，以及被迁移模块用于定位旧数据。
+ */
+export declare const ACCOUNT_HUB_NS = "jet-hub";
+/**
+ * 模型黑名单：provider id → **被关闭**的模型 id 列表。
+ *
+ * 采用**黑名单制**：只有出现在这里、且 `disabled` 为 true 的模型会被隐藏，
+ * 未记录的模型一律视为默认打开。这样服务端新增模型时无需任何配置即自动可见，
+ * 不会像白名单那样把新模型静默挡在门外。
+ */
+export type ModelDisableMap = Record<string, Record<string, boolean>>;
+/**
+ * 逐模型的**上下文窗口预算**：provider id → 模型 id → 窗口 token 数。
+ *
+ * ## 语义（与「专家设置」严格区分）
+ *
+ * 这里的值**不是用户可以自由填的数字**，而是「该模型目录公布过的档位之一」——
+ * 由 `model.setContextBudget` 校验后写入（见 `src/account-hub-rpc.ts`），适配器读取时
+ * 还要**再判一次**「它是否精确等于该模型当前目录的 Max 档」（见
+ * `TraeCnAdapter.resolveModel` 的预算覆盖）。
+ *
+ * 两道判据都指向同一件事：**用户设置永远不能编造窗口**。目录 roster 浮动后
+ * 旧预算自动失效（退回默认档），而不是拿一个模型已经不认的数字去声明窗口 ——
+ * 声明值决定宿主的压缩阈值（`0.8 × 窗口`），编造值会静默改写用户的压缩时机。
+ *
+ * 缺省 = 全部模型用**默认档**（目录的 dev 档）。
+ */
+export type ContextBudgetMap = Record<string, Record<string, number>>;
+/**
+ * 当前数据版本号。
+ *
+ * - `0`（或字段缺失）= 旧命名：provider 为 `buddy`（中国版）/ `workbuddy`（国际版）；
+ * - `1` = 新命名（`buddy-cn` / `buddy`），已由
+ *   `src/provider-rename-migration.ts` 迁移完毕；
+ * - `2` = 文档新增第五字段 `checkins`（自动签到记录）。
+ * - `3` = 文档新增第六、第七字段 `consumption` / `consumptionCursors`
+ *   （消耗顺序 / 切换粒度 / 遍历游标）。
+ * - `4` = `checkins` 的值口径由「本地纪元日数」换成「**下一次可签毫秒时间戳**」
+ *   （各 provider 重置钟点不同，见 `src/checkin-schedule.ts`）。
+ * - `5` = 文档新增第八字段 `providerAuditVersion`（provider 体检的独立闸门）。
+ * - `6` = 文档新增第九字段 `autoRoute`（自动路由配置，唯一真相源在
+ *   `src/auto-route.ts`）。
+ *
+ * ⚠️ **4 是唯一一次「搬动既有数据」的版本提升**（其余都只补字段）：旧值必须
+ * 换算，否则会被当成一个 1970 年的时间戳、判成「永远可签」而每轮重复签到。
+ * 换算本身发生在**读盘那一层**（`sanitizeCheckins` + `normalizeCheckinValue`），
+ * 故它不依赖迁移函数是否跑过 —— 版本号的提升只是把「文档已按新口径读过一次」
+ * 这件事在存储里落个可判定的标记，并让 `migrateProviderNames` 多跑一趟
+ * （那一趟对已迁移数据是无操作）。
+ *
+ * ⚠️ **2 / 3 / 5 / 6 四次提升都只是「补字段」，不搬动任何既有数据**：旧文档读入时
+ * 由 `sanitizeAccountHubDocument` 补空对象 / 0 / 默认配置（缺 `consumption` 即等于
+ * `DEFAULT_CONSUMPTION`，缺 `providerAuditVersion` 即等于「体检未跑」，缺
+ * `autoRoute` 即等于 `DEFAULT_AUTO_ROUTE_CONFIG`）。
+ * 提升版本号的实际效果是让 `migrateProviderNames` 对旧文档**多跑一次无操作迁移**
+ * 并把版本号落定，从而「文档已含该字段」这件事在存储里有个可判定的标记。
+ * 数据搬迁由各自的独立闸门负责：体检走 {@link PROVIDER_AUDIT_VERSION}。
+ *
+ * ⚠️ **默认档位从 `sequential` 翻成 `round-robin` 时刻意不提升版本号**：
+ * 那是 `DEFAULT_CONSUMPTION` 的取值变化，**不涉及文档形状**——旧文档本来就可能
+ * 没有 `consumption` 条目，读出来即新默认值；提升版本号只会白跑一次无操作迁移
+ * 并让版本号与「文档长什么样」脱钩（版本号表达的是字段集合，不是取值语义）。
+ * 存量用户的选号行为确实会从「固定第一个」变为「逐请求轮转」，那正是用户要的。
+ *
+ * 迁移函数在版本号 ≥ 本常量时整体 short-circuit，因此这个数字只会前进。
+ *
+ * ⚠️ **本常量兼职过一次「体检闸门」，那是一次事故**：体检（账号标签与凭据内容
+ * 是否对得上）当年把闸门判据也写成 `schemaVersion >= 1`，而改名迁移早已把版本
+ * 推到 1 ⇒ 体检**永远不会执行**，一条「国际版凭据挂在 `buddy-cn` 前缀下」的脏
+ * 数据因此活了很久。结论：**字段集合版本**与**体检版本**必须是两个数字，见
+ * `src/provider-audit-migration.ts` 的模块头。
+ */
+export declare const ACCOUNT_HUB_SCHEMA_VERSION = 6;
+/**
+ * provider 体检的**独立**版本号（存入文档的 `providerAuditVersion` 字段）。
+ *
+ * 体检内容：逐条账号解析其凭据里 JWT 的 `iss` / `domain`，判定该凭据属于哪个
+ * 产品，与条目上的 `provider` 标签比对，不一致即原地重建为正确的 provider。
+ * 见 `src/provider-audit-migration.ts`。
+ *
+ * ⚠️ **不要与 {@link ACCOUNT_HUB_SCHEMA_VERSION} 合并**（理由见该常量的末段：
+ * 合并正是脏数据活下来的原因）。`0`（或字段缺失）表示从未体检；达到 `1` 即
+ * 整体 short-circuit。体检逻辑本身也刻意写成幂等 —— 万一有人手工把版本号改回
+ * 0，重跑一遍不会破坏任何数据（只可能多留一份无害的孤儿凭据）。
+ */
+export declare const PROVIDER_AUDIT_VERSION = 1;
+/**
+ * AccountPool —— 多账号管理核心
+ *
+ * 职责：
+ * - 账号列表 CRUD（索引存于 **storage 域** `dsh_account_hub`
+ *   → `$DSH_HOME/storages/dsh_account_hub.json`，凭据存于 `ctx.credentials`，各自独立）
+ * - 获取指定 provider + 模型的下一个可用账号
+ *   算法：enabled=true 且模型不在重置期内 → 取第一个
+ * - 更新模型重置时间（收到限流错误后调用）
+ *
+ * ## 持久层的三条通路（storage 优先，settings 回退，内存兜底）
+ *
+ * | 运行环境 | storage | `settings.register` | 行为 |
+ * |---|---|---|---|
+ * | 0.1.6（现役） | ✓ | ✓ | storage 为主；首次启动做一次性迁移 |
+ * | 0.1.7 | ✓ | ✗ | storage 为主；首次启动做一次性迁移 |
+ * | 旧环境 / 测试缺 storage | ✗ | ✓ | 回退旧 settings 路径 |
+ * | 两者都缺 | ✗ | ✗ | 纯内存降级 |
+ *
+ * 为什么不再以 settings 为主：0.1.7 删除了 `ctx.settings.register(ns, schema) → scope`
+ * 整套 seam，插件在新版下走优雅降级分支、**不抛错、静默全空** —— 用户看到
+ * 「所有账号消失」。storage 三件套在两版的 base patch 里逐字一致，两版通吃。
+ *
+ * ⚠️ 构造**同步**完成，`openStorage()` 才是异步的：storage 域的打开要走后端 IO，
+ * 而本类的所有读方法都是同步的（适配器在 `resolveModel` 里同步读窗口预算）。
+ * 故由 `src/index.ts` 的 `apply()` 显式 `await pool.openStorage()` —— 在那之前
+ * 写入仍走旧 settings/内存路径，不会「先写内存再被 storage 覆盖」。
+ */
+export declare class AccountPool {
+    private readonly ctx;
+    /** 已注册的 settings scope（**回退路径**；storage 可用时它是死路径）。 */
+    private scope;
+    /** 已打开的 storage 域句柄；不可用时为 undefined（回退 settings / 内存）。 */
+    private storage;
+    /**
+     * **首次** `openStorage()` 的在途/已决 Promise（`openStorage` 的幂等闸门）。
+     *
+     * 为什么必须是 Promise 而不是布尔标记：只用布尔闸门时，第二次调用会立刻
+     * `return this.storage !== undefined` —— 若首次打开**仍在途**，此刻 `storage`
+     * 还是 undefined，第二次调用就以 `false` **提前 resolve**，于是挂在它
+     * `.then()` 上的启动逻辑会在 storage 接管**之前**跑（读到旧 settings/内存快照）。
+     * `apply()` 里几处 `void pool.openStorage().then(...)`（改名迁移、Qoder 资料
+     * 回填、自动签到 sweep，以及续期调度判据）全部踩这一条。
+     *
+     * 缓存 Promise 后，所有调用方拿到的是**同一个**「storage 真的就绪」信号，
+     * 与调用顺序无关。
+     */
+    private storagePromise;
+    /**
+     * 账号列表的**权威进程内副本**。
+     *
+     * 不直接每次读持久层：settings 的 resolved 快照在 `replace()` 后未必立即更新，
+     * 而本类的每次写入都是「读 → 改 → 整体 replace」。若以滞后快照为读源，
+     * 并发/连续的 updateModelRateLimit 会互相覆盖（典型表现：多个账号触发限流后，
+     * 一条 modelRateLimits 都没有）。因此首次载入后，这份副本即为唯一读源。
+     */
+    private cache;
+    /**
+     * 模型黑名单的**权威进程内副本**（与 {@link cache} 同理）。
+     */
+    private modelCache;
+    /**
+     * 逐模型上下文窗口预算的**权威进程内副本**（同 {@link cache}）。
+     *
+     * ⚠️ 它与账号、黑名单、签到、版本号是**同一份文档的五件套**：任何一次写入都是整体
+     * replace，五者必须互相携带，漏一个就会在下次别的写入里被清空。
+     */
+    private budgetCache;
+    /**
+     * 自动签到记录的**权威进程内副本**（同 {@link cache}）。
+     *
+     * ⚠️ 它与账号、黑名单、预算、版本号是**同一份文档的五件套**：任何一次写入都是
+     * 整体 replace，五者必须互相携带，漏一个就会在下次别的写入里被清空。
+     * 字段语义与 {@link budgetCache} 完全同构（键 `provider:accountId`，见
+     * `sanitizeCheckins`）。
+     */
+    private checkinCache;
+    /**
+     * 消耗顺序 / 切换粒度的**权威进程内副本**（同 {@link cache}）。
+     *
+     * ⚠️ 与账号、黑名单、预算、签到、游标、版本号是**同一份文档的七件套**：任何一次
+     * 写入都是整体 replace，七者必须互相携带，漏一个就会在下次别的写入里被清空。
+     */
+    private consumptionCache;
+    /**
+     * 遍历游标的**权威进程内副本**（同 {@link cache}）。
+     *
+     * ⚠️ 同属七件套（理由见 {@link consumptionCache}）。它只有 `round-robin` 档会写，
+     * 但**任何**写入路径都必须带上它 —— 否则一次无关的“改个模型开关”就会把游标清零，
+     * 表现是「轮转突然从第一个重新开始」。
+     */
+    private cursorCache;
+    /**
+     * 自动路由配置的**权威进程内副本**（同 {@link cache}）。
+     *
+     * ⚠️ 同属九件套（理由见 {@link consumptionCache}）。它只在用户改自动路由时写，
+     * 但**任何**写入路径都必须带上它 —— 否则一次无关的「改个模型开关」就会把
+     * 用户配好的自动模型整组清空，且完全没有报错。
+     */
+    private autoRouteCache;
+    /**
+     * 数据版本号的**权威进程内副本**（同 {@link cache}）。
+     *
+     * 一次性迁移（provider 改名）靠它 short-circuit，因此它必须与账号、黑名单
+     * 一起参与「读 → 改 → 整体 replace」，漏带就会在下次写入时被重置为 0，
+     * 让迁移在每次启动时重跑。
+     */
+    private versionCache;
+    /**
+     * provider 体检版本号的**权威进程内副本**（同 {@link cache}）。
+     *
+     * ⚠️ 与 `versionCache` 同一条陷阱：它必须参与每一次「读 → 改 → 整体 replace」。
+     * 漏带会让体检在**每次启动**重跑（多打日志、多搬一次凭据），而体检本身是
+     * 幂等的，所以症状只是噪音 —— 但那正是「闸门形同虚设」。
+     */
+    private auditVersionCache;
+    /** 是否已从持久层完成首次载入。 */
+    private loaded;
+    /**
+     * 宿主侧**内存级余额缓存**（最高优先档的依赖）。
+     *
+     * 刻意不落盘（理由见 `src/account-consumption.ts` 的 `BalanceCache` 说明）：
+     * 余额是秒级可变的远端事实，落盘只会让一份几小时前的数字看起来像权威数据。
+     */
+    private readonly balances;
+    /**
+     * 轮次锁：轮次键 → 该轮锁定的 accountId（`per-turn` 粒度用）。
+     *
+     * 轮次键由调用方（宿主的选号器）给出 —— 它把 `options.signal` 的身份换算成一个
+     * 稳定字符串（见 `src/index.ts` 的 `makeTurnKey`）。池这一层不认识 signal，
+     * 只认「同一个键 = 同一轮」，从而保持可单测。
+     */
+    private readonly turnLocks;
+    constructor(ctx: Context);
+    /**
+     * 打开 storage 域并（首次时）执行一次性迁移。
+     *
+     * **幂等且可重入**：重复调用返回**同一个** Promise（见 {@link storagePromise}）——
+     * 并发/后续调用不会在首次打开仍在途时提前拿到 false。storage 不可用时静默返回
+     * false，账号池继续用 settings（回退路径）或纯内存 —— 绝不抛错、绝不阻断插件启动。
+     *
+     * ⚠️ 因此调用方 `await pool.openStorage()` / `.then(...)` 拿到 true 时，
+     * **storage 一定已接管**（`this.storage` 已赋值、一次性迁移已跑完），
+     * 这正是 `src/index.ts` 里各处启动逻辑所依赖的时序保证。
+     *
+     * @returns 是否成功接管（true = storage 为主路径）。
+     */
+    openStorage(): Promise<boolean>;
+    /** `openStorage` 的**单次**实现；只由 {@link openStorage} 在首次调用时进入。 */
+    private openStorageOnce;
+    /** 把旧 settings 位置的数据一次性搬进 storage（失败只记日志，不阻断）。 */
+    private runLegacyMigration;
+    /** 首次访问时从**主路径**载入九件套。 */
+    private ensureLoaded;
+    /**
+     * 持久化九件套。
+     *
+     * ⚠️ **唯一写落点**：所有写入方法最终都汇到这里，九件套一起带上。
+     * 主路径是 storage 域的 `global.set`（整体替换那份单例文档）；回退路径是
+     * settings scope 的 `replace`（同样是整体替换，漏带即清空）。
+     */
+    private persist;
+    /** 读取账号列表（进程内权威副本）。 */
+    private readAccounts;
+    /**
+     * 数据版本号（0 = 旧命名尚未迁移，见 {@link ACCOUNT_HUB_SCHEMA_VERSION}）。
+     *
+     * 一次性迁移用它做 short-circuit；普通读取路径不关心它。
+     */
+    get schemaVersion(): number;
+    /**
+     * provider 体检版本号（0 = 体检尚未执行，见 {@link PROVIDER_AUDIT_VERSION}）。
+     *
+     * 体检迁移（`src/provider-audit-migration.ts`）用它 short-circuit；普通读取
+     * 路径不关心它。⚠️ **它与 `schemaVersion` 是两个独立的闸门**，不要合并。
+     */
+    get providerAuditVersion(): number;
+    /**
+     * 列出**全部** provider 的模型黑名单（含从未改过开关的 provider）。
+     *
+     * 与 {@link listDisabledModels} 的区别：后者按 provider 取单个子表，
+     * 满足设置页渲染；一次性迁移需要整体搬运键名（`buddy` ↔ `workbuddy`），
+     * 因此需要一份完整快照。返回的是浅拷贝，改它不会影响进程内副本。
+     */
+    allDisabledModels(): ModelDisableMap;
+    /**
+     * 一次性整体写入账号列表、模型黑名单与上下文预算（外加版本号、签到、
+     * 游标、自动路由与体检版本）。
+     *
+     * 为什么需要它：{@link writeAccounts} / {@link writeModels} 各自只接受
+     * 自己那一半，调用方要先写一半再写另一半，中间崩溃会留下半迁移状态。
+     * 一次性迁移必须**原子**地落盘「账号 + 黑名单 + 上下文预算 + 版本号 + 体检版本」
+     * 九件套，故这里直接构造完整的 replace 载荷，只发一次写。
+     *
+     * ⚠️ **上下文预算、消耗顺序、游标与自动路由原样带上**（不是本次迁移的对象，
+     * 但同属一个文档）：漏带会让迁移顺手清空用户的窗口档位选择、轮转进度或
+     * 配好的自动模型。
+     * ⚠️ 本方法**逐字段构造** replace 载荷（不是 spread 保留未列字段）：加新字段时
+     * 这里必须显式补一行，漏了就是静默清空。
+     *
+     * @param accounts - 新的账号列表。
+     * @param disabledModels - 新的模型黑名单。
+     * @param schemaVersion - 迁移完成后的**数据版本号**（字段集合版本）。
+     * @param checkins - 签到记录；缺省取进程内副本（与 `contextBudgets` 的处理一致）。
+     * @param consumptionCursors - 遍历游标；缺省取进程内副本。体检迁移**必须**传
+     *        新的（被重建账号的游标值指向旧 accountId）。
+     * @param providerAuditVersion - 体检版本号；缺省取进程内副本（体检迁移传
+     *        {@link PROVIDER_AUDIT_VERSION} 标记已跑完）。
+     */
+    replaceAll(accounts: ProviderAccountEntry[], disabledModels: ModelDisableMap, schemaVersion?: number, checkins?: Record<string, number>, consumptionCursors?: ConsumptionCursorMap, providerAuditVersion?: number): Promise<void>;
+    /**
+     * 持久化账号列表（同时更新进程内权威副本）。
+     *
+     * **必须连同黑名单、上下文预算、签到与版本号一起写回**：settings 的 `replace()` 是整体替换，
+     * 只写 `{ accounts }` 会把同一 namespace 下的 `disabledModels`、`contextBudgets`
+     * 与 `checkins` 抹掉，`schemaVersion` 同理会被重置为 0（于是改名迁移会在每次启动时重跑）。
+     */
+    private writeAccounts;
+    /**
+     * 读取某 provider 的模型黑名单（被关闭的模型 id 集合）。
+     *
+     * 适配器只调用这一个方法，因此进程内副本就是它们的读源：设置页改开关
+     * 后，下一次 `listModels` 立即生效，无需重启或重新注册适配器。
+     */
+    disabledModelsFor(provider: string): ReadonlySet<string>;
+    /**
+     * 列出某 provider 的模型黑名单，供设置页渲染开关。
+     *
+     * 返回**全部键**（含显式设为 false 的），以便 UI 区分"从未设置过"与
+     * "曾被关闭又打开"——两者对用户都是"开"，但保留记录便于排查。
+     */
+    listDisabledModels(provider: string): Record<string, boolean>;
+    /**
+     * 打开/关闭某个模型。
+     *
+     * 关闭时写入 `true`；打开时**删除该键**而不是写 `false` —— 保持黑名单
+     * 里只留真正被关闭的模型，`disabledModelsFor` 的语义因此始终是
+     * "键存在且为 true 即隐藏"，配置文件也不会随开关操作无限膨胀。
+     */
+    setModelDisabled(provider: string, modelId: string, disabled: boolean): Promise<void>;
+    /** 持久化模型黑名单（同时更新进程内权威副本）。 */
+    private writeModels;
+    /**
+     * 读取某模型的**上下文窗口预算**（未被设置过时为 `undefined` = 默认档）。
+     *
+     * 与 {@link disabledModelsFor} 同款：只读进程内权威副本，同步返回 —— 适配器在
+     * `resolveModel` 里同步调用它，写档位后无需重建适配器，下一次解析即生效。
+     */
+    contextBudget(provider: string, modelId: string): number | undefined;
+    /**
+     * 写入/清除某模型的上下文窗口预算。
+     *
+     * 只改**单个键**（读 → 改 → 整体 replace），与 {@link setModelDisabled} 同款。
+     * `value === undefined` = **删除该键**（恢复默认档），而不是写一个 0 或 -1 的哨兵值：
+     * 「未设置」与「设成某个数」在读取侧必须是两种可区分的状态，写哨兵会让
+     * `contextBudget()` 的返回值语义分叉。
+     *
+     * ⚠️ 本方法**不做档位校验** —— 校验属于 RPC 层（它手上有目录）。
+     * 但读取侧（`TraeCnAdapter.resolveModel`）仍会再判一次「是否精确命中目录公布的档位」，
+     * 故即便有人绕过 RPC 写入一个编造值，最坏结果也只是静默退回默认档，不会改写声明窗口。
+     */
+    writeContextBudget(provider: string, modelId: string, value: number | undefined): Promise<void>;
+    /** 持久化上下文窗口预算（同时更新进程内权威副本）。 */
+    private writeBudgets;
+    /**
+     * 读取某账号的**下一次可签时刻**（本地时间毫秒时间戳）。
+     *
+     * 只读进程内权威副本，同步返回 —— 与 {@link contextBudget} 同款。不在表里的键
+     * （尚未签过 / 该键不存在）读回 `undefined` = 可签。
+     *
+     * ⚠️ **返回值不是「签到日」**：它是「下一次可签的时刻」，判定已签要用
+     * `Date.now() < 返回值`（见 `src/checkin-schedule.ts` 的 `isCheckinDue`）。
+     * 旧口径（本地纪元日数）已整体作废，读盘时由 `sanitizeCheckins` 就地迁移。
+     *
+     * @param provider - provider id。
+     * @param accountId - 账号 id。
+     */
+    checkinNextEligible(provider: string, accountId: string): number | undefined;
+    /**
+     * 列出**全部**签到记录（浅拷贝快照）。
+     *
+     * 与 {@link allDisabledModels} 同款：一次性迁移要按 `provider:accountId` 键
+     * **搬动整条记录**（账号被重建时键的两半都变），逐账号读 `checkinNextEligible`
+     * 做不到这件事。返回的是副本，改它不会影响进程内权威副本。
+     */
+    allCheckins(): Record<string, number>;
+    /**
+     * 判定某账号**此刻是否可签**（无记录、或记录的下一次可签时刻已过）。
+     *
+     * 收在池上而不是让调用方自己比：`now` 的取值时点与存储的读法必须一致，
+     * 三处调用点（sweep 筛选 / 面板状态 / 单账号签到）各写一次就会在边界上漂移。
+     *
+     * @param provider - provider id。
+     * @param accountId - 账号 id。
+     * @param now - 判定时刻，缺省当前时间（便于测试注入固定时刻）。
+     */
+    isCheckinDue(provider: string, accountId: string, now?: number): boolean;
+    /**
+     * 持久化某账号的**下一次可签时刻**。
+     *
+     * 只改**单个键**（读 → 改 → 整体 replace），与 {@link writeContextBudget} 同款。
+     * 键格式 `${provider}:${accountId}`。
+     *
+     * ⚠️ **必须先 ensureLoaded()**：整体 replace 若在 `loaded` 尚未置位时跑，会把账号、
+     * 黑名单、预算、版本号一起覆盖成空（同 `setModelDisabled` / `writeContextBudget`
+     * 那条陷阱）。读经 `ensureLoaded`、写经 `persist` 的唯一通路。
+     *
+     * ⚠️ **值是「下一次可签时刻」，不是签到时刻**：调用方应传
+     * `nextEligibleAt(签到成功时刻, provider)`（见 `src/checkin-schedule.ts`），
+     * 不要传 `Date.now()` —— 那等于把「刚签完」记成「此刻可签」，下一个 tick 就会
+     * 再签一次。
+     *
+     * @param provider - provider id。
+     * @param accountId - 账号 id。
+     * @param nextEligible - 下一次可签时刻（毫秒时间戳，按该 provider 的重置钟点算）。
+     */
+    writeCheckinNextEligible(provider: string, accountId: string, nextEligible: number): Promise<void>;
+    /** 持久化签到记录（同时更新进程内权威副本）。 */
+    private writeCheckins;
+    /**
+     * 清理该 provider 的**孤儿签到键**（兜底，供设置页打开面板时调用）。
+     *
+     * 删除 `checkins` 里 `provider:` 前缀匹配、但 accountId **不在当前账号列表**的键。
+     * 「账号删除时」那条清理（{@link removeAccount}）只在单键发生时顺带做；这是
+     * **残留兜底**：太久不删的账号若在别处（如 provider 改名）留下残余，面板打开时
+     * 一次性清掉。无账号时跳过。
+     *
+     * @param provider - provider id。
+     */
+    pruneOrphanCheckins(provider: string): Promise<void>;
+    /** 列出某个 provider 的所有账号（含状态信息） */
+    /**
+     * 读某 provider 的**消耗顺序 / 切换粒度**配置。
+     *
+     * 未配置时返回默认值（`round-robin` + `per-turn`），**永不抛错** —— 它是选号
+     * 热路径上的同步读，一次配置读取失败绝不能让请求发不出去。
+     */
+    consumptionSetting(provider: string): ConsumptionSetting;
+    /**
+     * 列出**全部** provider 的消耗配置（浅拷贝快照）。
+     *
+     * 供 RPC 一次性回传整页状态，以及宿主判定「哪些 provider 开了最高优先档」
+     * （后者决定余额刷新要不要为它发请求，见 `src/index.ts` 的余额刷新接线）。
+     */
+    allConsumption(): ConsumptionMap;
+    /**
+     * 列出**全部** provider 的遍历游标（浅拷贝快照）。
+     *
+     * 与 {@link allConsumption} 同款：一次性迁移要在**原子写**里搬走游标，
+     * 而池没有别的读法（`writeConsumptionCursor` 只写单个 provider）。
+     * 游标的值是 accountId —— 账号被重建时它**必须跟着换**，否则「下一个该用的
+     * 账号」会指向一个不存在的 id，轮转档在下一轮悄悄退回数组首位。
+     */
+    allConsumptionCursors(): ConsumptionCursorMap;
+    /**
+     * 读**自动路由配置**（整份）。
+     *
+     * 只读进程内权威副本，同步返回 —— 与 {@link consumptionSetting} 同款。返回的是
+     * **深拷贝**（经 `sanitizeAutoRouteConfig`，它每次都新建定义与条目）：调用方
+     * （适配器注册、RPC 回传）就地改它不会串到池内状态。
+     *
+     * **永不抛错**：它是适配器 `listModels` 热路径上的同步读，一次配置读取失败
+     * 绝不能让整条模型目录播报不出来。脏值由读路径逐层丢弃。
+     */
+    autoRouteConfig(): AutoRouteConfig;
+    /**
+     * 写**自动路由配置**（**部分更新**）。
+     *
+     * ## 为什么是部分更新而不是整体覆盖
+     *
+     * 界面上「总开关」与「自动模型列表」是两个彼此独立的入口，各自只改一个字段。
+     * 若做成整体覆盖，客户端每次都要把另一半也回传 —— 一旦它手上的另一半是过期的
+     * （另一个标签页刚改过），用户改列表会顺手把开关改回去。与
+     * {@link writeConsumption} 的取舍一致。
+     *
+     * ## `models` 是**整组替换**，不做逐条合并
+     *
+     * 定义是有序的、且 `entries` 的顺序就是候选优先级：逐条合并无法表达「删掉一条」
+     * 与「把某条挪到队首」，而这两种操作都是界面上的常规动作。故客户端提交的是
+     * **完整的目标列表**，这里整体落位。
+     *
+     * ## 校验在写入侧（RPC 也要再判一次）
+     *
+     * **合并当前值后整体过** {@link assertValidAutoRouteConfig}：非法配置**抛错拒绝**，
+     * 而不是「尽力而为」地写一个永不生效的值 —— 后者在界面上的表现是「点了保存
+     * 却什么都没存」，比一句明确的报错难排查得多。⚠️ 校验必须发生在**改进程内副本
+     * 之前**：否则一次被拒的写入会把池内状态留在半截形态。
+     *
+     * @param patch - 只含要改的字段；两个字段都不给时是无操作（不写盘）。
+     */
+    writeAutoRoute(patch: {
+        enabled?: boolean;
+        models?: AutoRouteDefinition[];
+    }): Promise<void>;
+    /** 持久化自动路由配置（同时更新进程内权威副本）。 */
+    private writeAutoRouteAll;
+    /**
+     * 写某 provider 的消耗配置（**部分更新**）。
+     *
+     * ## 为什么是部分更新而不是整体覆盖
+     *
+     * 界面是两个**彼此独立**的选择器（消耗顺序 / 切换粒度），各自只改一个字段。
+     * 若做成整体覆盖，客户端每次都要把另一半也回传 —— 一旦它手上的另一半是过期的
+     * （另一个标签页刚改过），用户改顺序会顺手把粒度改回去。
+     *
+     * ## 校验在写入侧（RPC 也要再判一次）
+     *
+     * 非法档位**抛错拒绝**，而不是「尽力而为」地写一个永不生效的值：
+     * 后者在界面上的表现是「选了没反应」，比一句明确的报错难排查得多。
+     *
+     * @param provider - provider id。
+     * @param patch - 只含要改的字段；两个字段都不给时是无操作（不写盘）。
+     */
+    writeConsumption(provider: string, patch: Partial<ConsumptionSetting>): Promise<void>;
+    /** 持久化消耗配置（同时更新进程内权威副本）。 */
+    private writeConsumptionAll;
+    /**
+     * 记下遍历游标（`round-robin` 档「下一个该用的账号」）。
+     *
+     * **游标没变时不写盘**：单账号 provider 每次请求的游标都是它自己，若照写不误，
+     * 每个请求都会触发一次整体 replace（含全部账号与配置）——纯属浪费，且在
+     * storage 上是真实的 IO。
+     */
+    private writeConsumptionCursor;
+    /**
+     * 整批记录余额（供宿主侧的余额刷新调用，见 `src/account-hub-rpc.ts` 的
+     * `collectProviderBalances`）。**只进内存缓存，不落盘**。
+     *
+     * @param provider - provider id。
+     * @param entries - 每个账号的余额；查不到的账号不在数组里（保持缓存原值）。
+     * @param now - 记录时刻（缺省为当前时间；便于测试注入）。
+     */
+    recordBalances(provider: string, entries: readonly {
+        accountId: string;
+        total: number;
+    }[], now?: number): void;
+    /** 读该 provider 当前**未过期**的余额快照（最高优先档的排序依据）。 */
+    balanceSnapshot(provider: string, now?: number): Map<string, number>;
+    listAccounts(provider: string): Promise<ProviderAccountStatus[]>;
+    /** 列出所有 provider 的账号 */
+    listAllAccounts(): Promise<ProviderAccountEntry[]>;
+    /**
+     * **同步**列出所有 provider 的账号（进程内权威副本）。
+     *
+     * 与 {@link listAllAccounts} 是同一份数据，唯一区别是**不需要 await** ——
+     * 供「判据本身就是同步逻辑」的调用点使用（如启动续期调度的 `hasRefreshable`
+     * 判定）。它读的就是 `ensureLoaded()` 之后的权威副本，因此**必须在
+     * `openStorage()` 之后调用**：在那之前副本来自 settings 回退路径或空表。
+     *
+     * 刻意返回**副本**而不是内部数组：调用方（含定时器回调）拿到的是快照，
+     * 就地改它不会污染池。
+     */
+    listAllAccountsSnapshot(): ProviderAccountEntry[];
+    /**
+     * 审计「凭据域名与当前产品配置不符」的账号，**只告警、不删除**。
+     *
+     * 用途：国际版 provider（`buddy`，www.workbuddy.ai）早年是中国版实现
+     * （copilot.tencent.com），改造后旧账号存的仍是中国版凭据 —— 它们的
+     * `token.domain` 指向旧端点，用新 endpoint 发请求必然失败（且会一直续期失败）。
+     *
+     * ⚠️ **迷信删除是数据丢失事故的根因**：domain 失配的账号其凭据往往依然有效
+     * （例如国际版账号凭据里写着中国版时代遗留的 domain），直接连凭据一起删除会把
+     * 不可恢复的登录凭据销毁。因此这里**保留**账号与凭据，仅记一条含 provider /
+     * accountId / domain 的警告，交由用户自行判断与处理——机器不再静默销毁数据。
+     *
+     * 判据是**凭据里记录的 domain 与产品配置的 apiDomain 不一致**（而不是简单按
+     * provider 名），这样只圈定真正失配的条目，不会误伤已在新端点登录的账号。
+     * 凭据完全不可解析（缺失 / domain 为空 / JSON 损坏）的历史条目**从不动手**，
+     * 一律保守保留，交给「凭据未配置」的正常报错路径处理。
+     *
+     * @returns 被判定为「域名失配」的账号 id 列表（供调用方记日志）。
+     */
+    pruneAccountsWithForeignDomain(product: BuddyProduct): Promise<string[]>;
+    /** 添加新账号（登录成功后调用） */
+    addAccount(entry: ProviderAccountEntry): Promise<void>;
+    /** 更新账号部分字段 */
+    updateAccount(id: string, patch: Partial<Pick<ProviderAccountEntry, 'nickname' | 'enabled' | 'expiresAt' | 'refreshable'>>): Promise<void>;
+    /**
+     * 删除账号（同时尽力清理凭据，并顺带清掉其孤儿签到键）。
+     *
+     * ## ⚠️ 顺序是「先写账号列表、后 unset 凭据」—— 刻意如此，别改回去
+     *
+     * 反过来的顺序（旧实现：先 `unset` 凭据、再写账号列表）在**两步之间中断**时
+     * 留下的是最坏的一种残骸：**条目还在、凭据已经被删**。而条目上的 `credentialRef`
+     * 是「同前缀的下一次登录」可能复用的名字（ref 由 `${provider}-${shortId}` 派生，
+     * 短 id 撞车虽罕见，但**外部重建 / 手工编辑**不需要撞车就能命中同一个 ref），
+     * 于是新登录写进去的凭据挂到了旧条目上 —— 真实事故正是这么发生的：国际版
+     * （`iss=…workbuddy.ai`）的凭据落在 `BUDDY_CN_ACCOUNT_*` 下，条目却写着
+     * `buddy-cn`，并因此活了很久（见 `src/provider-audit-migration.ts` 的模块头）。
+     *
+     * 换成「先写条目、后 unset」之后，同一个中断点的最坏形态变成**孤儿凭据但没有
+     * 条目** —— 无害：没有任何条目指向它，它只是一份没人读的登录态（下次同 ref
+     * 登录会覆盖它，或被用户手工清理）。
+     *
+     * 调用方语义不变：仍然是「删条目 + 尽力清凭据」。
+     */
+    removeAccount(id: string): Promise<void>;
+    /**
+     * 重排某 provider 下账号的顺序（Account Hub 拖拽排序）。
+     *
+     * ## 为什么顺序有实际意义
+     *
+     * 账号列表的数组顺序就是 {@link getAvailableAccount} 的**候选优先级**：
+     * 自动选号、限流后的换号重试都按这个顺序取「第一个可用账号」。
+     * 因此拖拽不是 UI 装饰，它直接决定实际用哪个账号发请求。
+     *
+     * ## 只动本 provider 的槽位
+     *
+     * 账号存在**一个全局数组**里（各 provider 混排，靠 `provider` 字段区分），
+     * 而设置页是按 provider 分组渲染的。因此这里取「该 provider 账号原本占用的
+     * 那些下标」，把新顺序填回这些下标 —— 其他 provider 的账号**位置不变**。
+     *
+     * 不这么做（例如把该 provider 的账号整体挪到数组头部）会让拖拽 CodeArts
+     * 的顺序顺带改变 Buddy 账号的相对位置，属于跨面板的意外副作用。
+     *
+     * ## 校验：必须是同一集合的一个排列
+     *
+     * `orderedIds` 必须恰好包含该 provider 的**全部**账号 id（顺序可变、集合不可变）。
+     * 不满足就抛错而不是「尽力而为」：
+     * - 少了某个 id（前端列表过期，期间账号被别处新增）→ 若静默忽略，那个账号
+     *   会莫名其妙掉到末尾，用户看到的是"顺序自己变了"；
+     * - 多了未知 id、或同一个 id 出现两次 → 说明前端状态与服务端不一致。
+     * 两种情况都让用户刷新重试，比悄悄改数据安全。
+     *
+     * @param provider - provider id
+     * @param orderedIds - 该 provider 全部账号 id 的目标顺序
+     */
+    reorderAccounts(provider: string, orderedIds: readonly string[]): Promise<void>;
+    /**
+     * 按凭据内容反查账号 id（供适配器记录"当前用的是哪个账号"）。
+     *
+     * 适配器不持有 ctx，也不该直接访问本类的私有凭据存储，
+     * 因此这里集中做「遍历已启用账号 → 解析凭据 → 比对标识字段」。
+     * @param provider - provider 名称（'buddy-cn' | 'buddy' | 'codearts'）。
+     * @param identity - 比对用的标识值：Buddy 系传 access_token，CodeArts 传 access_key_id。
+     * @returns 匹配到的账号 id；无匹配返回空串。
+     */
+    findAccountIdByCredential(provider: string, identity: string): Promise<string>;
+    /** 解析某个 credentialRef 下的凭据 JSON；不可用时返回 undefined。 */
+    private resolveCredentialByRef;
+    /** 按 id 查找账号条目（含已停用账号）。 */
+    findAccount(id: string): ProviderAccountEntry | undefined;
+    /** 列出某 provider 的全部账号（含已停用），供「重测所有 / 重置所有」使用。 */
+    listAccountsByProvider(provider: string): ProviderAccountEntry[];
+    /**
+     * 该 provider 是否**至少有一个已登录（凭据可解析）的账号**。
+     *
+     * 供适配器的 `listModels` 做目录门控：没有已登录账号时返回空目录，让 DSH 的
+     * `buildModelCatalog` 把整个 provider 分组隐藏（它显式
+     * `.filter(group => group.models.length > 0)`），从而显著减少模型选择列表里
+     * 用不上的条目。
+     *
+     * ## 为什么判据是「凭据可解析」而不是「有条目」
+     *
+     * 1. **`logout()` 只清凭据、保留账号条目**（删除条目是另一条路径
+     *    `removeAccount`）。若只看「有没有条目」，用户登出后模型仍会显示，
+     *    门控形同虚设。
+     * 2. **不看 `enabled`**：停用只应影响「自动选号」，与「是否已登录」无关。
+     *    这与续期调度器「只按 `refreshable` 过滤、不看 `enabled`」是同一条既有
+     *    约定（停用账号同样参与积分领取），故这里保持一致。
+     *
+     * ⚠️ **这是异步的**：需要逐个解析凭据。但只解析到**第一个可用凭据**即返回
+     * （短路），多账号场景下通常第一次就命中。
+     *
+     * ⚠️ **本方法只用于「目录展示」的门控**，绝不能用于路由判定 —— DSH 约定
+     * `listModels` 结果仅供参考，隐藏目录不等于拒绝请求（被隐藏的模型仍可
+     * `resolveModel` / 正常收发）。
+     *
+     * ## `extraCredentialRefs`：本仓特有的**单凭据路径**（不要照抄上游删掉）
+     *
+     * 上游把 CodeArts 的单凭据回退整体移除（`extraCredentialRefs` 参数一并删除），
+     * 因为它的登录入口只剩设置页、凭据一律写入 `CODEARTS_ACCOUNT_XXX`。
+     *
+     * **本仓不同**：`/codearts-login` 命令仍然存在且活跃（`src/index.ts` 的
+     * `service.login()`），它把凭据写进固定的 `CODEARTS_ACCESS_TOKEN`；适配器的
+     * `makeCredentialResolver` 也在池中取不到账号时回退读同一个 ref。若门控只看
+     * 账号池，**纯单凭据登录的用户会看到 codearts 的全部模型凭空消失**。
+     * 故这里额外接受一组 ref，任一可解析即视为「已登录」。
+     *
+     * 其余五个 provider 的 `Auth.login()` 在本仓**没有任何调用者**（Account Hub
+     * 一律走两段式直接写 `*_ACCOUNT_XXX`），故它们的默认 ref 不构成活跃登录路径，
+     * 刻意不传 —— 传了是死代码。
+     *
+     * @param provider - provider id。
+     * @param extraCredentialRefs - 额外的单凭据 ref（如 `CODEARTS_ACCESS_TOKEN`）。
+     */
+    hasLoggedInAccount(provider: string, extraCredentialRefs?: readonly string[]): Promise<boolean>;
+    /**
+     * 按账号 id 解析凭据（**不检查 enabled**）。
+     *
+     * 限流重测必须能对已停用账号发请求（用户明确要求"停用的账号也能发送"），
+     * 因此这里刻意与 {@link getAvailableAccount} 的过滤条件区分开：自动选择
+     * 只认启用账号，而按 id 的显式探测认全部账号。
+     * @returns 凭据对象；账号不存在或凭据不可用时返回 undefined。
+     */
+    resolveCredentialForAccount(id: string): Promise<CodeArtsCredential | BuddyCredential | undefined>;
+    /**
+     * 清除限流标记。
+     *
+     * @param accountId - 目标账号。
+     * @param modelIds - 要清除的模型；省略时清除该账号的**全部**标记。
+     * @returns 实际清除的标记数。
+     */
+    clearModelRateLimits(accountId: string, modelIds?: readonly string[]): Promise<number>;
+    /**
+     * 获取指定 provider + 模型的下一个可用账号。
+     *
+     * `modelId` 为空串时**不做限流过滤**——调用方（provider 的
+     * resolveCredential 入口）此时还不知道要发哪个模型，只能退化为
+     * "任取一个启用账号"。但 `enabled` 过滤在任何情况下都生效：
+     * 停用账号绝不参与自动选择，空 modelId 也不例外。
+     *
+     * @param provider - provider id（`this.product.id`，不要写死字面量）
+     * @param modelId - 目标模型；空串表示不按模型过滤
+     * @param excludeAccountIds - 需要跳过的账号 id。
+     *
+     * **为什么需要 `excludeAccountIds`**：调用方在「请求级轮换」时会逐个换号
+     * 重试，必须能拿到**下一个**账号而不是每次都拿回同一个。
+     * 候选顺序是**用户手动顺序**（见 {@link reorderAccounts}），当失败类别
+     * **不写限流标记**时（如 5xx / 请求错误 —— 它们不是限流，不该留徽章），
+     * 刚失败的账号仍排在原位，调用方若不排除它就会原地打转、
+     * 换号形同虚设。Go 侧对应的是 `PickExcluding(tried)`（`pool.go:131`）。
+     *
+     * 在池这一层排除（而非让调用方自己跳过）是必要的：调用方只能拿到
+     * 「池认为最优的一个」，无法枚举候选自己去重。
+     *
+     * ## `pick`：消耗顺序 / 切换粒度（可选，**不传即历史行为**）
+     *
+     * 见 `src/account-consumption.ts`。四种调用形态的语义：
+     *
+     * | `pick` | 行为 |
+     * |---|---|
+     * | 不传 | **与改动前逐字段一致**（顺序档：永远取第一个可用账号） |
+     * | `{ turnKey }` | 按该 provider 配置的档位选号，`per-turn` 时同轮锁同一账号 |
+     * | `{ turnKey: '' }` / 省略 `turnKey` | 按档位选号但**不锁**（等价 `per-request`） |
+     *
+     * ⚠️ **不传 `pick` 与「传了但没配过」必须都是历史行为** —— auth 的单发路径
+     * （`buddy-auth.fetchModels` / `lobsterai-auth.fetchModels`）与
+     * `makeAccountPicker` 都靠这条不被影响。
+     *
+     * ## 适配器的**换号重试循环刻意不传 `pick`**
+     *
+     * `buddy-adapter` / `lobsterai-adapter` / `trae-cn-adapter` / `qoder-adapter` /
+     * `llm-adapter` 在限流或额度耗尽后各自有一个「取下一个未试过的账号」循环，
+     * 那里的调用**刻意保持三个实参**（不传 `pick`）。理由是语义而非省事：
+     *
+     * - 消耗顺序的档位定义是「每次**请求**轮转下一个」。一次请求内部的换号重试
+     *   仍是**同一次请求**，让它再消耗一格轮转名额，会让「两个账号」的池在
+     *   一请求一失败后跳过整整一轮 —— 用户看到的是「轮转跳着走」；
+     * - 重试的目标只有一个：**换一个没试过的账号**。候选已被 `tried` 排除，
+     *   取数组顺序的下一个即可，与档位无关；
+     * - 它同时避开了「重试路径二次写游标」——那会让一次失败请求落盘两次。
+     *
+     * 换句话说：档位决定**请求开始时**用谁，重试只决定**这一个请求内**还试谁。
+     *
+     * @param pick.turnKey - 轮次键：同一个键 = 同一轮对话（`per-turn` 档据此锁号）。
+     *        宿主侧由 `options.signal` 的身份换算（见 `src/index.ts` 的
+     *        `TurnKeyTracker`）；空串 / 缺省表示「这不是一轮对话」（不锁）。
+     */
+    getAvailableAccount(provider: string, modelId: string, excludeAccountIds?: ReadonlySet<string>, pick?: {
+        turnKey?: string;
+    }): Promise<{
+        entry: ProviderAccountEntry;
+        credential: CodeArtsCredential | BuddyCredential;
+    } | null>;
+    /**
+     * 按配置的档位重排候选（消耗顺序 + 切换粒度）。
+     *
+     * 四步，顺序不可调换：
+     * 1. **轮次锁**命中 → 直接返回那一个（只锁**已启用且通过限流过滤**的账号：
+     *    锁里的账号可能已被停用/删除/限流，那种情况必须重新选，见第 4 步）；
+     * 2. **顺序档** → 原样返回（历史行为）；
+     * 3. **遍历档** → 按游标轮转；**最高优先档** → 按余额降序（余额未知即原样，
+     *    等价降级回顺序）；
+     * 4. 选完（并在调用方解析出真正可用的账号后）登记/更新轮次锁。
+     */
+    private applyConsumptionOrder;
+    /**
+     * 从（可能已被重排的）候选里解析出**第一个凭据可用**的账号。
+     *
+     * 与改动前的循环逐行等价，唯一区别是输入数组可能已被重排 —— 因此「跳过
+     * 凭据未配置 / 损坏的账号」这条既有语义完整保留（遍历档下它会顺延到下一个）。
+     */
+    private resolveFirstUsable;
+    /**
+     * 选号收尾：推进遍历游标、登记轮次锁。
+     *
+     * ## 为什么两件事都在这里（而不是在 `applyConsumptionOrder` 里）
+     *
+     * 它们都需要**最终真的被选中的那个账号**，而那只在凭据解析成功之后才知道
+     * （重排后的首位可能凭据损坏、被顺延到下一个）。在这里做，锁与游标记的就是
+     * 「本次实际用了谁」，不会出现「记了 A、实际用了 B」的分叉。
+     */
+    private advanceCursorIfNeeded;
+    /**
+     * 更新某账号某模型的重置时间。
+     *
+     * 关键：基于**读取到的最新账号列表**做局部合并，再把整个列表写回。
+     * settings scope 的 get() 返回的是服务内部快照，可能滞后于磁盘；
+     * 但 replace() 是整体替换，因此这里每次都在最新快照上合并，
+     * 避免"写 A 的限流 → 读旧快照 → 写 B 的限流"把 A 的记录抹掉。
+     */
+    updateModelRateLimit(accountId: string, modelId: string, resetAtMs: number): Promise<void>;
+    /** 清理已过期的重置时间记录 */
+    sweepExpiredRateLimits(): Promise<void>;
+}
+/**
+ * 计算「今天」的**本地时区纪元日数**。
+ *
+ * 口径：取 `new Date(...)` 的**本地年月日**（`getFullYear()` / `getMonth()` /
+ * `getDate()`），再换算成 epoch day（`Date.UTC(y,m,d) / 86400000`）。
+ *
+ * ⚠️ **签到域已不再用它判「今天签过没」**（2026-09-24 起改用「下一次可签时刻」
+ * 毫秒时间戳，见 `src/checkin-schedule.ts`）。它仍然有两个在用的消费者：
+ * 1. 旧 dayNumber → 新时间戳的**迁移**（`migrateLegacyCheckinDay` 的换算基准）；
+ * 2. `checkins` 的键之外、按自然日表达的历史语义（如既有测试基线）。
+ * 新代码**不要**再拿它做签到判定。
+ *
+ * ⚠️ 不要用 `getUTCDay`，也不用时间戳毫秒数 —— 跨时区 / 跨日边界都会乱。时区切换、
+ * 夏令时的偏移只在**这一处**收敛，存的值本身不依赖「今天」。
+ *
+ * @param now - 要换算的时刻；缺省为当前时间（便于测试注入固定时刻）。
+ */
+export declare function todayDayNumber(now?: Date): number;
+/**
+ * 清理某个 provider 的**孤儿签到键**（兜底，供设置页打开面板时调用）。
+ *
+ * 直接委托给 {@link AccountPool.pruneOrphanCheckins}。以自由函数形态导出，
+ * 便于面板调用方不持有 pool 类型也能直接复用（见设计文档 §孤儿清理策略）。
+ *
+ * @param pool - AccountPool（读账号列表与写 checkins 的唯一入口）。
+ * @param provider - provider id。
+ */
+export declare function pruneOrphanCheckins(pool: AccountPool, provider: string): Promise<void>;
+/**
+ * `listModels` 的目录门控：**该 provider 是否应在模型目录中展示**。
+ *
+ * ## 需求来源
+ *
+ * 「如果某供应商没有已登录的账号，就不显示该供应商的所有模型 —— 这样对大多数
+ * 用户来说模型选择选项卡臃肿的问题能改善很多。」
+ *
+ * ## 为什么可行：DSH 原生支持「空目录即隐藏」
+ *
+ * `packages/api/session-controller/src/catalog.ts` 的 `buildModelCatalog` 显式做了
+ * `.filter(group => group.models.length > 0)`（注释：*"successful non-empty
+ * provider groups"*）。因此适配器返回 `[]` 就能让整个 provider 分组从模型选择器
+ * 中消失 —— **无需任何前端改动**。
+ *
+ * ⚠️ **必须返回空数组，不能抛错**：`buildModelCatalog` 的 `catch` 会把抛错归入
+ * `failures`，界面上会多出一条 provider 报错，比「不显示」更糟。
+ *
+ * ⚠️ **不影响路由**：`catalog.routableProviders` 由 `listProviders()` 单独生成
+ * （不经过该 filter），且 DSH 明确约定 *"Catalog membership is advisory and never
+ * changes routing"* —— 隐藏目录不等于拒绝请求，已持久化的模型仍能 `resolveModel`
+ * / 正常收发。
+ *
+ * ## 判定语义
+ *
+ * - **默认开启**（`DSH_HIDE_MODELS_WITHOUT_ACCOUNT=0` 可关）：与
+ *   `DSH_TRAE_MAX_MODE` 同为「默认开、显式假值才关」的语义，故单列一个解析
+ *   函数，**不要与「默认关」的解析混用**。
+ * - `accountPool` 缺失（headless / CLI / 单测）或替身未实现
+ *   `hasLoggedInAccount` 时**视为可见** —— 门控是**展示优化而非安全边界**，
+ *   判定不可用时宁多勿少（否则会让整个 provider 的模型凭空消失且无从排查）。
+ * - 读凭据抛异常（存储损坏等）时同样**保守展示**。
+ * - `extraCredentialRefs` 承载本仓的**单凭据路径**（见
+ *   {@link AccountPool.hasLoggedInAccount} 的说明），仅 CodeArts 需要。
+ *
+ * ## 自动路由的**隐藏门控**（本函数里的第一条判据）
+ *
+ * `auto-route` 是一个**虚拟 provider**：它自己没有任何账号，「已登录」这个判据对它
+ * 不成立。用户在 Account Hub 里打开总开关时，模型下拉里应当出现这些自动模型；
+ * **关掉开关时它必须从下拉里消失** —— 否则留下的是「点了必然报全部不可用」的一组
+ * 模型，比不显示糟得多。
+ *
+ * ⚠️ **门控只作用于 DSH 的目录拉取路径**（即各适配器 `listModels` → `buildModelCatalog`）。
+ * 面板内的 `model.list` RPC 走的是适配器实例的 `listAllModels()`、账号管理与签到余额
+ * 更是完全不经过这里 —— 用户要求「关掉开关后依旧可编辑」，故这些路径一行都不动。
+ *
+ * ⚠️ **与 `hasLoggedInAccount` 判据是「或」的关系，且必须**：自动路由没有账号，
+ * 若照抄账号判据会恒返回 false，于是**开着开关也永远看不到**（正是这条接线要避免的
+ * 静默失效）。故这里是「命中自动路由 → 按开关返回」，否则才走原来的账号判据。
+ *
+ * ## 自动路由开关的**反向**判据：开着就隐藏其它 provider（本函数里的第零条）
+ *
+ * 上面那条只管「自动路由自己可不可见」，**不足以**实现面板文案承诺的语义：
+ * 「开启后本插件其它供应商从列表隐藏」。缺了它，用户打开自动路由后模型下拉里会
+ * 同时出现「自动路由」与七个直连 provider 的全部分组 —— 而后者恰恰是用户选择
+ * 自动路由**想要摆脱**的那一堆（自动路由已把它们打包成一个模型，重复列出等于
+ * 让选择器重新臃肿）。
+ *
+ * 三条边界：
+ *
+ * 1. **单列判据、置于 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` 短路之前**。那个变量名字与
+ *    文档都只讲一件事：「**没有已登录账号**就隐藏」。而本判据与账号无关 —— 它是
+ *    用户在面板上的**显式选择**（「以后走自动路由」）。把两者混在一起，会让
+ *    「为了看全目录而临时关掉账号门控」的用户连带失去自动路由的隐藏效果，
+ *    于是**开着自动路由却又看到七个直连 provider**，与面板上的开关状态自相矛盾。
+ *    （自动路由**自己**那条判据仍留在短路之后：那是既有语义，不改。）
+ * 2. **用 `!== AUTO_ROUTE_PROVIDER_ID` 反向保护自己**，绝不写成「除自己外全部隐藏」
+ *    之后又忘了自己 —— 那会让开启后**一个分组都不剩**（比不隐藏更糟）。
+ * 3. **只在「池存在且开关可读到 true」时隐藏**；读配置抛错与池缺失都**保守放行**
+ *    （与下面各条同款）。宁可多显示一组（用户能自己看到开关状态），也不要让
+ *    七个 provider 的模型凭空消失且无从排查。
+ *
+ * @param accountPool - 适配器的账号池（可能为 undefined）。
+ * @param provider - provider id。
+ * @param extraCredentialRefs - 额外的单凭据 ref（CodeArts 的单凭据回退）。
+ */
+export declare function providerCatalogVisible(accountPool: AccountPool | undefined, provider: string, extraCredentialRefs?: readonly string[]): Promise<boolean>;
+//# sourceMappingURL=account-pool.d.ts.map
