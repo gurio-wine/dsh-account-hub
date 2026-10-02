@@ -24,12 +24,12 @@
 ## 技术栈与约束
 
 - **Node.js** `^22.19.0 || >=24.0.0`；**依赖管理** pnpm workspace（作为 DSH 插件安装）；**代码风格**与 `@deepseek-ai/dsh` 主仓库保持一致。
-- **构建**：宿主侧 TypeScript `tsc` → `lib/`；客户端 bundle `esbuild`（`plugin-src/client/build.mjs`）→ `lib/client/account-hub.js`。两者都产出到已 gitignore 的 `lib/`，`prepare` 执行 `pnpm build:all` 保证 git 安装时两侧产物齐全。⚠️ **`build:client` 末尾含产物顶层求值冒烟（stub require）** —— 模板字符串求值类错误构建即炸，而 `plugin-src/` 不在 typecheck/test 视野内，**这道闸是客户端 bundle 的唯一语义防线，勿删**。
+- **构建与分发**：宿主 TypeScript 与客户端 bundle 均输出到已入库的 `lib/` 预构建产物；git 安装不触发本地构建，`prepack` 仅在打包或发布时执行构建。推送或发布 release 前必须先运行 `pnpm build:all` 刷新 `lib/`，并将产物与源码一起提交。
 - **测试**：Vitest。`pnpm test` 为单元测试（快速、无网络、全部 mock）；`pnpm test:e2e:*` 按 provider 分列（如 `test:e2e:codearts` / `buddy-cn` / `buddy-claim`），**均有闸门、默认全部跳过**，哪些会消耗模型积分见 `tests/e2e/README.md`。测试文件按约定放 `tests/unit/` 与 `tests/e2e/`。
 
 ## 项目结构
 
-`src/` 宿主 TS；`plugin-src/client/` 客户端源码（esbuild）；`lib/` 编译产物（gitignore）；`tests/unit/` 单测；`cordis.patch.yml` bundle 补丁；`tsconfig.json` / `vitest.config.ts` 配置。
+`src/` 宿主 TS；`plugin-src/client/` 客户端源码（esbuild）；`lib/` 已入库的预构建产物；`tests/unit/` 单测；`cordis.patch.yml` bundle 补丁；`tsconfig.json` / `vitest.config.ts` 配置。
 
 ## DSH 插件契约
 

@@ -10,12 +10,7 @@ DeepSeek Harness 插件，提供「账号中心」面板和七个 LLM provider �
 
 ### 从 GitHub 安装（推荐）
 
-先在对应 profile 的 `pnpm-workspace.yaml`（`~/.dsh/profiles/<name>/pnpm-workspace.yaml`）中允许安装脚本：
-
-```yaml
-allowBuilds:
-  dsh-account-hub@git+https://github.com/gurio-wine/dsh-account-hub.git: true
-```
+GitHub 仓库已随源码提交预构建 `lib/` 产物，直接安装即可。
 
 然后安装：
 
@@ -23,7 +18,7 @@ allowBuilds:
 dsh plugin --profile <name> add "https://github.com/gurio-wine/dsh-account-hub.git"
 ```
 
-Git 安装会自动构建插件，无需手动运行构建命令。
+Git 安装不触发本地构建，直接使用仓库中已提交的 `lib/` 产物。
 
 ### 从源码目录安装（本地开发）
 
@@ -36,7 +31,7 @@ dsh plugin --profile <name> install <path-to-this-repo>
 
 ### 从旧包迁移
 
-若安装的是 `dsh-codearts-auth`，先移除旧包，再安装新包，并将 `pnpm-workspace.yaml` 的 `allowBuilds` 项更新为上面的包名：
+若安装的是 `dsh-codearts-auth`，先移除旧包，再安装新包：
 
 ```sh
 dsh plugin --profile <name> remove dsh-codearts-auth
@@ -59,7 +54,7 @@ CodeArts 也提供命令入口：`/codearts-login` 登录、`/codearts-status` �
 
 打开账号中心页面时会静默检查一次；也可点击页面右上角的 ⇩ 按钮（「检查更新」）。当前更新检查只读取 GitHub Release/Tag，不包含尚未发布的提交。
 
-发现新版本时，提示行会提供「立即更新」按钮。点击后会自动更新 profile 的版本 pin 与 `allowBuilds` 白名单、执行安装并校验 lockfile；完整 pnpm 安装日志可展开查看。已是最新时，「账号中心」标题旁会显示常驻的「已是最新」标签，直到再次检查更新或出现新版本；检查失败则静默处理。
+发现新版本时，提示行会提供「立即更新」按钮。点击后会自动更新 profile 的版本 pin、执行安装并校验 lockfile；完整 pnpm 安装日志可展开查看。已是最新时，「账号中心」标题旁会显示常驻的「已是最新」标签，直到再次检查更新或出现新版本；检查失败则静默处理。
 
 检查和下载需要能访问 `api.github.com` 与 `codeload.github.com`。更新成功后提示建议重启会话生效，因为插件运行时代码在会话启动时加载。
 
@@ -70,6 +65,8 @@ pnpm build:all
 pnpm typecheck
 pnpm test
 ```
+
+推送或发布 release 前，必须先运行 `pnpm build:all` 刷新已入库的 `lib/` 产物，并将产物与源码一起提交。
 
 `pnpm test:e2e:*` 会运行按 provider 划分的线上用例，部分用例可能触发真实登录或积分操作；运行前请查看 [e2e 测试说明](tests/e2e/README.md)。
 
