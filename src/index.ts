@@ -1029,6 +1029,7 @@ export function apply(ctx: Context, config?: Config): void {
     refresh: makeAccountRefresher(pool, LOBSTERAI.id, lobsterai),
     fetchRemoteModels: () => lobsterai.fetchModels(pool),
     resolveClientVersion: () => lobsterai.resolveClientVersion(),
+    readImage: makeReadImage(ctx),
     accountPool: pool,
     product: LOBSTERAI,
     // settings 地址按契约现算（0.1.6：`llm-lobsterai` + `[]`；
@@ -1142,6 +1143,7 @@ export function apply(ctx: Context, config?: Config): void {
       })
     },
     accountPool: pool,
+    readImage: makeReadImage(ctx),
     product: QODER,
     // settings 地址按契约现算（0.1.6：`llm-qoder` + `[]`；
     // 0.1.7：entry id + `['providers', 'qoder']`）。两个 region 各取自己那份 ——
@@ -1244,6 +1246,7 @@ export function apply(ctx: Context, config?: Config): void {
       })
     },
     accountPool: pool,
+    readImage: makeReadImage(ctx),
     product: QODER_CN,
     // settings 地址按契约现算（0.1.6：`llm-qoder-cn` + `[]`；
     // 0.1.7：entry id + `['providers', 'qoder-cn']`）。两区各占一个槽，

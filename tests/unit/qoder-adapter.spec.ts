@@ -226,6 +226,37 @@ describe('buildQoderChatBody', () => {
     expect(wire.find((message) => message.role === 'assistant')?.tool_calls).toBeUndefined()
   })
 
+  it('工具结果中的图像 parts 延后发送，文本（包括缺图占位）完整保序保留', () => {
+    const wire = serializeQoderMessages([
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'call-image', name: 'read_image', arguments: '{}' }] },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool-result',
+          toolCallId: 'call-image',
+          content: [
+            { type: 'text', text: 'before|' },
+            { type: 'image', attachment: { attachmentId: 'att-ok' } },
+            { type: 'text', text: '|middle|' },
+            { type: 'image', attachment: { attachmentId: 'att-missing' } },
+            { type: 'text', text: '|after' },
+          ],
+        }],
+      },
+    ], new Map([['att-ok', 'data:image/png;base64,AQID']]))
+
+    expect(wire).toContainEqual({
+      role: 'tool', tool_call_id: 'call-image', content: 'before||middle|[image unavailable]|after',
+    })
+    expect(wire).toContainEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Attached image(s) from tool result:' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+      ],
+    })
+  })
+
   it('assistant 只有 tool_calls 时 content 为 null（OpenAI 规范）', () => {
     const wire = serializeQoderMessages([
       { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }] },
@@ -772,6 +803,8 @@ describe('模型目录已接线（步骤 3 起不再是占位）', () => {
     const adapter = new QoderAdapter(adapterOptions())
     const models = await adapter.listModels('qoder')
     expect(models.map((model) => model.id)).toEqual(['qmodel_38max', 'qfmodel', 'lite'])
+    expect(models.find((model) => model.id === 'qmodel_38max')?.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((model) => model.id === 'lite')?.inputModalities).toEqual(['text'])
   })
 
   it('resolveModel 声明目录产出的能力（此处为静态兜底表的档位与窗口）', async () => {
@@ -780,9 +813,67 @@ describe('模型目录已接线（步骤 3 起不再是占位）', () => {
     expect(resolved.name).toBe('Qwen3.8-Max')
     expect(resolved.reasoning?.defaultEffort).toBe('medium')
     expect(resolved.context).toEqual({ contextWindow: 200_000 })
-    // ⚠️ 模态**恒为纯文本**，与目录的 is_vl 无关（见 qoder-models.spec.ts 的
-    // 「模态恒声明纯文本」用例）。
+    // 模态依据静态 supportsImages 真值，不受目录 is_vl 字段影响。
+    expect(resolved.inputModalities).toEqual(['text', 'image'])
+  })
+
+  it('远端 is_vl=false 不覆盖静态 supportsImages=true', async () => {
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchRemoteModels: async () => [{
+        id: 'qmodel_38max', name: 'Qwen3.8-Max', enabled: true, supportsImages: false,
+      }],
+    }))
+    const listed = await adapter.listModels('qoder')
+    expect(listed.find((model) => model.id === 'qmodel_38max')?.inputModalities).toEqual(['text', 'image'])
+    const resolved = await adapter.resolveModel('qoder', 'qmodel_38max')
+    expect(resolved.inputModalities).toEqual(['text', 'image'])
+  })
+
+  it('静态表未标注图片能力的 lite 在 resolveModel 中声明为文本', async () => {
+    const adapter = new QoderAdapter(adapterOptions())
+    const resolved = await adapter.resolveModel('qoder', 'lite')
     expect(resolved.inputModalities).toEqual(['text'])
+  })
+
+  it('支持图片的模型将附件序列化为 image_url data URL', async () => {
+    let requestBody = ''
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: (async (_input: unknown, init?: { body?: unknown }) => {
+        requestBody = String(init?.body ?? '')
+        return sseResponse(NORMAL_STREAM)
+      }) as unknown as typeof fetch,
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+    }))
+    const options = generateOptions({
+      model: 'qmodel_38max',
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: '这张图是什么？' },
+        { type: 'image', attachment: { attachmentId: 'att-qoder-1' } },
+      ] }],
+    })
+    await collect(adapter.stream(options))
+    const body = JSON.parse(requestBody) as { messages: Array<{ role: string; content: unknown }> }
+    expect(body.messages.find((message) => message.role === 'user')?.content).toEqual([
+      { type: 'text', text: '这张图是什么？' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+    ])
+  })
+
+  it('静态不支持图片的模型收到图片时在发请求前抛 UNSUPPORTED_CONTENT', async () => {
+    const fetcher = vi.fn(async () => sseResponse(NORMAL_STREAM))
+    const readImage = vi.fn(async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }))
+    const adapter = new QoderAdapter(adapterOptions({
+      fetchImpl: fetcher as unknown as typeof fetch,
+      readImage,
+    }))
+    const options = generateOptions({
+      model: 'lite',
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'att-qoder-2' } }] }],
+    })
+
+    await expect(collect(adapter.stream(options))).rejects.toMatchObject({ code: 'UNSUPPORTED_CONTENT' })
+    expect(readImage).not.toHaveBeenCalled()
+    expect(fetcher).not.toHaveBeenCalled()
   })
 
   it('providerInfo 对非字符串 provider 做防御性回退', () => {

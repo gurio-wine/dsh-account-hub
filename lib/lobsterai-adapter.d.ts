@@ -14,7 +14,7 @@
  * | `tool_choice` | **不适用**：DSH 的 `GenerateOptions` 无该字段，且 body 由本适配器自建，天然不会出现（Go 桥接层要归一化是因为它转发客户端的原始 body） |
  * | `prompt_cache_key` | **不发** —— 那是腾讯后端的前缀缓存机制，此处未实测支持 |
  * | 思考等级 | **不照抄** buddy 的 deepseek 补档逻辑（那是针对腾讯后端实测的）；仅透传 |
- * | 图片 | **不支持**，`inputModalities` 恒为 `['text']`（判定证据链见 {@link LOBSTERAI_IMAGE_MODALITY_NOTE}） |
+ * | 图片 | 按远端 `supportsImage` 优先、静态 `supportsImages` 回退声明模态；出站序列化尚未实现 |
  *
  * 可以原样复用的是 `src/sse.ts` 的三个工具函数（`readWithIdleTimeout` /
  * `resolveToolPairing` / `normalizeToolArguments` / `isTruncatedArguments`）——
@@ -31,53 +31,17 @@ import type { LlmSettingsAddress } from './types.js';
 /** 本适配器注册的 provider 路由名（历史常量，等价于 `LOBSTERAI.id`）。 */
 export declare const PROVIDER = "lobsterai";
 /**
- * 图片模态**刻意不声明**的判定记录（2026-09-21 取证）。
+ * 图片能力与出站处理状态（2026-09-21 取证；出站实现于后续接通）。
  *
- * 结论：`inputModalities` 保持 `['text']`，**不补图片出站**。
- * 下面是完整的证据链与取舍，供后来者复核而不是重新猜一遍。
+ * 模型目录优先采用远端 `supportsImage`，缺失时回退静态 `supportsImages`；
+ * `stream()` 使用同一来源判定准入，并通过附件服务将支持的图片序列化为 OpenAI
+ * `image_url` data URL。
  *
- * ## 已经确证的三件事
- *
- * 1. **远端确实声明图片能力**：真机 `GET /api/models/available` 的
- *    `supportsImage` 在 14 个声明了窗口的模型里 **11 项为 true**（应用日志
- *    `[Auth:getModels] Response data` 逐条可查）。
- * 2. **官方客户端也按多模态用**：`%APPDATA%\LobsterAI\openclaw\state\openclaw.json`
- *    的 `lobsterai-server` 提供者里，同批模型带 `"input": ["text","image"]`，
- *    传输层 `api: "openai-completions"`（`kimi-k3` 还带 `video`）。
- * 3. **协议形态是标准 OpenAI**：装包内 `openclaw` 的
- *    `dist-openai-completions-stream-*.cjs` 把图片块编码为
- *    `{type:'image_url', image_url:{url:'data:<mime>;base64,<data>'}}`
- *    （与 buddy 适配器现在用的形态**逐字节同款**）。
- *
- * ## 为什么仍然不声明（三条独立理由，任一条都足以否决）
- *
- * 1. **我们发不到那个端点**。官方客户端**不直连上游**：它先起一个本地代理
- *    `OpenClawTokenProxy`（应用日志 `started on 127.0.0.1:<port>`），
- *    openclaw 的 `baseUrl` 是 `http://127.0.0.1:<port>/v1`，由该代理注入令牌并
- *    转发到 `{apiBase}/api/proxy/v1`。**图片出站是否被上游 `/api/proxy/v1`
- *    接受，证据全部产生于代理之后的链路**，而我方是直连 —— 「官方能发」推不出
- *    「我们能发」。
- * 2. **没有对上游的直接实测**。上述三条证据里没有一条是「向
- *    `https://lobsterai-server.youdao.com/api/proxy/v1/chat/completions` 发一张
- *    真图并拿到成功响应」。本项目的规矩是「没观察到的东西不猜」——
- *    `reasoning_effort` 当初之所以能接线，是因为有**服务端行为**级的
- *    单变量证据（错值 500、对值 200）；图片没有同等级的样本。
- * 3. **声明错了比不声明更糟**。`stream()` 现在对图片块抛
- *    `UNSUPPORTED_CONTENT`（见下方）。若先声明 `['text','image']` 再补出站，
- *    一旦上游拒绝，用户拿到的会是「选了图片 → 请求失败」，而不是现在这种
- *    「这个模型不吃图」的明确拒绝；更糟的是 DSH 会把图片块**当作已支持**而
- *    路由进这条通道（`src/qoder-adapter.ts` 的注释记着同型教训：
- *    「两处若分叉会让图片被路由进这条**必然丢图**的通道」）。
- *
- * ## 何时可以翻案
- *
- * 拿到「直连上游 + 真图 + 成功响应」的实测样本后：补 `readImage` 桥接
- * （`src/index.ts` 已有 `makeReadImage`，buddy 系在用）、按 `supportsImage`
- * 逐模型给模态、并让 `serializeMessages` 编码 `image_url`。
- * 在那之前，本条与 `stream()` 的拒绝逻辑**必须保持一致**（一处声明、
- * 一处拦截，分叉即静默故障）。
+ * 既有取证仍说明官方客户端在代理之后使用标准 OpenAI 图片形态，但本适配器直连
+ * 上游，当前任务不包含真机请求验证。因此代码单测只证明出站 body 的构造行为，
+ * 不证明 LobsterAI 上游接受直连图片请求。
  */
-export declare const LOBSTERAI_IMAGE_MODALITY_NOTE = "\u8FDC\u7AEF supportsImage=true \u4F46\u51FA\u7AD9\u672A\u652F\u6301\uFF0C\u4FDD\u5B88\u4E0D\u58F0\u660E";
+export declare const LOBSTERAI_IMAGE_MODALITY_NOTE = "\u8FDC\u7AEF supportsImage \u4F18\u5148\uFF0C\u9759\u6001 supportsImages \u56DE\u9000\uFF1B\u56FE\u7247\u51FA\u7AD9\u4F7F\u7528 image_url data URL\uFF0C\u5C1A\u672A\u771F\u673A\u9A8C\u8BC1";
 /**
  * LobsterAI 远端模型条目。
  *
@@ -144,6 +108,8 @@ export interface LobsteraiRemoteModel {
     name: string;
     /** 上下文窗口；真机为 `null` 或缺失时**不声明**（不编造）。 */
     contextWindow?: number;
+    /** 远端 `supportsImage` 能力；未提供时使用静态目录兜底。 */
+    supportsImages?: boolean;
     /**
      * 可选思考档位（**发给服务端的 wire 值**，由真机
      * `thinkingConfig.options[].openclawLevel` 解析得到，`off` 保留）。
@@ -210,6 +176,11 @@ export interface LobsteraiAdapterOptions {
     fetchRemoteModels?: () => Promise<LobsteraiRemoteModel[]>;
     /** 解析当前客户端版本号（chat 与模型列表都要带）。 */
     resolveClientVersion?: () => Promise<string>;
+    /** 读取图片附件字节；附件不可用时由序列化器留下占位文本。 */
+    readImage?: (attachment: unknown) => Promise<{
+        data: Uint8Array;
+        mediaType: string;
+    } | undefined>;
     fetchImpl?: typeof fetch;
     /** 多账号池（用于限流时切换账号）。 */
     accountPool?: AccountPool;

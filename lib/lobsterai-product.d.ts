@@ -41,6 +41,8 @@ export interface LobsteraiFallbackModel {
     id: string;
     /** 展示名（真机 `modelName`）。 */
     name: string;
+    /** 是否接受图片输入；缺省按不支持处理。 */
+    supportsImages?: boolean;
     /**
      * 上下文窗口（真机 `contextWindow`，权威值）。
      *

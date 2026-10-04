@@ -14,7 +14,7 @@
  * | `tool_choice` | **不适用**：DSH 的 `GenerateOptions` 无该字段，且 body 由本适配器自建，天然不会出现（Go 桥接层要归一化是因为它转发客户端的原始 body） |
  * | `prompt_cache_key` | **不发** —— 那是腾讯后端的前缀缓存机制，此处未实测支持 |
  * | 思考等级 | **不照抄** buddy 的 deepseek 补档逻辑（那是针对腾讯后端实测的）；仅透传 |
- * | 图片 | **不支持**，`inputModalities` 恒为 `['text']`（判定证据链见 {@link LOBSTERAI_IMAGE_MODALITY_NOTE}） |
+ * | 图片 | 按远端 `supportsImage` 优先、静态 `supportsImages` 回退声明模态；出站序列化尚未实现 |
  *
  * 可以原样复用的是 `src/sse.ts` 的三个工具函数（`readWithIdleTimeout` /
  * `resolveToolPairing` / `normalizeToolArguments` / `isTruncatedArguments`）——
@@ -69,53 +69,17 @@ import { hasUsableToolName, isTruncatedArguments, normalizeToolArguments, readWi
 export const PROVIDER = 'lobsterai'
 
 /**
- * 图片模态**刻意不声明**的判定记录（2026-09-21 取证）。
+ * 图片能力与出站处理状态（2026-09-21 取证；出站实现于后续接通）。
  *
- * 结论：`inputModalities` 保持 `['text']`，**不补图片出站**。
- * 下面是完整的证据链与取舍，供后来者复核而不是重新猜一遍。
+ * 模型目录优先采用远端 `supportsImage`，缺失时回退静态 `supportsImages`；
+ * `stream()` 使用同一来源判定准入，并通过附件服务将支持的图片序列化为 OpenAI
+ * `image_url` data URL。
  *
- * ## 已经确证的三件事
- *
- * 1. **远端确实声明图片能力**：真机 `GET /api/models/available` 的
- *    `supportsImage` 在 14 个声明了窗口的模型里 **11 项为 true**（应用日志
- *    `[Auth:getModels] Response data` 逐条可查）。
- * 2. **官方客户端也按多模态用**：`%APPDATA%\LobsterAI\openclaw\state\openclaw.json`
- *    的 `lobsterai-server` 提供者里，同批模型带 `"input": ["text","image"]`，
- *    传输层 `api: "openai-completions"`（`kimi-k3` 还带 `video`）。
- * 3. **协议形态是标准 OpenAI**：装包内 `openclaw` 的
- *    `dist-openai-completions-stream-*.cjs` 把图片块编码为
- *    `{type:'image_url', image_url:{url:'data:<mime>;base64,<data>'}}`
- *    （与 buddy 适配器现在用的形态**逐字节同款**）。
- *
- * ## 为什么仍然不声明（三条独立理由，任一条都足以否决）
- *
- * 1. **我们发不到那个端点**。官方客户端**不直连上游**：它先起一个本地代理
- *    `OpenClawTokenProxy`（应用日志 `started on 127.0.0.1:<port>`），
- *    openclaw 的 `baseUrl` 是 `http://127.0.0.1:<port>/v1`，由该代理注入令牌并
- *    转发到 `{apiBase}/api/proxy/v1`。**图片出站是否被上游 `/api/proxy/v1`
- *    接受，证据全部产生于代理之后的链路**，而我方是直连 —— 「官方能发」推不出
- *    「我们能发」。
- * 2. **没有对上游的直接实测**。上述三条证据里没有一条是「向
- *    `https://lobsterai-server.youdao.com/api/proxy/v1/chat/completions` 发一张
- *    真图并拿到成功响应」。本项目的规矩是「没观察到的东西不猜」——
- *    `reasoning_effort` 当初之所以能接线，是因为有**服务端行为**级的
- *    单变量证据（错值 500、对值 200）；图片没有同等级的样本。
- * 3. **声明错了比不声明更糟**。`stream()` 现在对图片块抛
- *    `UNSUPPORTED_CONTENT`（见下方）。若先声明 `['text','image']` 再补出站，
- *    一旦上游拒绝，用户拿到的会是「选了图片 → 请求失败」，而不是现在这种
- *    「这个模型不吃图」的明确拒绝；更糟的是 DSH 会把图片块**当作已支持**而
- *    路由进这条通道（`src/qoder-adapter.ts` 的注释记着同型教训：
- *    「两处若分叉会让图片被路由进这条**必然丢图**的通道」）。
- *
- * ## 何时可以翻案
- *
- * 拿到「直连上游 + 真图 + 成功响应」的实测样本后：补 `readImage` 桥接
- * （`src/index.ts` 已有 `makeReadImage`，buddy 系在用）、按 `supportsImage`
- * 逐模型给模态、并让 `serializeMessages` 编码 `image_url`。
- * 在那之前，本条与 `stream()` 的拒绝逻辑**必须保持一致**（一处声明、
- * 一处拦截，分叉即静默故障）。
+ * 既有取证仍说明官方客户端在代理之后使用标准 OpenAI 图片形态，但本适配器直连
+ * 上游，当前任务不包含真机请求验证。因此代码单测只证明出站 body 的构造行为，
+ * 不证明 LobsterAI 上游接受直连图片请求。
  */
-export const LOBSTERAI_IMAGE_MODALITY_NOTE = '远端 supportsImage=true 但出站未支持，保守不声明'
+export const LOBSTERAI_IMAGE_MODALITY_NOTE = '远端 supportsImage 优先，静态 supportsImages 回退；图片出站使用 image_url data URL，尚未真机验证'
 
 /**
  * 限流重置时间的本地兜底（毫秒，1 小时）。
@@ -172,6 +136,8 @@ interface LobsteraiCatalogEntry {
   id: string
   name: string
   contextWindow?: number
+  /** 仅来自静态兜底目录；远端响应不提供该字段。 */
+  supportsImages?: boolean
   reasoningEfforts?: readonly string[]
   defaultReasoningEffort?: string
 }
@@ -276,6 +242,8 @@ export interface LobsteraiRemoteModel {
   name: string
   /** 上下文窗口；真机为 `null` 或缺失时**不声明**（不编造）。 */
   contextWindow?: number
+  /** 远端 `supportsImage` 能力；未提供时使用静态目录兜底。 */
+  supportsImages?: boolean
   /**
    * 可选思考档位（**发给服务端的 wire 值**，由真机
    * `thinkingConfig.options[].openclawLevel` 解析得到，`off` 保留）。
@@ -315,6 +283,8 @@ export function parseLobsteraiModels(body: unknown): LobsteraiRemoteModel[] {
     // 上下文窗口：真机为 null 时不声明（编一个数会让选择器显示错误容量）。
     const contextWindow = readNumberField(record, 'contextWindow')
     if (contextWindow !== undefined && contextWindow > 0) model.contextWindow = contextWindow
+    // 图片能力：远端字段权威，缺省时由匹配的静态模型条目兜底。
+    if (typeof record.supportsImage === 'boolean') model.supportsImages = record.supportsImage
     // 思考档位：真机权威来源。`supportsThinking:false` 时不声明。
     if (record.supportsThinking !== false) {
       const config = parseLobsteraiThinkingConfig(record.thinkingConfig)
@@ -403,6 +373,8 @@ export interface LobsteraiAdapterOptions {
   fetchRemoteModels?: () => Promise<LobsteraiRemoteModel[]>
   /** 解析当前客户端版本号（chat 与模型列表都要带）。 */
   resolveClientVersion?: () => Promise<string>
+  /** 读取图片附件字节；附件不可用时由序列化器留下占位文本。 */
+  readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
   fetchImpl?: typeof fetch
   /** 多账号池（用于限流时切换账号）。 */
   accountPool?: AccountPool
@@ -434,22 +406,82 @@ function contentToText(content: unknown): string {
     .join('')
 }
 
-/**
- * 将 harness 对话消息序列化为 OpenAI chat-completions 传输格式。
- *
- * 与 buddy 适配器的差异：这里**不强制** assistant 携带 `reasoning_content`
- * （那是腾讯后端对推理模型的要求，未在 LobsterAI 上实测），
- * 但仍保留其中的**通用协议要求**：
- * - 孤儿工具调用清理（见 `resolveToolPairing` 的说明，后端会 400）；
- * - 正文为空且有 `tool_calls` 时 `content` 必须为 `null`（OpenAI 规范）。
- *
- * 图片块在此**不处理**：LobsterAI 是否支持图片输入未实测，
- * `stream()` 已在更早的地方以 `UNSUPPORTED_CONTENT` 拒绝。
- */
+function collectImageRefs(content: readonly unknown[], refs: Map<string, unknown>): boolean {
+  let foundImage = false
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as {
+      type?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
+    if (block.type === 'image') {
+      foundImage = true
+      if (typeof block.attachment?.attachmentId === 'string') {
+        refs.set(block.attachment.attachmentId, block.attachment)
+      }
+    } else if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      if (collectImageRefs(block.content, refs)) foundImage = true
+    }
+  }
+  return foundImage
+}
+
+/** 有图片时序列化为 OpenAI 多模态 parts；无图时保留原有字符串格式。 */
+function userContentParts(
+  content: readonly unknown[],
+  imageUrls: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> | undefined {
+  const parts: Array<Record<string, unknown>> = []
+  let hasImage = false
+  for (const raw of content) {
+    if (typeof raw !== 'object' || raw === null) continue
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      attachment?: { attachmentId?: unknown }
+      content?: unknown
+    }
+    if (block.type === 'text') {
+      const text = String(block.text ?? '')
+      if (text.length > 0) parts.push({ type: 'text', text })
+    } else if (block.type === 'image') {
+      hasImage = true
+      const url = typeof block.attachment?.attachmentId === 'string'
+        ? imageUrls.get(block.attachment.attachmentId)
+        : undefined
+      parts.push(url === undefined
+        ? { type: 'text', text: '[image unavailable]' }
+        : { type: 'image_url', image_url: { url } })
+    } else if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      const nested = userContentParts(block.content, imageUrls)
+      if (nested !== undefined) {
+        hasImage = true
+        parts.push(...nested)
+      } else {
+        const text = contentToText(block.content)
+        if (text.length > 0) parts.push({ type: 'text', text })
+      }
+    }
+  }
+  return hasImage ? parts : undefined
+}
+
+/** 将 harness 对话消息序列化为 OpenAI chat-completions 传输格式。 */
 function serializeMessages(
   messages: readonly { role: string; content: unknown }[],
+  imageUrls?: ReadonlyMap<string, string>,
 ): Array<Record<string, unknown>> {
   const wire: Array<Record<string, unknown>> = []
+  const pendingToolImages: Array<Record<string, unknown>> = []
+  const flushToolImages = (): void => {
+    if (pendingToolImages.length === 0) return
+    wire.push({
+      role: 'user',
+      content: [{ type: 'text', text: 'Attached image(s) from tool result:' }, ...pendingToolImages],
+    })
+    pendingToolImages.length = 0
+  }
   // OpenAI 兼容协议要求 tool_call 与 tool 结果严格配对：缺任一侧后端都会
   // 以 400 拒绝整个请求，而这条坏历史会被每次请求原样重放 ——
   // 表现为「会话突然报废，此后所有消息都无回复」。发出前剔除可让会话自愈。
@@ -479,6 +511,7 @@ function serializeMessages(
         .map((block) => String(block.text))
         .join('')
       const text = contentToText(content)
+      flushToolImages()
       wire.push({
         role: 'assistant',
         // 正文为空且有工具调用时 content 必须为 null（OpenAI 规范）。
@@ -489,25 +522,51 @@ function serializeMessages(
       continue
     }
     if (message.role === 'system') {
+      flushToolImages()
       wire.push({ role: 'system', content: contentToText(message.content) })
       continue
     }
-    // user 角色：工具结果搭载在 harness 用户消息中，展开为独立的 role:'tool' 消息。
+    // user 角色：展开工具结果前先发常规消息；工具结果内嵌图片挂起到 role:tool 后。
     const content = Array.isArray(message.content) ? message.content : []
     const toolResults = content.filter((block): block is { type: string; toolCallId: unknown; content: unknown } =>
       typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result')
-    const text = contentToText(message.content)
-    if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+    const regular = content.filter((block) =>
+      !(typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'tool-result'))
+    const text = contentToText(regular)
+    const parts = imageUrls === undefined ? undefined : userContentParts(regular, imageUrls)
+    if (parts !== undefined) {
+      flushToolImages()
+      wire.push({ role: 'user', content: parts })
+    } else if (text.length > 0 || toolResults.length === 0) {
+      flushToolImages()
+      wire.push({ role: 'user', content: text })
+    }
     for (const result of toolResults) {
       // 丢弃孤儿工具结果：没有对应 assistant tool_call 的结果同样会让后端 400。
       if (!keepResultIds.has(String(result.toolCallId))) continue
+      let resultText = '(no output)'
+      if (imageUrls !== undefined && Array.isArray(result.content)) {
+        const resultParts = userContentParts(result.content, imageUrls)
+        if (resultParts !== undefined) {
+          pendingToolImages.push(...resultParts.filter((part) => part.type !== 'text'))
+          resultText = resultParts
+            .filter((part) => part.type === 'text')
+            .map((part) => String(part.text))
+            .join('') || '(no output)'
+        } else {
+          resultText = contentToText(result.content) || '(no output)'
+        }
+      } else {
+        resultText = contentToText(result.content) || '(no output)'
+      }
       wire.push({
         role: 'tool',
         tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
+        content: resultText,
       })
     }
   }
+  flushToolImages()
   return wire
 }
 
@@ -737,6 +796,7 @@ export class LobsteraiAdapter extends LlmAdapter {
       id: remote.id,
       name: remote.name.length > 0 ? remote.name : fallback?.name ?? remote.id,
       contextWindow: remote.contextWindow ?? fallback?.contextWindow,
+      supportsImages: remote.supportsImages ?? fallback?.supportsImages,
       reasoningEfforts: remote.reasoningEfforts ?? fallback?.reasoningEfforts,
       defaultReasoningEffort: remote.defaultReasoningEffort ?? fallback?.defaultReasoningEffort,
     }
@@ -760,8 +820,9 @@ export class LobsteraiAdapter extends LlmAdapter {
       provider: this.product.id,
       id: model.id,
       name: model.name,
-      // 图片输入刻意不声明，判定证据链见 LOBSTERAI_IMAGE_MODALITY_NOTE。
-      inputModalities: ['text'] as const,
+      inputModalities: (model.supportsImages ?? this.fallbackIndex.get(model.id)?.supportsImages) === true
+        ? ['text', 'image'] as const
+        : ['text'] as const,
     }))
   }
 
@@ -786,11 +847,8 @@ export class LobsteraiAdapter extends LlmAdapter {
       provider,
       id: model,
       name: entry?.name ?? model,
-      // 与 listModels **同源同口径**：LobsterAI 逐模型区分多模态没有实测依据，
-      // 两处一律 `['text']`（判定证据链见 LOBSTERAI_IMAGE_MODALITY_NOTE）。
-      // ⚠️ 两处若分叉（一处报 `['text','image']`）会让图片被路由进这条
-      // **必然丢图**的通道 —— 与 qoder / trae-cn 的同型约束一致。
-      inputModalities: ['text'],
+      // catalogEntry 已把远端 supportsImage 与静态 supportsImages 回退合并到 entry。
+      inputModalities: entry?.supportsImages === true ? ['text', 'image'] : ['text'],
     }
     // 上下文窗口：真机 `contextWindow` 为权威值；真机给 null 的条目**不声明**
     // （早期版本一律写死 131072，比真值小 8 倍，会误导用户判断上下文余量）。
@@ -829,21 +887,33 @@ export class LobsteraiAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    // 图片：明确报错而不是静默丢弃（静默丢弃会让用户以为模型看到了图片）。
-    // 检查在取凭据之前，省掉一次无谓的凭据读取。
-    //
-    // ⚠️ **这条拒绝与 `inputModalities` 的 `['text']` 是一对**：一旦哪天补上
-    // 图片出站，两处必须**同时**改（判定与翻案条件见
-    // {@link LOBSTERAI_IMAGE_MODALITY_NOTE}）。只改一处就是静默故障。
+    // 图片准入必须与目录声明一致：远端 supportsImage 优先，缺失时回退静态表。
+    // 图片引用含 tool-result 内的递归内容，附件不可用时由 image_url parts 输出占位文本。
+    const imageRefs = new Map<string, unknown>()
+    let hasImages = false
     for (const message of options.messages) {
-      if (!Array.isArray(message.content)) continue
-      const hasImage = message.content.some((block) =>
-        typeof block === 'object' && block !== null && (block as { type?: unknown }).type === 'image')
-      if (hasImage) {
+      if (Array.isArray(message.content) && collectImageRefs(message.content, imageRefs)) hasImages = true
+    }
+
+    let imageUrls: Map<string, string> | undefined
+    if (hasImages) {
+      await this.ensureRemoteModels()
+      if (this.catalogEntry(options.model)?.supportsImages !== true) {
         throw new LlmError(
-          'lobsterai: 当前 provider 不支持图片输入',
+          `lobsterai: model "${options.model}" does not accept image input`,
           'UNSUPPORTED_CONTENT',
         )
+      }
+      imageUrls = new Map()
+      for (const [id, ref] of imageRefs) {
+        try {
+          const image = await this.options.readImage?.(ref)
+          if (image !== undefined) {
+            imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString('base64')}`)
+          }
+        } catch {
+          // 附件缺失/读取失败不丢掉整条对话：序列化阶段留下 [image unavailable]。
+        }
       }
     }
 
@@ -879,10 +949,10 @@ export class LobsteraiAdapter extends LlmAdapter {
       }
     }
 
-    await this.ensureRemoteModels()
+    if (!hasImages) await this.ensureRemoteModels()
 
     // 3. 构造请求体
-    const messages = serializeMessages(options.messages)
+    const messages = serializeMessages(options.messages, imageUrls)
     if (options.system !== undefined && options.system.length > 0) {
       messages.unshift({ role: 'system', content: options.system })
     }

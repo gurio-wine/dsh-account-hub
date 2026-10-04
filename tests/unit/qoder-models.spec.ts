@@ -470,8 +470,8 @@ describe('QoderAdapter.listModels', () => {
     const adapter = new QoderAdapter(adapterOptions())
     const models = await adapter.listModels('qoder')
     expect(models).toEqual([
-      { provider: 'qoder', id: 'qmodel_38max', name: 'Qwen3.8-Max', inputModalities: ['text'] },
-      { provider: 'qoder', id: 'qfmodel', name: 'Qwen3.8-Flash', inputModalities: ['text'] },
+      { provider: 'qoder', id: 'qmodel_38max', name: 'Qwen3.8-Max', inputModalities: ['text', 'image'] },
+      { provider: 'qoder', id: 'qfmodel', name: 'Qwen3.8-Flash', inputModalities: ['text', 'image'] },
     ])
   })
 
@@ -535,11 +535,13 @@ describe('QoderAdapter.listModels', () => {
     expect(resolved.name).toBe('Qwen3.8-Max')
   })
 
-  it('模态恒声明纯文本（目录的 is_vl=true 不照抄 —— 本适配器送不到图片）', async () => {
+  it('模态按静态表 supportsImages 声明（目录的 is_vl=true 不作依据 —— 它在 T1 恒为 true）', async () => {
     const adapter = new QoderAdapter(adapterOptions())
     const models = await adapter.listModels('qoder')
     // T1 快照 17 项 is_vl 全为 true，若照抄就会全报 ['text','image']。
-    expect(models.every((model) => JSON.stringify(model.inputModalities) === '["text"]')).toBe(true)
+    // 能力只依据静态表逐模型真值：qmodel_38max / qfmodel 标了 supportsImages:true。
+    expect(models.find((model) => model.id === 'qmodel_38max')?.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((model) => model.id === 'qfmodel')?.inputModalities).toEqual(['text', 'image'])
   })
 })
 

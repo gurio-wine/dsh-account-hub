@@ -130,24 +130,10 @@ export declare function extractQoderErrorFacts(body: string): QoderErrorFacts;
  * —— 它是余额展示的口径，属步骤 4。
  */
 export declare function parseQoderUsage(payload: unknown): TokenUsage | undefined;
-/**
- * 把 harness 消息序列化为 **标准 OpenAI** 的 `messages` 数组。
- *
- * 与 `serializeTraeCnMessages` 的差别只有一处：**没有 SOLO 通道的出站改写**
- * （不改 `role`、不包 `[{type:'text',text}]`、不把 `function` 改名
- * `function_call`）—— Qoder 的 chat 端点接受的就是标准 OpenAI 形态，
- * 任何「顺手统一」的改写都会让它认不出消息结构。
- *
- * 两条与厂商无关的通用协议要求仍必须保留（见 `src/sse.ts`）：
- * - **剔除无法配对的 tool_call / tool-result**：后端会以 400 拒绝整个请求，
- *   而这条坏历史会被每次请求原样重放 —— 表现为「会话突然报废，此后所有消息
- *   都无回复」。发出前剔除可让会话自愈；
- * - assistant 正文为空且有 `tool_calls` 时 `content` 必须为 `null`（OpenAI 规范）。
- */
 export declare function serializeQoderMessages(messages: readonly {
     role: string;
     content: unknown;
-}[]): Array<Record<string, unknown>>;
+}[], imageUrls?: ReadonlyMap<string, string>): Array<Record<string, unknown>>;
 /**
  * 构造 chat 请求体（**导出的纯函数，便于逐字段单测**）。
  *
@@ -180,7 +166,7 @@ export declare function serializeQoderMessages(messages: readonly {
  * @param product - 产品配置；**缺省用国际版**，使既有调用点（与既有测试）
  *                  一行不改即得到与接入 CN 前逐字节相同的请求体。
  */
-export declare function buildQoderChatBody(options: GenerateOptions, product?: QoderProduct): string;
+export declare function buildQoderChatBody(options: GenerateOptions, product?: QoderProduct, imageUrls?: ReadonlyMap<string, string>): string;
 /** {@link consumeQoderStream} 的入参。 */
 export interface QoderStreamOptions {
     /** 错误消息前缀（如 `qoder`）。 */
@@ -328,6 +314,11 @@ export interface QoderAdapterOptions {
      * 而不必在适配器里假设响应形态 —— 解析规则只有一处（`parseQoderDirectory`）。
      */
     fetchRemoteModels?: (credential: QoderCredential) => Promise<readonly QoderModelEntry[]>;
+    /** 读取图片附件字节；附件缺失或读取失败时请求中保留占位文本。 */
+    readImage?: (attachment: unknown) => Promise<{
+        data: Uint8Array;
+        mediaType: string;
+    } | undefined>;
     fetchImpl?: typeof fetch;
     /** 多账号池（用于确证额度耗尽后切换账号）。 */
     accountPool?: AccountPool;

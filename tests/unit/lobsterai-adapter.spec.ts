@@ -101,6 +101,23 @@ describe('LobsterAI 模型列表解析', () => {
     })).toEqual([{ id: 'glm-5.2', name: 'GLM-5.2' }])
   })
 
+  it('解析远端 supportsImage 布尔值并忽略非布尔值', () => {
+    expect(parseLobsteraiModels({
+      code: 0,
+      data: [
+        { modelId: 'vision', modelName: 'Vision', supportsImage: true },
+        { modelId: 'text', modelName: 'Text', supportsImage: false },
+        { modelId: 'unknown', modelName: 'Unknown', supportsImage: 'true' },
+        { modelId: 'missing', modelName: 'Missing' },
+      ],
+    })).toEqual([
+      { id: 'vision', name: 'Vision', supportsImages: true },
+      { id: 'text', name: 'Text', supportsImages: false },
+      { id: 'unknown', name: 'Unknown' },
+      { id: 'missing', name: 'Missing' },
+    ])
+  })
+
   it('解析 contextWindow 与 thinkingConfig（思考档的权威来源，wire 值 openclawLevel）', () => {
     expect(parseLobsteraiModels({
       code: 0,
@@ -239,22 +256,58 @@ describe('LobsteraiAdapter 模型目录', () => {
     expect(models[0]).toMatchObject({ provider: 'lobsterai', id: 'deepseek-flash' })
   })
 
-  it('inputModalities 恒为 text（图片出站未支持，保守不声明）', async () => {
-    // 判定证据链见 `LOBSTERAI_IMAGE_MODALITY_NOTE`：远端 `supportsImage` 与
-    // 官方 openclaw.json 的 `input` 都声明了图片，但官方走的是本地
-    // OpenClawTokenProxy、我方直连上游，**没有对上游的图片实测样本**，
-    // 故不声明（声明错了比不声明更糟：DSH 会把图片路由进必然失败的通道）。
-    const { adapter } = makeAdapter(() => textSse('x'))
-    for (const model of await adapter.listModels('lobsterai')) {
-      expect(model.inputModalities).toEqual(['text'])
-    }
+  it('listModels 按静态支持能力声明模态，缺省/false 保持 text-only', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      product: {
+        ...LOBSTERAI,
+        fallbackModels: [
+          { id: 'vision', name: 'Vision', supportsImages: true },
+          { id: 'default', name: 'Default' },
+          { id: 'text-only', name: 'Text Only', supportsImages: false },
+        ],
+      },
+    })
+    const models = await adapter.listModels('lobsterai')
+    expect(models.find((model) => model.id === 'vision')?.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((model) => model.id === 'default')?.inputModalities).toEqual(['text'])
+    expect(models.find((model) => model.id === 'text-only')?.inputModalities).toEqual(['text'])
   })
 
-  it('resolveModel 与 listModels 的模态**同源同口径**（都是 text）', async () => {
-    // 两处若分叉会让图片被路由进必然丢图的通道（qoder / trae-cn 的同型约束）。
+  it('静态兜底目录仅对明确视觉模型声明 image', async () => {
     const { adapter } = makeAdapter(() => textSse('x'))
-    expect((await adapter.resolveModel('lobsterai', 'glm-5.2')).inputModalities).toEqual(['text'])
-    expect((await adapter.resolveModel('lobsterai', '不存在')).inputModalities).toEqual(['text'])
+    const models = await adapter.listModels('lobsterai')
+    expect(models.find((model) => model.id === 'glm-5v-turbo')?.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((model) => model.id === 'deepseek-v4-flash-vision-exp')?.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((model) => model.id === 'deepseek-flash')?.inputModalities).toEqual(['text'])
+    expect(models.find((model) => model.id === 'qwen3.8-omni-flash')?.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((model) => model.id === 'doubao-seed-2-1-pro-260915')?.inputModalities).toEqual(['text', 'image'])
+  })
+
+  it('listModels 远端 supportsImage 优先，缺失时回退静态能力', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      product: {
+        ...LOBSTERAI,
+        fallbackModels: [
+          { id: 'remote-true', name: 'Remote True', supportsImages: false },
+          { id: 'remote-false', name: 'Remote False', supportsImages: true },
+          { id: 'fallback-true', name: 'Fallback True', supportsImages: true },
+          { id: 'fallback-false', name: 'Fallback False', supportsImages: false },
+        ],
+      },
+      fetchRemoteModels: async () => [
+        { id: 'remote-true', name: 'Remote True', supportsImages: true },
+        { id: 'remote-false', name: 'Remote False', supportsImages: false },
+        { id: 'fallback-true', name: 'Fallback True' },
+        { id: 'fallback-false', name: 'Fallback False' },
+        { id: 'remote-only', name: 'Remote Only', supportsImages: true },
+      ],
+    })
+    const models = await adapter.listModels('lobsterai')
+    expect(models.find((model) => model.id === 'remote-true')?.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((model) => model.id === 'remote-false')?.inputModalities).toEqual(['text'])
+    expect(models.find((model) => model.id === 'fallback-true')?.inputModalities).toEqual(['text', 'image'])
+    expect(models.find((model) => model.id === 'fallback-false')?.inputModalities).toEqual(['text'])
+    expect(models.find((model) => model.id === 'remote-only')?.inputModalities).toEqual(['text', 'image'])
   })
 
   it('远端可用时以远端为准（不做「以兜底表为准」的裁剪）', async () => {
@@ -290,6 +343,55 @@ describe('LobsteraiAdapter 模型目录', () => {
 })
 
 describe('LobsteraiAdapter resolveModel', () => {
+  it('按静态 supportsImages 声明 image，缺省/false 保持 text-only', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      product: {
+        ...LOBSTERAI,
+        fallbackModels: [
+          { id: 'vision', name: 'Vision', supportsImages: true },
+          { id: 'default', name: 'Default' },
+          { id: 'text-only', name: 'Text Only', supportsImages: false },
+        ],
+      },
+    })
+    expect((await adapter.resolveModel('lobsterai', 'vision')).inputModalities).toEqual(['text', 'image'])
+    expect((await adapter.resolveModel('lobsterai', 'default')).inputModalities).toEqual(['text'])
+    expect((await adapter.resolveModel('lobsterai', 'text-only')).inputModalities).toEqual(['text'])
+  })
+
+  it('resolveModel 对静态表已确认视觉模型开放图片模态，其余保守为 text-only', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'))
+    expect((await adapter.resolveModel('lobsterai', 'glm-5v-turbo')).inputModalities).toEqual(['text', 'image'])
+    expect((await adapter.resolveModel('lobsterai', 'qwen3.8-omni-flash')).inputModalities).toEqual(['text', 'image'])
+    expect((await adapter.resolveModel('lobsterai', 'deepseek-flash')).inputModalities).toEqual(['text'])
+  })
+
+  it('resolveModel 远端 supportsImage 优先，缺失时回退静态能力', async () => {
+    const { adapter } = makeAdapter(() => textSse('x'), {
+      product: {
+        ...LOBSTERAI,
+        fallbackModels: [
+          { id: 'remote-true', name: 'Remote True', supportsImages: false },
+          { id: 'remote-false', name: 'Remote False', supportsImages: true },
+          { id: 'fallback-true', name: 'Fallback True', supportsImages: true },
+          { id: 'fallback-false', name: 'Fallback False', supportsImages: false },
+        ],
+      },
+      fetchRemoteModels: async () => [
+        { id: 'remote-true', name: 'Remote True', supportsImages: true },
+        { id: 'remote-false', name: 'Remote False', supportsImages: false },
+        { id: 'fallback-true', name: 'Fallback True' },
+        { id: 'fallback-false', name: 'Fallback False' },
+        { id: 'remote-only', name: 'Remote Only', supportsImages: true },
+      ],
+    })
+    expect((await adapter.resolveModel('lobsterai', 'remote-true')).inputModalities).toEqual(['text', 'image'])
+    expect((await adapter.resolveModel('lobsterai', 'remote-false')).inputModalities).toEqual(['text'])
+    expect((await adapter.resolveModel('lobsterai', 'fallback-true')).inputModalities).toEqual(['text', 'image'])
+    expect((await adapter.resolveModel('lobsterai', 'fallback-false')).inputModalities).toEqual(['text'])
+    expect((await adapter.resolveModel('lobsterai', 'remote-only')).inputModalities).toEqual(['text', 'image'])
+  })
+
   it('用兜底表给出上下文窗口（真机权威值，非早期写死的 131072）', async () => {
     const { adapter } = makeAdapter(() => textSse('x'))
     const resolved = await adapter.resolveModel('lobsterai', 'glm-5.2')
@@ -509,19 +611,110 @@ describe('LobsteraiAdapter 错误处理', () => {
     expect(error.code).toBe('TRANSPORT')
   })
 
+  it('支持图片的模型将图片序列化为 image_url data URL', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('ok'), {
+      fetchRemoteModels: async () => [{ id: 'vision-model', name: 'Vision', supportsImages: true }],
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+    })
+    const options = {
+      provider: 'lobsterai',
+      model: 'vision-model',
+      messages: [{ role: 'user', content: [
+        { type: 'text', text: '这张图是什么？' },
+        { type: 'image', attachment: { attachmentId: 'att-1' } },
+      ] }],
+    } as never
+    await collect(options, adapter)
+    const request = calls.find((call) => call.url.includes('/chat/completions'))
+    const body = JSON.parse(String(request?.init?.body)) as { messages: Array<{ role: string; content: unknown }> }
+    expect(body.messages.find((message) => message.role === 'user')?.content).toEqual([
+      { type: 'text', text: '这张图是什么？' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } },
+    ])
+  })
+
+  it('工具结果深层图片也序列化为独立 user image_url 消息', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('ok'), {
+      fetchRemoteModels: async () => [{ id: 'vision-model', name: 'Vision', supportsImages: true }],
+      readImage: async () => ({ data: new Uint8Array([4, 5]), mediaType: 'image/jpeg' }),
+    })
+    const options = {
+      provider: 'lobsterai',
+      model: 'vision-model',
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool-call', id: 'call-1', name: 'read_image', arguments: '{}' }] },
+        { role: 'user', content: [{
+          type: 'tool-result', toolCallId: 'call-1', content: [{
+            type: 'tool-result', toolCallId: 'nested', content: [
+              { type: 'text', text: 'found image' },
+              { type: 'image', attachment: { attachmentId: 'att-nested' } },
+            ],
+          }],
+        }] },
+      ],
+    } as never
+    await collect(options, adapter)
+    const body = JSON.parse(String(calls.find((call) => call.url.includes('/chat/completions'))?.init?.body)) as {
+      messages: Array<{ role: string; content: unknown }>
+    }
+    expect(body.messages).toContainEqual({
+      role: 'tool', tool_call_id: 'call-1', content: 'found image',
+    })
+    expect(body.messages).toContainEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'Attached image(s) from tool result:' },
+        { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,BAU=' } },
+      ],
+    })
+  })
+
+  it('图片附件读取失败时保留 unavailable 占位文本', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('ok'), {
+      fetchRemoteModels: async () => [{ id: 'vision-model', name: 'Vision', supportsImages: true }],
+      readImage: async () => { throw new Error('attachment unavailable') },
+    })
+    const options = {
+      provider: 'lobsterai',
+      model: 'vision-model',
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }] }],
+    } as never
+    await collect(options, adapter)
+    const body = JSON.parse(String(calls.find((call) => call.url.includes('/chat/completions'))?.init?.body)) as {
+      messages: Array<{ role: string; content: unknown }>
+    }
+    expect(body.messages.find((message) => message.role === 'user')?.content)
+      .toEqual([{ type: 'text', text: '[image unavailable]' }])
+  })
+
+  it('文本模型收到图片时抛 UNSUPPORTED_CONTENT 且不发 chat 请求', async () => {
+    const { adapter, calls } = makeAdapter(() => textSse('ok'), {
+      fetchRemoteModels: async () => [{ id: 'text-only-model', name: 'Text only', supportsImages: false }],
+      readImage: async () => ({ data: new Uint8Array([1]), mediaType: 'image/png' }),
+    })
+    const options = {
+      provider: 'lobsterai',
+      model: 'text-only-model',
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'att-1' } }] }],
+    } as never
+    const error = await collect(options, adapter).catch((e: unknown) => e as { code?: string })
+    expect(error.code).toBe('UNSUPPORTED_CONTENT')
+    expect(calls.some((call) => call.url.includes('/chat/completions'))).toBe(false)
+  })
+
   it('图片输入报 UNSUPPORTED_CONTENT（而不是静默丢弃）', async () => {
-    // ⚠️ 这条拒绝与 `inputModalities` 的 `['text']` 是一对：一旦补上图片出站，
-    // 两处必须**同时**改（判定与翻案条件见 `LOBSTERAI_IMAGE_MODALITY_NOTE`）。
+    // ⚠️ 这条拒绝与 `inputModalities` 的 `['text']` 是一对：不支持图片模型必须同时拒绝。
     const { adapter, calls } = makeAdapter(() => textSse('hi'))
-    const options = generateOptions({
-      messages: [createUserMessage({
-        content: [{ type: 'image', attachment: { attachmentId: 'a1' } }],
-        source: { kind: 'user' },
-      })],
-    } as never)
-    await expect(collect(options, adapter)).rejects.toThrow(/不支持图片输入/)
-    // 应在取凭据/发请求之前就拒绝。
-    expect(calls).toHaveLength(0)
+    const options = {
+      provider: 'lobsterai',
+      model: 'glm-5.2',
+      messages: [{ role: 'user', content: [{ type: 'image', attachment: { attachmentId: 'a1' } }] }],
+    } as never
+    const error = await collect(options, adapter).catch((e: unknown) => e as { code?: string; message?: string })
+    expect(error.code).toBe('UNSUPPORTED_CONTENT')
+    expect(error.message).toMatch(/does not accept image/)
+    // 应在发 chat 请求之前拒绝。
+    expect(calls.some((call) => call.url.includes('/chat/completions'))).toBe(false)
   })
 })
 

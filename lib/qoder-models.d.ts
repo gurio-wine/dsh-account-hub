@@ -120,13 +120,10 @@ export interface QoderFallbackModel {
     /** 展示名（目录的 `display_name`）。 */
     name: string;
     /**
-     * 目录的 `is_vl`（多模态标记）。
-     *
-     * ⚠️ **本字段目前不参与 `inputModalities` 声明**：本适配器的 chat 路径
-     * （`serializeQoderMessages`）只搬运文本块，图片块会被静默丢弃，故对外
-     * **一律声明纯文本**。把 `is_vl:true` 报成「支持图片」会让 DSH 把图片路由
-     * 进这条必然丢图的通道 —— 那是真实的数据丢失，比少报一个能力严重得多。
-     * 保留字段是为了忠实记录实测值（将来接上图片通路时按它声明）。
+     * 图片能力（静态表真值；目录的 `is_vl` 在 T1 快照 17 项恒为 true，不能作为
+     * 逐模型信号，解析时降级为目录元数据）。`supportsImages: true` 的模型，
+     * 适配器的 chat 路径（`serializeQoderMessages`）会把图片块转成 OpenAI
+     * `image_url` data URL 真实出站；未标注的模型一律按纯文本处理。
      */
     supportsImages?: boolean;
     /**
