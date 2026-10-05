@@ -2580,6 +2580,14 @@ function AutoRouteEntryRow({
   entry, index, catalog, busy, drag, onNeedEffort, onRemove, onEdit,
 }) {
   const providerGroup = catalog.find(group => group.id === entry.provider);
+  const model = providerGroup && Array.isArray(providerGroup.models)
+    ? providerGroup.models.find(item => item.id === entry.model)
+    : undefined;
+  // 供应商与模型显示名都来自目录；目录缺项时回退到已存的 id，保证历史配置仍可读。
+  // 存储与提交始终使用 entry.model 本身，modelLabel 仅用于候选摘要的展示层。
+  const modelLabel = model && typeof model.name === 'string' && model.name !== ''
+    ? model.name
+    : entry.model;
   // 供应商显示名与模型列表弹窗同一写法（PROVIDERS 是品牌名的唯一真相源）；
   // 目录组名与裸 id 是兜底 —— 目录里出现 PROVIDERS 之外的 id 时不能显示 undefined。
   const providerLabel = PROVIDERS.find(p => p.id === entry.provider)?.label
@@ -2588,7 +2596,7 @@ function AutoRouteEntryRow({
     ? '选择供应商'
     : entry.model === ''
       ? '选择模型'
-      : `${entry.model}${entry.effort ? `(${entry.effort})` : ''}-${providerLabel}`;
+      : `${modelLabel}${entry.effort ? `(${entry.effort})` : ''}-${providerLabel}`;
   // 占位文案（还没选全）与已配好的取值用不同色档区分，见 .dim-ah-arEntryText。
   const placeholder = entry.provider === '' || entry.model === '';
 

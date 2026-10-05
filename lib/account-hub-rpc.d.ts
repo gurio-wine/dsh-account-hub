@@ -523,6 +523,9 @@ export declare function refreshConsumptionBalances(deps: ProviderBalancesDeps, p
  * `listModels` 返回空数组（整个 provider 分组从模型选择器消失），而设置页仍须
  * 列出该 provider 的全部模型 —— 反而更需要它（此时 `listModels` 一个都不给）。
  *
+ * ⚠️ `autoroute.catalog` 会在读取本目录前通过 `llm.listModels()` 预热适配器缓存；
+ * 若预热失败，仍继续读取此方法提供的缓存/静态兜底目录。
+ *
  * ⚠️ **只声明用到的方法**（结构化类型），避免本模块依赖七个具体适配器类。
  * 实例由 `src/index.ts` 显式收集后传入（`ctx.llm` 不透传自定义方法）。
  */

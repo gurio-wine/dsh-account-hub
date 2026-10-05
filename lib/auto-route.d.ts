@@ -455,7 +455,7 @@ export declare function autoRouteHead(rt: AutoRouteRuntime, definitionId: string
  *   不依赖队列本身发生变化。
  * - 未知定义 id / 空队列：返回 `null`，不抛错。
  *
- * 不计数、不记录失败原因：失败原因的处置（是否报错、报什么）属于调用方。
+ * 不计数、不记录失败原因：失败原因的处置（是否报错、报什么、是否记录日志）属于调用方；纯逻辑层保持无 I/O。
  */
 export declare function demoteAutoRouteHead(rt: AutoRouteRuntime, definitionId: string): AutoRouteEntry | null;
 /**

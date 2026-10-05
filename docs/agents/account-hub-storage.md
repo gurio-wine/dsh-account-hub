@@ -21,9 +21,9 @@
 `disabledModels` 字段保存被关闭的模型（旧 `jet-hub` 仅作回退读取）：
 
 - **黑名单制**：键为 `true` 才隐藏，未记录默认打开（新模型自动可见）；过滤点在适配器 `listModels`，每次实时读 `pool.disabledModelsFor(provider)`
-- **只影响播报、不影响路由**（DSH 约定：目录仅供参考）：被关闭的模型仍可 `resolveModel` / 正常收发；**无「凭据可解析」账号时 `listModels` 返回 `[]`**（隐藏整个分组；判据不看条目 / `enabled`；判定不可用则放行；开关 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` 默认开；CodeArts 额外认单凭据 ref）
+- **影响播报与自动路由候选选择列表展示，但不影响已配置候选的路由转发**：候选列表只隐藏用户在 Account Hub 显式禁用的模型；被关闭的模型仍可 `resolveModel` / 正常收发，自动路由运行时仍按既有队列轮转已配置条目。**无「凭据可解析」账号时 `listModels` 返回 `[]`**（隐藏整个分组；判据不看条目 / `enabled`；判定不可用则放行；开关 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT` 默认开；CodeArts 额外认单凭据 ref）
 - `writeAccounts` / `writeModels` 是**整体 replace**，必须互带对方字段；改名迁移**对调式搬运** `disabledModels` 的 provider 键（`buddy`→`buddy-cn`、`workbuddy`→`buddy`），有测试（`src/provider-rename-migration.ts`）
-- 设置页目录走适配器 `listAllModels()`（不套黑名单 / 门控，`registerAccountHubRpc` **第 11 实参**，第 10 是 `contextTiers`）；`CodeArtsAdapter.listModels` 必须 `await this.ensureRemoteModels()`；RPC `model.list` / `model.setDisabled`，前端 `plugin-src/client/account-hub.js` 的 `ModelListPanel`
+- 模型开关设置页目录走适配器 `listAllModels()`（不套黑名单 / 门控，`registerAccountHubRpc` **第 11 实参**，第 10 是 `contextTiers`）；`CodeArtsAdapter.listModels` 必须 `await this.ensureRemoteModels()`；RPC `model.list` / `model.setDisabled`，前端 `plugin-src/client/account-hub.js` 的 `ModelListPanel`
 
 ## 登录必须两段式：RPC 立即返回 loginUrl
 
@@ -241,9 +241,7 @@ Buddy 系改名曾将中国版 `buddy` 调整为 `buddy-cn`，国际版 `workbud
   **过滤掉 `id === AUTO_ROUTE_PROVIDER_ID`** → 逐个取目录 → 收成
   `{ providers: [{ id, name, models: [{ id, name }] }] }`。**数据源是混合的**（2026-09-23
   修复门控泄漏）：`modelAdapters`（`registerAccountHubRpc` 第 11 实参）里有条目的
-  provider —— 本插件七个 —— 走适配器实例的 `listAllModels()`，**不套目录门控、也不套
-  黑名单**（黑名单只影响播报、不影响路由，被关掉的模型当然可当候选），判法与 `model.list`
-  同源；没有条目的（DSH 内置 / 其它插件）才回落 `ctx.llm.listModels()`（它们不经过本插件
+  provider —— 本插件七个 —— 先调用 `ctx.llm.listModels(provider)` 预热目录缓存，再走适配器实例的 `listAllModels()`；候选选择列表只隐藏 `disabledModelsFor(provider)` 命中的用户显式禁用模型，roster 侧 `is_enabled:false` 不在本层另加过滤；黑名单影响播报与候选列表展示，但不影响已配置候选的自动路由转发；没有条目的（DSH 内置 / 其它插件）才回落 `ctx.llm.listModels()`（它们不经过本插件
   门控）。混合是**必需**的：本插件适配器的 `listModels` 套 `providerCatalogVisible`，
   而该门控第 ⓪ 条正是「自动路由开着 → 本插件其它 provider 从 DSH 目录隐藏」——照旧走
   `listModels` 的话，用户一开总开关，本插件七个 provider 全部返回 `[]`，编辑器里一个
@@ -251,8 +249,8 @@ Buddy 系改名曾将中国版 `buddy` 调整为 `buddy-cn`，国际版 `workbud
   自身（列出来就等于让用户配出自引用递归，写路径虽会拒，但先显示再报错是更差的体验）；
   ② **逐 provider 收窄失败面** —— 某个目录查询抛错（适配器抛错 / 远端超时）只让该组记
   空列表 + `logger.warn` 点名 provider，其余照常返回（一个远端目录超时不该让编辑器连别的
-  供应商都看不到）；③ **有适配器条目时绝不回落 `listModels`**，否则门控泄漏原样回来；
-  ④ 模型条目**只透出 `{ id, name }`** —— 宿主 `LlmModelInfo` 另有 `provider` /
+  供应商都看不到）；③ **有适配器条目时，`listModels` 仅用于预热，目录结果仍取
+  `listAllModels()`**，预热失败时保留缓存/静态兜底；④ 模型条目**只透出 `{ id, name }`** —— 宿主 `LlmModelInfo` 另有 `provider` /
   `description` / `inputModalities`，照抄出去等于把宿主字段名变成客户端的隐性契约。
 - `autoroute.model-info`（请求 `{ provider, model }`）：`resolveModelInfo(provider, model)`
   → 取 `reasoning` → `{ efforts: id[], defaultEffort? }`（`defaultEffort` 缺席即不补键，

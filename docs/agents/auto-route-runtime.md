@@ -231,9 +231,11 @@ provider 侧签名（Anthropic 的 `thinkingSignature` / DeepSeek Messages 的
 - **只影响 DSH 目录拉取路径**（各适配器 `listModels` → `buildModelCatalog`）。
   面板内的 `model.list` RPC 走的是适配器实例的 `listAllModels()`，**不经过本门控** ——
   这正是「开启自动路由后仍能在面板里编辑候选」的落地处：`autoroute.catalog` 的数据源
-  是**混合的**（本插件七个走 `listAllModels()`，DSH 内置与其它插件回落
-  `ctx.llm.listModels()`），若照旧逐个 `await llm.listModels(id)`，用户一开总开关
-  七个 provider 全部返回 `[]`，「加候选」这个动作直接死掉。
+  是**混合的**（本插件七个先调用 `ctx.llm.listModels()` 预热目录缓存，再读适配器的
+  `listAllModels()`；预热失败仍回退缓存/静态目录；候选选择列表隐藏用户显式禁用模型，
+  但已配置候选的路由转发不变；DSH 内置与其它插件直接回落 `ctx.llm.listModels()`），若照旧
+  逐个 `await llm.listModels(id)` 取本插件结果，用户一开总开关七个 provider 全部返回 `[]`，
+  「加候选」这个动作直接死掉。
 
 ### 自可见性：`auto-route` 按自己的开关可见
 

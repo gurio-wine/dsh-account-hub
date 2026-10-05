@@ -396,6 +396,7 @@ export class AutoRouteAdapter extends LlmAdapter {
           return
         }
         // 一个 chunk 都还没透传：静默吞掉这个 finish，换下一个候选，DSH 无感。
+        logSilentAutoRouteDemotion(this.options.ctx, definition, entry, reason)
         demotions += 1
         continue candidates
       }
@@ -404,6 +405,7 @@ export class AutoRouteAdapter extends LlmAdapter {
       demoteAutoRouteHead(this.runtime, definition.id)
       if (!emitted) {
         // 一个 chunk 都没透传：静默换下一个候选。
+        logSilentAutoRouteDemotion(this.options.ctx, definition, entry, null)
         demotions += 1
         continue
       }
@@ -713,6 +715,37 @@ export function createAutoRouteRegistration(
       routed = current.enabled
     }
     appliedFacts = facts
+  }
+}
+
+/** 只在「未透传任何 chunk」的静默降级路径记录候选失败原因。 */
+function logSilentAutoRouteDemotion(
+  ctx: Context,
+  definition: AutoRouteDefinition,
+  entry: AutoRouteEntry,
+  reason: Extract<StreamChunk, { type: 'finish' }>['reason'] | null,
+): void {
+  const finishKind = reason?.kind ?? '无终止 chunk'
+  const failure = reason?.kind === 'error' ? reason.failure : undefined
+  const details = [
+    '静默降级',
+    `聚合模型 ${AUTO_ROUTE_PROVIDER_ID}/${definition.id}（${definition.name}）`,
+    `候选 ${entry.provider}/${entry.model}`,
+    `finish=${finishKind}`,
+    ...(failure === undefined ? [] : [
+      `code=${failure.code ?? '未知'}`,
+      `message=${failure.message}`,
+    ]),
+    ...entry.userAgent === undefined ? [] : [`userAgent=${entry.userAgent}`],
+    ...entry.originator === undefined ? [] : [`originator=${entry.originator}`],
+    ...entry.masquerade?.windowId === undefined ? [] : [`masquerade.windowId=${entry.masquerade.windowId}`],
+  ]
+  try {
+    const logger = ctx.logger
+    if (typeof logger?.warn !== 'function') return
+    logger.warn(`[auto-route] ${details.join('；')}`)
+  } catch {
+    // 日志后端异常不得改变候选轮转、吞错或 exhaust 行为。
   }
 }
 

@@ -72,7 +72,14 @@ const def = (
   name: string,
   // 两个头覆写字段也要能造出来：它们与 effort 一样**影响出站行为**，故同样必须进
   // 内容指纹（见 autoRouteConfigFacts 那组用例）。
-  entries: { provider: string; model: string; effort?: string; userAgent?: string; originator?: string }[],
+  entries: {
+    provider: string
+    model: string
+    effort?: string
+    userAgent?: string
+    originator?: string
+    masquerade?: { windowId: string }
+  }[],
 ): AutoRouteDefinition => ({ id, name, entries })
 
 /** 目标模型能力（含思考档，用于测合并规则）。 */
@@ -425,6 +432,38 @@ describe('stream：转发改写', () => {
 // ──────────────────────────── 3. 降级：首 chunk 前失败 ────────────────────────────
 
 describe('stream：首 chunk 前失败 → 静默降级', () => {
+  it('记录被降级候选、聚合模型、真实失败原因与出站覆写', async () => {
+    const cfg = () => config(true, [def('glm-53-auto', 'GLM 5.3 自动', [
+      {
+        provider: 'qoder-cn',
+        model: 'gmodel',
+        userAgent: 'test-agent',
+        originator: 'test-origin',
+      },
+      { provider: 'qoder', model: 'fallback-model' },
+    ])])
+    const { ctx, adapter, target } = await harness({ config: cfg })
+    const warn = vi.fn()
+    ;(ctx as unknown as { logger: unknown }).logger = { warn }
+    target.queue('qoder-cn', { kind: 'error', code: 'UPSTREAM_REJECTED', message: '真实错误原文：model unavailable' })
+    target.queue('qoder', { kind: 'chunks', chunks: [{ type: 'finish', reason: { kind: 'stop' } }] })
+
+    const chunks = await drain(adapter, 'glm-53-auto')
+
+    expect(kinds(chunks)).toEqual(['finish:stop'])
+    expect(target.seen.get('qoder-cn')).toHaveLength(1)
+    expect(target.seen.get('qoder')).toHaveLength(1)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[auto-route]'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('qoder-cn/gmodel'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('聚合模型 auto-route/glm-53-auto（GLM 5.3 自动）'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('finish=error'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('code=UPSTREAM_REJECTED'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('真实错误原文：model unavailable'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('userAgent=test-agent'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('originator=test-origin'))
+  })
+
   it('第一个条目失败、第二个成功 → 外层只见到成功流，**没有** error finish', async () => {
     const cfg = () => config(true, [def('m1', '自动一号', [
       { provider: 'p-a', model: 'a' },
@@ -502,12 +541,14 @@ describe('stream：首 chunk 前失败 → 静默降级', () => {
     expect(target.seen.get('p-b')).toHaveLength(1)
   })
 
-  it('内层流没给终止 chunk 且**一个 chunk 都没透传** → 静默换下一个候选', async () => {
+  it('内层流没给终止 chunk 且**一个 chunk 都没透传** → 静默换下一个候选并记录原因', async () => {
     const cfg = () => config(true, [def('m1', '自动一号', [
       { provider: 'p-a', model: 'a' },
       { provider: 'p-b', model: 'b' },
     ])])
-    const { adapter, target } = await harness({ config: cfg })
+    const { ctx, adapter, target } = await harness({ config: cfg })
+    const warn = vi.fn()
+    ;(ctx as unknown as { logger: unknown }).logger = { warn }
     // 空的 chunks 步 = 什么都不 yield 就结束（合法的「无终止 chunk」形态）。
     target.queue('p-a', { kind: 'chunks', chunks: [] })
     target.queue('p-b', { kind: 'chunks', chunks: [{ type: 'finish', reason: { kind: 'stop' } }] })
@@ -516,6 +557,9 @@ describe('stream：首 chunk 前失败 → 静默降级', () => {
 
     expect(kinds(chunks)).toEqual(['finish:stop'])
     expect(target.seen.get('p-b')).toHaveLength(1)
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('候选 p-a/a'))
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('finish=无终止 chunk'))
   })
 })
 

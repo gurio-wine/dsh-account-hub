@@ -592,9 +592,12 @@ function entryValuesOf(card: ElementNode): Array<{ provider: string; model: stri
     if (group === undefined) throw new Error(`行文本里读不出供应商（aria-label 形态变了？）：${label}`)
     const head = description.slice(0, description.length - group.name.length - 1)
     const withEffort = /^(.*)\(([^()]*)\)$/.exec(head)
+    const modelLabel = withEffort !== null ? withEffort[1]! : head
+    // 行摘要使用目录显示名；按同一目录反查模型 id，未命中时保留原文。
+    const model = group.models.find((item) => item.name === modelLabel)?.id ?? modelLabel
     return withEffort !== null
-      ? { provider: group.id, model: withEffort[1]!, effort: withEffort[2]! }
-      : { provider: group.id, model: head }
+      ? { provider: group.id, model, effort: withEffort[2]! }
+      : { provider: group.id, model }
   })
 }
 

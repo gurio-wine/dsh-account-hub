@@ -6,17 +6,17 @@
  *
  * 1. `autoroute.catalog` 把 `ctx.llm.listProviders()` 与逐个目录查询收成两级目录。
  *    **数据源是混合的**（2026-09-23 修复门控泄漏）：`modelAdapters` 里有条目的
- *    provider（本插件七个）走适配器实例的 `listAllModels()` —— 与 `model.list`
- *    同源、**不套目录门控也不套黑名单**；没有条目的（DSH 内置 / 其它插件）才回落
- *    `ctx.llm.listModels()`。理由：本插件适配器的 `listModels` 套
- *    `providerCatalogVisible`，用户一开自动路由开关，本插件七个 provider 全被
- *    隐藏 ⇒ 编辑器一个模型都选不出来（正是「开启后加不了候选」的根因）。
+ *    provider（本插件七个）先调用 `ctx.llm.listModels()` 预热，再走适配器的
+ *    `listAllModels()`；仅隐藏 `disabledModelsFor` 命中的用户显式禁用模型。没有条目的
+ *    （DSH 内置 / 其它插件）才直接使用 `ctx.llm.listModels()`。
+ *    本插件适配器的 `listModels` 套 `providerCatalogVisible`，用户一开自动路由开关，本插件七个
+ *    provider 全被隐藏 ⇒ 编辑器一个模型都选不出来（正是「开启后加不了候选」的根因）。
  *    四条判据在这里锁死：
  *    - **`auto-route` 自身必须被排除**（用户明令）：把虚拟 provider 列进自己的候选，
  *      等于让用户配出「自动路由委派给自动路由」，运行时无限递归；
  *    - **单个 provider 的目录失败不得炸掉整条端点**：一个远端目录超时不该让编辑器
  *      连别的供应商都看不到 —— 该组记空列表、其余照常返回；
- *    - **适配器条目存在时绝不回落到 `listModels`**：回落就把门控泄漏带回来了；
+ *    - **适配器条目存在时先调用 `listModels` 预热**：预热失败仍回退缓存/静态目录；
  *    - 模型条目**只透出 `{ id, name }`**：宿主 `LlmModelInfo` 还带 `provider` /
  *      `description` / `inputModalities`，编辑器用不到，照抄出去只是把宿主字段名
  *      变成客户端的隐性契约。
@@ -36,13 +36,16 @@ interface FakeLlm {
   resolveModelInfo: (provider: string, model: string) => Promise<Record<string, unknown>>
 }
 
-function makeHarness(llm: Partial<FakeLlm> | undefined) {
+function makeHarness(
+  llm: Partial<FakeLlm> | undefined,
+  disabledModels: Record<string, Record<string, boolean>> = {},
+) {
   const warn = vi.fn()
   let handler: ((request: Request) => Promise<Response>) | undefined
 
   let doc: Record<string, unknown> = {
     accounts: [],
-    disabledModels: {},
+    disabledModels: disabledModels,
     contextBudgets: {},
     checkins: {},
     consumption: {},
@@ -110,10 +113,16 @@ function makeHarness(llm: Partial<FakeLlm> | undefined) {
 }
 
 /** `modelAdapters`（`registerAccountHubRpc` 的 `modelAdapters` 字段）的替身形状：只声明 `listAllModels`。 */
-type FakeAdapters = Readonly<Record<string, { listAllModels: () => ReadonlyArray<{ id: string; name: string }> }>>
+type FakeAdapters = Readonly<Record<string, {
+  listAllModels: () => ReadonlyArray<{ id: string; name: string; is_enabled?: boolean }>
+}>>
 
-async function setup(llm: Partial<FakeLlm> | undefined, modelAdapters?: FakeAdapters) {
-  const h = makeHarness(llm)
+async function setup(
+  llm: Partial<FakeLlm> | undefined,
+  modelAdapters?: FakeAdapters,
+  disabledModels: Record<string, Record<string, boolean>> = {},
+) {
+  const h = makeHarness(llm, disabledModels)
   const pool = new AccountPool(h.ctx as never)
   await pool.openStorage()
   registerAccountHubRpc({
@@ -270,8 +279,8 @@ describe('autoroute.catalog：本插件 provider 走适配器目录（不受自�
     const result = await h.call('autoroute.catalog', {})
 
     expect(result.ok).toBe(true)
-    // 只对**没有适配器条目**的那个 provider 发起宿主查询；有适配器的一个都不查。
-    expect(listModels.mock.calls.map((call) => call[0])).toEqual(['dsh-builtin'])
+    // 适配器 provider 先预热一次；无适配器条目的 provider 也直接查询目录。
+    expect(listModels.mock.calls.map((call) => call[0])).toEqual(['buddy-cn', 'dsh-builtin'])
     const providers = (result.value as { providers: Array<{ id: string; models: unknown[] }> }).providers
     expect(providers[0]!.models).toHaveLength(1)
     expect(providers[1]!.models).toHaveLength(1)
@@ -299,6 +308,102 @@ describe('autoroute.catalog：本插件 provider 走适配器目录（不受自�
     expect(catalogWarns[0]).toContain('buddy-cn')
   })
 
+  it('插件 provider 预热成功后，listAllModels 读取动态目录条目', async () => {
+    let warmed = false
+    const listModels = vi.fn(async (provider: string) => {
+      if (provider === 'buddy-cn') warmed = true
+      return []
+    })
+    const h = await setup({
+      ...gatedLlm(),
+      listModels,
+    }, {
+      'buddy-cn': {
+        listAllModels: () => warmed
+          ? [{ id: 'dynamic-1', name: '动态模型' }]
+          : [{ id: 'fallback-1', name: '静态兜底模型' }],
+      },
+    })
+
+    const result = await h.call('autoroute.catalog', {})
+
+    expect(result.ok).toBe(true)
+    const providers = (result.value as { providers: Array<{ id: string; models: unknown[] }> }).providers
+    expect(providers[0]).toEqual({
+      id: 'buddy-cn', name: 'CodeBuddy 中国版', models: [{ id: 'dynamic-1', name: '动态模型' }],
+    })
+    expect(listModels).toHaveBeenCalledWith('buddy-cn')
+  })
+
+  it('插件 provider 预热失败 → RPC 仍成功并使用缓存/静态目录', async () => {
+    const h = await setup({
+      ...gatedLlm(),
+      listModels: async (provider: string) => {
+        if (provider === 'buddy-cn') throw new Error('远端目录超时')
+        return [{ provider, id: 'builtin-1', name: '内置模型' }]
+      },
+    }, {
+      'buddy-cn': {
+        listAllModels: () => [{ id: 'cached-1', name: '缓存模型' }],
+      },
+    })
+
+    const result = await h.call('autoroute.catalog', {})
+
+    expect(result.ok).toBe(true)
+    expect(result.value).toEqual({
+      providers: [
+        { id: 'buddy-cn', name: 'CodeBuddy 中国版', models: [{ id: 'cached-1', name: '缓存模型' }] },
+        { id: 'dsh-builtin', name: 'DSH 内置', models: [{ id: 'builtin-1', name: '内置模型' }] },
+      ],
+    })
+    const warmWarns = h.warn.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes('预热') && line.includes('buddy-cn'))
+    expect(warmWarns).toHaveLength(1)
+  })
+
+  it('候选目录隐藏显式 disabledModels，但保留未命中项（含 roster is_enabled:false 条目）', async () => {
+    const h = await setup(gatedLlm(), {
+      'buddy-cn': {
+        // listAllModels 表示完整 roster；其中 roster-off 模拟 is_enabled:false，
+        // 本层只按用户显式 disabledModels 过滤，不按 roster 状态另加过滤。
+        listAllModels: () => [
+          { id: 'hidden-by-user', name: '用户禁用模型' },
+          { id: 'roster-off', name: 'roster 未启用模型', is_enabled: false },
+          { id: 'visible', name: '可见模型' },
+        ],
+      },
+    }, {
+      'buddy-cn': { 'hidden-by-user': true },
+    })
+
+    const result = await h.call('autoroute.catalog', {})
+
+    expect(result.ok).toBe(true)
+    const providers = (result.value as { providers: Array<{ id: string; models: Array<{ id: string }> }> }).providers
+    expect(providers[0]!.models.map((model) => model.id)).toEqual(['roster-off', 'visible'])
+  })
+
+  it('已配置的自动路由候选不因 disabledModels 从配置中移除', async () => {
+    const h = await setup(gatedLlm(), undefined, {
+      'buddy-cn': { 'hidden-by-user': true },
+    })
+    const written = await h.call('autoroute.set', {
+      models: [{
+        id: 'route-1',
+        name: '自动模型',
+        entries: [{ provider: 'buddy-cn', model: 'hidden-by-user' }],
+      }],
+    })
+
+    expect(written.ok).toBe(true)
+    const result = await h.call('autoroute.get', {})
+    expect(result.ok).toBe(true)
+    expect(result.value).toMatchObject({
+      models: [{ entries: [{ provider: 'buddy-cn', model: 'hidden-by-user' }] }],
+    })
+  })
   it('省略 `modelAdapters` 字段（headless / 测试降级）→ 全部回落 ctx.llm.listModels（历史行为）', async () => {
     const listModels = vi.fn(async (provider: string) => [{ provider, id: 'm-1', name: '模型一' }])
     const h = await setup({ ...gatedLlm(), listModels })

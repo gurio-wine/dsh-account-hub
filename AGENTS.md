@@ -49,7 +49,7 @@
 ## 账号池与模型列表（概览）
 
 - 账号池持久层在 storage 域 `dsh_account_hub`（降级矩阵：storage → 旧 settings 回退 → 内存），凭据本体存 `ctx.credentials`；数组顺序即候选优先级；限流后自动换号。细节见 `docs/agents/account-hub-storage.md`。
-- `disabledModels` 黑名单制：只影响播报、不影响路由；无可用账号时 `listModels` 返回 `[]` 隐藏整个分组。细节见 `docs/agents/account-hub-storage.md`。
+- `disabledModels` 黑名单制：影响模型播报与自动路由候选选择列表展示（候选列表隐藏用户显式禁用模型），但不影响已配置候选的路由转发；无可用账号时 `listModels` 返回 `[]` 隐藏整个分组。细节见 `docs/agents/account-hub-storage.md`。
 - 上下文窗口档位（context tiers）：注册表经 `registerAccountHubRpc` 第 10 实参注入；buddy 系与 qoder 两区有远端档位数据源，trae-cn 走 agent 组目录，lobsterai 无档位源。细节见 `docs/agents/account-hub-storage.md` 与各 providers-*.md。
 
 ## LLM Provider 约定
