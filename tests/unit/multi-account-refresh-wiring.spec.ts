@@ -217,7 +217,7 @@ describe('R1：30 分钟续期定时器的注册判据必须等 storage 就绪',
     ).toBe(1)
   })
 
-  it('storage 里全部账号都不可续期时：不补跑、也不注册定时器', async () => {
+  it('storage 里全部账号都不可续期时：仍补跑并注册定时器（refreshable 不参与武装）', async () => {
     const storage = createGatedStorage([{ ...refreshableCodeartsAccount(), refreshable: false }])
     const ctx = makeContext(storage.facility)
     const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
@@ -228,13 +228,12 @@ describe('R1：30 分钟续期定时器的注册判据必须等 storage 就绪',
     storage.release()
     await flush()
 
-    expect(refreshTimerCount(setIntervalSpy)).toBe(0)
-    expect(pipeline.codearts).not.toHaveBeenCalled()
+    expect(refreshTimerCount(setIntervalSpy)).toBe(1)
+    expect(pipeline.codearts).toHaveBeenCalledTimes(1)
   })
 
-  it('settings 回退路径里的账号不参与判据（判据只认 storage 主路径）', async () => {
-    // storage 为空、settings 里有一条可续期账号：storage 已接管时，
-    // 读路径走 storage（空表）⇒ 不注册。这条锁的是「判据与读路径同源」。
+  it('storage 为空时仍注册调度器，settings 回退账号不影响空池判据', async () => {
+    // storage 已接管且为空：调度器仍须武装，不能把「暂时无账号」当作永久禁用。
     const storage = createGatedStorage([])
     const ctx = makeContext(storage.facility, [refreshableCodeartsAccount()])
     const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
@@ -245,8 +244,8 @@ describe('R1：30 分钟续期定时器的注册判据必须等 storage 就绪',
     storage.release()
     await flush()
 
-    expect(refreshTimerCount(setIntervalSpy)).toBe(0)
-    expect(pipeline.codearts).not.toHaveBeenCalled()
+    expect(refreshTimerCount(setIntervalSpy)).toBe(1)
+    expect(pipeline.codearts).toHaveBeenCalledTimes(1)
   })
 
   it('补跑续期失败只记日志，不影响定时器注册（不炸启动）', async () => {

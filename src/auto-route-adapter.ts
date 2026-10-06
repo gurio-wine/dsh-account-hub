@@ -57,6 +57,9 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
+import { appendFile, mkdir, rename, stat, unlink } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { EMPTY_RESPONSE_CODE, LlmAdapter, LlmError, ReasoningEffortId, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 // 两条头覆写通道 + windowId 通道：既要它们的**类型**（形状，字段本体由 forwardOptions
 // 写入、由内层适配器读取），也要它们的**归一化函数** —— 伪装载荷与转发载体必须同源，
@@ -718,6 +721,76 @@ export function createAutoRouteRegistration(
   }
 }
 
+const AUTO_ROUTE_DEMOTION_LOG_MAX_BYTES = 1024 * 1024
+const AUTO_ROUTE_DEMOTION_LOG_RELATIVE_PATH = join('logs', 'dsh-account-hub', 'auto-route-demotion.log')
+
+type AutoRouteLogContext = Context & {
+  dshHomePath?: (...segments: string[]) => string
+}
+
+const autoRouteDemotionLogDirectoryPromises = new Map<string, Promise<void>>()
+const autoRouteDemotionLogWritePromises = new Map<string, Promise<void>>()
+
+function autoRouteDemotionLogPath(ctx: Context): string {
+  const resolveHome = (ctx as AutoRouteLogContext).dshHomePath
+  const home = typeof resolveHome === 'function'
+    ? resolveHome()
+    : process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(home, AUTO_ROUTE_DEMOTION_LOG_RELATIVE_PATH)
+}
+
+function ensureAutoRouteDemotionLogDirectory(logPath: string): Promise<void> {
+  const directory = dirname(logPath)
+  const existing = autoRouteDemotionLogDirectoryPromises.get(directory)
+  if (existing !== undefined) return existing
+  const promise = mkdir(directory, { recursive: true }).then(() => undefined)
+  autoRouteDemotionLogDirectoryPromises.set(directory, promise)
+  return promise
+}
+
+/** 文件通道只做诊断：任何路径/目录/轮转/追加错误都不能影响路由。 */
+export function writeAutoRouteDemotionLog(ctx: Context, details: string): void {
+  let logPath: string
+  try {
+    logPath = autoRouteDemotionLogPath(ctx)
+    const previous = autoRouteDemotionLogWritePromises.get(logPath) ?? Promise.resolve()
+    const next = previous
+      .catch(() => {})
+      .then(async () => {
+        await ensureAutoRouteDemotionLogDirectory(logPath)
+        let existingSize = 0
+        try {
+          existingSize = (await stat(logPath)).size
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return
+        }
+        if (existingSize > AUTO_ROUTE_DEMOTION_LOG_MAX_BYTES) {
+          const backupPath = `${logPath}.1`
+          try {
+            await unlink(backupPath)
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+          }
+          await rename(logPath, backupPath)
+        }
+        return appendFile(
+          logPath,
+          `${new Date().toISOString()} [auto-route] ${details}\n`,
+          'utf8',
+        ).then(() => undefined)
+      })
+    autoRouteDemotionLogWritePromises.set(logPath, next)
+    void next.catch(() => {})
+  } catch {
+    // 解析 DSH 根或排队时的同步异常同样只能静默跳过。
+  }
+}
+
+/** 仅供单测等待 fire-and-forget 文件写入收口；生产路径绝不调用。 */
+export async function flushAutoRouteDemotionLogWrites(): Promise<void> {
+  await Promise.allSettled([...autoRouteDemotionLogWritePromises.values()])
+}
+
 /** 只在「未透传任何 chunk」的静默降级路径记录候选失败原因。 */
 function logSilentAutoRouteDemotion(
   ctx: Context,
@@ -740,13 +813,14 @@ function logSilentAutoRouteDemotion(
     ...entry.originator === undefined ? [] : [`originator=${entry.originator}`],
     ...entry.masquerade?.windowId === undefined ? [] : [`masquerade.windowId=${entry.masquerade.windowId}`],
   ]
+  const message = details.join('；')
   try {
     const logger = ctx.logger
-    if (typeof logger?.warn !== 'function') return
-    logger.warn(`[auto-route] ${details.join('；')}`)
+    if (typeof logger?.warn === 'function') logger.warn(`[auto-route] ${message}`)
   } catch {
     // 日志后端异常不得改变候选轮转、吞错或 exhaust 行为。
   }
+  writeAutoRouteDemotionLog(ctx, message)
 }
 
 /**

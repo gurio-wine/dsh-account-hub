@@ -229,6 +229,10 @@ export declare function registerAutoRouteLlm(ctx: Context, options: AutoRouteAda
  * @returns 幂等的刷新函数（可反复调用）。
  */
 export declare function createAutoRouteRegistration(ctx: Context, config: () => AutoRouteConfig): () => void;
+/** 文件通道只做诊断：任何路径/目录/轮转/追加错误都不能影响路由。 */
+export declare function writeAutoRouteDemotionLog(ctx: Context, details: string): void;
+/** 仅供单测等待 fire-and-forget 文件写入收口；生产路径绝不调用。 */
+export declare function flushAutoRouteDemotionLogWrites(): Promise<void>;
 /**
  * 在 `agent/request` 瀑布流上兜底校验打到聚合模型的 `reasoningEffort`。
  *

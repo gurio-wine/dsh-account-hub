@@ -17,6 +17,7 @@ import { LobsteraiAuth } from './lobsterai-auth.js'
 import { TraeCnAuth } from './trae-cn-auth.js'
 import { QoderAuth } from './qoder-auth.js'
 import { AccountPool } from './account-pool.js'
+import { MultiAccountRefreshScheduler } from './refresh-scheduler.js'
 import { createAutoRouteRegistration, installAutoRouteEffortGuard } from './auto-route-adapter.js'
 import { TurnKeyTracker } from './account-consumption.js'
 import { createContextTierRegistry } from './context-tiers.js'
@@ -1309,52 +1310,31 @@ export function apply(ctx: Context, config?: Config): void {
     } catch { /* 静默 */ }
   }
 
-  // 启动时如果有任何可续期账号，安排定期续期。
+  // 启动时**无条件**武装续期调度器，并在账号入库时补一次武装。
   //
-  // ⚠️ 判据只看 `refreshable`，**不看 `enabled`**：停用只影响账号池的**自动选号**，
-  // 与「凭据是否需要保持新鲜」无关。早期这里写成 `a.refreshable && a.enabled`，
-  // 于是**全部账号都被停用**时续期定时器根本不注册 —— 整个多账号续期静默失效，
-  // 所有 refresh_token 一路放到过期，用户重新启用后只能重新登录（真实缺陷）。
+  // ⚠️ 空池只用于日志措辞，不参与是否武装的决策：冷启动空池是新用户、
+  // 刚清过存储时的正常态。若在这里因空池直接 return，之后登录的账号就不会
+  // 获得本会话内的主动续期路径。refreshable 也不能作为武装判据，因为它可能
+  // 被历史数据误标，而调度器本身正是修正这类状态的自愈路径。
   //
-  // ⚠️⚠️ **判据必须在 storage 就绪之后才算**（本单修复的主因）：`apply()` 是同步
-  // 签名，而 `pool.openStorage()` 是异步的。历史接线在 apply 的**同步执行期**就
-  // 对 `pool.listAllAccounts()` 求值，此时 storage 尚未接管，读到的只有 settings
-  // 回退路径（或空表）—— `hasRefreshable` 恒为 false，**30 分钟续期定时器从未
-  // 注册过**。故这里照抄下方自动签到的 `void pool.openStorage().then(...)` 模式，
-  // 把「判据 + 注册」整体移进 then 链。
-  //
-  // ⚠️ **storage 就绪后要立即补跑一次 `refreshAllCredentials()`**：定时器的第一次
-  // 触发要等满 30 分钟，而登录后长时间不关机的用户在此期间若凭据先过期，就会带着
-  // 过期凭据发请求。立即补跑消除这 30 分钟空窗（与下方 Qoder 资料回填同因）。
-  // 补跑同样先过判据：没有可续期账号时一次网都不出。
-  void pool.openStorage().then(() => {
-    const hasRefreshable = pool.listAllAccountsSnapshot().some(a => a.refreshable)
-    if (!hasRefreshable) return
-    // 立即补跑：失败只记日志，**绝不炸启动**（下面各服务的 refreshAll 内部已自吞
-    // 单账号异常，这里只兜住意外抛出）。
-    void refreshAllCredentials().catch((error: unknown) => {
-      ctx.logger.warn(`[account-hub] 启动续期失败（不影响后续定时续期）：${String(error)}`)
-    })
-    const refreshTimer = setInterval(() => void refreshAllCredentials(), REFRESH_INTERVAL_MS)
-    refreshTimer.unref?.()
-    ctx.effect(() => () => {
-      clearInterval(refreshTimer)
-      service.stop()
-      buddyCn.stop()
-      buddy.stop()
-      lobsterai.stop()
-      traeCn.stop()
-      qoder.stop()
-      qoderCn.stop()
-    }, 'account-hub: multi-account refresh scheduler')
-  }).catch((error: unknown) => {
-    // 判据读取本身失败（异常 storage 形状等）：记日志并放弃注册定时器，
-    // 绝不让它冒泡成 apply 的异常。
-    ctx.logger.warn(`[account-hub] 续期调度注册失败，本次不做定时续期：${String(error)}`)
+  // ⚠️ 调度器仍挂在 `openStorage().then(...)` 上：账号池在 storage 接管前只
+  // 是 settings / 内存快照，启动判据与实际读路径必须保持同一时序。
+  const refreshScheduler = new MultiAccountRefreshScheduler({
+    refresh: refreshAllCredentials,
+    intervalMs: REFRESH_INTERVAL_MS,
+    isPoolEmpty: async () => (await pool.listAllAccounts()).length === 0,
+    info: (message) => ctx.logger?.info?.(message),
+    warn: (message) => ctx.logger?.warn?.(message),
   })
 
-  // 保留旧的 stop scheduler（兼容旧命令）
+  let unsubscribeAccountAdded: (() => void) | undefined
+  let schedulerDisposed = false
+  // 清理 effect 必须同步注册：storage 可能尚未就绪时宿主就销毁插件。
+  // 续期订阅句柄则在 storage ready 后填充，避免读到未接管的账号池。
   ctx.effect(() => () => {
+    schedulerDisposed = true
+    unsubscribeAccountAdded?.()
+    refreshScheduler.stop()
     service.stop()
     buddyCn.stop()
     buddy.stop()
@@ -1362,7 +1342,33 @@ export function apply(ctx: Context, config?: Config): void {
     traeCn.stop()
     qoder.stop()
     qoderCn.stop()
-  }, 'codearts-auth.scheduler (legacy)')
+  }, 'account-hub: multi-account refresh scheduler')
+
+  void pool.openStorage().then(() => {
+    if (schedulerDisposed) return
+    // 先订阅再 start：首轮续期是异步的，首轮期间若有账号入库，通知也不能漏。
+    unsubscribeAccountAdded = pool.onAccountAdded(() => {
+      refreshScheduler.notifyAccountAdded()
+    })
+    if (schedulerDisposed) {
+      unsubscribeAccountAdded()
+      unsubscribeAccountAdded = undefined
+      return
+    }
+    // `start()` 内建首轮续期，因此无需在 index.ts 再手写一次 refreshAllCredentials。
+    // 不 await：apply() 是同步签名，网络续期不能阻塞插件激活。
+    void refreshScheduler.start().catch((error: unknown) => {
+      ctx.logger?.warn?.(
+        `[account-hub] 多账号续期调度器启动失败（后续可由账号入库通知补武装）：`
+        + `${error instanceof Error ? error.message : String(error)}`,
+      )
+    })
+  }).catch((error: unknown) => {
+    // openStorage 自身会吞掉可预期的降级错误；这里只兜住意外 rejection，
+    // 不让一次存储抖动炸掉插件启动。
+    ctx.logger?.warn?.(`[account-hub] 续期调度注册失败：${String(error)}`)
+  })
+
 
   // ===== Qoder 存量账号资料回填（启动时一次） =====
   //

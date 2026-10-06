@@ -219,6 +219,13 @@ export declare class AccountPool {
      * 幂等的，所以症状只是噪音 —— 但那正是「闸门形同虚设」。
      */
     private auditVersionCache;
+    /**
+     * 「账号入库」订阅者（Gitee issue IKJOZB）。
+     *
+     * 刻意不落盘、不跨实例：订阅者是当前插件会话内的续期调度器，
+     * 持久化订阅者没有意义，也会让启动时恢复订阅变成额外状态。
+     */
+    private readonly accountAddedListeners;
     /** 是否已从持久层完成首次载入。 */
     private loaded;
     /**
@@ -578,6 +585,14 @@ export declare class AccountPool {
     pruneAccountsWithForeignDomain(product: BuddyProduct): Promise<string[]>;
     /** 添加新账号（登录成功后调用） */
     addAccount(entry: ProviderAccountEntry): Promise<void>;
+    /**
+     * 注册「账号入库」回调，并返回取消订阅函数。
+     *
+     * 订阅者异常由 notifyAccountAdded 吞掉并记 warn，绝不冒泡到登录流程。
+     */
+    onAccountAdded(listener: (entry: ProviderAccountEntry) => void): () => void;
+    /** 逐个调用账号入库订阅者；异常只记 warn。 */
+    private notifyAccountAdded;
     /** 更新账号部分字段 */
     updateAccount(id: string, patch: Partial<Pick<ProviderAccountEntry, 'nickname' | 'enabled' | 'expiresAt' | 'refreshable'>>): Promise<void>;
     /**

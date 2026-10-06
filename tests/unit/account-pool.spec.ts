@@ -19,6 +19,7 @@ function createMockContext(
     initialContextBudgets?: Record<string, Record<string, number>>
     initialCheckins?: Record<string, number>
     initialSchemaVersion?: number
+    failReplace?: boolean
   } = {},
 ) {
   let stored: {
@@ -50,6 +51,7 @@ function createMockContext(
         checkins?: Record<string, number>
         schemaVersion?: number
       }) => {
+        if (options.failReplace) throw new Error('disk full')
         if (options.staleReads) {
           // 模拟滞后：get() 始终慢一拍，本次写入要等下一次 replace 才可见
           visible = stored
@@ -1220,5 +1222,44 @@ describe('AccountPool 签到存储（checkins 第五件套）', () => {
     expect(last.contextBudgets).toEqual({ 'buddy-cn': { 'glm-5.2': 200_000 } })
     expect(last.schemaVersion).toBe(0)
     expect(last.checkins).toEqual({ 'buddy-cn:buddy-001': nextEligible })
+  })
+
+  describe('账号入库通知（issue IKJOZB）', () => {
+    it('每次 addAccount 都回调一次并带上新增条目', async () => {
+      const added: ProviderAccountEntry[] = []
+      pool.onAccountAdded((entry) => added.push(entry))
+      await pool.addAccount(makeMockAccount())
+      await pool.addAccount(makeMockAccount({ id: 'buddy-002' }))
+      expect(added.map((entry) => entry.id)).toEqual(['buddy-001', 'buddy-002'])
+    })
+
+    it('落盘失败时仍通知订阅者，并保留原始写入错误', async () => {
+      const failing = createMockContext([], { failReplace: true })
+      const failingPool = new AccountPool(failing as never)
+      let notified = 0
+      failingPool.onAccountAdded(() => { notified++ })
+      await expect(failingPool.addAccount(makeMockAccount())).rejects.toThrow('disk full')
+      expect(notified).toBe(1)
+    })
+
+    it('订阅者抛错只记 warn，不冒泡到 addAccount', async () => {
+      const warnings: string[] = []
+      const notifying = createMockContext()
+      notifying.logger.warn = (message: string) => { warnings.push(message) }
+      const notifyingPool = new AccountPool(notifying as never)
+      notifyingPool.onAccountAdded(() => { throw new Error('subscriber boom') })
+      await expect(notifyingPool.addAccount(makeMockAccount())).resolves.toBeUndefined()
+      expect(await notifyingPool.listAllAccounts()).toHaveLength(1)
+      expect(warnings.some((message) => message.includes('subscriber boom'))).toBe(true)
+    })
+
+    it('取消订阅后不再收到通知，多个订阅者互不影响', async () => {
+      const seen: string[] = []
+      const unsubscribe = pool.onAccountAdded(() => { seen.push('first') })
+      pool.onAccountAdded(() => { seen.push('second') })
+      unsubscribe()
+      await pool.addAccount(makeMockAccount())
+      expect(seen).toEqual(['second'])
+    })
   })
 })

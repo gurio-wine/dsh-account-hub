@@ -17,3 +17,9 @@ stderr.log']
 commit-msg.tmp
 
 ide-models.json
+
+# 本地 npm/pnpm 配置不入库（镜像上游 ed1c04c，issue !IKIRUB）：
+# script-shell 指向 Windows 专有路径，随包分发到 Android/Linux/macOS 后
+# pnpm 生命周期脚本 spawn 失败、插件装不上；win32 默认 %ComSpec% 就是
+# cmd.exe，仓库里这份纯属冗余。确需指定 shell 写用户级 ~/.npmrc。
+.npmrc
