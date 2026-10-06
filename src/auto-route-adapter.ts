@@ -395,11 +395,18 @@ export class AutoRouteAdapter extends LlmAdapter {
         if (emitted) {
           // 已透传过内容：不硬换（换了会污染外层流语法），透传失败让 loop 走
           // 官方的 `agent/request-error` 重试 —— 用户只看到一条正常重试。
+          logAutoRouteDemotion(this.options.ctx, definition, entry, reason, {
+            branch: '已透传后失败降级',
+            emitted: true,
+          })
           yield chunk
           return
         }
         // 一个 chunk 都还没透传：静默吞掉这个 finish，换下一个候选，DSH 无感。
-        logSilentAutoRouteDemotion(this.options.ctx, definition, entry, reason)
+        logAutoRouteDemotion(this.options.ctx, definition, entry, reason, {
+          branch: '静默降级',
+          emitted: false,
+        })
         demotions += 1
         continue candidates
       }
@@ -408,7 +415,10 @@ export class AutoRouteAdapter extends LlmAdapter {
       demoteAutoRouteHead(this.runtime, definition.id)
       if (!emitted) {
         // 一个 chunk 都没透传：静默换下一个候选。
-        logSilentAutoRouteDemotion(this.options.ctx, definition, entry, null)
+        logAutoRouteDemotion(this.options.ctx, definition, entry, null, {
+          branch: '静默降级',
+          emitted: false,
+        })
         demotions += 1
         continue
       }
@@ -416,12 +426,23 @@ export class AutoRouteAdapter extends LlmAdapter {
       // 静静地结束：外层装配器会把「无终止 chunk」当成一次正常完成，用户拿到的是
       // 一个没有解释的空白回答。故自己补一个 error finish，把控制权交给 loop 既有的
       // 失败路径。
+      const incompleteMessage = autoRouteIncompleteMessage(definition.name, entry.provider, entry.model)
+      logAutoRouteDemotion(this.options.ctx, definition, entry, {
+        kind: 'error',
+        failure: {
+          message: incompleteMessage,
+          code: AUTO_ROUTE_INCOMPLETE_CODE,
+        },
+      }, {
+        branch: '已透传后流提前结束',
+        emitted: true,
+      })
       yield {
         type: 'finish',
         reason: {
           kind: 'error',
           failure: {
-            message: autoRouteIncompleteMessage(definition.name, entry.provider, entry.model),
+            message: incompleteMessage,
             code: AUTO_ROUTE_INCOMPLETE_CODE,
           },
         },
@@ -791,17 +812,19 @@ export async function flushAutoRouteDemotionLogWrites(): Promise<void> {
   await Promise.allSettled([...autoRouteDemotionLogWritePromises.values()])
 }
 
-/** 只在「未透传任何 chunk」的静默降级路径记录候选失败原因。 */
-function logSilentAutoRouteDemotion(
+/** 记录队列轮转原因；所有分支共用同一条 warn + 文件日志管道。 */
+function logAutoRouteDemotion(
   ctx: Context,
   definition: AutoRouteDefinition,
   entry: AutoRouteEntry,
   reason: Extract<StreamChunk, { type: 'finish' }>['reason'] | null,
+  outcome: { branch: string; emitted: boolean },
 ): void {
   const finishKind = reason?.kind ?? '无终止 chunk'
   const failure = reason?.kind === 'error' ? reason.failure : undefined
   const details = [
-    '静默降级',
+    outcome.branch,
+    `emitted=${outcome.emitted}`,
     `聚合模型 ${AUTO_ROUTE_PROVIDER_ID}/${definition.id}（${definition.name}）`,
     `候选 ${entry.provider}/${entry.model}`,
     `finish=${finishKind}`,
