@@ -35,7 +35,7 @@
 ## DSH 插件契约
 
 - 插件注入 `@deepseek-ai/dsh` 的 `credentials`、`commands`、`llm` 服务；凭据存储用 `ctx.credentials`，ref 遵循 POSIX 标识符（如 `CODEARTS_ACCESS_TOKEN`）
-- LLM provider 用 `ctx.llm.registerProvider()` 注册；命令用 `ctx.commands.register()`；插件配置用 `ctx.schema` 在 profile layer 栈中声明
+- LLM provider 用 `ctx.llm.registerAdapter()` 注册；命令用 `ctx.commands.register()`；插件配置用 `ctx.schema` 在 profile layer 栈中声明
 
 ## 工作方式
 
