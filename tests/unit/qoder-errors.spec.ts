@@ -119,7 +119,45 @@ describe('Qoder 402 + code 116（额度类候选）', () => {
   })
 })
 
-// ── 2. applyQoderQuotaVerdict：四位分支 ──────────────────────────────────────
+// ── 2. code 110：每日计费上限，直接确证并换号 ─────────────────────────────────
+
+describe('Qoder code 110（每日计费上限）', () => {
+  it('预流 HTTP 402 + 数字 110 直接确证额度耗尽并切换账号', () => {
+    const result = classifyQoderError({
+      httpStatus: 402,
+      code: 110,
+      message: 'daily billing limit exceeded',
+    })
+
+    expect(result.action).toBe('switch-account')
+    expect(result.quotaCandidate).toBe(true)
+    expect(result.quotaConfirmed).toBe(true)
+    expect(result.skipQuotaConfirm).toBe(true)
+    expect(shouldSwitchQoderAccount(result.action)).toBe(true)
+    expect(result.message).toContain('每日计费上限')
+    expect(result.message).toContain('UTC+8 00:00')
+  })
+
+  it('流内 HTTP 200 + 字符串 "110" 归一化为相同的直接确证结果', () => {
+    const result = classifyQoderError({
+      httpStatus: 200,
+      code: '110',
+      message: 'daily billing limit exceeded',
+    })
+
+    expect(result.action).toBe('switch-account')
+    expect(result.quotaCandidate).toBe(true)
+    expect(result.quotaConfirmed).toBe(true)
+    expect(result.skipQuotaConfirm).toBe(true)
+    expect(result.status).toBe(200)
+    expect(result.code).toBe('110')
+    expect(shouldSwitchQoderAccount(result.action)).toBe(true)
+    expect(result.message).toContain('每日计费上限')
+    expect(result.message).toContain('UTC+8 00:00')
+  })
+})
+
+// ── 3. applyQoderQuotaVerdict：四位分支 ──────────────────────────────────────
 
 describe('applyQoderQuotaVerdict 二次判别', () => {
   const candidate = classifyQoderError({ httpStatus: 402, code: 116, message: 'quota exceeded' })
@@ -937,14 +975,18 @@ describe('本地字节闸（QODER_MAX_REQUEST_BYTES）', () => {
       .toBe('CONTEXT_WINDOW_EXCEEDED')
   })
 
-  it('文案含关键信息：字节数、256 KiB 墙、宿主将压缩重试、压缩不可用则新建对话', () => {
+  it('文案区分本地预拦线与上游 256 KiB 墙，并保留压缩补救句', () => {
     const gated = buildQoderByteGateFailure(262_400)
 
     expect(gated.message).toContain('262400')
     expect(gated.message).toContain('256 KiB')
-    expect(gated.message).toContain('262 144')
+    expect(gated.message).toContain('262 144 字节')
+    expect(gated.message).toContain(`本地预拦阈值 ${QODER_MAX_REQUEST_BYTES} 字节（240 KiB）`)
+    expect(gated.message).toContain(`${262_144 - QODER_MAX_REQUEST_BYTES} 字节`)
+    expect(gated.message).toContain('恒回 HTTP 500')
     expect(gated.message).toContain('压缩')
     expect(gated.message).toContain('新建对话')
+    expect(gated.message).toContain('DSH 将自动压缩上下文后重试；若压缩不可用（或压缩后仍然超限），请新建对话再继续。')
   })
 
   it('文案带 provider 名，两个 region 各自可分辨（共用同一道闸）', () => {

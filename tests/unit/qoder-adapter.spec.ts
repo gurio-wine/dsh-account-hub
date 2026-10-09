@@ -970,7 +970,7 @@ describe('本地字节闸', () => {
     expect(updateModelRateLimit).not.toHaveBeenCalled()
   })
 
-  it('错误文案不丢关键信息（字节数 / 256 KiB / 压缩重试 / 新建对话）', async () => {
+  it('错误文案区分本地预拦线与上游墙，并保留压缩补救提示', async () => {
     const adapter = new QoderAdapter(adapterOptions({
       fetchImpl: (async () => sseResponse(NORMAL_STREAM)) as unknown as typeof fetch,
     }))
@@ -980,8 +980,13 @@ describe('本地字节闸', () => {
     expect(error).toBeInstanceOf(Error)
     const message = String(error?.message)
     expect(message).toContain('256 KiB')
+    expect(message).toContain('262 144 字节')
+    expect(message).toContain(`本地预拦阈值 ${QODER_MAX_REQUEST_BYTES} 字节（240 KiB）`)
+    expect(message).toContain('16384 字节')
+    expect(message).toContain('恒回 HTTP 500')
     expect(message).toContain('压缩')
     expect(message).toContain('新建对话')
+    expect(message).toContain('DSH 将自动压缩上下文后重试；若压缩不可用（或压缩后仍然超限），请新建对话再继续。')
     // 真的报出**实测的那个字节数**（不是阈值），用户据此能知道超了多少。
     expect(message).toContain(String(QODER_MAX_REQUEST_BYTES))
   })

@@ -13,6 +13,7 @@
  * | 场景 | HTTP | 容器 | `code` | 文案字段 |
  * |---|---|---|---|---|
  * | quota=0 / 无效模型名 / `model:""` | **402** | pre-stream | `116`（**数字**） | `error` |
+ * | 每日计费上限（110）→ 非重试 `QUOTA_EXCEEDED` / 换号 | **402 / 200** | pre-stream / 流内 | `110`（数字或字符串） | `error` / `message` |
  * | `messages:[]` + `stream:true` | **200** | **流内** | `"invalid_parameter_error"` | `message` |
  * | `messages:[]` + `stream:false` | **400** | pre-stream | `"provider_error"` + `details` | `message` |
  * | 缺 `model` + `stream:true` | **200** | **流内** | `"invalid_model_error"` | `message` |
@@ -150,10 +151,12 @@ export interface QoderErrorClassification {
     code?: QoderErrorCode;
     /** HTTP 状态码（有则带）。 */
     status?: number;
-    /** 是否「额度类候选」（402 + code 116）—— **未确证**，绝不据此换号。 */
+    /** 是否「额度类候选」（402 + code 116）或需换号的额度耗尽（code 110）。 */
     quotaCandidate: boolean;
-    /** 是否已由 {@link applyQoderQuotaVerdict} 确证为额度耗尽。 */
+    /** 是否已由 code 110 直接确证，或由 {@link applyQoderQuotaVerdict} 确证为额度耗尽。 */
     quotaConfirmed: boolean;
+    /** 是否跳过额度端点二次确证（code 110 的每日计费上限语义明确）。 */
+    skipQuotaConfirm: boolean;
     /** chat 401 的「jt 过期」信号：适配器应先 invalidate + 重换一次再试。 */
     jobTokenExpired: boolean;
     /** 凭据（PAT）失效：需用户重新粘贴。 */

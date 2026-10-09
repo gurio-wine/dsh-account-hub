@@ -13,6 +13,7 @@
  * | 场景 | HTTP | 容器 | `code` | 文案字段 |
  * |---|---|---|---|---|
  * | quota=0 / 无效模型名 / `model:""` | **402** | pre-stream | `116`（**数字**） | `error` |
+ * | 每日计费上限（110）→ 非重试 `QUOTA_EXCEEDED` / 换号 | **402 / 200** | pre-stream / 流内 | `110`（数字或字符串） | `error` / `message` |
  * | `messages:[]` + `stream:true` | **200** | **流内** | `"invalid_parameter_error"` | `message` |
  * | `messages:[]` + `stream:false` | **400** | pre-stream | `"provider_error"` + `details` | `message` |
  * | 缺 `model` + `stream:true` | **200** | **流内** | `"invalid_model_error"` | `message` |
@@ -160,10 +161,12 @@ export interface QoderErrorClassification {
   code?: QoderErrorCode
   /** HTTP 状态码（有则带）。 */
   status?: number
-  /** 是否「额度类候选」（402 + code 116）—— **未确证**，绝不据此换号。 */
+  /** 是否「额度类候选」（402 + code 116）或需换号的额度耗尽（code 110）。 */
   quotaCandidate: boolean
-  /** 是否已由 {@link applyQoderQuotaVerdict} 确证为额度耗尽。 */
+  /** 是否已由 code 110 直接确证，或由 {@link applyQoderQuotaVerdict} 确证为额度耗尽。 */
   quotaConfirmed: boolean
+  /** 是否跳过额度端点二次确证（code 110 的每日计费上限语义明确）。 */
+  skipQuotaConfirm: boolean
   /** chat 401 的「jt 过期」信号：适配器应先 invalidate + 重换一次再试。 */
   jobTokenExpired: boolean
   /** 凭据（PAT）失效：需用户重新粘贴。 */
@@ -546,6 +549,7 @@ interface QoderClassificationSeed {
   message: string
   quotaCandidate?: boolean
   quotaConfirmed?: boolean
+  skipQuotaConfirm?: boolean
   jobTokenExpired?: boolean
   credentialInvalid?: boolean
   localByteGate?: boolean
@@ -566,6 +570,7 @@ function buildClassification(input: QoderErrorInput, seed: QoderClassificationSe
     ...(input.httpStatus === undefined ? {} : { status: input.httpStatus }),
     quotaCandidate: seed.quotaCandidate ?? false,
     quotaConfirmed: seed.quotaConfirmed ?? false,
+    skipQuotaConfirm: seed.skipQuotaConfirm ?? false,
     jobTokenExpired: seed.jobTokenExpired ?? false,
     credentialInvalid: seed.credentialInvalid ?? false,
     localByteGate: seed.localByteGate ?? false,
@@ -630,7 +635,19 @@ export function classifyQoderError(input: QoderErrorInput): QoderErrorClassifica
     })
   }
 
-  // 2. 401 + 额度端点：重换 jt 救不了，只能判「jt 过期」或「凭据失效」。
+  // 2. 110：每日计费上限语义明确，直接确证并换号，不查询额度端点。
+  if (normalized === 110) {
+    return buildClassification(input, {
+      action: 'switch-account',
+      quotaCandidate: true,
+      quotaConfirmed: true,
+      skipQuotaConfirm: true,
+      message: '已达每日计费上限（错误码 110）。每日 UTC+8 00:00 重置；'
+        + '可立即切换其他账号（若有多账号）或等待重置。',
+    })
+  }
+
+  // 3. 401 + 额度端点：重换 jt 救不了，只能判「jt 过期」或「凭据失效」。
   if (status === HTTP_UNAUTHORIZED && source === 'quota') {
     const haystack = `${input.message ?? ''}\n${input.body ?? ''}`.toUpperCase()
     if (QODER_TOKEN_EXPIRE_MARKERS.some((marker) => haystack.includes(marker))) {
@@ -805,10 +822,12 @@ export function buildQoderByteGateFailure(
   return buildClassification({}, {
     action: 'fail',
     localByteGate: true,
-    message: `${product.id} 的请求体为 ${bodyBytes} 字节，超出 Qoder 上游网关的 256 KiB `
-      + `（262 144 字节）限制 —— 该限制是确定性的，超过后网关恒回 HTTP 500，重发无用，`
-      + `故本次请求在本地就被拦下（未发出）。DSH 将自动压缩上下文后重试；`
-      + `若压缩不可用（或压缩后仍然超限），请新建对话再继续。`,
+    message: `${product.id} 的请求体为 ${bodyBytes} 字节，已达到本地预拦阈值 `
+      + `${QODER_MAX_REQUEST_BYTES} 字节（${QODER_MAX_REQUEST_BYTES / 1024} KiB），`
+      + `该阈值比 Qoder 上游网关的 256 KiB（262 144 字节）限制低 `
+      + `${262_144 - QODER_MAX_REQUEST_BYTES} 字节，以预留传输与中间层安全边际。`
+      + `上游请求体超过该限制恒回 HTTP 500，重发无用；本次请求已在本地拦下（未发出）。`
+      + `DSH 将自动压缩上下文后重试；若压缩不可用（或压缩后仍然超限），请新建对话再继续。`,
   })
 }
 
